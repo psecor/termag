@@ -7,6 +7,9 @@
 //   BoxDiskField  the full UI's New project form: a native number input in an
 //                 npf-field, like its Box name field.
 //
+// The Resize box dialogs use them too (BoxResizeDialog, BoxResizeLaunchPad),
+// with a range from the box's current disk (grow only) to the server's cap.
+//
 // Both show what the server says a box for the repository gets (its
 // .termag/environment.json resources.diskGiB, else 120) until the person types,
 // and send only what was typed (utils/boxDisk.ts). The range is the server's,
@@ -26,7 +29,9 @@ interface DiskProps {
   disabled?: boolean;
 }
 
-export function BoxDiskInput({ disk, typed, onType, warmBoxReady = false, disabled, className }: DiskProps & { className?: string }) {
+export function BoxDiskInput({
+  disk, typed, onType, warmBoxReady = false, disabled, className, label = 'Disk',
+}: DiskProps & { className?: string; label?: string }) {
   const shown = diskShown(disk, typed);
   const error = diskInputError(disk, typed);
   const note = diskNote(disk, typed, warmBoxReady);
@@ -43,8 +48,10 @@ export function BoxDiskInput({ disk, typed, onType, warmBoxReady = false, disabl
       isDisabled={disabled}
       isInvalid={!!error}
     >
-      <Label className="box-disk-input-label">Disk</Label>
-      <Input className="box-disk-input-field" aria-label="Disk size in GB" />
+      <Label className="box-disk-input-label">{label}</Label>
+      {/* NumberField's onChange commits only on blur or Enter; the raw text too, so a button pressed
+          while the field still has focus sends what is typed (Cursor on #1214). */}
+      <Input className="box-disk-input-field" aria-label="Disk size in GB" onChange={e => onType(e.target.value.trim())} />
       <Text slot="description" className="box-disk-input-hint">GB, {disk.minGiB}–{disk.maxGiB}</Text>
       {error && <FieldError className="box-disk-input-error">{error}</FieldError>}
       {/* Plain text: inside the field, LaunchPad's Text takes only its description and errorMessage slots. */}
@@ -53,14 +60,16 @@ export function BoxDiskInput({ disk, typed, onType, warmBoxReady = false, disabl
   );
 }
 
-export function BoxDiskField({ disk, typed, onType, warmBoxReady = false, disabled }: DiskProps) {
+export function BoxDiskField({
+  disk, typed, onType, warmBoxReady = false, disabled, id = 'npf-box-disk', label = 'Disk (GB)',
+}: DiskProps & { id?: string; label?: string }) {
   const error = diskInputError(disk, typed);
   const note = diskNote(disk, typed, warmBoxReady);
   return (
     <div className="npf-field npf-inline">
-      <label htmlFor="npf-box-disk">Disk (GB)</label>
+      <label htmlFor={id}>{label}</label>
       <input
-        id="npf-box-disk"
+        id={id}
         type="number"
         inputMode="numeric"
         min={disk.minGiB}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  CHAT_MODELS, chatAgentName, chatModelFromWire, chatModelLabel, chatModelOptions, chatModelWire, chatModelTakesPdfs, claudeModelForCreate, isChatModel, modelFamily, newChatCreateFields, repoListView, repoTriggerLabel, REPO_EMPTY, REPO_LOAD_ERROR,
+  CHAT_MODELS, chatAgentName, chatModelFromWire, chatModelLabel, chatModelOptions, chatModelWire, chatModelTakesPdfs, claudeModelForCreate, isChatModel, modelFamily, newChatCreateFields, repoListView, repoTriggerLabel, REPO_EMPTY, REPO_LOAD_ERROR, REPO_LOAD_ERROR_NO_PASTE,
 } from './composer';
 import { catalogFromWire, degradedCatalog, type RepoPick } from '../utils/repoPick';
 
@@ -53,6 +53,13 @@ describe('repository list states', () => {
     expect(REPO_EMPTY).toMatch(/Paste a URL/);
     const reconnect = catalogFromWire({ status: 'reconnect', reconnect: { sentence: 'Reconnect GitHub in Settings' } });
     expect(repoListView(reconnect)).toEqual({ kind: 'error', text: 'Reconnect GitHub in Settings' });
+  });
+
+  it('offers no paste where there is no paste field', () => {
+    expect(repoListView(degradedCatalog(), false)).toEqual({ kind: 'error', text: REPO_LOAD_ERROR_NO_PASTE });
+    expect(REPO_LOAD_ERROR_NO_PASTE).not.toMatch(/Paste/);
+    const reconnect = catalogFromWire({ status: 'reconnect', reconnect: { sentence: 'Reconnect GitHub in Settings' } });
+    expect(repoListView(reconnect, false)).toEqual({ kind: 'error', text: 'Reconnect GitHub in Settings' });
   });
 });
 

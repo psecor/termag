@@ -27,7 +27,7 @@ vi.mock('../../flags', async () => {
 });
 vi.mock('../../services/boxFeed', () => ({ boxFeed: { subscribe: () => () => {}, getSnapshot: () => mocks.boxes } }));
 vi.mock('../../chat/useChatSpaces', () => ({
-  useSharedChatSpaces: () => ({ enabled: true, loaded: true, current: true, spaces: [{ id: 's-notes', name: 'notes' }], index: new Map([['box-1', ['notes']]]), colorOf: () => '#888888' }),
+  useSharedChatSpaces: () => ({ loaded: true, current: true, spaces: [{ id: 's-notes', name: 'notes' }], index: new Map([['box-1', ['notes']]]), colorOf: () => '#888888' }),
 }));
 
 import { SessionContextCard } from './SessionContextCard';
@@ -81,6 +81,25 @@ describe('SessionContextCard', () => {
   it('shows where the session runs: the box and its state, the space, the repository and the branch', async () => {
     await render();
     expect(rows()).toEqual(['box-2Running', 'notes', 'example-org/webapp', 'fix-retry']);
+  });
+
+  it("shows the environment file's steps: setup's time and each port's health, and nothing without a report", async () => {
+    await render();
+    expect(host.querySelector('.ctx-env')).toBeNull();
+    const withEnv = { ...project, environmentStatus: {
+      state: 'up', setup: { state: 'succeeded', durationMs: 38_000 }, run: { state: 'succeeded' }, seed: { state: 'none' },
+      ports: [{ name: 'frontend', port: 5174, path: '/termag/', healthy: true }, { name: 'backend', port: 3040, path: '/', healthy: false }],
+      secrets: { resolved: [], missing: [] }, warnings: [],
+    } } as unknown as Project;
+    await act(async () => root.render(<SessionContextCard project={withEnv} workstream="main" />));
+    const env = host.querySelector('.ctx-env')!;
+    expect(env.querySelector('.ctx-env-state')?.textContent).toBe('App up · set up in 38s');
+    expect([...env.querySelectorAll('.ctx-env-port')].map(r => [r.textContent, r.classList.contains('is-healthy')])).toEqual([['frontend:5174', true], ['backend:3040', false]]);
+    // Each port opens, in a new tab, in the owner's own browser pane on the box, at its path.
+    const link = env.querySelector('a.ctx-env-port') as HTMLAnchorElement;
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(new URL(link.href).searchParams.get('browserUrl')).toBe('http://localhost:5174/termag/');
+    expect(new URL(link.href).searchParams.get('project')).toBe('p1');
   });
 
   it('says so when the session has no pull request, and lists no changes', async () => {

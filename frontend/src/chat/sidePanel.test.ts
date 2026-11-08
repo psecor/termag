@@ -65,14 +65,12 @@ describe('clampSidePanelWidth', () => {
 
 describe('tabs', () => {
   it('offers Browser only where the browser pane is on', () => {
-    expect(sidePanelTabs(false)).toEqual(['terminal']);
-    expect(sidePanelTabs(true)).toEqual(['terminal', 'browser']);
+    expect(sidePanelTabs()).toEqual(['terminal', 'browser']);
   });
 
   it('shows Terminal when the remembered Browser tab is not offered', () => {
-    expect(shownSidePanelTab('browser', false)).toBe('terminal');
-    expect(shownSidePanelTab('browser', true)).toBe('browser');
-    expect(shownSidePanelTab('terminal', true)).toBe('terminal');
+    expect(shownSidePanelTab('browser')).toBe('browser');
+    expect(shownSidePanelTab('terminal')).toBe('terminal');
   });
 
   it('remembers Files', () => {
@@ -82,34 +80,32 @@ describe('tabs', () => {
   });
 
   it('offers Files first where there is a space, and only Files beside no session', () => {
-    expect(sidePanelTabs(true, { files: true, session: true })).toEqual(['files', 'terminal', 'browser']);
-    expect(sidePanelTabs(true, { files: true, session: false })).toEqual(['files']);
-    expect(sidePanelTabs(true, { files: false, session: true })).toEqual(['terminal', 'browser']);
+    expect(sidePanelTabs({ files: true, session: true })).toEqual(['files', 'terminal', 'browser']);
+    expect(sidePanelTabs({ files: true, session: false })).toEqual(['files']);
+    expect(sidePanelTabs({ files: false, session: true })).toEqual(['terminal', 'browser']);
   });
 
   it('offers Share last, beside a session that may be shared, and only with the browser pane on', () => {
     const shared = { files: true, session: true, share: true };
-    expect(sidePanelTabs(true, shared)).toEqual(['files', 'terminal', 'browser', 'share']);
-    expect(sidePanelTabs(false, shared)).toEqual(['files', 'terminal']);
-    expect(sidePanelTabs(true, { files: false, session: true, share: false })).toEqual(['terminal', 'browser']);
-    expect(sidePanelTabs(true, { files: true, session: false, share: true })).toEqual(['files']);
+    expect(sidePanelTabs(shared)).toEqual(['files', 'terminal', 'browser', 'share']);
+    expect(sidePanelTabs({ files: false, session: true, share: false })).toEqual(['terminal', 'browser']);
+    expect(sidePanelTabs({ files: true, session: false, share: true })).toEqual(['files']);
   });
 
   it('remembers Share, and shows Terminal for it where it is not offered', () => {
     const s = memory();
     writeSidePanel(s, { open: true, tab: 'share', width: 480 });
     expect(readSidePanel(s).tab).toBe('share');
-    expect(shownSidePanelTab('share', true, { files: false, session: true, share: true })).toBe('share');
-    expect(shownSidePanelTab('share', true, { files: false, session: true, share: false })).toBe('terminal');
-    expect(shownSidePanelTab('share', false, { files: false, session: true, share: true })).toBe('terminal');
+    expect(shownSidePanelTab('share', { files: false, session: true, share: true })).toBe('share');
+    expect(shownSidePanelTab('share', { files: false, session: true, share: false })).toBe('terminal');
   });
 
   it('shows Files beside a file whatever was remembered, and Terminal for a remembered Files beside an agent with no space', () => {
     const file = { files: true, session: false };
-    expect(shownSidePanelTab('terminal', true, file)).toBe('files');
-    expect(shownSidePanelTab('browser', true, file)).toBe('files');
-    expect(shownSidePanelTab('files', true, { files: false, session: true })).toBe('terminal');
-    expect(shownSidePanelTab('files', true, { files: true, session: true })).toBe('files');
+    expect(shownSidePanelTab('terminal', file)).toBe('files');
+    expect(shownSidePanelTab('browser', file)).toBe('files');
+    expect(shownSidePanelTab('files', { files: false, session: true })).toBe('terminal');
+    expect(shownSidePanelTab('files', { files: true, session: true })).toBe('files');
   });
 });
 

@@ -58,9 +58,9 @@ describe('parseEntry', () => {
   });
 
   it('reads several flags, separated by commas', () => {
-    const p = parseEntry('a', file(`${FIELDS}\nflag: simple-ui-side-panel-enabled,  spaces-enabled`));
-    expect(p.ok && p.entry.flags).toEqual(['simple-ui-side-panel-enabled', 'spaces-enabled']);
-    expect(problemsOf('a', file(`${FIELDS}\nflag: spaces-enabled, spaces-enabled`))).toEqual(['flag lists a key twice']);
+    const p = parseEntry('a', file(`${FIELDS}\nflag: simple-ui-reviews-enabled,  automations-enabled`));
+    expect(p.ok && p.entry.flags).toEqual(['simple-ui-reviews-enabled', 'automations-enabled']);
+    expect(problemsOf('a', file(`${FIELDS}\nflag: automations-enabled, automations-enabled`))).toEqual(['flag lists a key twice']);
   });
 
   it('keeps a colon in a value, takes CRLF files and strips matching quotes', () => {
@@ -97,7 +97,7 @@ describe('parseEntry', () => {
       'flag must list on/off flags in frontend/src/flags.ts (FLAGS), not "no-such-flag-enabled"',
     ]);
     expect(problemsOf('a', file(`${FIELDS}\nflag: browser-pane-preview-share-ttl-hours`))).toHaveLength(1);
-    expect(problemsOf('a', file(`${FIELDS}\nflag: spaces-enabled, no-such-flag-enabled`))).toHaveLength(1);
+    expect(problemsOf('a', file(`${FIELDS}\nflag: automations-enabled, no-such-flag-enabled`))).toHaveLength(1);
   });
 
   it('refuses an empty body and a file name that is not a slug', () => {
@@ -124,7 +124,7 @@ describe('copyProblems', () => {
   it('keeps PR numbers, flag keys and the old UI names out of the copy', () => {
     expect(copyProblems(entry({ body: 'Shipped in #823.' }))).toEqual(['it cites a PR or issue number; say what changed instead']);
     expect(copyProblems(entry({ body: 'Behind box-sizes-enabled.' }))).toEqual(['it names a flag key; the flag goes in the flag field']);
-    expect(copyProblems(entry({ body: 'Behind spaces-enabled.' }))).toHaveLength(1);
+    expect(copyProblems(entry({ body: 'Behind automations-enabled.' }))).toHaveLength(1);
     expect(copyProblems(entry({ title: 'Tabs in the Simple UI' }))).toEqual(['it says simple or full UI; the two UIs are termag and lab']);
     expect(copyProblems(entry({ body: 'Back to the full-view list.' }))).toHaveLength(1);
   });

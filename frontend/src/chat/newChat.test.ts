@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   queueKey, sessionWords, worktreeName, worktreeTargets,
-  agentUp, bootEstimateMinutes, boxComingUp, CLAIM_TTL_MS, claimHeldUntil, claimQueued, finishQueued, newChatNames, orchestratorOption, preLaunchTail,
+  agentUp, bootEstimateMinutes, boxComingUp, CLAIM_TTL_MS, claimHeldUntil, claimQueued, finishQueued, queuedSendId, renewClaim, newChatNames, orchestratorOption, preLaunchTail,
   readLastPick, readLastStart, readQueued, releaseQueued, rememberStartPick, setupComplete, setupSteps, showSetup, startBlocker, uniqueName, writeLastPick, writeLastStart, writeQueued,
   type SetupInput,
 } from './newChat';
@@ -156,6 +156,38 @@ describe('queued first message', () => {
     expect(writeQueued(null, 'p1', 'fix it')).toBe(false);
     const refusing = { getItem: () => null, setItem: () => { throw new Error('QuotaExceededError'); }, removeItem: () => {} };
     expect(writeQueued(refusing, 'p1', 'fix it')).toBe(false);
+  });
+
+  it("renews only this tab's own claim, and never brings back one that was given up", () => {
+    const s = memory();
+    writeQueued(s, 'p1', 'fix it');
+    expect(claimQueued(s, 'p1', 'tab-a', 1_000)).toBe('fix it');
+    expect(renewClaim(s, 'p1', 'tab-a', 1_000 + CLAIM_TTL_MS - 1)).toBe(true);
+    // Renewed: another tab still can't take it past the first claim's TTL.
+    expect(claimQueued(s, 'p1', 'tab-b', 1_000 + CLAIM_TTL_MS + 5_000)).toBeNull();
+    expect(renewClaim(s, 'p1', 'tab-b', 2_000)).toBe(false);
+    releaseQueued(s, 'p1', 'tab-a');
+    expect(renewClaim(s, 'p1', 'tab-a', 3_000)).toBe(false);
+    expect(claimHeldUntil(s, 'p1')).toBeNull();
+  });
+
+  it('gives each queued text one send id, kept for every try of that text and dropped once it is sent', () => {
+    const s = memory();
+    let n = 0;
+    const make = () => `send-id-000${++n}`;
+    writeQueued(s, 'p1', 'fix the login bug');
+    const id = queuedSendId(s, 'p1', 'fix the login bug', make);
+    expect(id).toBe('send-id-0001');
+    // A retry, or another tab taking the message over, sends it with the same id.
+    expect(queuedSendId(s, 'p1', 'fix the login bug', make)).toBe(id);
+    // Text added behind it is another message.
+    expect(queuedSendId(s, 'p1', 'fix the login bug and the logout', make)).toBe('send-id-0002');
+    finishQueued(s, 'p1', 'fix the login bug and the logout');
+    expect(queuedSendId(s, 'p1', 'fix the login bug and the logout', make)).toBe('send-id-0003');
+    // No storage, or a broken one: no id, and the send goes without one.
+    expect(queuedSendId(null, 'p1', 'x', make)).toBeNull();
+    const refusing = { getItem: () => null, setItem: () => { throw new Error('QuotaExceededError'); }, removeItem: () => {} };
+    expect(queuedSendId(refusing, 'p1', 'x', make)).toBeNull();
   });
 
   it('after a send, keeps what was queued behind it', () => {
@@ -363,6 +395,12 @@ describe('orchestratorOption', () => {
     expect(orchestratorOption({ providerHasSkill: true, scheduled: true, trusted: true })).toBe('hidden');
     expect(orchestratorOption({ providerHasSkill: true, scheduled: false, trusted: false })).toBe('needs-trust');
     expect(orchestratorOption({ providerHasSkill: true, scheduled: false, trusted: true })).toBe('available');
+  });
+
+  it('is off on a box with termag setup off, which has no skill to use, whatever the trust', () => {
+    expect(orchestratorOption({ providerHasSkill: true, scheduled: false, trusted: true, setupOff: true })).toBe('setup-off');
+    expect(orchestratorOption({ providerHasSkill: true, scheduled: false, trusted: false, setupOff: true })).toBe('setup-off');
+    expect(orchestratorOption({ providerHasSkill: true, scheduled: true, trusted: true, setupOff: true })).toBe('hidden');
   });
 });
 

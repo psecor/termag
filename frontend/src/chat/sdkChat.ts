@@ -295,6 +295,16 @@ export function addPending(state: ChatState, text: string, images: ChatImage[] =
   return { ...state, seq, items: [...state.items, { kind: 'user', key: key ?? `pending:${seq}`, text, pending: true, ...withImages(images) }] };
 }
 
+/**
+ * The messages the box holds behind the running turn (history's `waiting`),
+ * as queued bubbles: a reload or a switch back starts from an empty chat, so
+ * without them a queued message is gone from the view until its turn starts.
+ */
+export function withWaiting(state: ChatState, waiting: unknown): ChatState {
+  if (!Array.isArray(waiting)) return state;
+  return waiting.reduce<ChatState>((s, w) => (w && typeof w.text === 'string' ? addPending(s, w.text, refImages(w.images)) : s), state);
+}
+
 function streamEvent(state: ChatState, ev: AnyEvent): ChatState {
   const e = ev.event ?? {};
   switch (e.type) {
@@ -1180,6 +1190,66 @@ export function chatGroupKey(g: ChatGroup): string {
   return g.kind === 'reply' ? g.key : g.item.key;
 }
 
+type Earlier = { before: string; entries: unknown[] };
+const uuidOf = (e: unknown): string | null => {
+  const uuid = (e as { uuid?: unknown } | null)?.uuid;
+  return typeof uuid === 'string' && uuid ? uuid : null;
+};
+const isMarker = (e: unknown): boolean => {
+  const type = (e as { type?: unknown } | null)?.type;
+  return type === 'context-cleared' || type === 'context-compacted';
+};
+/** A clear or compact divider's identity, to tell one a page brings from one the history kept. */
+const markerKey = (e: unknown): string => {
+  const m = e as { type?: unknown; uuid?: unknown; at?: unknown };
+  return `${String(m.type)}:${typeof m.uuid === 'string' ? m.uuid : ''}:${String(m.at ?? '')}`;
+};
+
+/**
+ * The uuid of the oldest entry that has one, dividers aside: where the page
+ * before a history starts from. A divider the history's cap kept (capHistory)
+ * sits ahead of entries it is not next to, so paging from it would skip them.
+ */
+export function firstUuid(entries: readonly unknown[]): string | null {
+  for (const e of entries) {
+    if (isMarker(e)) continue;
+    const uuid = uuidOf(e);
+    if (uuid) return uuid;
+  }
+  return null;
+}
+
+/**
+ * A history with the earlier pages paged in before it (chatApi.earlier):
+ * `earlier.entries` are the ones before the entry `earlier.before`, so they
+ * go on from where it is in this snapshot. The dividers the snapshot kept
+ * ahead of that entry stay, above the pages, until a page brings them in
+ * itself. Null when the entry is not there any more: the pages no longer join up.
+ */
+export function withEarlier(entries: unknown[], earlier: Earlier | null): unknown[] | null {
+  if (!earlier) return entries;
+  const at = entries.findIndex(e => uuidOf(e) === earlier.before);
+  if (at < 0) return null;
+  const paged = new Set(earlier.entries.filter(isMarker).map(markerKey));
+  const kept = entries.slice(0, at).filter(e => isMarker(e) && !paged.has(markerKey(e)));
+  return [...kept, ...earlier.entries, ...entries.slice(at)];
+}
+
+/**
+ * The earlier pages carried onto a history that moved on past the entry they
+ * joined (a long chat's cap dropped it as the chat grew): the entries the last
+ * history had from that entry up to this history's own first entry go onto
+ * the pages, so they join this one. Null when the two histories do not overlap.
+ */
+export function carryEarlier(prev: readonly unknown[], entries: readonly unknown[], earlier: Earlier): Earlier | null {
+  const before = firstUuid(entries);
+  if (!before) return null;
+  const from = prev.findIndex(e => uuidOf(e) === earlier.before);
+  const to = prev.findIndex(e => uuidOf(e) === before);
+  if (from < 0 || to < from) return null;
+  return { before, entries: [...earlier.entries, ...prev.slice(from, to)] };
+}
+
 /**
  * Where a chat's window starts: at the group it was fixed to (`from`, a
  * group key), so new prompts and replies append below without pushing the
@@ -1190,6 +1260,16 @@ export function chatGroupKey(g: ChatGroup): string {
 export function windowStart(keys: readonly string[], from: string | null): number {
   const at = from == null ? -1 : keys.indexOf(from);
   return at >= 0 ? at : Math.max(0, keys.length - TRANSCRIPT_WINDOW);
+}
+
+/**
+ * Where the window was once a page of older history came in above it: at the
+ * group it was fixed to, or, when that group's key changed (a page that ends
+ * mid-turn joins onto it), `tail` groups from the end.
+ */
+export function windowStartAfterPage(keys: readonly string[], from: string | null, tail: number): number {
+  const at = from == null ? -1 : keys.indexOf(from);
+  return at >= 0 ? at : Math.max(0, keys.length - tail);
 }
 
 /** Where the window starts once the next earlier groups come in. */
@@ -1500,6 +1580,30 @@ export function desktopTurnStatus(status: { status?: string; source?: string | n
   return null;
 }
 
+/**
+ * A step of a turn the desktop app's thread runs on this chat's session: that
+ * thread's hook post (a prompt, a tool), keyed by when it came, and one step
+ * for its rest after. The turn writes the session file, not this chat's runner,
+ * so no chat frame carries it; each step is a reason to read the history
+ * again. At rest it stays one step: a status push that changes only its
+ * metadata reads nothing. Null for anything else.
+ */
+export function desktopTurnStep(status: { status?: string; source?: string | null; updatedAt?: string } | undefined): string | null {
+  if (!status || typeof status.source !== 'string' || !status.source.startsWith('t3:')) return null;
+  if (status.status !== 'working' && status.status !== 'waiting') return 'rest';
+  return `${status.status}|${status.updatedAt ?? ''}`;
+}
+
+/**
+ * Whether a desktop turn's step reads the history again: a new step for the
+ * chat already on screen. The step a chat opens with is what its first load
+ * already read, so a switch or an open never reads twice.
+ */
+export function desktopStepReloads(shown: { chatId: string; step: string | null } | null, chatId: string, step: string | null): boolean {
+  if (step === null) return false;
+  return shown !== null && shown.chatId === chatId && shown.step !== step;
+}
+
 /** The single line under the chat saying what Claude is doing now. */
 export function chatStatus(state: ChatState, sendsLive = false): ChatStatusLine {
   if (!state.running) {
@@ -1638,7 +1742,7 @@ function runningTurnStart(items: readonly ChatItem[], records: ReadonlyArray<Tur
 }
 
 export function mergeHistory(
-  snapshot: { entries: unknown[]; sessionId: string | null; running: boolean; turns?: readonly TurnRecord[] },
+  snapshot: { entries: unknown[]; sessionId: string | null; running: boolean; turns?: readonly TurnRecord[]; waiting?: unknown },
   live: readonly unknown[],
 ): ChatState {
   const fromEntries = fromHistory(snapshot.entries, snapshot.sessionId, null, snapshot.turns ?? []);
@@ -1648,7 +1752,8 @@ export function mergeHistory(
   // only that turn's background calls can still run.
   const cut = snapshot.running ? runningTurnStart(fromEntries.items, snapshot.turns ?? []) : fromEntries.items.length;
   const base = cut > 0 ? { ...fromEntries, items: [...settleBackground(fromEntries.items.slice(0, cut)), ...fromEntries.items.slice(cut)] } : fromEntries;
-  let state: ChatState = snapshot.running ? { ...base, running: true, phase: 'thinking' } : base;
+  // Queued bubbles before the live events: a turn-start among them takes its own.
+  let state: ChatState = withWaiting(snapshot.running ? { ...base, running: true, phase: 'thinking' } : base, snapshot.waiting);
   // Assistant blocks the snapshot already holds, by message id and content.
   const sig = (e: AnyEvent) => `${e.message?.id ?? ''}|${JSON.stringify(e.message?.content ?? null)}`;
   const assistants = (snapshot.entries as AnyEvent[]).filter(e => e?.type === 'assistant');

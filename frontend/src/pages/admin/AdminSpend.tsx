@@ -5,7 +5,7 @@ import { ChartCard } from '../dashboard/ChartCard';
 import { AdminBoxCost } from './AdminBoxCost';
 import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, HUE, CURSOR, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
 import { shortDate } from '../dashboard/range';
-import { DataTable, KeyValues, errorText, fmtPct, fmtTok, pendingText, useAdminPolled, type Column } from './shared';
+import { DataTable, TableReset, KeyValues, errorText, fmtPct, fmtTok, pendingText, useAdminPolled, type Column } from './shared';
 import { fmtShare, fmtUsd, mixToText, pricesToText, textToMix, textToPrices, windowKeys } from './spendText';
 
 const WINDOWS = [7, 30, 90] as const;
@@ -76,7 +76,8 @@ export function AdminSpend() {
 
   const t = r?.totals;
   return (
-    <>
+    // The window and the denominator change every table's rows: back to page 1 (Bugbot on #1298).
+    <TableReset value={[win, active]}>
       <div className="admin-pr-controls">
         <Choice label="window" value={win} options={WINDOWS} onChange={setWin} render={d => `${d}d`} />
         <Choice label="denominator" value={active ? 'active' : 'all'} options={['all', 'active'] as const} onChange={v => setActive(v === 'active')} render={v => (v === 'all' ? 'all termag users' : 'active users only')} />
@@ -133,13 +134,13 @@ export function AdminSpend() {
       </ChartCard>
 
       <ChartCard title="People" subtitle={r ? `${r.people.length} ${r.denominator.mode === 'all' ? 'termag users' : 'active users'}; pools split per their rule · % of loaded is the window annualised` : pendingText(report)} stale={report.loading}>
-        <DataTable rows={r?.people ?? []} columns={peopleCols} rowKey={x => x.userId} defaultSort="total" dense empty={r ? 'nobody in this window' : pendingText(report)} />
+        <DataTable rows={r?.people ?? []} columns={peopleCols} rowKey={x => x.userId} defaultSort="total" dense search="filter people" storageKey="spend-people" empty={r ? 'nobody in this window' : pendingText(report)} />
       </ChartCard>
 
       <AdminBoxCost from={keys.from} to={keys.to} />
 
       <SpendModelEditor onSaved={report.refresh} />
-    </>
+    </TableReset>
   );
 }
 

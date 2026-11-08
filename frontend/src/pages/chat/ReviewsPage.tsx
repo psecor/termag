@@ -7,7 +7,9 @@
 // the PR merged or closed). Each section links the same list on GitHub.
 // A row opens its review (a session, or the session whose review pane reads
 // it), else the PR's page; Review on a row starts one (ReviewMenu.tsx).
-import React, { startTransition, useState } from 'react';
+// The filter bar at the top (ReviewFilters.tsx) narrows every section, and
+// each count is of what it shows.
+import React, { startTransition, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Button, ButtonGroup, Disclosure, DisclosurePanel, Heading, IconButton, Menu, MenuItem, MenuTrigger, Popover, Text } from '@launchpad-ui/components';
 import { Icon } from '@launchpad-ui/icons';
@@ -16,7 +18,8 @@ import { prsApi } from '../../services/api';
 import { fmtAge } from '../../utils/format';
 import { memberReview, memberBotReview } from '../../utils/prReviewGroups';
 import { PRS_CHANGED_EVENT, rowParam } from '../../utils/prPipeline';
-import { githubListUrl, leftToReview, prPath, prShort, SECTION_NAME, SECTION_ORDER, type QueueGroup, type QueueItem, type QueueSection } from '../../chat/reviews';
+import { filterOptions, filterQueue, githubListUrl, hasFilters, leftToReview, prPath, prShort, queueNote, sectionCounts, SECTION_NAME, SECTION_ORDER, type QueueGroup, type QueueItem, type QueueSection } from '../../chat/reviews';
+import { ReviewFilterBar, useReviewFilters } from './ReviewFilters';
 import { desktopPrHref } from '../../chat/desktopLinks';
 import { ChatHistoryButton } from './chatChrome';
 import { reviewHref, reviewLinkState } from './reviewLinks';
@@ -107,18 +110,22 @@ function Row({ it, now }: { it: QueueItem; now: number }) {
 
 function GroupCard({ g, viewer, now }: { g: QueueGroup; viewer: string | null; now: number }) {
   const navigate = useNavigate();
-  const next = leftToReview(g.group, viewer)[0] ?? null;
-  const none = g.group.members.filter(m => m.state === 'open' && memberReview(m, viewer)?.kind === 'none').length;
+  // With filters set, the card lists and counts only the members that match (g.shown); Review all together
+  // still reviews the whole group.
+  const members = g.shown ?? g.group.members;
+  const hidden = g.group.members.length - members.length;
+  const next = leftToReview({ ...g.group, members }, viewer)[0] ?? null;
+  const none = members.filter(m => m.state === 'open' && memberReview(m, viewer)?.kind === 'none').length;
   return (
     <li className="rv-group">
       <div className="rv-group-head">
         <span className="rv-group-name">{g.group.name}</span>
         <span className="rv-group-meta">
-          {g.group.members.length} PRs · {g.left} of {g.group.members.length} to review{none ? ` · no review yet on ${none}` : ''}
+          {members.length} PRs · {g.left} of {members.length} to review{none ? ` · no review yet on ${none}` : ''}{hidden ? ` · ${hidden} hidden by the filters` : ''}
         </span>
       </div>
       <ol className="rv-group-list">
-        {g.group.members.map((m, n) => {
+        {members.map(m => {
           const review = memberReview(m, viewer);
           const bot = memberBotReview(m);
           const state = m.checked ? 'done' : next && next.repo === m.repo && next.number === m.number ? 'next' : 'todo';
@@ -127,7 +134,7 @@ function GroupCard({ g, viewer, now }: { g: QueueGroup; viewer: string | null; n
               <span className="rv-group-mark" aria-hidden="true">
                 {state === 'done' ? <Icon name="check-circle" size="small" /> : state === 'next' ? <Icon name="chevron-right" size="small" /> : null}
               </span>
-              <span className="rv-group-n">{n + 1}</span>
+              <span className="rv-group-n">{g.group.members.indexOf(m) + 1}</span>
               <Link to={prPath(m.repo, m.number)} className="rv-row-num rv-group-link">{prShort(m.repo, m.number)}</Link>
               <span className="rv-group-title" title={m.note ?? undefined}>{m.title}</span>
               <span className="rv-group-pills">
@@ -148,10 +155,16 @@ function GroupCard({ g, viewer, now }: { g: QueueGroup; viewer: string | null; n
 }
 
 export function ReviewsPage() {
-  const { queue, loading, failed, prs, refresh } = useReviewsData();
+  const { queue: all, loading, failed, prs, refresh } = useReviewsData();
+  const { filters, setFilters, clear } = useReviewFilters();
+  const queue = useMemo(() => filterQueue(all, filters), [all, filters]);
+  const counts = sectionCounts(queue);
+  const options = useMemo(() => filterOptions(all), [all]);
+  const anything = (q: typeof all) => q.items.length + q.groups.length + q.deferred.length + q.reviewed.length > 0;
   const now = Date.now();
   const [showTeam, setShowTeam] = useState(true);
   const disconnected = prs !== null && !prs.connected;
+  const note = queueNote(all, queue, filters, { loading, failed, disconnected });
   return (
     <div className="chat-view">
       <section className="chat-conv rv-page">
@@ -164,6 +177,15 @@ export function ReviewsPage() {
         </header>
         <div className="chat-transcript">
           <div className="rv-queue">
+            {(anything(all) || hasFilters(filters)) && (
+              <ReviewFilterBar filters={filters} setFilters={setFilters} clear={clear} repos={options.repos} authors={options.authors} />
+            )}
+            {note === 'no-match' && (
+              <div className="rv-filter-none">
+                <p className="rv-note">No pull requests match these filters.</p>
+                <Button size="small" variant="minimal" onPress={clear}>Clear filters</Button>
+              </div>
+            )}
             {loading && <p className="rv-note">Reading your review requests from GitHub…</p>}
             {disconnected && <p className="rv-note">Connect GitHub in Settings to see the PRs that ask for your review.</p>}
             {failed && !loading && (
@@ -172,9 +194,7 @@ export function ReviewsPage() {
                 <Button size="small" variant="minimal" onPress={refresh}>Try again</Button>
               </p>
             )}
-            {!loading && !failed && !disconnected && queue.items.length === 0 && queue.groups.length === 0 && (
-              <p className="rv-note">Nothing asks for your review right now.</p>
-            )}
+            {note === 'nothing' && <p className="rv-note">Nothing asks for your review right now.</p>}
             {SECTION_ORDER.map(s => {
               const items = queue.items.filter(i => i.section === s);
               const groups = s === 'to-review' ? queue.groups : [];
@@ -189,7 +209,7 @@ export function ReviewsPage() {
                           <Icon name={folded ? 'chevron-right' : 'chevron-down'} size="small" aria-hidden="true" />{SECTION_NAME[s]}
                         </button>
                       : SECTION_NAME[s]}
-                    <span className="rv-count">{items.length + groups.length}</span>
+                    <span className="rv-count">{counts[s]}</span>
                     {HINT[s] && <span className="rv-section-hint">{HINT[s]}</span>}
                     {gh && <a className="rv-section-gh" href={gh} target="_blank" rel="noopener noreferrer" title="The same list on GitHub">GitHub<Icon name="link-external" size="small" aria-hidden="true" /></a>}
                   </h2>

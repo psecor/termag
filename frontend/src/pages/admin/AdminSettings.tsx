@@ -21,7 +21,7 @@ export function AdminSettings({ range, now, onRange }: { range: AdminRange; now:
   };
 
   const tcols: Column<AdminToken>[] = [
-    { id: 'name', label: 'token', value: r => r.name, render: r => <span>{r.name} <span className="usage-dim">{r.tokenPrefix}</span></span> },
+    { id: 'name', label: 'token', value: r => r.name, render: r => <span>{r.name} <span className="usage-dim admin-mono">{r.tokenPrefix}</span></span> },
     { id: 'owner', label: 'owner', value: r => r.owner?.unixUsername ?? '', render: r => r.owner ? <span>{r.owner.unixUsername}{r.owner.stillAdmin ? '' : <span className="admin-bad"> (no longer admin)</span>}</span> : <span className="admin-bad">no owner</span> },
     { id: 'created', label: 'created', value: r => Date.parse(r.createdAt), render: r => fmtAgo(r.createdAt, now) },
     { id: 'used', label: 'last used', value: r => r.lastUsedAt ? Date.parse(r.lastUsedAt) : null, render: r => fmtAgo(r.lastUsedAt, now) },
@@ -31,7 +31,7 @@ export function AdminSettings({ range, now, onRange }: { range: AdminRange; now:
   ];
   const acols: Column<AuditRow>[] = [
     { id: 'at', label: 'when', value: r => Date.parse(r.at), render: r => fmtAgo(r.at, now) },
-    { id: 'actor', label: 'actor', value: r => r.actor, render: r => <span>{r.actor}{r.tokenId ? <span className="usage-dim"> (token)</span> : ''}</span> },
+    { id: 'actor', label: 'actor', value: r => r.actor, render: r => <span>{r.actor}{r.boxId ? <span className="usage-dim" title={r.boxId}> (box)</span> : r.tokenId ? <span className="usage-dim"> (token)</span> : ''}</span> },
     { id: 'surface', label: 'via', value: r => r.surface },
     { id: 'action', label: 'action', value: r => r.action },
     { id: 'args', label: 'args', value: r => r.args ? JSON.stringify(r.args) : null, render: r => <span className="usage-dim admin-mono">{r.args ? JSON.stringify(r.args) : ''}</span> },
@@ -81,7 +81,7 @@ export function AdminSettings({ range, now, onRange }: { range: AdminRange; now:
       <RangePicker value={range} onChange={onRange} />
       <section className="dash-section">
         <div className="dash-section-title">Audit log {audit.data && <span className="dash-count">{audit.data.rows.length}</span>}<span className="usage-dim">every admin REST request and MCP tool call in the selected range (newest {audit.data?.limit ?? 300})</span></div>
-        <DataTable rows={audit.data?.rows ?? []} columns={acols} rowKey={r => r.id} defaultSort="at" dense empty={audit.data ? 'nothing yet' : pendingText(audit)} />
+        <DataTable rows={audit.data?.rows ?? []} columns={acols} rowKey={r => r.id} defaultSort="at" dense search="filter the log" storageKey="audit" resetKey={range} empty={audit.data ? 'nothing yet' : pendingText(audit)} />
       </section>
     </>
   );

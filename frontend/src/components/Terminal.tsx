@@ -10,7 +10,7 @@ import { noteFirstTerminalData } from '../services/claimTiming';
 import { recordProductEventOnce } from '../observability';
 import { isAgentPaneSession } from '../utils/sessionName';
 import { boxStatusBus } from '../utils/boxStatusBus';
-import { customKeySequence } from '../utils/terminalKeys';
+import { COARSE_POINTER_QUERY, customKeySequence, touchTypingAttributes } from '../utils/terminalKeys';
 import { guardViewportAfterDispose, hasLayoutSize } from '../utils/xtermLifecycle';
 import { findImagePathLinks, imagePreviewUrl, RowText } from '../utils/imagePathLinks';
 import { ImagePreviewAnchor, TerminalImagePreview } from './TerminalImagePreview';
@@ -48,6 +48,30 @@ interface TerminalProps {
    * POST /review/seen while its review is done.
    */
   onFocus?: () => void;
+  /**
+   * A handle for input from outside the pane, once the pane is built (and
+   * null when it is torn down): the simple UI's phone key bar
+   * (pages/chat/TerminalKeyBar.tsx) sends its keys down the same WebSocket
+   * as typing and focuses the pane from a tap.
+   */
+  onReady?: (handle: TerminalHandle | null) => void;
+  /**
+   * Rewrites what xterm encoded from the keyboard before it is sent (the key
+   * bar's sticky Ctrl). Read from a ref: changing it never rebuilds the pane.
+   * Not applied to `TerminalHandle.send`.
+   */
+  transformInput?: (data: string) => string;
+}
+
+export interface TerminalHandle {
+  /** Send bytes as if typed (they count as activity, like typing). */
+  send: (data: string) => void;
+  /** Focus xterm's textarea; inside a tap, this is what raises a phone's keyboard. */
+  focus: () => void;
+  /** xterm's textarea has focus. */
+  isFocused: () => boolean;
+  /** The pane is in application cursor mode (arrows are SS3). */
+  appCursor: () => boolean;
 }
 
 // Regex to match mouse tracking enable/disable escape sequences
@@ -173,13 +197,17 @@ function imageFromClipboardData(dt: DataTransfer | null): File | null {
   return null;
 }
 
-export function Terminal({ sessionName, projectId, workstream, instanceId, active, autoFocus, onActivity, onFocus }: TerminalProps) {
+export function Terminal({ sessionName, projectId, workstream, instanceId, active, autoFocus, onActivity, onFocus, onReady, transformInput }: TerminalProps) {
   const instanceIdRef = useRef(instanceId);
   instanceIdRef.current = instanceId;
   // Latest onFocus without re-running the effect that registers the listener
   // (a changed callback must not rebuild the terminal).
   const onFocusRef = useRef(onFocus);
   onFocusRef.current = onFocus;
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
+  const transformInputRef = useRef(transformInput);
+  transformInputRef.current = transformInput;
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -379,6 +407,9 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
       if (textarea) {
         textarea.addEventListener('focus', onFocus);
         textarea.addEventListener('blur', onBlur);
+        // A phone keyboard must not capitalise or "correct" shell input (utils/terminalKeys.ts).
+        const coarse = typeof window.matchMedia === 'function' && window.matchMedia(COARSE_POINTER_QUERY).matches;
+        for (const [name, value] of Object.entries(touchTypingAttributes(coarse))) textarea.setAttribute(name, value);
       }
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -499,7 +530,16 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
           recordProductEventOnce('first.prompt', { 'termag.pane': 'terminal' });
         }
       };
-      const dataDisposable = term.onData(sendInput);
+      const dataDisposable = term.onData((data) => {
+        const transform = transformInputRef.current;
+        sendInput(transform ? transform(data) : data);
+      });
+      onReadyRef.current?.({
+        send: sendInput,
+        focus: () => term.focus(),
+        isFocused: () => textarea != null && document.activeElement === textarea,
+        appCursor: () => term.modes.applicationCursorKeysMode,
+      });
 
       const sendPasteImage = async (blob: Blob) => {
         try {
@@ -623,6 +663,7 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
       if (retryTimer) clearTimeout(retryTimer);
       if (resizeTimer) clearTimeout(resizeTimer);
       retryRef.current = null;
+      onReadyRef.current?.(null);
       const extras = (term as any)._termag;
       if (extras) {
         extras.dataDisposable.dispose();

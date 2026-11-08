@@ -7,10 +7,14 @@ import { useQueuedMessage, type QueuedMessage } from './useQueuedMessage';
 
 const latest: { current: QueuedMessage | null } = { current: null };
 let renders = 0;
+// The send id each send carried, in order (chat/newChat.ts queuedSendId).
+let sendIds: Array<string | undefined> = [];
 
 function Harness(props: { projectId: string; workstream?: string; up?: boolean; raw?: boolean; send: (p: string, w: string, k: string) => Promise<void> }) {
   renders++;
-  latest.current = useQueuedMessage({ projectId: props.projectId, workstream: props.workstream ?? 'main', up: props.up ?? true, offline: false, send: props.send, raw: props.raw });
+  const { send } = props;
+  const recorded = React.useCallback((p: string, w: string, k: string, id?: string) => { sendIds.push(id); return send(p, w, k); }, [send]);
+  latest.current = useQueuedMessage({ projectId: props.projectId, workstream: props.workstream ?? 'main', up: props.up ?? true, offline: false, send: recorded, raw: props.raw });
   return null;
 }
 
@@ -26,6 +30,7 @@ let root: Root;
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   localStorage.clear();
+  sendIds = [];
   root = createRoot(document.createElement('div'));
 });
 
@@ -116,6 +121,32 @@ describe('useQueuedMessage', () => {
     expect(readQueued(localStorage, 'A')).toBeNull();
   });
 
+  it("a new session's first message is sent exactly once: a send whose answer was lost and its Retry carry one send id, the next message another", async () => {
+    writeQueued(localStorage, 'A', 'connect the MCP server');
+    // The orchestrator stops waiting while the box goes on to start the turn (backend services/chatRunner.ts chatSendTimeoutMs).
+    const send = vi.fn<(p: string, w: string, k: string) => Promise<void>>(
+      () => Promise.reject({ response: { status: 502, data: { error: 'Agent request timed out: chat-send' } } }),
+    );
+    await act(async () => root.render(<Harness projectId="A" raw send={send} />));
+    await flush();
+    expect(latest.current?.error).toBe('Agent request timed out: chat-send');
+
+    send.mockImplementation(() => Promise.resolve());
+    await act(async () => { latest.current!.retry(); });
+    await flush();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(sendIds).toHaveLength(2);
+    expect(sendIds[0]).toMatch(/^[A-Za-z0-9-]{8,64}$/);
+    // The box answers a repeat of the id as it answered the first send, and starts no second turn (agent/chat-send-ids.js).
+    expect(sendIds[1]).toBe(sendIds[0]);
+
+    act(() => { latest.current!.enqueue('and then the next one'); });
+    await flush();
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(sendIds[2]).toMatch(/^[A-Za-z0-9-]{8,64}$/);
+    expect(sendIds[2]).not.toBe(sendIds[0]);
+  });
+
   it('leaves a message another tab is sending alone', async () => {
     writeQueued(localStorage, 'A', 'fix the bug');
     claimQueued(localStorage, 'A', 'other-tab', Date.now());
@@ -163,6 +194,41 @@ describe('useQueuedMessage', () => {
     await act(async () => { window.dispatchEvent(new StorageEvent('storage', { key: 'termag-chat-queued-claim:A' })); });
     await flush();
     expect(send).toHaveBeenCalledWith('A', 'main', 'fix the bug');
+  });
+
+  it('keeps its claim for as long as its send is in flight, so another tab never sends the message again meanwhile', async () => {
+    vi.useFakeTimers();
+    try {
+      writeQueued(localStorage, 'A', 'fix the bug');
+      // The orchestrator may wait CHAT_SEND_TIMEOUT_MS (60 s) for the box, after a claim update's hold of up to 150 s.
+      const inFlight = deferred();
+      const send = vi.fn(() => inFlight.promise);
+      await act(async () => root.render(<Harness projectId="A" send={send} />));
+      expect(send).toHaveBeenCalledTimes(1);
+      for (let waited = 0; waited < 4 * CLAIM_TTL_MS; waited += 5_000) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+        expect(claimQueued(localStorage, 'A', 'other-tab', Date.now()), `another tab took the claim ${waited + 5_000} ms into the send`).toBeNull();
+      }
+      await act(async () => { inFlight.resolve(); await inFlight.promise; });
+      expect(readQueued(localStorage, 'A')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops renewing once its send settles: a failed send gives the claim back for Retry or another tab', async () => {
+    vi.useFakeTimers();
+    try {
+      writeQueued(localStorage, 'A', 'fix the bug');
+      const inFlight = deferred();
+      const send = vi.fn(() => inFlight.promise);
+      await act(async () => root.render(<Harness projectId="A" send={send} />));
+      await act(async () => { inFlight.reject({ response: { status: 502, data: { error: 'Agent request timed out: chat-send' } } }); await inFlight.promise.catch(() => {}); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(CLAIM_TTL_MS); });
+      expect(claimQueued(localStorage, 'A', 'other-tab', Date.now())).toBe('fix the bug');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('takes over once a claim left by a tab that went away has expired', async () => {

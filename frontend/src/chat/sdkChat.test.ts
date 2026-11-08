@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { desktopTurnStatus,
+import { desktopStepReloads, desktopTurnStatus, desktopTurnStep,
   addPending, alignTurnCosts, applyEvent, applyFrame, chatCostTotal, chatStatus, contextActions, costSinceCleared, commandLine, emptyChat, errorHint, formatCost, formatDuration, frameDisposition, fromHistory, groupTurns,
-  lastAssistantText, liveFrameAction, localCommand, mergeHistory, resultText, retryText, sdkReadiness, seedLiveTurn, sendGoesLive, shortPath, stopChoices, stopControl, stopTitle, tasksLine, toolSummary, turnCost, turnCosts, turnMeta, type ChatItem, type ChatState, type TurnRecord, EARLIER_EDGE_PX, loadsEarlier, earlierStart, TRANSCRIPT_WINDOW, transcriptWindow, windowStart,
+  lastAssistantText, liveFrameAction, localCommand, mergeHistory, resultText, retryText, sdkReadiness, seedLiveTurn, sendGoesLive, shortPath, stopChoices, stopControl, stopTitle, tasksLine, toolSummary, turnCost, turnCosts, turnMeta, type ChatItem, type ChatState, type TurnRecord, EARLIER_EDGE_PX, loadsEarlier, earlierStart, TRANSCRIPT_WINDOW, transcriptWindow, windowStart, windowStartAfterPage, firstUuid, carryEarlier, withEarlier, withWaiting,
 } from './sdkChat';
 
 const run = (events: unknown[], from: ChatState = emptyChat) => events.reduce<ChatState>(applyEvent, from);
@@ -224,6 +224,41 @@ describe('sdkReadiness', () => {
   });
 });
 
+describe('paging in older history', () => {
+  const u = (uuid: string) => ({ type: 'user', uuid });
+  it('starts the next page from the oldest entry with a uuid', () => {
+    expect(firstUuid([{ type: 'context-cleared', at: 'x' }, u('a'), u('b')])).toBe('a');
+    expect(firstUuid([{ type: 'context-cleared' }])).toBeNull();
+  });
+
+  it('joins the pages on where their entry is in the snapshot, or not at all once it is gone', () => {
+    const snapshot = [{ type: 'context-cleared' }, u('c'), u('d')];
+    expect(withEarlier(snapshot, null)).toBe(snapshot);
+    // The divider the cap kept stays above the pages until a page brings it in.
+    expect(withEarlier(snapshot, { before: 'c', entries: [u('a'), u('b')] })).toEqual([{ type: 'context-cleared' }, u('a'), u('b'), u('c'), u('d')]);
+    expect(withEarlier(snapshot, { before: 'c', entries: [u('a'), { type: 'context-cleared' }, u('b')] })).toEqual([u('a'), { type: 'context-cleared' }, u('b'), u('c'), u('d')]);
+    expect(withEarlier([u('d')], { before: 'c', entries: [u('a')] })).toBeNull();
+  });
+
+  it('pages from the oldest entry, not from a divider the cap kept ahead of it', () => {
+    const compacted = { type: 'context-compacted', uuid: 'k' };
+    expect(firstUuid([compacted, u('c'), u('d')])).toBe('c');
+    expect(withEarlier([compacted, u('c')], { before: 'c', entries: [u('a'), compacted, u('b')] })).toEqual([u('a'), compacted, u('b'), u('c')]);
+  });
+
+  it('carries the pages onto a history that moved on past their entry', () => {
+    const earlier = { before: 'c', entries: [u('a'), u('b')] };
+    expect(carryEarlier([u('c'), u('d'), u('e')], [u('e'), u('f')], earlier)).toEqual({ before: 'e', entries: [u('a'), u('b'), u('c'), u('d')] });
+    expect(carryEarlier([u('c'), u('d')], [u('x'), u('y')], earlier)).toBeNull();
+  });
+
+  it('keeps the window on its group, or as far from the end as it was when that group changed', () => {
+    expect(windowStartAfterPage(['a', 'b', 'c', 'd'], 'c', 1)).toBe(2);
+    expect(windowStartAfterPage(['a', 'b', 'c', 'd'], 'x', 1)).toBe(3);
+    expect(windowStartAfterPage(['a'], 'x', 5)).toBe(0);
+  });
+});
+
 describe('windowStart and transcriptWindow', () => {
   const keys = Array.from({ length: 100 }, (_, i) => `g${i}`);
 
@@ -322,6 +357,16 @@ describe('mergeHistory', () => {
       { type: 'assistant', message: { id: 'm1', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } },
     ]);
     expect(s.items.map(i => (i.kind === 'text' ? i.text : i.kind))).toEqual(['user', 'Let me look.', 'tool']);
+  });
+
+  it('shows what the box holds behind the turn as queued, until its turn starts', () => {
+    const s = mergeHistory({ entries, sessionId: 's', running: true, waiting: [{ text: 'and the tests?' }, { text: 'then push' }] }, []);
+    expect(s.items.map(i => i.kind === 'user' && `${i.text}${i.pending ? '*' : ''}`)).toEqual(['what is in here?', false, 'and the tests?*', 'then push*']);
+    const started = mergeHistory({ entries, sessionId: 's', running: true, waiting: [{ text: 'and the tests?' }] }, [
+      { type: 'turn-end', exitCode: 0 },
+      { type: 'turn-start', text: 'and the tests?' },
+    ]);
+    expect(started.items.filter(i => i.kind === 'user').map(i => i.kind === 'user' && `${i.text}${i.pending ? '*' : ''}`)).toEqual(['what is in here?', 'and the tests?']);
   });
 
   it('is the snapshot when nothing arrived meanwhile', () => {
@@ -1803,5 +1848,60 @@ describe('desktopTurnStatus', () => {
     for (const st of [{ status: 'working', source: 'chat-runner' }, { status: 'working', source: 'claude' }, { status: 'idle', source: 't3:claude' }, { status: 'working' }, undefined]) {
       expect(desktopTurnStatus(st)).toBeNull();
     }
+  });
+});
+
+describe('desktopTurnStep', () => {
+  it("is a new step each time the desktop app's thread posts on the session, its last (the stop) too", () => {
+    const steps = [
+      { status: 'working', source: 't3:claude', updatedAt: '2026-11-03T21:00:00.000Z' },
+      { status: 'working', source: 't3:claude', updatedAt: '2026-11-03T21:00:04.000Z' },
+      { status: 'idle', source: 't3:claude', updatedAt: '2026-11-03T21:00:09.000Z' },
+    ].map(desktopTurnStep);
+    expect(new Set(steps).size).toBe(3);
+    expect(steps.every(step => step !== null)).toBe(true);
+  });
+
+  it("is nothing for the chat's own runner, a pane or no status", () => {
+    for (const st of [{ status: 'working', source: 'chat-runner', updatedAt: 'x' }, { status: 'working', source: 'claude', updatedAt: 'x' }, { status: 'working', updatedAt: 'x' }, undefined]) {
+      expect(desktopTurnStep(st)).toBeNull();
+    }
+  });
+
+  it('stays one step at rest, so a metadata-only push reads nothing', () => {
+    const rest = (updatedAt: string) => desktopTurnStep({ status: 'idle', source: 't3:claude', updatedAt });
+    expect(rest('2026-11-03T21:00:09.000Z')).toBe(rest('2026-11-03T21:03:00.000Z'));
+    expect(desktopTurnStep({ status: 'not_running', source: 't3:claude', updatedAt: 'x' })).toBe(rest('y'));
+  });
+});
+
+describe('desktopStepReloads', () => {
+  it('reads again for a new step on the chat on screen', () => {
+    expect(desktopStepReloads({ chatId: 'p|main', step: 'working|1' }, 'p|main', 'working|2')).toBe(true);
+    expect(desktopStepReloads({ chatId: 'p|main', step: null }, 'p|main', 'working|1')).toBe(true);
+  });
+
+  it('never for the step a chat opens or switches with, the same step, or none', () => {
+    expect(desktopStepReloads(null, 'p|main', 'idle|0')).toBe(false);
+    expect(desktopStepReloads({ chatId: 'q|main', step: 'working|1' }, 'p|main', 'idle|0')).toBe(false);
+    expect(desktopStepReloads({ chatId: 'p|main', step: 'working|1' }, 'p|main', 'working|1')).toBe(false);
+    expect(desktopStepReloads({ chatId: 'p|main', step: 'working|1' }, 'p|main', null)).toBe(false);
+  });
+});
+
+describe('withWaiting', () => {
+  it('adds a queued bubble for each waiting message, images by their box references', () => {
+    const s = withWaiting(emptyChat, [{ text: 'look at this', images: [{ id: 'a', path: '/img/a.png', mediaType: 'image/png' }] }, { nope: 1 }]);
+    expect(s.items).toEqual([expect.objectContaining({ kind: 'user', text: 'look at this', pending: true, images: [{ mediaType: 'image/png', path: '/img/a.png' }] })]);
+  });
+
+  it('leaves the chat alone for an older agent that sends none', () => {
+    expect(withWaiting(emptyChat, undefined)).toBe(emptyChat);
+  });
+
+  it('is taken in by a live turn that reads it', () => {
+    const s = run([{ type: 'user', isReplay: true, uuid: 'u2', message: { role: 'user', content: 'and this?' } }], withWaiting({ ...emptyChat, running: true }, [{ text: 'and this?' }]));
+    expect(s.items).toEqual([expect.objectContaining({ kind: 'user', text: 'and this?', midTurn: true })]);
+    expect(s.items[0]).not.toHaveProperty('pending');
   });
 });

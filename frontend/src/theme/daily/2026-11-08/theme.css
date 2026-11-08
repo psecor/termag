@@ -1,0 +1,22 @@
+/* New moon: moonlit periwinkle accents in both UIs and both palettes. Contrast:
+   dark: #a9b4ff on #0d1117 9.61:1, #161b22 8.78:1, #21262d 7.73:1, simple UI #181a1f 8.84:1,
+   #23252a 7.78:1; white on #5a66d4 4.90:1; #5a66d4 as a border or outline on #21262d 3.11:1,
+   #23252a 3.13:1.
+   light: #4a52b5 on #ffffff 6.63:1, #f6f8fa 6.23:1, #eaeef2 5.69:1, simple UI #f7f9fb 6.29:1;
+   white on #3f479f 8.04:1. */
+
+html[data-daily-theme="2026-11-08"],
+html[data-daily-theme="2026-11-08"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-08"] .lp-theme {
+  --accent: #a9b4ff;
+  --accent-dim: #5a66d4;
+  --accent-rgb: 169, 180, 255;
+}
+
+html[data-daily-theme="2026-11-08"][data-palette="light"],
+html[data-daily-theme="2026-11-08"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-08"][data-palette="light"] .lp-theme {
+  --accent: #4a52b5;
+  --accent-dim: #3f479f;
+  --accent-rgb: 74, 82, 181;
+}

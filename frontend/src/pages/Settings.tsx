@@ -9,6 +9,8 @@ import { AppearanceSection } from './settings/AppearanceSection';
 import { BriefingSection } from './settings/BriefingSection';
 import { McpSection } from './settings/McpSection';
 import { NotificationsSection } from './settings/NotificationsSection';
+import { BoxNoticesSection } from './settings/BoxNoticesSection';
+import { TelemetrySection } from './settings/TelemetrySection';
 import { DocsLink } from './settings/DocsLink';
 import { FileSharingSection } from './settings/FileSharingSection';
 import { settingsBackLink } from './settings/backLink';
@@ -44,6 +46,8 @@ export default function Settings() {
         <CliDevicesSection />
         <BriefingSection />
         <NotificationsSection />
+        <BoxNoticesSection />
+        <TelemetrySection />
         <AppearanceSection />
         <FileSharingSection />
         {/* Sign out lives here rather than the sidebar header: rarely used, and

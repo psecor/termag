@@ -15,12 +15,15 @@ import { projectKindTraits } from './utils/projectKind';
 import { ProjectControl } from './components/ProjectControl';
 import { Terminal } from './components/Terminal';
 import { Hyperspace } from './components/Hyperspace';
+import { DailyThemeLayer } from './theme/daily/DailyThemeLayer';
 import { ConnectionOverlay } from './components/ConnectionOverlay';
 import { PrContextPrompt } from './components/PrContextPrompt';
 import { HandoffStrip } from './components/HandoffStrip';
 import { canHandOff } from './utils/handoff';
+import { useSetupOff } from './hooks/useSetupOff';
 import { ReviewButton } from './components/ReviewButton';
 import { ReviewDock } from './components/ReviewDock';
+import { ConfirmDialog } from './components/ConfirmDialog';
 import { ShareDialog } from './components/ShareDialog';
 import Preview from './pages/Preview';
 import { useBrowserShareHandoff } from './hooks/useBrowserShareHandoff';
@@ -41,12 +44,14 @@ import { rateLimitLabel } from './utils/rateLimit';
 import { FOCUS_PANE_EVENT, retryUntil, type FocusPaneDetail } from './utils/workspaceTarget';
 import { activityApi, warpApi, authApi, AuthMode } from './services/api';
 import { useReviewPanes } from './hooks/useReviewPanes';
+import { useTerminalTabs } from './hooks/useTerminalTabs';
+import { terminalSessionName } from './utils/sessionName';
 import { boxFeed } from './services/boxFeed';
 import { useStartParkedBoxOnOpen } from './hooks/useStartParkedBoxOnOpen';
 import { BriefingCard } from './components/BriefingCard';
 import { APP_START_PATH, appStartTarget, useLaunchQueue } from './mobile/launch';
 import { currentUiMode, leavePageEntry, notePageLocation, pageEntry, recordUiMode, shouldOpenSimpleUi, simpleUiShareHandoff } from './chat/uiMode';
-import { currentOptOut, installedAppMode, isStandalone, mobileHrefFromWorkspaceSearch, MOBILE_MEDIA_QUERY, setInstalledAppEnabled, shouldRedirectToMobile, TOUCH_MEDIA_QUERY } from './mobile/redirect';
+import { currentOptOut, installedAppMode, isStandalone, mobileHrefFromWorkspaceSearch, MOBILE_MEDIA_QUERY, shouldRedirectToMobile, TOUCH_MEDIA_QUERY } from './mobile/redirect';
 import { readRefreshHint } from './onboarding/refreshHint';
 
 const BROWSER_EXPANDED_KEY = 'termag.browserPane.expanded';
@@ -160,14 +165,11 @@ function MainLayout() {
   // The route takes the workstream's id.
   const handoffOn = useFlag(FLAGS.agentHandoff, false);
   // Browser pane: a headless Chromium on the project's
-  // box, docked under the ctrl terminal, behind browser-pane-enabled. Expanded
-  // per project + workstream; collapsing closes the browser on the box.
-  const browserPaneOn = useFlag(FLAGS.browserPane, false);
-  // Preview shares: the owner's "Share…" on the dock,
-  // the default lifetime it preselects, and kept profiles' "Reset browser".
-  const previewShareOn = useFlag(FLAGS.previewShare, false);
+  // box, docked under the ctrl terminal. Expanded per project + workstream;
+  // collapsing closes the browser on the box.
+  // Preview shares: the default lifetime the owner's
+  // "Share…" on the dock preselects.
   const previewShareTtl = useFlag(FLAGS.previewShareTtlHours, 24);
-  const keptProfilesOn = useFlag(FLAGS.persistentProfiles, false);
   // The share dialog, open with the page the owner's pane shows (its links open there).
   const [sharing, setSharing] = useState<{ atPath: string | null } | null>(null);
   // Kept in sessionStorage for this tab: Settings and the dashboard unmount
@@ -183,12 +185,14 @@ function MainLayout() {
     });
   }, [browserKey]);
   const handoffWs = activeProject?.workstreams.find(w => w.name === activeWorkstream);
+  // A box with termag setup off has no termag-handoff skill.
+  const activeOnSetupOff = useSetupOff(activeProject?.instanceId);
   // The workstream's stored agent, as the menus read it: only one that can write a handoff gets the button.
   const handoffProvider = handoffWs
     ? activeProject?.workflows.find(w => w.type === 'agent' && w.workstreamId === handoffWs.id)?.provider ?? user?.defaultAgentProvider ?? 'claude'
     : null;
   const handoffWorkstreamId = handoffOn && activeProject && handoffWs && activeProject.role !== 'collaborator'
-    && projectKindTraits(activeProject.kind).canHandOff && canHandOff(handoffProvider)
+    && projectKindTraits(activeProject.kind).canHandOff && canHandOff(handoffProvider) && !activeOnSetupOff
     ? handoffWs.id
     : null;
   const agentSession = activeProject
@@ -209,6 +213,27 @@ function MainLayout() {
     status: statusMap[statusKey(activeProject?.instanceId, agentSession)],
   });
   const { expandFor: expandReviewFor } = reviews;
+
+  // Terminal slots: the ctrl pane is the first tab;
+  // + adds another shell in the workstream, ✕ closes one. The tab list is
+  // what tmux says (hooks/useTerminalTabs.ts), fetched per project+workstream
+  // and updated optimistically. Confirm state for the ✕, which kills any
+  // program running in the pane.
+  const terminalTabsOn = useFlag(FLAGS.terminalTabs, false);
+  const terminalTabs = useTerminalTabs({ projectId: activeProject?.id ?? null, workstream: activeWorkstream, enabled: terminalTabsOn });
+  // Latest tabs hook for the focus handler, whose listener registers once (a
+  // changed setActiveSlot is stable, but the hook object is not).
+  const terminalTabsRef = useRef(terminalTabs);
+  terminalTabsRef.current = terminalTabs;
+  const [confirmCloseSlot, setConfirmCloseSlot] = useState<number | null>(null);
+  // The active slot's session name; null activeSlot is the ctrl pane itself.
+  // The active slot's session name derives from the slot number alone — not
+  // from the fetched tab list, which lags behind the switch (a focus retry
+  // must not attach the ctrl pane while the list is still in flight).
+  const activeSlot = terminalTabs.activeSlot;
+  const activeTerminalSession = activeProject && activeSlot !== null && activeSlot >= 2
+    ? terminalSessionName(sessionOwner, activeProject.name, activeWorkstream, activeSlot)
+    : ctrlSession;
 
   // Typing boost — decays after 1.5s of no keystrokes
   const [typing, setTyping] = useState(false);
@@ -308,16 +333,27 @@ function MainLayout() {
   useEffect(() => {
     let cancel: (() => void) | null = null;
     const onFocusPane = (e: Event) => {
-      const { projectId, workstream, pane, session } = (e as CustomEvent<FocusPaneDetail>).detail;
+      const { projectId, workstream, pane, session, slot } = (e as CustomEvent<FocusPaneDetail>).detail;
       if (isNarrow) setActivePane(pane === 'agent' ? 'agent' : 'ctrl');
       if (pane === 'review') {
         // The pane it names, else the first one.
         expandReviewFor(projectId, workstream, session);
         return;
       }
+      // A terminal tab the hit is about: activate the
+      // slot inside the retry — the tab list resets when the switch's fetch
+      // lands, so the first attempts may be clobbered — and only call the
+      // attempt won when the focused textarea belongs to THAT tab's terminal
+      // (the holder is tagged with the active slot), never the outgoing one's.
+      const wanted = pane === 'ctrl' ? (slot !== undefined && slot >= 2 ? slot : null) : undefined;
+      const setSlot = wanted !== undefined ? () => terminalTabsRef.current.setActiveSlot(wanted) : null;
       cancel?.();
       cancel = retryUntil(() => {
-        const el = document.querySelector<HTMLTextAreaElement>(`#terminal-${pane} textarea`);
+        setSlot?.();
+        const holder = wanted !== undefined
+          ? document.querySelector(`#terminal-ctrl [data-active-slot="${wanted === null ? 1 : wanted}"]`)
+          : document.querySelector(`#terminal-${pane}`);
+        const el = holder?.querySelector('textarea');
         el?.focus();
         return !!el && document.activeElement === el;
       });
@@ -390,6 +426,8 @@ function MainLayout() {
     <div className="app-layout">
       {/* Sustained-offline takeover: dims everything below (fixed, z 200). */}
       <ConnectionOverlay />
+      {/* Theme of the day; the turkeys win over its sprite. */}
+      <DailyThemeLayer suppressSprite={showHyperspace && starfieldTurkeys} />
       {showHyperspace && (
         <div className="app-hyperspace-bg">
           <Hyperspace
@@ -561,16 +599,56 @@ function MainLayout() {
             <div className={`app-ctrl ${isNarrow ? 'app-ctrl-full' : ''}`} id="terminal-ctrl">
               {activeProject && hasAgent && !cloneHeld ? (
                 <>
-                  <div className="app-ctrl-term">
+                  {/* Terminal tabs: ctrl plus the workstream's
+                      shell slots; the active one's Terminal fills .app-ctrl-term. */}
+                  {terminalTabsOn && (
+                    <div className="terminal-tabs" role="tablist" aria-label="Terminals">
+                      <button
+                        role="tab"
+                        aria-selected={terminalTabs.activeSlot === null}
+                        className={`terminal-tab ${terminalTabs.activeSlot === null ? 'active' : ''}`}
+                        onClick={() => terminalTabs.setActiveSlot(null)}
+                      >ctrl</button>
+                      {terminalTabs.tabs.map(t => (
+                        <span key={t.slot} className="terminal-tab-holder">
+                          <button
+                            role="tab"
+                            aria-selected={terminalTabs.activeSlot === t.slot}
+                            className={`terminal-tab ${terminalTabs.activeSlot === t.slot ? 'active' : ''}`}
+                            onClick={() => terminalTabs.setActiveSlot(t.slot)}
+                          >{t.label}</button>
+                          <button
+                            className="terminal-tab-close"
+                            title={`Close ${t.label} (kills anything running in it)`}
+                            aria-label={`Close ${t.label}`}
+                            onClick={() => setConfirmCloseSlot(t.slot)}
+                          >✕</button>
+                        </span>
+                      ))}
+                      <button
+                        className="terminal-tab-add"
+                        title={terminalTabs.tabs.length >= 7 ? 'All 8 terminals in this workstream are in use' : 'Add a terminal'}
+                        disabled={terminalTabs.adding || terminalTabs.tabs.length >= 7}
+                        onClick={() => { void terminalTabs.add(); }}
+                      >+</button>
+                      {terminalTabs.error && (
+                        <span className="terminal-tab-error" role="alert">
+                          {terminalTabs.error}
+                          <button className="terminal-tab-error-close" aria-label="Dismiss" onClick={terminalTabs.clearError}>✕</button>
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  <div className="app-ctrl-term" data-active-slot={activeSlot !== null && activeSlot >= 2 ? activeSlot : 1}>
                     <Terminal
-                      sessionName={ctrlSession}
+                      sessionName={activeTerminalSession}
                       projectId={activeProject.id}
                       workstream={activeWorkstream}
                       instanceId={activeProject.instanceId}
                       active={true}
                       autoFocus={isNarrow && activePane === 'ctrl'}
                       onActivity={onActivity}
-                      key={`${activeProject.id}-${activeWorkstream}-ctrl${isNarrow ? `-${activePane}` : ''}`}
+                      key={`${activeProject.id}-${activeWorkstream}-${activeSlot !== null && activeSlot >= 2 ? `slot${activeSlot}` : 'ctrl'}${isNarrow ? `-${activePane}` : ''}`}
                     />
                   </div>
                   {/* The review panes dock under the ctrl terminal, slot order:
@@ -594,18 +672,16 @@ function MainLayout() {
                   ))}
                   {/* The browser pane docks under the review pane: a one-line
                       bar collapsed, most of the column expanded. */}
-                  {browserPaneOn && (
-                    <BrowserDock
-                      projectId={activeProject.id}
-                      workstream={activeWorkstream}
-                      expanded={browserExpanded[browserKey] ?? false}
-                      onToggle={toggleBrowser}
-                      openShare={browserOpenShare}
-                      onOpenShareUsed={consumeOpenShare}
-                      showReset={keptProfilesOn}
-                      onShare={previewShareOn && activeProject.role !== 'collaborator' ? (atPath) => setSharing({ atPath }) : undefined}
-                    />
-                  )}
+                  <BrowserDock
+                    projectId={activeProject.id}
+                    workstream={activeWorkstream}
+                    expanded={browserExpanded[browserKey] ?? false}
+                    onToggle={toggleBrowser}
+                    openShare={browserOpenShare}
+                    onOpenShareUsed={consumeOpenShare}
+                    showReset
+                    onShare={activeProject.role !== 'collaborator' ? (atPath) => setSharing({ atPath }) : undefined}
+                  />
                   {sharing && (
                     <ShareDialog
                       projectId={activeProject.id}
@@ -617,6 +693,14 @@ function MainLayout() {
                       onSwitchWorkstream={(ws) => setActiveWorkstream(activeProject.id, ws)}
                     />
                   )}
+                  {confirmCloseSlot !== null && (
+                    <ConfirmDialog
+                      message={`Close ${terminalTabs.tabs.find(t => t.slot === confirmCloseSlot)?.label ?? `term ${confirmCloseSlot}`}? Anything running in it stops with it.`}
+                      confirmLabel="Close terminal"
+                      onConfirm={() => { void terminalTabs.close(confirmCloseSlot); setConfirmCloseSlot(null); }}
+                      onCancel={() => setConfirmCloseSlot(null)}
+                    />
+                )}
                 </>
               ) : (
                 <div className="empty-pane">
@@ -645,26 +729,24 @@ const Settings = lazy(() => import('./pages/Settings'));
 const Admin = lazy(() => import('./pages/Admin'));
 const SpawnNetwork = lazy(() => import('./pages/SpawnNetwork'));
 const Automations = lazy(() => import('./pages/Automations'));
+const Environments = lazy(() => import('./pages/Environments'));
 const Welcome = lazy(() => import('./pages/Welcome'));
 const SignIn = lazy(() => import('./pages/welcome/SignIn'));
 const MobileApp = lazy(() => import('./pages/mobile/MobileApp'));
 const ChatApp = lazy(() => import('./pages/chat/ChatApp'));
 
 /**
- * Phone-sized viewports go to the mobile client when the
- * `mobile-redirect-enabled` flag is on and this browser has not pressed
- * "Lab". With `mobile-installed-app-enabled`, an app installed on a touch
+ * Phone-sized viewports go to the mobile client unless
+ * this browser has pressed "Lab". An app installed on a touch
  * device always does (§5.1) and its "Lab" lasts for that window only. Sits
  * inside FeatureFlagsProvider (for the flags) and before MainLayout, so no
  * terminal socket is opened for a page that is about to leave.
  */
 function MobileRedirectGate({ children }: { children: React.ReactNode }) {
-  const flagOn = useFlag(FLAGS.mobileRedirect, false);
   const phoneLike = typeof window !== 'undefined' && window.matchMedia(MOBILE_MEDIA_QUERY).matches;
-  setInstalledAppEnabled(useFlag(FLAGS.mobileInstalledApp, false));
   const installed = typeof window !== 'undefined' && installedAppMode(window);
   const optedOut = currentOptOut(installed);
-  if (shouldRedirectToMobile({ flagOn, phoneLike, optedOut, installed })) {
+  if (shouldRedirectToMobile({ phoneLike, optedOut, installed })) {
     return <Navigate to={mobileHrefFromWorkspaceSearch(window.location.search)} replace />;
   }
   return <>{children}</>;
@@ -676,12 +758,10 @@ function MobileRedirectGate({ children }: { children: React.ReactNode }) {
  * a share link its owner opened: its side panel's browser, not the dock.
  */
 function SimpleUiReturnGate({ children }: { children: React.ReactNode }) {
-  const flagOn = useFlag(FLAGS.simpleUi, false);
-  const sidePanelOn = useFlag(FLAGS.chatSidePanel, false);
   const location = useLocation();
-  const [toSimple] = useState(() => simpleUiShareHandoff({ flagOn, sidePanelOn, mode: currentUiMode(), search: location.search })
+  const [toSimple] = useState(() => simpleUiShareHandoff({ mode: currentUiMode(), search: location.search })
     ?? (shouldOpenSimpleUi({
-      flagOn, mode: currentUiMode(), entry: pageEntry(), here: `${location.pathname}${location.search}`, locationKey: location.key,
+      mode: currentUiMode(), entry: pageEntry(), here: `${location.pathname}${location.search}`, locationKey: location.key,
     }) ? '/chat' : null));
   useEffect(() => {
     leavePageEntry();
@@ -700,17 +780,9 @@ function PageEntryTracker() {
 
 /** The installed app's start_url (mobile/launch.ts): the phone client or the simple UI. */
 function AppStart() {
-  const simpleUi = useFlag(FLAGS.simpleUi, false);
   const touch = typeof window !== 'undefined' && window.matchMedia(TOUCH_MEDIA_QUERY).matches;
   const standalone = typeof window !== 'undefined' && isStandalone(window);
-  return <Navigate to={appStartTarget({ touch, standalone, simpleUi })} replace />;
-}
-
-/** The simple UI at /chat exists only for users with simple-ui-enabled. */
-function SimpleUiGate({ children }: { children: React.ReactNode }) {
-  const enabled = useFlag(FLAGS.simpleUi, false);
-  if (!enabled) return <Navigate to="/" replace />;
-  return <>{children}</>;
+  return <Navigate to={appStartTarget({ touch, standalone })} replace />;
 }
 
 /**
@@ -785,6 +857,8 @@ export default function App() {
               element={
                 <RequireAuth>
                   <FeatureFlagsProvider>
+                    {/* So turning the theme of the day on shows it right here. */}
+                    <DailyThemeLayer />
                     <Suspense fallback={<div className="loading-screen">Loading…</div>}>
                       <Settings />
                     </Suspense>
@@ -797,9 +871,7 @@ export default function App() {
               the dashboard, so it opens no status WebSocket and sends no heartbeat. */}
           {/* Automations: the index and one automation's page
               with its runs. Mounted like the dashboard (no status socket, no
-              heartbeat) but inside FeatureFlagsProvider, as /welcome is: a run's
-              conversation link reads simple-ui-enabled, and useFlag outside the
-              provider only ever returns its fallback. */}
+              heartbeat) but inside FeatureFlagsProvider, as /welcome is. */}
           <Route
             path="/automations"
             element={
@@ -824,6 +896,23 @@ export default function App() {
               </RequireAuth>
             }
           />
+          {/* Environments: shared, so every signed-in user
+              sees and edits every one. Mounted like Automations. */}
+          {['/environments', '/environments/:id', '/environments/:id/history'].map(path => (
+            <Route
+              key={path}
+              path={path}
+              element={
+                <RequireAuth>
+                  <FeatureFlagsProvider>
+                    <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                      <Environments history={path.endsWith('/history')} />
+                    </Suspense>
+                  </FeatureFlagsProvider>
+                </RequireAuth>
+              }
+            />
+          ))}
           <Route
             path="/spawns/:rootId"
             element={
@@ -888,22 +977,20 @@ export default function App() {
             }
           />
           {/* The simple UI (chat-first, terminals on request): same providers
-              as the workspace, no MainLayout. Behind simple-ui-enabled. */}
+              as the workspace, no MainLayout. */}
           <Route
             path="/chat/*"
             element={
               <RequireAuth>
                 <FirstRunGate>
                 <FeatureFlagsProvider>
-                  <SimpleUiGate>
-                    <ConnectionProvider>
-                      <ProjectProvider>
-                        <Suspense fallback={<div className="loading-screen">Loading…</div>}>
-                          <ChatApp />
-                        </Suspense>
-                      </ProjectProvider>
-                    </ConnectionProvider>
-                  </SimpleUiGate>
+                  <ConnectionProvider>
+                    <ProjectProvider>
+                      <Suspense fallback={<div className="loading-screen">Loading…</div>}>
+                        <ChatApp />
+                      </Suspense>
+                    </ProjectProvider>
+                  </ConnectionProvider>
                 </FeatureFlagsProvider>
                 </FirstRunGate>
               </RequireAuth>

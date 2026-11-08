@@ -77,6 +77,8 @@ export interface PanelTabsUi {
   pick: (tool: SidePanelTab) => void;
   add: () => void;
   close: (id: string) => void;
+  /** Opens and shows a subagent's tab (openAgentTab). */
+  openAgent: (agent: AgentTabRef) => void;
 }
 
 /**
@@ -176,6 +178,7 @@ export function usePanelTabs(
     pick: kind => set(openTool(state, kind, active.kind === 'launcher' && active.id !== STAND_IN ? active.id : undefined)),
     add: () => set(addLauncher(state)),
     close: id => { if (id !== STAND_IN) set(closePanelTab(state, id, shown.map(t => t.id))); },
+    openAgent: agent => set(openAgentTab(state, agent)),
   };
 }
 

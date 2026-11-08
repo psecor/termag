@@ -1,6 +1,7 @@
 // The sidebar's groups under the chrome refresh's view options
 // (chat/sidebarView.ts): the spaces' own groups with the filters applied, or
-// every agent by its state (chat/rowState.ts) and then the files and new tabs.
+// every agent by its project or its state (chat/rowState.ts), and then the
+// files and new tabs.
 // Pure, for the tests; OpenItems.tsx draws what it returns.
 import type { OpenItem } from './openItems';
 import type { RowStateKind } from './rowState';
@@ -18,9 +19,9 @@ export const STATUS_GROUPS: readonly StatusGroup[] = [
 export const FILES_GROUP = { key: 'files', name: 'Files' } as const;
 
 export interface ViewGroup {
-  /** The space a space group is, null for No space and for a state's group. */
+  /** The space a space group is, null for No space and for a project's or a state's group. */
   space: string | null;
-  /** The state's group, or null for a space's. */
+  /** A project's group (key `project:<id>`) or a state's, or null for a space's. */
   status: { key: string; name: string } | null;
   items: OpenItem[];
   /** How many it had before the filters: a space emptied by them is not "Nothing open". */
@@ -31,13 +32,15 @@ export interface ViewGroup {
  * `stateOf` is an agent tab's state, or null when its row is unknown (kept, so
  * a filter never hides what it can't judge). `openTab` is the tab on screen,
  * which no filter hides: the sidebar never loses what is open, as a folded
- * space keeps it too.
+ * space keeps it too. `projectOf` is an agent tab's project name; null (no
+ * name known) groups it under its project id rather than dropping it.
  */
 export function viewGroups(
   groups: ReadonlyArray<{ space: string | null; items: readonly OpenItem[] }>,
   view: Pick<SidebarView, 'groupBy' | 'showFiles' | 'showIdle'>,
   stateOf: (item: OpenItem) => RowStateKind | null,
   openTab: string | null = null,
+  projectOf: (item: OpenItem & { kind: 'chat' }) => string | null = () => null,
 ): ViewGroup[] {
   const keep = (item: OpenItem) => {
     if (item.id === openTab) return true;
@@ -48,6 +51,23 @@ export function viewGroups(
     return groups.map(g => ({ space: g.space, status: null, items: g.items.filter(keep), total: g.items.length }));
   }
   const all = groups.flatMap(g => g.items).filter(keep);
+  const files = all.filter(i => i.kind !== 'chat');
+  const filesGroup: ViewGroup = { space: null, status: { ...FILES_GROUP }, items: files, total: files.length };
+  if (view.groupBy === 'project') {
+    // Every agent under its project, by name, then the files and new tabs.
+    const byProject = new Map<string, { name: string; items: OpenItem[] }>();
+    for (const item of all) {
+      if (item.kind !== 'chat') continue;
+      const group = byProject.get(item.projectId);
+      if (group) group.items.push(item);
+      else byProject.set(item.projectId, { name: projectOf(item) ?? item.projectId, items: [item] });
+    }
+    const out: ViewGroup[] = [...byProject.entries()]
+      .sort(([, a], [, b]) => a.name.localeCompare(b.name))
+      .map(([id, g]) => ({ space: null, status: { key: `project:${id}`, name: g.name }, items: g.items, total: g.items.length }));
+    out.push(filesGroup);
+    return out.filter(g => g.items.length > 0);
+  }
   const out: ViewGroup[] = STATUS_GROUPS.map(sg => {
     const items = all.filter(i => {
       if (i.kind !== 'chat') return false;
@@ -57,7 +77,6 @@ export function viewGroups(
     });
     return { space: null, status: { key: sg.key, name: sg.name }, items, total: items.length };
   });
-  const files = all.filter(i => i.kind !== 'chat');
-  out.push({ space: null, status: { ...FILES_GROUP }, items: files, total: files.length });
+  out.push(filesGroup);
   return out.filter(g => g.items.length > 0);
 }

@@ -61,3 +61,28 @@ describe('useBrowserShareHandoff', () => {
     expect(window.location.search).toBe('?project=p1');
   });
 });
+
+describe('useBrowserShareHandoff: an environment port link (browserUrl)', () => {
+  it('sets the page the pane opens for the project in the link, before any pane mounts, then drops the parameter', () => {
+    localStorage.removeItem('termag.browserPane.url.p1/main');
+    window.history.replaceState(null, '', '/termag/?project=p1&ws=main&browser=open&browserUrl=http%3A%2F%2Flocalhost%3A5174%2Ftermag%2F');
+    render('');
+    expect(localStorage.getItem('termag.browserPane.url.p1/main')).toBe('http://localhost:5174/termag/');
+    render('p1/main');
+    expect(expandDock).toHaveBeenCalledWith('p1/main');
+    expect(got!.openShare).toBeNull();
+    expect(window.location.search).toBe('?project=p1&ws=main');
+  });
+
+  it("reads the simple UI's /chat/p/<id>?ws=, and ignores a URL off the box's loopback", () => {
+    localStorage.removeItem('termag.browserPane.url.p2/fix');
+    window.history.replaceState(null, '', '/termag/chat/p/p2?ws=fix&browser=open&browserUrl=http%3A%2F%2Flocalhost%3A3040%2F');
+    render('p2/fix');
+    expect(localStorage.getItem('termag.browserPane.url.p2/fix')).toBe('http://localhost:3040/');
+    localStorage.removeItem('termag.browserPane.url.p2/fix');
+    window.history.replaceState(null, '', '/termag/chat/p/p2?ws=fix&browser=open&browserUrl=https%3A%2F%2Fevil.example%2F');
+    act(() => root.unmount()); root = createRoot(el);
+    render('p2/fix');
+    expect(localStorage.getItem('termag.browserPane.url.p2/fix')).toBeNull();
+  });
+});

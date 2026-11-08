@@ -15,7 +15,7 @@ vi.mock('../../services/boxFeed', () => ({
   boxFeed: { subscribe: () => () => {}, getSnapshot: () => noBoxes },
 }));
 vi.mock('../../chat/useChatSpaces', () => ({
-  useSharedChatSpaces: () => ({ enabled: false, loaded: true, current: true, spaces: [], index: new Map(), colorOf: () => '' }),
+  useSharedChatSpaces: () => ({ loaded: true, current: true, spaces: [], index: new Map(), colorOf: () => '' }),
 }));
 
 let root: Root;

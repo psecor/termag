@@ -1,4 +1,4 @@
-// The simple UI's tabs (simple-ui-side-panel-enabled): what the sidebar
+// The simple UI's tabs: what the sidebar
 // lists, grouped by space. A tab shows an agent session (a project
 // workstream, in its own space: chat/chatSpaces.ts chatHomeSpace, or with
 // none, the space its tab was opened from: OpenItem.openedIn), a
@@ -44,7 +44,7 @@ export type OpenItem = OpenItemRef & {
 
 /**
  * The explorer of agents in no space (pages/chat/AgentsExplorer.tsx), for a
- * person with no spaces or spaces off, and beside an agent with no space: a
+ * person with no spaces, and beside an agent with no space: a
  * new tab on it is `{ kind: 'explorer', space: NO_SPACE_EXPLORER }`, at
  * /chat/agents, under No space. Not a valid space name, so no space has it.
  */
@@ -55,6 +55,21 @@ export interface OpenItemsState {
   seeded: boolean;
   /** In the person's order; a group's tabs keep their relative order. */
   items: OpenItem[];
+  /**
+   * Tab ids, the one shown most recently first, at most RECENT_TABS_MAX, each
+   * one a tab in `items` (noteActive). Closing the open tab goes back along it
+   * (tabAfterClose). Unset until a tab is first shown.
+   */
+  recent?: readonly string[];
+}
+
+/** How many tabs `recent` keeps. */
+export const RECENT_TABS_MAX = 50;
+
+/** Tab `id` shown now: first in `recent`. An id no tab has changes nothing. */
+export function noteActive(state: OpenItemsState, id: string): OpenItemsState {
+  if (state.recent?.[0] === id || !state.items.some(i => i.id === id)) return state;
+  return { ...state, recent: [id, ...(state.recent ?? []).filter(r => r !== id)].slice(0, RECENT_TABS_MAX) };
 }
 
 export const EMPTY_OPEN_ITEMS: OpenItemsState = { seeded: false, items: [] };
@@ -106,10 +121,19 @@ function shown(prev: OpenItem, ref: OpenItemRef, now: number, openedIn?: string 
  * a new tab, on top. With no tab named, the first tab already showing `ref`
  * is the one (it doesn't move), else a new tab goes on top. `openedIn` is
  * where a chat was opened from, for a tab that starts showing it (OpenItem).
- * Returns the state and the tab that shows `ref`.
+ * With `active`, the route is the one on screen, and its tab goes first in
+ * `recent` (noteActive). Returns the state and the tab that shows `ref`.
  */
 export function openItem(
   state: OpenItemsState, ref: OpenItemRef, tab: string | null, now: number, makeId: () => string = newTabId, openedIn?: string | null,
+  active = false,
+): { state: OpenItemsState; id: string } {
+  const r = placeItem(state, ref, tab, now, makeId, openedIn);
+  return active ? { state: noteActive(r.state, r.id), id: r.id } : r;
+}
+
+function placeItem(
+  state: OpenItemsState, ref: OpenItemRef, tab: string | null, now: number, makeId: () => string, openedIn: string | null | undefined,
 ): { state: OpenItemsState; id: string } {
   const at = tab ? state.items.findIndex(i => i.id === tab) : state.items.findIndex(i => itemKey(i) === itemKey(ref));
   if (at < 0) {
@@ -186,7 +210,41 @@ export function duplicateItem(state: OpenItemsState, id: string, copyId: string,
 export function dismissItem(state: OpenItemsState, id: string | readonly string[]): OpenItemsState {
   const ids = new Set(typeof id === 'string' ? [id] : id);
   const items = state.items.filter(i => !ids.has(i.id));
-  return items.length === state.items.length ? state : { ...state, items };
+  return items.length === state.items.length ? state : keepTabs(state, items);
+}
+
+/** `state` with only `items` (a subset of its tabs) left, and `recent` holding only their ids. */
+function keepTabs(state: OpenItemsState, items: OpenItem[]): OpenItemsState {
+  if (!state.recent) return { ...state, items };
+  const left = new Set(items.map(i => i.id));
+  return { ...state, items, recent: state.recent.filter(r => left.has(r)) };
+}
+
+/**
+ * Where closing tabs `ids` leaves the person, given the sidebar's `groups` and
+ * the open tab `active`: null when the open tab isn't among them (the route
+ * stays). Otherwise `stay` (the tab acted on, when it stays open); with
+ * `recent` (TabClose.tsx passes it for every close), the tab shown most recently that stays
+ * open and is in a group or in `also` (tabs the sidebar lists outside the
+ * groups: review sessions, in Reviews); else the first tab left in the open
+ * tab's group, else the first left anywhere; undefined when none is left (Home).
+ */
+export function tabAfterClose(
+  groups: readonly OpenItemGroup[], ids: readonly string[], active: string | null,
+  opts: { stay?: OpenItem; recent?: readonly string[]; also?: readonly OpenItem[] } = {},
+): OpenItem | null | undefined {
+  const gone = new Set(ids);
+  if (!active || !gone.has(active)) return null;
+  if (opts.stay && !gone.has(opts.stay.id)) return opts.stay;
+  const all = groups.flatMap(g => g.items);
+  const back = opts.also?.length ? [...all, ...opts.also] : all;
+  for (const id of opts.recent ?? []) {
+    if (gone.has(id)) continue;
+    const item = back.find(i => i.id === id);
+    if (item) return item;
+  }
+  const left = (list: readonly OpenItem[]) => list.find(i => !gone.has(i.id));
+  return left(groups.find(g => g.items.some(i => i.id === active))?.items ?? []) ?? left(all);
 }
 
 /**
@@ -221,7 +279,8 @@ export function arrangeItems(state: OpenItemsState, group: readonly string[], or
 /**
  * The first load: what was opened before, then a tab for every session that
  * exists, in the order given (most recent activity first), so turning the
- * flag on loses nobody's list. Later loads leave the list alone.
+ * flag on loses nobody's list, and the tabs shown most recently stay as
+ * they are. Later loads leave the list alone.
  */
 export function seedItems(
   state: OpenItemsState,
@@ -234,16 +293,16 @@ export function seedItems(
   const added: OpenItem[] = chats
     .filter(c => !have.has(itemKey({ kind: 'chat', ...c })))
     .map((c, i) => ({ kind: 'chat' as const, projectId: c.projectId, workstream: c.workstream, id: makeId(), openedAt: c.lastActiveAt ?? now - 1 - i }));
-  return { seeded: true, items: [...state.items, ...added] };
+  return { ...state, seeded: true, items: [...state.items, ...added] };
 }
 
 /** A session opened this recently stays even when the project list doesn't have it yet (New session just made it). */
 export const RECONCILE_GRACE_MS = 2 * 60_000;
 
-/** Tabs on sessions that no longer exist (deleted or archived) close. Files and explorers stay. */
+/** Tabs on sessions that no longer exist (deleted or archived) close, and leave `recent`. Files and explorers stay. */
 export function reconcileItems(state: OpenItemsState, liveChats: ReadonlySet<string>, now: number): OpenItemsState {
   const items = state.items.filter(i => i.kind !== 'chat' || liveChats.has(itemKey(i)) || now - i.openedAt < RECONCILE_GRACE_MS);
-  return items.length === state.items.length ? state : { ...state, items };
+  return items.length === state.items.length ? state : keepTabs(state, items);
 }
 
 /** Where a chat tab's session is: its own space, and the spaces whose explorers list it (its box reaches them). */
@@ -296,7 +355,7 @@ function validRef(r: Record<string, unknown>, id: string, at: number): OpenItem 
 export function parseOpenItems(raw: string | null): OpenItemsState {
   if (!raw) return EMPTY_OPEN_ITEMS;
   try {
-    const data = JSON.parse(raw) as { v?: unknown; seeded?: unknown; items?: unknown };
+    const data = JSON.parse(raw) as { v?: unknown; seeded?: unknown; items?: unknown; recent?: unknown };
     if ((data.v !== 1 && data.v !== 2) || !Array.isArray(data.items)) return EMPTY_OPEN_ITEMS;
     const v1 = data.v === 1;
     const items = data.items.map((r, i) => validItem(r, `m${i}`, v1)).filter((i): i is OpenItem => i != null);
@@ -308,14 +367,17 @@ export function parseOpenItems(raw: string | null): OpenItemsState {
       seen.add(k);
       return true;
     });
-    return { seeded: data.seeded === true, items: unique };
+    if (!Array.isArray(data.recent)) return { seeded: data.seeded === true, items: unique };
+    const tabs = new Set(unique.map(i => i.id));
+    const recent = [...new Set(data.recent.filter((r): r is string => typeof r === 'string' && tabs.has(r)))].slice(0, RECENT_TABS_MAX);
+    return { seeded: data.seeded === true, items: unique, recent };
   } catch {
     return EMPTY_OPEN_ITEMS;
   }
 }
 
 export function serializeOpenItems(state: OpenItemsState): string {
-  return JSON.stringify({ v: 2, seeded: state.seeded, items: state.items });
+  return JSON.stringify({ v: 2, seeded: state.seeded, items: state.items, ...(state.recent ? { recent: state.recent } : {}) });
 }
 
 /** A path segment decoded, or as-is when it isn't valid percent-encoding (a hand-typed lone `%`). */

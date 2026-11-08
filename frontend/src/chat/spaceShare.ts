@@ -17,8 +17,8 @@ export const SHARE_ROLES: readonly SpaceRole[] = ['editor', 'viewer', 'owner'];
 export const DEFAULT_SHARE_ROLE: SpaceRole = 'editor';
 
 export interface ShareAbilities {
-  /** The add form: shown, refused by spaces-sharing-enabled, or not the caller's to use. */
-  addPeople: 'yes' | 'sharing_off' | 'not_owner';
+  /** The add form: shown, or not the caller's to use. */
+  addPeople: 'yes' | 'not_owner';
   /** Change roles, remove people and cancel invites. */
   manage: boolean;
   /** Add one of their own boxes (editor and up, as POST /boxes). */
@@ -28,13 +28,12 @@ export interface ShareAbilities {
 /**
  * What the dialog offers someone with `role` in a space, as the routes
  * decide it (routes/spaces.ts): owners manage, editors add their boxes, and a
- * read-only space (no owner left) lets no one change anything. `sharing` is
- * the server's answer from GET /members, null until it has loaded.
+ * read-only space (no owner left) lets no one change anything.
  */
-export function shareAbilities(role: SpaceRole | undefined, readOnly: boolean, sharing: boolean | null): ShareAbilities {
+export function shareAbilities(role: SpaceRole | undefined, readOnly: boolean): ShareAbilities {
   const owner = role === 'owner' && !readOnly;
   return {
-    addPeople: !owner ? 'not_owner' : sharing === false ? 'sharing_off' : 'yes',
+    addPeople: owner ? 'yes' : 'not_owner',
     manage: owner,
     addBoxes: roleAtLeast(role, 'editor') && !readOnly,
   };

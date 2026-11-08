@@ -1,4 +1,4 @@
-// The agents in a space's explorer (simple-ui-side-panel-enabled), beside its
+// The agents in a space's explorer, beside its
 // files: every agent whose box reaches the space, with the agents another
 // agent started nested under it the way files nest in
 // folders. Agents whose box doesn't reach the space aren't listed.
@@ -106,3 +106,21 @@ export function searchAgents<R extends AgentRowLike>(nodes: ReadonlyArray<AgentN
   return out;
 }
 
+
+/**
+ * `nodes` without the agents archived from Files (chat-nested-agents-enabled), and those, for its Archived
+ * fold: each archived agent with the agents under it, wherever it was in the tree. One that `keep`s (it is
+ * working, or open), or has one under it that does, stays where it is.
+ */
+export function splitArchived<R extends AgentRowLike & { explorerArchived?: boolean }>(
+  nodes: ReadonlyArray<AgentNode<R>>, keep: (r: R) => boolean,
+): { shown: Array<AgentNode<R>>; archived: Array<AgentNode<R>> } {
+  const archived: Array<AgentNode<R>> = [];
+  const live = (n: AgentNode<R>): boolean => keep(n.row) || n.children.some(live);
+  const walk = (list: ReadonlyArray<AgentNode<R>>): Array<AgentNode<R>> => list.flatMap(n => {
+    if (n.row.explorerArchived && !live(n)) { archived.push(n); return []; }
+    return [{ ...n, children: walk(n.children) }];
+  });
+  const shown = walk(nodes);
+  return { shown, archived: archived.sort((a, b) => byLabel(a.row, b.row)) };
+}

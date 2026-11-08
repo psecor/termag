@@ -1,9 +1,10 @@
 /**
- * The Software tab's tool update actions, for each tool termag updates: what the buttons offer, what the confirms say,
- * and how a run reads in a cell. The browser never reads a tool's enabled flag (claude-code-update-enabled,
- * codex-update-enabled, cursor-update-enabled, devin-update-enabled, pi-update-enabled, gh-update-enabled, aws-update-enabled, node-update-enabled): a route answering 404 claude_update_off hides the action it backs.
+ * The Software tab's tool update actions ("Manual, from the admin Software
+ * tab"), for each tool termag updates: what the buttons offer, what the confirms say,
+ * and how a run reads in a cell. The browser never reads a tool's policy flag (<tool>-update-policy, whose
+ * mode off turns updating off): a route answering 404 claude_update_off hides the action it backs.
  */
-import type { ToolRestart, ToolUpdatePreview, ToolUpdateScope, FleetToolUpdate, SoftwareHost, SoftwareUpdateRun, UpdatableTool } from '../services/adminApi';
+import type { ToolRestart, ToolUpdatePreview, ToolUpdateScope, FleetSkipReason, FleetToolUpdate, SoftwareHost, SoftwareUpdateRun, UpdatableTool } from '../services/adminApi';
 
 /** A tool the tab can update, as the orchestrator's registry has it (backend services/toolUpdate/components.ts). */
 export interface UpdateTool {
@@ -16,6 +17,16 @@ export interface UpdateTool {
   capability: string;
   /** False for a tool with no sessions to restart (the GitHub CLI): its only restart choice is none. */
   sessions?: false;
+  /** Whose sessions a restart stops, when they are other tools' (Node's: the tools that run on it); else the tool's own panes. */
+  sessionsOf?: string;
+  /** The restart its selects start at, when it is not DEFAULT_RESTART. */
+  defaultRestart?: ToolRestart;
+  /**
+   * Updated only at the box's start, before its service runs anything (Docker: an upgrade restarts dockerd,
+   * which stops every container). Update queues a run; the box installs it at its next start, and the run's
+   * report arrives after that start. Never the orchestrator host.
+   */
+  atStart?: true;
 }
 export const UPDATE_TOOLS: ReadonlyArray<UpdateTool> = [
   { component: 'claude', label: 'Claude Code', inventory: 'claude', capability: 'tool-update-v1' },
@@ -25,9 +36,17 @@ export const UPDATE_TOOLS: ReadonlyArray<UpdateTool> = [
   { component: 'pi', label: 'pi', inventory: 'pi', capability: 'tool-update-pi-v1' },
   { component: 'gh', label: 'GitHub CLI', inventory: 'gh', capability: 'tool-update-gh-v1', sessions: false },
   { component: 'aws', label: 'AWS CLI', inventory: 'aws', capability: 'tool-update-aws-v1', sessions: false },
-  // Node restarts the agent but no session in this version.
-  { component: 'node', label: 'Node', inventory: 'node', capability: 'tool-update-node-v1', sessions: false },
+  // Node restarts the agent; a restart stops and resumes the sessions of the tools that run on it, and
+  // only when asked: its selects start at none.
+  { component: 'node', label: 'Node', inventory: 'node', capability: 'tool-update-node-v1', sessionsOf: 'Claude Code, Codex and pi', defaultRestart: 'none' },
+  // Python has no sessions: a process keeps the patch it started on.
+  { component: 'python', label: 'Python', inventory: 'python', capability: 'tool-update-python-v1', sessions: false },
+  // Docker: queued for the box's next start, installed there before docker.service.
+  { component: 'docker', label: 'Docker', inventory: 'docker', capability: 'tool-update-docker-v1', sessions: false, atStart: true },
 ];
+/** The host panel's button: "Update Docker at next start" for a tool updated only then. */
+export const hostButtonLabel = (tool: UpdateTool): string => (tool.atStart ? `Update ${tool.label} at next start` : `Update ${tool.label}`);
+const AT_START_NOTE = 'Nothing changes on the running box: the update is queued and installs at the box’s next start (a stop and start, not a hibernation resume), before Docker starts any container. Its report arrives after that start.';
 export const updateTool = (component: UpdatableTool): UpdateTool => UPDATE_TOOLS.find(t => t.component === component)!;
 /** The tool whose matrix column is `inventory`, if the tab can update it. */
 export const toolForInventory = (inventory: string): UpdateTool | undefined => UPDATE_TOOLS.find(t => t.inventory === inventory);
@@ -37,13 +56,13 @@ export function restartChoices(tool: UpdateTool): ReadonlyArray<{ value: ToolRes
   if (tool.sessions === false) return [{ value: 'none', label: RESTART_LABEL.none, note: `${tool.label} has no sessions to restart` }];
   return [
     { value: 'none', label: RESTART_LABEL.none, note: 'running sessions keep the old version until they next start' },
-    { value: 'idle', label: RESTART_LABEL.idle, note: `each ${tool.label} pane restarts once its turn ends` },
+    { value: 'idle', label: RESTART_LABEL.idle, note: tool.sessionsOf ? `each ${tool.sessionsOf} session on the old ${tool.label} restarts once its turn ends` : `each ${tool.label} pane restarts once its turn ends` },
     { value: 'force', label: RESTART_LABEL.force, note: 'cuts running turns' },
   ];
 }
 export const DEFAULT_RESTART: ToolRestart = 'idle';
-/** The restart a tool's selects start at: idle, or none for a tool with no sessions. */
-export const defaultRestart = (tool: UpdateTool): ToolRestart => (tool.sessions === false ? 'none' : DEFAULT_RESTART);
+/** The restart a tool's selects start at: idle, its own default (Node's none), or none for a tool with no sessions. */
+export const defaultRestart = (tool: UpdateTool): ToolRestart => (tool.sessions === false ? 'none' : tool.defaultRestart ?? DEFAULT_RESTART);
 export const restartLabel = (r: ToolRestart): string => RESTART_LABEL[r] ?? r;
 
 export const SCOPE_CHOICES: ReadonlyArray<{ value: Exclude<ToolUpdateScope, 'all'>; label: string }> = [
@@ -69,29 +88,23 @@ export function conflictText(e: unknown, tool: UpdateTool): string | null {
   return (code && CONFLICT[code]?.(tool)) ?? `Refused${code ? ` (${code})` : ''}.`;
 }
 
-/**
- * What a 202 from the host update says: the box's agent started its unit, or the RPC's answer was lost and
- * the run stays requested (it may be running; the runs list says how it went). Neither is an error.
- */
-export function hostRequestedText(res: { runId: string; acknowledged: boolean }): { text: string; className: '' | 'admin-warn' } {
-  return res.acknowledged
-    ? { text: `update started (run ${res.runId})`, className: '' }
-    : { text: `update sent, but the box’s acknowledgement was lost (run ${res.runId}): it may be running; the runs list will say`, className: 'admin-warn' };
-}
-
 export type HostUpdateAction = { kind: 'hidden' } | { kind: 'disabled'; reason: string } | { kind: 'ready' };
 /** The host panel's button from its preview: none while loading, when off ('off') or not capable. */
 export function hostUpdateAction(p: ToolUpdatePreview | 'off' | null): HostUpdateAction {
   if (!p || p === 'off' || !p.capable) return { kind: 'hidden' };
   if (!p.connected) return { kind: 'disabled', reason: 'offline' };
-  if (p.runInFlight) return { kind: 'disabled', reason: 'an update is already running' };
+  if (p.runInFlight) return { kind: 'disabled', reason: p.atStart ? 'an update is already queued for the next start' : 'an update is already running' };
   return { kind: 'ready' };
 }
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export function hostConfirmText(tool: UpdateTool, name: string, p: ToolUpdatePreview, restart: ToolRestart): string {
-  const sessions = `${plural(p.liveSessions, `live ${tool.label} session`)}, ${p.busySessions} busy.`;
+  if (tool.atStart) {
+    return [`Queue a ${tool.label} update for ${name}’s next start?`, '', `${p.current ?? 'unknown'} → ${p.target ?? 'the target'}${p.floor ? ` (floor ${p.floor})` : ''}`, AT_START_NOTE].join('\n');
+  }
+  // A Node update's are the sessions of the tools on it (sessionsOf), not Node's own.
+  const sessions = `${plural(p.liveSessions, `live ${tool.sessionsOf ?? tool.label} session`)}, ${p.busySessions} busy.`;
   const effect = restart === 'force' && p.busySessions > 0
     ? `Restarting now cuts the ${plural(p.busySessions, 'running turn')}.`
     : restart === 'idle' ? 'Sessions restart as each goes idle.' : restart === 'none' ? 'Sessions keep running the old version until they next start.' : '';
@@ -166,6 +179,9 @@ export function fleetButtonLabel(scope: Exclude<ToolUpdateScope, 'all'>, n: numb
 
 export function fleetConfirmText(tool: UpdateTool, scope: Exclude<ToolUpdateScope, 'all'>, n: number | null, restart: ToolRestart, ref: { floor: string | null; target: string | null } | null): string {
   const which = scope === 'below-floor' ? `below the floor${ref?.floor ? ` ${ref.floor}` : ''}` : `behind the target${ref?.target ? ` ${ref.target}` : ''}`;
+  if (tool.atStart) {
+    return [`Queue a ${tool.label} update for the next start of ${n == null ? 'every box' : `about ${plural(n, 'box', 'boxes')}`} ${which}?`, '', AT_START_NOTE, 'Offline and incapable boxes, and the orchestrator host, are skipped.'].join('\n');
+  }
   return [
     `Update ${tool.label} on ${n == null ? 'every host' : `about ${plural(n, 'host')}`} ${which}?`,
     '',
@@ -174,12 +190,15 @@ export function fleetConfirmText(tool: UpdateTool, scope: Exclude<ToolUpdateScop
   ].join('\n');
 }
 
-const SKIP: Record<string, string> = { offline: 'offline', not_capable: 'agent can’t update', run_in_flight: 'already updating', claude_update_off: 'updates off for its owner' };
+const SKIP: Record<FleetSkipReason, string> = {
+  offline: 'offline', not_capable: 'agent can’t update', run_in_flight: 'already updating', claude_update_off: 'updates off for its owner',
+  not_installed: 'not installed', version_unreadable: 'version unreadable', no_inventory: 'no recent inventory', unknown_version: 'no version to compare with',
+};
 /** What a fleet update did, as a line, and one line per skipped host. */
 export function fleetResultLines(res: FleetToolUpdate, nameOf: (hostKey: string) => string): { summary: string; skipped: string[] } {
   return {
-    summary: `${plural(res.runs.length, 'run')} requested${res.skipped.length ? `, ${res.skipped.length} skipped` : ''}`,
-    skipped: res.skipped.map(s => `${nameOf(s.hostKey)}: ${SKIP[s.reason] ?? s.reason}`),
+    summary: `${plural(res.runs.length, 'run')} ${res.atStart ? 'queued for each box’s next start' : 'requested'}${res.skipped.length ? `, ${res.skipped.length} skipped` : ''}`,
+    skipped: res.skipped.map(s => `${nameOf(s.hostKey)}: ${SKIP[s.reason as FleetSkipReason] ?? s.reason}`),
   };
 }
 
@@ -195,6 +214,7 @@ export function latestRunByHost(runs: SoftwareUpdateRun[]): Map<string, Software
 
 /** "done · updated", "running", "refused": the run's state in a word or two. */
 export function runStateText(r: SoftwareUpdateRun): string {
+  if (r.waitingForStart) return 'queued for the box’s next start';
   return !r.outcome || r.outcome === r.status ? r.status : r.status === 'done' ? r.outcome : `${r.status} · ${r.outcome}`;
 }
 
@@ -222,4 +242,69 @@ export function runSessionsText(r: SoftwareUpdateRun): string {
     s.stopped && `${s.stopped} stopped`, s.resumed && `${s.resumed} resumed`, s.fresh && `${s.fresh} fresh`,
     s.cut && `${s.cut} cut`, s.typed && `${s.typed} typed`, s.other && `${s.other} other`, s.runnersLeft && `${s.runnersLeft} runners left`,
   ].filter(Boolean).join(' · ');
+}
+
+/** A run still going: asked for, or started on the box. Every other status is an end. */
+export const runInFlight = (r: SoftwareUpdateRun): boolean => r.status === 'requested' || r.status === 'running';
+
+// The update scripts' reason codes after ->FAILED: (deploy/termag-tool-update-lib and each tool's script), in words.
+const FAILED_REASON: Record<string, string> = {
+  unpinned: 'not pinned', 'not-in-repo': 'not in the package repo', 'not-in-npm-global': 'not in the npm global', 'no-npm': 'no npm',
+  digest: 'digest mismatch', 'other-major': 'another major version', 'already-there': 'already there', 'runtime-changed': 'runtime changed',
+  'no-nvm-default': 'no nvm default',
+};
+/**
+ * Why a run did not (fully) happen, from its detail, in a few words, with the version the reason names
+ * ("not pinned", 1.5.0 from npm=1.0.2->FAILED:unpinned:1.5.0); null when the detail names no reason
+ * (a plain ->FAILED, or the orchestrator's own sentence on an expired run, which the hover shows whole).
+ */
+export function runReason(detail: string | null | undefined): { text: string; version: string | null } | null {
+  if (!detail) return null;
+  const failed = /(?:->|=)FAILED:([a-z][a-z-]*)(?::(\S+))?/.exec(detail);
+  if (failed) return { text: FAILED_REASON[failed[1]] ?? failed[1].replace(/-/g, ' '), version: failed[2] ?? null };
+  const refused = /\bpolicy=refused:(\S+)/.exec(detail);
+  if (refused) return { text: `policy refused (${refused[1]})`, version: null };
+  if (/\bpolicy=unreachable\b/.test(detail)) return { text: 'policy unreachable', version: null };
+  if (/\block=held-by-another-run\b/.test(detail)) return { text: 'another run held the lock', version: null };
+  if (/->pin-mismatch\b/.test(detail)) return { text: 'pin mismatch', version: null };
+  if (/\(not-installed\)/.test(detail)) return { text: 'not installed', version: null };
+  if (/\brunners_left=[1-9]/.test(detail)) return { text: 'runners left draining', version: null };
+  return null;
+}
+
+/**
+ * The host panel's line under "Update <tool>" once it asked for a run: the run's live state from the runs
+ * list, in RunCell's words and colours. Until the run shows in the list, and while it stays requested,
+ * a request whose acknowledgement was lost says so (it may be running).
+ */
+export interface FollowedRunLine {
+  state: string;
+  reason: { text: string; version: string | null } | null;
+  versions: string | null;
+  runId: string;
+  className: '' | 'admin-ok' | 'admin-warn' | 'admin-bad';
+  title: string;
+  inFlight: boolean;
+}
+export function followedRunLine(req: { runId: string; acknowledged: boolean; atStart?: boolean }, run: SoftwareUpdateRun | undefined): FollowedRunLine {
+  const base = { runId: req.runId, reason: null, versions: null };
+  if (req.atStart && (!run || run.status === 'requested')) {
+    return { ...base, state: 'queued: installs at the box’s next start, and reports after it', className: '', title: run?.detail ?? 'waiting for the box’s next start', inFlight: false };
+  }
+  if (!run || run.status === 'requested') {
+    return req.acknowledged
+      ? { ...base, state: 'updating…', className: '', title: run?.detail ?? 'requested', inFlight: true }
+      : { ...base, state: 'update sent, but the box’s acknowledgement was lost: it may be running', className: 'admin-warn', title: run?.detail ?? 'requested', inFlight: true };
+  }
+  if (run.status === 'running') return { ...base, state: 'updating…', className: '', title: run.detail ?? 'running', inFlight: true };
+  const cls = runClass(run);
+  return {
+    ...base,
+    state: runStateText(run),
+    reason: cls === 'admin-bad' || cls === 'admin-warn' ? runReason(run.detail) : null,
+    versions: runVersions(run),
+    className: cls,
+    title: [runStateText(run), runSessionsText(run), run.detail].filter(Boolean).join('\n'),
+    inFlight: false,
+  };
 }

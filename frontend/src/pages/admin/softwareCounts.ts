@@ -1,7 +1,8 @@
 import type { SoftwareHost, SoftwareMatrix, SoftwareState, SoftwareSummary } from '../../services/adminApi';
 
 // A tool that is not installed is something to install, not an update: missing stays in its own column.
-export const NEEDS_UPDATE = new Set<SoftwareState>(['behind', 'outdated']);
+// A pending reboot (the `reboot` row) is an update installed but not yet running, so it counts.
+export const NEEDS_UPDATE = new Set<SoftwareState>(['behind', 'outdated', 'pending']);
 export const needsUpdate = (h: SoftwareHost) => Object.values(h.cells).some(c => NEEDS_UPDATE.has(c.state));
 /** Offline as the host table marks it; the orchestrator row is always online (backend services/software/summary.ts). */
 export const isOnline = (h: SoftwareHost) => h.kind === 'orchestrator' || h.connected;

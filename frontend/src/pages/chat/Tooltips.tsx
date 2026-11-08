@@ -4,16 +4,15 @@
 // element under .chat-root with a plain `title` has it moved to `data-tip`
 // the first time, so the browser's own tooltip never shows; a title that was
 // the element's only name becomes its aria-label. Frames keep their title,
-// which names them. Without `titles` (simple-ui-side-panel-enabled off) only
-// `data-tip` is shown and every `title` stays the browser's, as on main.
+// which names them.
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { scrollMoves } from '../../utils/scrollMoves';
 
 const DELAY_MS = 450;
 
-function tipText(el: HTMLElement, titles: boolean): string {
-  const title = titles ? el.getAttribute('title') : null;
+function tipText(el: HTMLElement): string {
+  const title = el.getAttribute('title');
   if (title != null) {
     el.removeAttribute('title');
     el.setAttribute('data-tip', title);
@@ -22,9 +21,9 @@ function tipText(el: HTMLElement, titles: boolean): string {
   return el.getAttribute('data-tip') ?? '';
 }
 
-function tipTarget(t: EventTarget | null, titles: boolean): HTMLElement | null {
+function tipTarget(t: EventTarget | null): HTMLElement | null {
   if (!(t instanceof Element)) return null;
-  const el = t.closest<HTMLElement>(titles ? '[data-tip],[title]' : '[data-tip]');
+  const el = t.closest<HTMLElement>('[data-tip],[title]');
   if (!el || el.tagName === 'IFRAME' || !el.closest('.chat-root')) return null;
   return el;
 }
@@ -33,7 +32,7 @@ function focusVisible(el: Element): boolean {
   try { return el.matches(':focus-visible'); } catch { return false; }
 }
 
-export function Tooltips({ titles }: { titles: boolean }) {
+export function Tooltips() {
   const [tip, setTip] = useState<{ text: string; rect: DOMRect } | null>(null);
   useEffect(() => {
     let current: HTMLElement | null = null;
@@ -42,7 +41,7 @@ export function Tooltips({ titles }: { titles: boolean }) {
     const show = (el: HTMLElement, now: boolean) => {
       if (el === current) return;
       hide();
-      const text = tipText(el, titles);
+      const text = tipText(el);
       if (!text) return;
       current = el;
       const go = () => { if (current === el && el.isConnected) setTip({ text, rect: el.getBoundingClientRect() }); };
@@ -50,12 +49,12 @@ export function Tooltips({ titles }: { titles: boolean }) {
     };
     const onOver = (e: PointerEvent) => {
       if (e.pointerType === 'touch') return;
-      const el = tipTarget(e.target, titles);
+      const el = tipTarget(e.target);
       if (el) show(el, false);
       else if (current && !current.contains(e.target as Node)) hide();
     };
     const onFocus = (e: FocusEvent) => {
-      const el = tipTarget(e.target, titles);
+      const el = tipTarget(e.target);
       if (el && focusVisible(el)) show(el, true);
     };
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') hide(); };
@@ -78,7 +77,7 @@ export function Tooltips({ titles }: { titles: boolean }) {
       document.removeEventListener('dragstart', hide);
       window.removeEventListener('keydown', onKey);
     };
-  }, [titles]);
+  }, []);
   return tip ? <Bubble text={tip.text} rect={tip.rect} /> : null;
 }
 

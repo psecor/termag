@@ -10,12 +10,11 @@ const mocks = vi.hoisted(() => ({
   send: vi.fn(),
   models: vi.fn(),
   noBoxes: [] as unknown[],
-  sidePanel: true,
 }));
 
 vi.mock('../../flags', async importOriginal => {
   const actual = await importOriginal<typeof import('../../flags')>();
-  return { ...actual, useFlag: <T,>(key: string, fallback: T) => (key === actual.FLAGS.chatSidePanel ? mocks.sidePanel as T : fallback) };
+  return { ...actual, useFlag: <T,>(_key: string, fallback: T) => fallback };
 });
 
 vi.mock('../../services/api', async importOriginal => ({
@@ -269,20 +268,6 @@ describe('SdkChatView header on a phone', () => {
     const items = [...document.querySelectorAll('.chat-ctx-menu [role=menuitem]')].map(b => b.textContent);
     expect(items).toEqual(['Archive', 'Open in Lab', 'Open in termag desktop']);
     expect(more.getAttribute('aria-expanded')).toBe('true');
-  });
-
-  it('is main\'s header with simple-ui-side-panel-enabled off', async () => {
-    mocks.history.mockResolvedValue(historyOn('sonnet'));
-    mocks.sidePanel = false;
-    try {
-      await render(true);
-      expect(document.querySelector('.chat-more-btn')).toBeNull();
-      expect(document.querySelector('.chat-header')!.classList.contains('chat-header-agent')).toBe(false);
-      expect(document.querySelector('.chat-header .chat-glyph')).not.toBeNull();
-      expect([...document.querySelectorAll('.chat-header button')].some(b => b.textContent === 'Archive')).toBe(true);
-    } finally {
-      mocks.sidePanel = true;
-    }
   });
 
   it('keeps the desktop header off a phone', async () => {

@@ -19,7 +19,7 @@ vi.mock('./simpleData', () => {
     items: { pick: mocks.pick, state: { items: [{ id: 't1', kind: 'file', space: 'notes', path: 'docs/plan.md', openedAt: 5 }] } },
     rows: [row('a', 'review-notes', 'box-n'), row('b', 'landing', 'box-d')],
     live: new Map(), setupOf: new Map(), links: [], activeTab: 't9', itemsShown: true,
-    spaces: { enabled: true, loaded: true, spaces: mocks.spaces, reload: mocks.reload, index: new Map([['box-n', ['notes']], ['box-d', ['design']]]) },
+    spaces: { loaded: true, spaces: mocks.spaces, reload: mocks.reload, index: new Map([['box-n', ['notes']], ['box-d', ['design']]]) },
   });
   return { WithSimpleData: ({ children }: { children: React.ReactNode }) => children, useSimpleData: data, useSimpleDataIfAny: data };
 });

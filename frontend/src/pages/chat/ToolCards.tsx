@@ -87,7 +87,9 @@ export const HEADING_WAIT_MS = 30_000;
  * has failed or is off.
  * `settled`: no more calls can join the run (something follows it, or the
  * turn is over). Until then the step going on shows on a muted line under
- * the heading.
+ * the heading, and only there: the call running now gets no card of its own
+ * in the shut run (chat/toolRuns.ts, alwaysShown), so the run's height holds
+ * while its calls come and go.
  * `live`: the run is in the turn running now. `asks`: the box is asking
  * Haiku for that turn's headings (its turn-start said so: never for an ask's
  * turn, a box from before them, or a sender with the flag off). Only a live

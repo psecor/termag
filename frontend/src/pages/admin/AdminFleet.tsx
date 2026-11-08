@@ -6,7 +6,7 @@ import { AdminBoxDisk } from './AdminBoxDisk';
 import { AdminBoxResize } from './AdminBoxResize';
 import { AdminBoxEvents } from './AdminBoxEvents';
 import { phaseLabel } from '../../utils/boxResize';
-import { useAdminPolled, useSelectedDetail, pendingText, refreshFailedText,DataTable, StatusPill, Dot, KeyValues, fmtAgo, fmtSeconds, type Column } from './shared';
+import { useAdminPolled, useSelectedDetail, pendingText, refreshFailedText,DataTable, StatusPill, statusPillText, Dot, KeyValues, fmtAgo, fmtSeconds, type Column } from './shared';
 import { adminCloudName, agentAgeLabel, cloudCountCell, pressureCell, pressureClass, updateOutcomeClass } from '../../utils/adminCloud';
 import { cloudStateLabel } from '../../utils/cloudSessions';
 import { BoxQuarantine } from './BoxQuarantine';
@@ -21,17 +21,22 @@ export function autoParkCell(
   if (!lc) return '— (no owner)';
   // Nothing parks an external or instanceless box, whatever its settings (Bugbot on #622).
   if (box.kind !== 'ec2' || !box.ec2InstanceId) return 'never (not an EC2 box termag runs)';
-  // A box's own hours stop it, under box-auto-lifecycle-enabled; box-idle-stop-enabled's window stops it too.
+  // A box's own hours stop it; the default window stops it too.
   const limit = lc.idleLimitHours
     ? lc.idleLimitSource === 'default'
-      ? `stops after ${lc.idleLimitHours} h idle (box-idle-stop-enabled)`
+      ? `stops after ${lc.idleLimitHours} h idle (default window)`
       : `stops after ${lc.idleLimitHours} h idle (its own)`
-    : lc.idleHibernateHours
-      ? `off (its own ${lc.idleHibernateHours} h need box-auto-lifecycle-enabled)`
-      : 'off';
+    : 'off';
   const park = lc.parkAt ? ` · ${lc.warnedAt ? 'warned, ' : ''}parks ${new Date(lc.parkAt).toLocaleString()}` : '';
   const last = lc.autoParkedAt ? ` · auto-parked ${fmtAgo(lc.autoParkedAt, now)}` : '';
   return `${limit}${park}${last}`;
+}
+
+// The size column sorts small < medium < large, then the rest (an instance type) by name.
+const SIZE_RANK: Record<string, number> = { small: 0, medium: 1, large: 2 };
+function sizeSortValue(size: string | null, instanceType: string | null): string {
+  const label = boxSizeBadge(size, instanceType)?.label ?? '';
+  return label ? `${SIZE_RANK[label] ?? 3} ${label}` : '';
 }
 
 export function AdminFleet({ range, now }: { range: AdminRange; now: number }) {
@@ -52,10 +57,10 @@ export function AdminFleet({ range, now }: { range: AdminRange; now: number }) {
   const cols: Column<AdminInstance>[] = [
     { id: 'name', label: 'box', value: r => r.name, render: r => <button type="button" className="admin-link" onClick={() => setParams({ box: r.id })}>{r.name}</button> },
     { id: 'owner', label: 'owner', value: r => r.owner?.unixUsername ?? '', render: r => r.owner?.unixUsername ?? <span className="usage-dim">warm pool</span> },
-    { id: 'status', label: 'status', value: r => r.status, render: r => <StatusPill status={r.status} /> },
+    { id: 'status', label: 'status', value: r => r.status, render: r => <StatusPill status={r.status} />, text: r => statusPillText(r.status) },
     { id: 'conn', label: 'agent', value: r => (r.connected ? 1 : 0), render: r => <Dot on={r.connected} /> },
     { id: 'kind', label: 'kind', value: r => r.kind },
-    { id: 'size', label: 'size', value: r => boxSizeBadge(r.size, r.instanceType)?.label ?? '', title: 'the size it launched at, and the EC2 type it got; the type alone for no size (BOX_INSTANCE_TYPE) and for a repo\'s .termag/environment.json requirements',
+    { id: 'size', label: 'size', value: r => sizeSortValue(r.size, r.instanceType), text: r => boxSizeBadge(r.size, r.instanceType)?.label ?? '', title: 'the size it launched at, and the EC2 type it got; the type alone for no size (BOX_INSTANCE_TYPE) and for a repo\'s .termag/environment.json requirements',
       render: r => {
         const badge = boxSizeBadge(r.size, r.instanceType);
         if (r.resize?.running) return <span title={phaseLabel(r.resize.phase)}>{badge?.label ?? '?'} → {r.resize.to} <span className="usage-dim">({r.resize.phase})</span></span>;
@@ -105,19 +110,19 @@ export function AdminFleet({ range, now }: { range: AdminRange; now: number }) {
           {detail && (
             <>
               <KeyValues items={[
-                ['agent', <><Dot on={detail.connected} /> {detail.connected ? 'connected' : 'offline'} · last connect {fmtAgo(detail.lastConnectedAt, now)}{detail.agentCommit ? ` · runs ${detail.agentCommit.slice(0, 12)}` : ''}</>],
-                ['agent build', detail.agentCommit ? `${detail.agentCommit.slice(0, 12)}${detail.agentCommitAt ? ` · ${new Date(detail.agentCommitAt).toLocaleString()}` : ' · date unknown (old agent)'} · ${agentAgeLabel(detail.agentCommit, detail.agentCommitAt, target, now)}` : 'unknown (offline, or an agent too old to say)'],
-                ['last update', detail.update ? <span className={updateOutcomeClass(detail.update.outcome)}>{detail.update.outcome} · {fmtAgo(detail.update.at, now)} · {detail.update.detail}{detail.update.commit ? ` · ${detail.update.commit.slice(0, 12)}` : ''}</span> : 'never reported (a wrapper from before the report, or never asked)'],
+                ['agent', <><Dot on={detail.connected} /> {detail.connected ? 'connected' : 'offline'} · last connect {fmtAgo(detail.lastConnectedAt, now)}{detail.agentCommit ? <> · runs <span className="admin-mono">{detail.agentCommit.slice(0, 12)}</span></> : ''}</>],
+                ['agent build', detail.agentCommit ? <><span className="admin-mono">{detail.agentCommit.slice(0, 12)}</span>{detail.agentCommitAt ? ` · ${new Date(detail.agentCommitAt).toLocaleString()}` : ' · date unknown (old agent)'} · {agentAgeLabel(detail.agentCommit, detail.agentCommitAt, target, now)}</> : 'unknown (offline, or an agent too old to say)'],
+                ['last update', detail.update ? <span className={updateOutcomeClass(detail.update.outcome)}>{detail.update.outcome} · {fmtAgo(detail.update.at, now)} · {detail.update.detail}{detail.update.commit ? <> · <span className="admin-mono">{detail.update.commit.slice(0, 12)}</span></> : ''}</span> : 'never reported (a wrapper from before the report, or never asked)'],
                 ['created / ready', `${fmtAgo(detail.createdAt, now)} / ${detail.readyAt ? fmtAgo(detail.readyAt, now) : '—'}`],
-                ['ec2', detail.ec2InstanceId ? `${detail.ec2InstanceId} · ${detail.region ?? ''} · ${detail.hostname ?? ''}` : 'none (external)'],
+                ['ec2', detail.ec2InstanceId ? <><span className="admin-mono">{detail.ec2InstanceId}</span> · {detail.region ?? ''} · <span className="admin-mono">{detail.hostname ?? ''}</span></> : 'none (external)'],
                 ['size', detail.size && isRequirementsSize(detail.size) ? boxSizeBadge(detail.size, detail.instanceType)!.title
                   : detail.size ? `${detail.size} · ${detail.instanceType ?? 'type not recorded'}` : detail.instanceType ? `${detail.instanceType} (no size: the configured type)` : 'not recorded (launched before sizes were recorded, or external)'],
                 ['resize', <AdminBoxResize key={detail.id} boxId={detail.id} onChanged={list.refresh} />],
-                ['image', detail.imageId ? `${detail.imageId} · ${detail.imageSource ?? 'published'}` : 'not recorded (launched before images were recorded, or external)'],
+                ['image', detail.imageId ? <><span className="admin-mono">{detail.imageId}</span> · {detail.imageSource ?? 'published'}</> : 'not recorded (launched before images were recorded, or external)'],
                 ['auto-park', autoParkCell(detail.lifecycle, now, detail)],
-                ['iam / sg', `${detail.iamRoleName ?? '—'} / ${detail.securityGroupId ?? '—'}`],
+                ['iam / sg', <><span className="admin-mono">{detail.iamRoleName ?? '—'}</span> / <span className="admin-mono">{detail.securityGroupId ?? '—'}</span></>],
                 ['error', detail.provisioningError ?? '—'],
-                ['tokens', detail.tokens.map(t => `${t.name} (${t.tokenPrefix}${t.revokedAt ? ', revoked' : ''})`).join(' · ') || '—'],
+                ['tokens', detail.tokens.length ? detail.tokens.map((t, i) => <React.Fragment key={`${t.tokenPrefix}:${i}`}>{i ? ' · ' : ''}{t.name} (<span className="admin-mono">{t.tokenPrefix}</span>{t.revokedAt ? ', revoked' : ''})</React.Fragment>) : '—'],
                 ['host', detail.host ? <span className={pressureClass(detail.host)}>{pressureCell(detail.host)} · {detail.host.keptCheckouts ?? 0} kept cloud checkout{detail.host.keptCheckouts === 1 ? '' : 's'} · sampled {fmtAgo(detail.host.sampledAt, now)}</span> : 'no sample yet (agent predates host sampling)'],
                 ['disk', <AdminBoxDisk boxId={detail.id} now={now} />],
                 ['operations', <AdminBoxEvents events={detail.events} now={now} />],
@@ -157,7 +162,8 @@ export function AdminFleet({ range, now }: { range: AdminRange; now: number }) {
           {overview.data && <span className="usage-dim">current image {overview.data.target.commit ? <span className="admin-mono">{overview.data.target.commit.slice(0, 7)}</span> : 'unknown'}{overview.data.target.imageCreatedAt ? ` baked ${fmtAgo(overview.data.target.imageCreatedAt, now)}` : ''} · {overview.data.behind} connected box{overview.data.behind === 1 ? '' : 'es'} behind</span>}
           <label className="admin-toggle"><input type="checkbox" checked={all} onChange={e => setAll(e.target.checked)} /> include terminated</label>
         </div>
-        <DataTable rows={list.data ?? []} columns={cols} rowKey={r => r.id} defaultSort="active" empty={list.data ? 'no boxes' : pendingText(list)} />
+        <DataTable rows={list.data ?? []} columns={cols} rowKey={r => r.id} defaultSort="active" selectedKey={selected}
+          search="filter boxes" storageKey="fleet" resetKey={all} empty={list.data ? 'no boxes' : pendingText(list)} />
       </section>
     </>
   );

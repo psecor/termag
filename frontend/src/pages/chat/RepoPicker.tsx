@@ -7,18 +7,34 @@
 // the repositories are LaunchPad's multi-select
 // ListBox: a row toggles its repository and the menu stays open, so one or
 // several can be chosen, and the chosen ones are pinned in a Selected section
-// at the top.
+// at the top. A started session's pill (SessionRepoPill.tsx) passes
+// `session`: its chosen repositories are the project's, locked, each with its
+// clone's status, and the menu opens upward from over the composer.
 import React, { useEffect, useRef, useState } from 'react';
 import '@launchpad-ui/tokens/index.css';
-import { Header, ListBox, ListBoxItem, ListBoxSection, type ListBoxProps } from '@launchpad-ui/components';
+import { Header, ListBox, ListBoxItem, ListBoxSection, Text, type ListBoxProps } from '@launchpad-ui/components';
 import { githubReposApi } from '../../services/api';
 import { catalogFromWire, degradedCatalog, type CatalogGroup, type RepoCatalog, type RepoPick } from '../../utils/repoPick';
 import { selectionLabel, type ListedPick } from '../../utils/multiRepo';
-import { REPO_EMPTY, repoListView, repoTriggerLabel } from '../../chat/composer';
+import { REPO_EMPTY, REPO_EMPTY_NO_PASTE, repoListView, repoTriggerLabel } from '../../chat/composer';
 
 type Selection = Parameters<NonNullable<ListBoxProps<object>['onSelectionChange']>>[0];
 
-export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, onOpenChange, more = [], onToggle }: {
+/** A started session's pill: what RepoPicker shows for repositories already in the project. */
+export interface SessionRepos {
+  /** A Selected row's line under its name (its clone's status), or null. */
+  rowNote: (fullName: string) => string | null;
+  /** Rows that cannot be ticked or unticked: the project's, and those being added. */
+  locked: ReadonlySet<string>;
+  /** The note under the search, in place of the new-session one. */
+  note: React.ReactNode;
+  /** Under the list: an error, a Retry. */
+  footer?: React.ReactNode;
+  /** Shown after the names on the pill. */
+  state: 'cloning' | 'failed' | null;
+}
+
+export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, onOpenChange, more = [], onToggle, session }: {
   pick: RepoPick;
   /** A listed repository (the menu then closes), or a pasted URL as it is typed ('empty' once cleared). */
   onPick: (pick: RepoPick) => void;
@@ -30,6 +46,8 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
   more?: readonly ListedPick[];
   /** A repository's row was clicked; the menu stays open. Without it a row picks that one repository and closes the menu. */
   onToggle?: (repo: ListedPick) => void;
+  /** With onToggle: the pill over a started session's composer. */
+  session?: SessionRepos;
 }) {
   const [paste, setPaste] = useState(pick.kind === 'pasted' ? pick.url : '');
   const [query, setQuery] = useState('');
@@ -49,16 +67,18 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
 
   useEffect(() => { loadRepos(false); }, []);
 
-  const list = repoListView(catalog);
+  const list = repoListView(catalog, !session);
   const q = query.trim().toLowerCase();
 
   // With onToggle, the chosen repositories sit in their own section at the
   // top, in the order they were chosen, whatever the search says.
   const selected: ListedPick[] = onToggle ? [...(pick.kind === 'listed' ? [pick] : []), ...more] : [];
   const pinned = new Set(selected.map(r => r.fullName));
+  // A project's repository is spelled as its URL is, which may not be the catalog's case.
+  const pinnedKeys = new Set(selected.map(r => r.fullName.toLowerCase()));
 
   function visibleRepos(group: CatalogGroup) {
-    const repos = group.repos.filter(repo => !pinned.has(repo.fullName));
+    const repos = group.repos.filter(repo => !pinnedKeys.has(repo.fullName.toLowerCase()));
     if (!q) return repos;
     return repos.filter(repo => repo.fullName.toLowerCase().includes(q));
   }
@@ -108,9 +128,14 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
       const repo = changed ? known.get(changed) : undefined;
       if (repo) toggle(repo);
     };
-    const item = (fullName: string) => (
-      <ListBoxItem key={fullName} id={fullName} textValue={fullName} className="chat-repo-option" data-repo={fullName}>{fullName}</ListBoxItem>
-    );
+    const item = (fullName: string) => {
+      const note = session?.rowNote(fullName) ?? null;
+      return (
+        <ListBoxItem key={fullName} id={fullName} textValue={fullName} className="chat-repo-option" data-repo={fullName}>
+          {note ? <><Text slot="label">{fullName}</Text><Text slot="description" className="chat-repo-option-note">{note}</Text></> : fullName}
+        </ListBoxItem>
+      );
+    };
     return (
       <>
         {(selected.length > 0 || sections.length > 0) && (
@@ -121,6 +146,7 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
             selectionMode="multiple"
             escapeKeyBehavior="none"
             selectedKeys={pinned}
+            disabledKeys={session?.locked}
             onSelectionChange={onSelectionChange}
           >
             {selected.length > 0 && (
@@ -160,10 +186,13 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
         onClick={() => onOpenChange(!open)}
       >
         <span className="chat-compose-repo-name">{selectionLabel(repoTriggerLabel(pick), more)}</span>
+        {session?.state && <span className="chat-compose-repo-state" data-state={session.state}>{session.state === 'cloning' ? 'cloning…' : 'failed'}</span>}
+        {session && <span className="chat-compose-caret" aria-hidden="true" />}
       </button>
       {open && (
         <div
           className="chat-compose-menu"
+          data-above={session ? '' : undefined}
           role={onToggle ? undefined : 'listbox'}
           aria-label={onToggle ? undefined : 'Repositories'}
           onKeyDown={onToggle ? onMenuKeyDown : undefined}
@@ -182,7 +211,7 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
               if (onToggle) closeToTrigger();
             }}
           />
-          {onToggle && list.kind === 'ready' && <div className="chat-compose-note">Pick one, or several to work across them.</div>}
+          {onToggle && list.kind === 'ready' && <div className="chat-compose-note">{session ? session.note : 'Pick one, or several to work across them.'}</div>}
           {list.kind === 'loading' && <div className="chat-compose-note">Loading repositories…</div>}
           {list.kind === 'error' && (
             <div className="chat-compose-note" role="alert">
@@ -190,7 +219,7 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
               <button type="button" className="chat-compose-retry" onClick={() => loadRepos(true)}>Try again</button>
             </div>
           )}
-          {list.kind === 'empty' && <div className="chat-compose-note">{REPO_EMPTY}</div>}
+          {list.kind === 'empty' && <div className="chat-compose-note">{session ? REPO_EMPTY_NO_PASTE : REPO_EMPTY}</div>}
           {onToggle ? multiList(onToggle) : catalog?.ok && catalog.groups.map(group => {
             const repos = visibleRepos(group);
             if (repos.length === 0 && group.status === 'ok') return null;
@@ -217,7 +246,8 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
               </div>
             );
           })}
-          <label className="chat-compose-paste">
+          {session?.footer}
+          {!session && <label className="chat-compose-paste">
             <span>Repository URL</span>
             <input
               value={paste}
@@ -226,7 +256,7 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
               aria-label="Repository URL"
               onKeyDown={e => { if (e.key === 'Enter') e.preventDefault(); }}
             />
-          </label>
+          </label>}
         </div>
       )}
     </div>

@@ -1,5 +1,4 @@
 import React, { useEffect, useState } from 'react';
-import { FLAGS, useFlag } from '../flags';
 import { previewSharesApi, type PreviewSettingsView } from '../services/api';
 
 /**
@@ -10,7 +9,6 @@ import { previewSharesApi, type PreviewSettingsView } from '../services/api';
  * hand: the PR overlay in the full UI, the PRs above in the side panel.
  */
 export function PrPreviewSettings({ projectId, byHand = 'from the PR overlay' }: { projectId: string; byHand?: string }) {
-  const prLinks = useFlag(FLAGS.prLinkShares, false);
   const [saved, setSaved] = useState<PreviewSettingsView | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [filter, setFilter] = useState('');
@@ -20,7 +18,6 @@ export function PrPreviewSettings({ projectId, byHand = 'from the PR overlay' }:
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!prLinks) return;
     let gone = false;
     previewSharesApi.settings(projectId).then(s => {
       if (gone) return;
@@ -30,9 +27,7 @@ export function PrPreviewSettings({ projectId, byHand = 'from the PR overlay' }:
       setHint(s.reviewerAccountHint ?? '');
     }, () => { if (!gone) setError('Could not load the PR preview settings.'); });
     return () => { gone = true; };
-  }, [projectId, prLinks]);
-
-  if (!prLinks) return null;
+  }, [projectId]);
 
   const dirty = saved !== null && (enabled !== saved.prLinksEnabled || filter.trim().split(/[\s,]+/).filter(Boolean).join(' ') !== saved.pathFilter.join(' ')
     || (hint.trim() || null) !== saved.reviewerAccountHint);

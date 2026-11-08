@@ -70,13 +70,15 @@ export function FollowsPermissions({ project, fetched = false }: {
   );
 }
 
-export function PermissionPicker({ value, onChange, open, onOpenChange, scheduled = false, disabled }: {
+export function PermissionPicker({ value, onChange, open, onOpenChange, scheduled = false, disabled, checkouts }: {
   value: PermissionChoice;
   onChange: (choice: PermissionChoice) => void;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   scheduled?: boolean;
   disabled?: boolean;
+  /** What the choice is for, when that isn't the one repository picked: an environment's checkouts, each at its branch. */
+  checkouts?: string[];
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -115,6 +117,9 @@ export function PermissionPicker({ value, onChange, open, onOpenChange, schedule
       {open && (
         <div className="chat-compose-model-menu chat-permission-menu" role="listbox" aria-label="Permissions">
           <div className="chat-menu-heading">Permissions</div>
+          {checkouts?.length ? (
+            <div className="chat-permission-for">For {checkouts.map((c, i) => <span key={c}>{i ? ', ' : ''}<code>{c}</code></span>)}</div>
+          ) : null}
           {(['read', 'full'] as const).map(choice => (
             <button
               key={choice}

@@ -27,6 +27,18 @@ export function reviewSessionName(username: string, project: string, workstream:
 }
 
 /**
+ * Terminal slots per workstream, mirror of backend
+ * `tmux.terminalSessionName`: slot 1 IS the ctrl pane (the one terminal every
+ * project has), slots 2..MAX are the tabs the user adds with +.
+ */
+export const MAX_TERMINAL_SLOTS = 8;
+
+export function terminalSessionName(username: string, project: string, workstream: string = 'main', slot: number = 1): string {
+  const base = sessionName(username, project, 'ctrl', workstream);
+  return slot === 1 ? base : `${base}-${slot}`;
+}
+
+/**
  * Whether a session name is a workstream's agent pane: the `-agent` role
  * suffix, as sessionName() puts it last. Not a substring match, so a project
  * or workstream whose own name contains `agent` (`u-agentops-ctrl`) is

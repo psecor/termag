@@ -9,7 +9,6 @@ import { Prs } from './Prs';
 // The phone's PR screen with review groups.
 const mocks = vi.hoisted(() => ({
   data: null as unknown,
-  groupsOn: true,
   start: vi.fn(async () => ({ ok: true })),
   setGroupMembers: vi.fn(async () => ({ ok: true })),
   createGroup: vi.fn(async () => ({ id: 'g9' })),
@@ -28,8 +27,8 @@ vi.mock('../../services/api', () => ({
   reviewApi: { start: mocks.start },
 }));
 vi.mock('../../flags', () => ({
-  FLAGS: { prReviewGroups: 'pr-review-groups-enabled' },
-  useFlag: (key: string, fallback: boolean) => (key === 'pr-review-groups-enabled' ? mocks.groupsOn : fallback),
+  FLAGS: {},
+  useFlag: (_key: string, fallback: boolean) => fallback,
 }));
 
 const TERMAG = { projectId: 'p1', projectName: 'termag', workstream: 'main' };
@@ -76,7 +75,6 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   Element.prototype.scrollIntoView = vi.fn();
   mocks.data = RES;
-  mocks.groupsOn = true;
   mocks.overview = null;
   vi.clearAllMocks();
   host = document.createElement('div');
@@ -201,14 +199,6 @@ describe('the phone\'s PR screen with review groups', () => {
     await act(async () => { button('New group')!.click(); });
     expect(mocks.createGroup).toHaveBeenCalledWith('Reviews', [{ repo: 'example-org/termag', number: 700, note: null }]);
   });
-  it('shows nothing of groups with the flag off', () => {
-    mocks.groupsOn = false;
-    render('/m/prs?lane=needs_my_review');
-    expect(document.querySelector('.m-prg')).toBeNull();
-    expect(titles()).toEqual(['bridge', 'agent', 'unrelated review']);
-    act(() => document.querySelector<HTMLButtonElement>('.m-more')!.click());
-    expect(button('Add to group…')).toBeUndefined();
-  });
 });
 
 describe('suggested groups on the phone (phase 3)', () => {
@@ -237,12 +227,6 @@ describe('suggested groups on the phone (phase 3)', () => {
     render('/m/prs?lane=needs_my_review');
     expect(document.querySelector('.m-prg-suggestion')).not.toBeNull();
     expect(document.querySelector('.m-empty')).toBeNull();
-  });
-  it('shows none with the flag off', () => {
-    mocks.data = { ...RES, suggestions: [SUGG] };
-    mocks.groupsOn = false;
-    render('/m/prs?lane=needs_my_review');
-    expect(document.querySelector('.m-prg-suggestion')).toBeNull();
   });
 });
 

@@ -48,9 +48,12 @@ describe('the note under it: only when another disk makes the box slow to come',
     expect(diskNote(REPO_DISK, null, true)).toBe('A 250 GB disk means launching a new box, a few minutes; the ready ones have 120 GB.');
   });
 
-  it('says nothing for the default disk, with no ready box (it is slow either way), or for a value it refuses', () => {
+  it('says nothing for the default disk, a smaller one the server raises and can still claim, with no ready box (it is slow either way), or for a value it refuses', () => {
     expect(diskNote(DISK, null, true)).toBeNull();
     expect(diskNote(DISK, '120', true)).toBeNull();
+    // A smaller one is raised to the image's 120 GB before the pool is asked, so a warm box may still be claimed.
+    expect(diskNote(DISK, '80', true)).toBeNull();
+    expect(diskNote({ ...DISK, diskGiB: 80 }, null, true)).toBeNull();
     expect(diskNote(DISK, '200', false)).toBeNull();
     expect(diskNote(DISK, '500', true)).toBeNull();
     expect(diskNote(null, '200', true)).toBeNull();

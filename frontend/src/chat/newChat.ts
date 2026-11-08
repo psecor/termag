@@ -69,10 +69,12 @@ export function startBlocker(i: {
  * of the conversation): hidden unless the provider has the
  * skill and the form starts a chat (not a schedule); disabled until the trust
  * box is ticked, since an untrusted turn has neither the Skill tool nor Bash
- * for `termag ask` (agent/chat-runner.js READ_ONLY_TOOLS).
+ * for `termag ask` (agent/chat-runner.js READ_ONLY_TOOLS). A box with termag
+ * setup off has no skill to use, so it is disabled there too.
  */
-export function orchestratorOption(i: { providerHasSkill: boolean; scheduled: boolean; trusted: boolean }): 'hidden' | 'needs-trust' | 'available' {
+export function orchestratorOption(i: { providerHasSkill: boolean; scheduled: boolean; trusted: boolean; setupOff?: boolean }): 'hidden' | 'setup-off' | 'needs-trust' | 'available' {
   if (!i.providerHasSkill || i.scheduled) return 'hidden';
+  if (i.setupOff) return 'setup-off';
   return i.trusted ? 'available' : 'needs-trust';
 }
 
@@ -245,8 +247,19 @@ export function queueKey(projectId: string, workstream: string): string {
 // localStorage, so a reload or a second tab still sends it once.
 const QUEUED_PREFIX = 'termag-chat-queued:';
 const CLAIM_PREFIX = 'termag-chat-queued-claim:';
-/** A claim older than this is a tab that went away mid-send; another may take over. */
+// The id the queued text's send carries: { id, text }.
+const SEND_ID_PREFIX = 'termag-chat-queued-send:';
+const SEND_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
+/**
+ * A claim older than this is a tab that went away mid-send; another may take
+ * over. The tab sending renews its claim every CLAIM_RENEW_MS while the send
+ * is in flight (renewClaim), since a send may wait far longer than this: the
+ * orchestrator's wait for the box (backend CHAT_SEND_TIMEOUT_MS), after a
+ * claim update's hold (CLAIM_UPDATE_TIMEOUT_MS).
+ */
 export const CLAIM_TTL_MS = 30_000;
+/** How often the tab sending renews its claim: well inside CLAIM_TTL_MS, so one late timer never lets the claim lapse. */
+export const CLAIM_RENEW_MS = CLAIM_TTL_MS / 3;
 
 type Store = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null | undefined;
 
@@ -284,6 +297,43 @@ export function claimQueued(store: Store, projectId: string, tab: string, now: n
   }
 }
 
+/**
+ * The send id for sending `text` from this project's queue: the same for
+ * every try of the same text, from any tab, so the box takes it once however
+ * often it is sent (agent/chat-send-ids.js). Another text gets a new id
+ * (`make`). Null when storage won't hold one: the send goes without.
+ */
+export function queuedSendId(store: Store, projectId: string, text: string, make: () => string): string | null {
+  if (!store) return null;
+  try {
+    const held = parseSendId(store.getItem(SEND_ID_PREFIX + projectId));
+    if (held && held.text === text) return held.id;
+    const id = make();
+    if (!SEND_ID_RE.test(id)) return null;
+    store.setItem(SEND_ID_PREFIX + projectId, JSON.stringify({ id, text }));
+    return parseSendId(store.getItem(SEND_ID_PREFIX + projectId))?.id === id ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseSendId(raw: string | null): { id: string; text: string } | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as { id?: unknown; text?: unknown };
+    return typeof v.id === 'string' && SEND_ID_RE.test(v.id) && typeof v.text === 'string' ? { id: v.id, text: v.text } : null;
+  } catch { return null; }
+}
+
+/** Push this tab's claim out to `now` + CLAIM_TTL_MS; false when the claim is not this tab's (nothing is written). */
+export function renewClaim(store: Store, projectId: string, tab: string, now: number): boolean {
+  try {
+    if (parseClaim(store?.getItem(CLAIM_PREFIX + projectId) ?? null)?.tab !== tab) return false;
+    store?.setItem(CLAIM_PREFIX + projectId, JSON.stringify({ tab, at: now }));
+    return true;
+  } catch { return false; }
+}
+
 /** When the current claim on this project's message expires, or null with no claim. */
 export function claimHeldUntil(store: Store, projectId: string): number | null {
   try {
@@ -302,6 +352,7 @@ export function finishQueued(store: Store, projectId: string, sent: string): voi
     if (now && now !== sent && now.startsWith(sent)) store?.setItem(QUEUED_PREFIX + projectId, now.slice(sent.length).trim());
     else if (now === sent) store?.removeItem(QUEUED_PREFIX + projectId);
     store?.removeItem(CLAIM_PREFIX + projectId);
+    store?.removeItem(SEND_ID_PREFIX + projectId);
   } catch { /* ignore */ }
 }
 

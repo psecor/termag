@@ -17,12 +17,18 @@ import { setFlagValues } from '../../flags';
 const mocks = vi.hoisted(() => ({
   links: [] as Array<{ projectId: string; workstream: string; parentProjectId: string; parentWorkstream: string }>,
   automations: null as unknown[] | null,
+  explorerArchive: vi.fn(async () => ({})),
+  history: vi.fn(),
+  asks: vi.fn(),
+  live: new Map<string, { tone: 'idle' | 'working' | 'error' | 'setup'; text: string; preview: string | null }>(),
 }));
 vi.mock('./simpleData', () => ({
-  useSimpleData: () => ({ live: new Map(), setupOf: new Map(), links: mocks.links }),
+  useSimpleData: () => ({ live: mocks.live, setupOf: new Map(), links: mocks.links }),
 }));
 vi.mock('../../services/api', async importOriginal => ({
   ...(await importOriginal<typeof import('../../services/api')>()),
+  workstreamsApi: { explorerArchive: mocks.explorerArchive },
+  chatApi: { history: mocks.history, asks: mocks.asks, paneSubagents: async () => ({ available: false, reason: 'offline' }) },
   automationsApi: {
     list: async () => mocks.automations
       ?? [{ projectId: 'babysit', schedule: '0 9 * * 1-5', timezone: 'UTC', enabled: true, pausedReason: null, nextRunAt: null, lastRun: null }],
@@ -269,5 +275,108 @@ describe('automations in an explorer, with their own pages (simple-ui-automation
     expect(host.querySelector('button.fx-runs-head')).not.toBeNull();
     expect(host.querySelector('a.fx-runs-head')).toBeNull();
     expect([...host.querySelectorAll('.fx-tree > li')]).toHaveLength(1);
+  });
+});
+
+describe('an agent\'s Claude subagents (chat-nested-agents-enabled)', () => {
+  beforeEach(() => {
+    setFlagValues({ 'chat-nested-agents-enabled': true });
+    mocks.history.mockReset().mockResolvedValue({
+      sessionId: null, running: false,
+      entries: [
+        { type: 'user', uuid: 'u1', message: { role: 'user', content: 'go' } },
+        { type: 'assistant', message: { id: 'm1', content: [{ type: 'tool_use', id: 't1', name: 'Agent', input: { description: 'FLASH candidate build', prompt: 'go', subagent_type: 'general-purpose' } }] } },
+        { type: 'user', message: { role: 'user', content: [{ tool_use_id: 't1', type: 'tool_result', content: [{ type: 'text', text: 'done' }] }] } },
+      ],
+    });
+    mocks.asks.mockReset().mockResolvedValue({ threads: [] });
+  });
+  afterEach(() => { setFlagValues(undefined); });
+  const chatRows = () => ROWS.map(r => ({ ...r, provider: 'claude-chat' }) as InboxRow);
+  const flush = async () => { for (let i = 0; i < 5; i++) await act(async () => { await Promise.resolve(); }); };
+  const subNames = () => [...host.querySelectorAll('.fx-subagent .fx-name')].map(n => n.textContent);
+
+  it('are read only once a leaf agent is opened, and sit under it; a row opens its chat', async () => {
+    render({ rows: chatRows() });
+    await flush();
+    // boss and kid are open (each has an agent under it) and read their own; the leaves grandkid and solo are folded and read nothing.
+    expect(mocks.history.mock.calls.map(c => c[0]).sort()).toEqual(['boss', 'kid']);
+    const caret = rowOf('solo').closest('li')!.querySelector<HTMLButtonElement>('.fx-twisty')!;
+    expect(caret.getAttribute('aria-label')).toBe('Show the agents solo runs');
+    expect(caret.getAttribute('aria-expanded')).toBe('false');
+    act(() => caret.click());
+    await flush();
+    expect(mocks.history).toHaveBeenCalledWith('solo', 'main');
+    expect(rowOf('solo').closest('li')!.querySelector('.fx-subagent .fx-name')?.textContent).toBe('FLASH candidate build');
+    act(() => rowOf('solo').closest('li')!.querySelector<HTMLButtonElement>('.fx-subagent')!.click());
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({ projectId: 'solo' }), false);
+    expect(subNames()).toContain('FLASH candidate build');
+  });
+
+  it('give a leaf agent no caret with the flag off', () => {
+    setFlagValues(undefined);
+    render({ rows: chatRows() });
+    expect(rowOf('solo').closest('li')!.querySelector('.fx-twisty')).toBeNull();
+  });
+});
+
+describe('archiving from Files (chat-nested-agents-enabled)', () => {
+  const ws = (r: InboxRow, over: Partial<InboxRow> = {}) => ({ ...r, workstreamId: `ws-${r.projectId}`, ...over }) as InboxRow;
+  beforeEach(() => { setFlagValues({ 'chat-nested-agents-enabled': true }); mocks.explorerArchive.mockClear(); });
+  afterEach(() => { setFlagValues(undefined); mocks.live.clear(); });
+  const menuItems = (name: string) => {
+    act(() => { rowOf(name).dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })); });
+    return [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].map(e => e.textContent ?? '');
+  };
+  const foldHead = () => host.querySelector<HTMLButtonElement>('.fx-archived-head');
+
+  it('moves an archived session, with the agents under it, into a folded Archived fold; Unarchive brings it back', async () => {
+    render({ rows: [ws(row('boss')), ws(row('kid'), { explorerArchived: true }), ws(row('grandkid')), ws(row('solo'))] });
+    expect(names()).toEqual(['boss', 'solo']);
+    expect(rowOf('kid')).toBeUndefined();
+    expect(foldHead()?.textContent).toContain('Archived');
+    expect(foldHead()?.getAttribute('aria-expanded')).toBe('false');
+    act(() => foldHead()!.click());
+    expect(rowOf('kid').closest('.fx-archived')).not.toBeNull();
+    expect(rowOf('grandkid').closest('.fx-archived')).not.toBeNull();
+    await act(async () => { host.querySelector<HTMLButtonElement>('.fx-unarchive')!.click(); });
+    expect(mocks.explorerArchive).toHaveBeenCalledWith('kid', 'ws-kid', false);
+  });
+
+  it('offers Archive in an owner\'s session\'s menu, and keeps one that is open where it is', async () => {
+    render({ rows: [ws(row('boss')), ws(row('solo'), { explorerArchived: true })], activeKey: 'solo|main' });
+    expect(foldHead()).toBeNull();
+    act(() => { rowOf('boss').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })); });
+    const archive = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(e => e.textContent?.includes('Archive'));
+    expect(archive).toBeDefined();
+    await act(async () => { archive!.click(); });
+    expect(mocks.explorerArchive).toHaveBeenCalledWith('boss', 'ws-boss', true);
+  });
+
+  it('keeps a session waiting on its owner where it is, though its chat\'s live status says idle', () => {
+    mocks.live.set('solo|main', { tone: 'idle', text: 'Waiting for approval', preview: null });
+    render({ rows: [ws(row('boss')), ws(row('solo'), { explorerArchived: true, status: 'waiting' })] });
+    expect(names()).toEqual(['boss', 'solo']);
+    expect(foldHead()).toBeNull();
+  });
+
+  it('gives the agents under an archived session neither action: they go back with it', () => {
+    render({ rows: [ws(row('boss')), ws(row('kid'), { explorerArchived: true }), ws(row('grandkid'))] });
+    act(() => foldHead()!.click());
+    expect(menuItems('grandkid').some(t => /archive/i.test(t))).toBe(false);
+    act(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+    expect(menuItems('kid')).toContain('Unarchive');
+  });
+
+  it('gives a search hit under an archived session neither action either', () => {
+    render({ rows: [ws(row('boss')), ws(row('kid'), { explorerArchived: true }), ws(row('grandkid'))], query: 'grand' });
+    expect(menuItems('grandkid').some(t => /archive/i.test(t))).toBe(false);
+  });
+
+  it('lists every session as before with the flag off', () => {
+    setFlagValues(undefined);
+    render({ rows: [ws(row('boss')), ws(row('solo'), { explorerArchived: true })] });
+    expect(names()).toEqual(['boss', 'solo']);
+    expect(foldHead()).toBeNull();
   });
 });

@@ -15,12 +15,12 @@ export function SpaceSwatch({ space }: { space: string | null }) {
 /**
  * The chat header's space: the chat's own (chat/chatSpaces.ts chatHomeSpace),
  * as the sidebar groups it and as its memory loads, or "No space" once the
- * user has spaces at all. Nothing while spaces are off or still loading,
+ * user has spaces at all. Nothing while they are still loading,
  * including the reload after a new box appears.
  */
 export function ChatSpaceChip({ place }: { place: ChatPlace }) {
-  const { enabled, loaded, current, spaces, index, colorOf } = useSharedChatSpaces();
-  if (!enabled || !loaded) return null;
+  const { loaded, current, spaces, index, colorOf } = useSharedChatSpaces();
+  if (!loaded) return null;
   const at = chatHeaderSpace(place, spaces, index);
   // A chat not fixed yet whose box the index doesn't know (a new session, its reload in flight) is not "No space".
   if (!at && ((!place.spaceFixed && !current) || spaces.length === 0)) return null;

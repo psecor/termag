@@ -1,5 +1,4 @@
 import React, { useState } from 'react';
-import { FLAGS, useFlag } from '../flags';
 import { previewShareLink, previewSharesApi, type LinkShareMade, type PrLaneId, type PrRow, type PrWorkstreamLink } from '../services/api';
 import { apiErrorText } from '../utils/prPipeline';
 import { checkoutLabel } from '../utils/checkoutLabel';
@@ -27,13 +26,10 @@ export function SharePrPreview({ row, onChanged, ended }: {
   /** Shares ended elsewhere (the side panel's share list): one it made is offered again. */
   ended?: ReadonlySet<string>;
 }) {
-  const sharing = useFlag(FLAGS.previewShare, false);
-  const prLinks = useFlag(FLAGS.prLinkShares, false);
   const [busy, setBusy] = useState(false);
   const [made, setMade] = useState<LinkShareMade | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  if (!sharing || !prLinks) return null;
   if (!offersPrShare(row)) return null;
   const ws = row.workstream;
   const repo = row.repo;

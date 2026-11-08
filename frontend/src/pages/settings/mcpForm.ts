@@ -1,6 +1,7 @@
 // Pure helpers for the MCP section of Settings (McpSection.tsx).
 
 import type { ProviderConfig } from '../../providers/registry';
+import type { McpConnectorOAuth } from '../../services/api';
 
 const PLACEHOLDER = /\{\{\s*secret\.([A-Za-z0-9_-]{1,40})\s*\}\}/g;
 
@@ -88,4 +89,17 @@ export function mcpAgentNames(providers: Record<string, Pick<ProviderConfig, 'id
     .filter(p => p.mcpConnectors && p.id !== 'claude' && !p.chatRunner)
     .map(p => p.displayName))];
   return names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/**
+ * The checklist's starting ticks. A first link (or any link of a server that
+ * isn't linked) starts with nothing ticked. Change permissions on a linked
+ * server starts with its current grant: what the server said it granted, or
+ * what was asked for when it didn't say, as far as the server still offers
+ * those scopes.
+ */
+export function initialScopes(oauth: Pick<McpConnectorOAuth, 'scopeChoice' | 'requestedScopes' | 'grantedScopes'>, linked: boolean): string[] {
+  if (!linked) return [];
+  const current = (oauth.grantedScopes ?? oauth.requestedScopes ?? []).map(s => s.name);
+  return (oauth.scopeChoice?.options ?? []).filter(o => current.includes(o.name)).map(o => o.name);
 }

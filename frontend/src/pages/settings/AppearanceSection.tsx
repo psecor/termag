@@ -5,6 +5,7 @@ import { themePalette } from '../../theme/apply';
 import { BASE_BACKGROUND_COLORS, DEFAULT_THEME, TerminalFont, ThemePalette, ThemeSettings, normalizeHexColor } from '../../theme/schema';
 import { terminalFontFamily } from '../../components/terminalFont';
 import { DocsLink } from './DocsLink';
+import { useDailyTheme } from '../../theme/daily/useDailyTheme';
 
 // Solid backdrops that read well under each palette's text. The first is the
 // palette's base (in dark, the colour the starfield fades to), so picking
@@ -42,10 +43,11 @@ function sameTheme(a: ThemeSettings, b: ThemeSettings): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-// Reset sends an explicit dark palette, no turkeys and Maple Mono: the server
-// fills a theme's absent optional keys from the stored one, so DEFAULT_THEME
-// alone would keep light (and the turkeys, and JetBrains Mono).
-const RESET_THEME: ThemeSettings = { ...DEFAULT_THEME, palette: 'dark', starfieldTurkeys: false, terminalFont: 'maple' };
+// Reset sends an explicit dark palette, no turkeys, no theme of the day and
+// Maple Mono: the server fills a theme's absent optional keys from the stored
+// one, so DEFAULT_THEME alone would keep light (and the turkeys, the theme of
+// the day, and JetBrains Mono).
+const RESET_THEME: ThemeSettings = { ...DEFAULT_THEME, palette: 'dark', starfieldTurkeys: false, dailyTheme: false, terminalFont: 'maple' };
 
 // Each choice shows a line of terminal text in its own face, italic included:
 // the italic is where the two differ most (Maple Mono's is cursive).
@@ -60,13 +62,16 @@ const TERMINAL_FONTS: { value: TerminalFont; name: string; meta: string }[] = [
  * or a solid colour), the font terminals are set in, whether the sidebar
  * footer shows the activity indicators, whether the project list offers MetaTerm, and whether it leaves
  * out the boxes and projects made for `termag ask`, and (behind
- * thanksgiving-turkeys-enabled) whether the starfield flies turkeys. Later theme axes
+ * thanksgiving-turkeys-enabled) whether the starfield flies turkeys, and (behind
+ * daily-theme-enabled) whether today's theme of the day applies. Later theme axes
  * (terminal colours) become further groups in this section.
  */
 export function AppearanceSection() {
   const { theme, saved, preview, save, saving } = useTheme();
   const lightModeEnabled = useFlag(FLAGS.lightMode, false);
   const turkeysEnabled = useFlag(FLAGS.thanksgivingTurkeys, false);
+  const dailyThemeEnabled = useFlag(FLAGS.dailyTheme, false);
+  const today = useDailyTheme(dailyThemeEnabled, theme.dailyTheme === true);
   const [error, setError] = useState('');
   const palette = themePalette(theme);
   // The colour "Solid color" returns to after a spell on the starfield. It
@@ -286,6 +291,41 @@ export function AppearanceSection() {
             </div>
           </div>
         )}
+        {dailyThemeEnabled && (
+          <div className="settings-choice">
+            <label className="settings-radio" data-checked={theme.dailyTheme || undefined}>
+              <input
+                type="checkbox"
+                checked={theme.dailyTheme === true}
+                disabled={saving}
+                onChange={e => void commit({ ...theme, dailyTheme: e.target.checked })}
+              />
+              <span className="settings-row-text">
+                <span className="settings-row-name">Theme of the day</span>
+                <span className="settings-row-meta">
+                  A new look most days, inspired by the season, Oakland's weather and what happened on this date. Colours, and sometimes a little animation.
+                </span>
+              </span>
+            </label>
+            {theme.dailyTheme === true && today.status !== 'loading' && (
+              <p className="settings-hint" data-testid="daily-theme-today">
+                {today.theme ? (
+                  <>
+                    Today: <strong>{today.theme.meta.title}</strong>. {today.theme.meta.blurb}{' '}
+                    {today.theme.meta.sources.map((src, i) => (
+                      <React.Fragment key={src.url}>
+                        {i > 0 && ', '}
+                        <a href={src.url} target="_blank" rel="noopener noreferrer">{src.label}</a>
+                      </React.Fragment>
+                    ))}
+                  </>
+                ) : (
+                  'No theme today, so you get the usual look.'
+                )}
+              </p>
+            )}
+          </div>
+        )}
         <div className="settings-choice" role="radiogroup" aria-label="Terminal font">
           <p className="settings-hint">The font terminals are set in. Code blocks and the file viewer stay in JetBrains Mono.</p>
           {TERMINAL_FONTS.map(f => (
@@ -357,6 +397,22 @@ export function AppearanceSection() {
                 Leaves out the boxes and projects <code>termag ask --new-box</code> makes, so the list shows only
                 what you started. Nothing happens to them: Boxes and search still list them, and the project you
                 have open stays.
+              </span>
+            </span>
+          </label>
+        </div>
+        <div className="settings-choice">
+          <label className="settings-radio" data-checked={theme.sidebarAskChats || undefined}>
+            <input
+              type="checkbox"
+              checked={theme.sidebarAskChats}
+              disabled={saving}
+              onChange={e => void commit({ ...theme, sidebarAskChats: e.target.checked })}
+            />
+            <span className="settings-row-text">
+              <span className="settings-row-name">Show ask sessions in the workspace</span>
+              <span className="settings-row-meta">
+                The ask-… sessions the chat UI makes when one agent asks another. They have no terminal pane here — read and reply to them in the chat UI.
               </span>
             </span>
           </label>

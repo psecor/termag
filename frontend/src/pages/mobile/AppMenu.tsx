@@ -16,7 +16,7 @@ export function AppMenu() {
   const navigate = useNavigate();
   const [open, setOpen] = useState<Open>(null);
   const install = useSyncExternalStore(subscribeInstall, currentInstallOption, () => 'none' as const);
-  // Off without VAPID keys or with mobile-web-push-enabled off for this user (routes/push.ts).
+  // Off without VAPID keys (routes/push.ts).
   const [pushAvailable, setPushAvailable] = useState(false);
   useEffect(() => {
     let live = true;

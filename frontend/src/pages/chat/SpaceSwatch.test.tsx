@@ -26,7 +26,7 @@ const other: SpaceView = { ...mine, id: '2', name: 'other' };
 
 /** A chat on box `instanceId`; `spaceId` the space the server fixed for it (undefined: not fixed, an older backend). */
 function render(instanceId: string | null, value: Partial<SharedChatSpaces>, spaceId?: string | null) {
-  const shared: SharedChatSpaces = { enabled: true, loaded: true, current: true, spaces: [mine], index: new Map([['box-a', ['mine', 'other']]]), colorOf: spaceColor, ...value };
+  const shared: SharedChatSpaces = { loaded: true, current: true, spaces: [mine], index: new Map([['box-a', ['mine', 'other']]]), colorOf: spaceColor, ...value };
   const place = { instanceId, ...(spaceId !== undefined ? { spaceId, spaceFixed: true } : {}) };
   act(() => root.render(<ChatSpacesProvider value={shared}><ChatSpaceChip place={place} /></ChatSpacesProvider>));
   return host.querySelector<HTMLElement>('.chat-title-space');
@@ -62,8 +62,7 @@ describe('ChatSpaceChip', () => {
     expect(render('box-new', { current: false }, '1')?.textContent).toBe('mine');
   });
 
-  it('shows nothing while spaces are off, loading, or the user has none', () => {
-    expect(render('box-a', { enabled: false })).toBeNull();
+  it('shows nothing while spaces are loading, or the user has none', () => {
     expect(render('box-a', { loaded: false })).toBeNull();
     expect(render('box-b', { spaces: [], index: new Map() })).toBeNull();
   });

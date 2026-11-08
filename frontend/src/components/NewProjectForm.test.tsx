@@ -45,11 +45,16 @@ const mocks = vi.hoisted(() => {
       repos: vi.fn(async () => ({ status: 'ok', groups: [] as unknown[] })),
       models: vi.fn(async () => ({ providers: {} as Record<string, unknown> })),
     },
+    // Every environment: none unless a test says so.
+    environments: vi.fn(async (): Promise<unknown[]> => []),
+    // What an environment resolves to now (GET /api/environments/:id/resolved): the checkouts a create from it is held to.
+    resolved: vi.fn(async (): Promise<{ repos: Array<{ repo: string; branch?: string; path?: string }>; size: unknown; warnings: string[] }> => ({ repos: [{ repo: 'example-org/webapp', branch: 'main' }], size: null, warnings: [] })),
   };
 });
 
+import { resetEnvironmentsForTests } from '../hooks/useEnvironments';
 vi.mock('../flags', () => ({
-  FLAGS: { repoFirstPicker: 'repo-first-picker-enabled', warmPool: 'warm-pool-enabled', multiRepo: 'multi-repo-projects-enabled' },
+  FLAGS: { multiRepo: 'multi-repo-projects-enabled', environmentSelection: 'environment-selection-enabled' },
   useFlag: (key: string, fallback: boolean) => (key in mocks.flags ? mocks.flags[key] : fallback),
 }));
 vi.mock('../contexts/AuthContext', () => ({ useAuth: () => ({ user: mocks.user }) }));
@@ -73,6 +78,9 @@ vi.mock('../services/api', () => ({
   githubReposApi: { list: mocks.api.repos },
   warmPoolApi: { get: mocks.api.warmPool },
   providersApi: { models: mocks.api.models },
+
+  spacesApi: { list: vi.fn(async () => ({ spaces: [] })) },
+  environmentsApi: { list: mocks.environments, resolved: mocks.resolved },
 }));
 
 function makeBox(over: Partial<Instance> & Pick<Instance, 'id' | 'name'>): Instance {
@@ -86,8 +94,9 @@ let container: HTMLDivElement;
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-  mocks.flags = { 'repo-first-picker-enabled': true };
+  mocks.flags = {};
   mocks.projects = [];
+  resetEnvironmentsForTests();
   mocks.resetFeed();
   mocks.setBoxes([makeBox({ id: 'box-1', name: 'box-1' })]);
   mocks.api.credentials.mockResolvedValue({ github: { boxGate: 'off' } });
@@ -248,6 +257,22 @@ describe('simplified new project form', () => {
     expect(mocks.api.createProject).toHaveBeenCalledWith(expect.objectContaining({ instanceId: 'box-1' }));
   });
 
+  it('relaunches a failed box with termag setup off as one, on Try again', async () => {
+    mocks.setBoxes([makeBox({ id: 'box-f', name: 'bare', status: 'failed', setupEnabled: false }), makeBox({ id: 'box-g', name: 'plain', status: 'failed' })]);
+    await renderForm({ initialBoxId: 'box-f' });
+    expect(document.body.textContent).toContain('Try again launches bare again');
+    await clickSubmit();
+    expect(mocks.api.createBox).toHaveBeenCalledWith('bare', 'ec2', expect.objectContaining({ setupEnabled: false }));
+    expect(document.body.textContent?.toLowerCase()).not.toContain('minimal');
+  });
+
+  it('relaunches a failed box with setup on as before, sending nothing about setup', async () => {
+    mocks.setBoxes([makeBox({ id: 'box-g', name: 'plain', status: 'failed' })]);
+    await renderForm({ initialBoxId: 'box-g' });
+    await clickSubmit();
+    expect(mocks.api.createBox).toHaveBeenCalledWith('plain', 'ec2', expect.not.objectContaining({ setupEnabled: expect.anything() }));
+  });
+
   it('keeps an initial box and does not provision another', async () => {
     await renderForm({ initialBoxId: 'box-1' });
     expect(field('npf-box').value).toBe('box-1');
@@ -362,28 +387,6 @@ describe('simplified new project form', () => {
     expect(mocks.api.createProject).toHaveBeenCalledTimes(2);
     expect(mocks.api.createProject.mock.calls[1][0]).toEqual(expect.objectContaining({ instanceId: 'created' }));
   });
-
-  it('defaults the flag-off form to the current project\'s box too', async () => {
-    mocks.flags = {};
-    mocks.setBoxes([
-      makeBox({ id: 'box-1', name: 'box-1', _count: { projects: 0 } }),
-      makeBox({ id: 'box-2', name: 'box-2', _count: { projects: 5 } }),
-    ]);
-    await renderForm({ defaultBoxId: 'box-2' });
-    expect(field('npf-box').value).toBe('box-2');
-  });
-
-  it('keeps the flag-off form on the ready box', async () => {
-    mocks.flags = {};
-    await renderForm();
-    expect(document.querySelector('details.npf-advanced')).toBeNull();
-    expect(field('npf-start')).toBeTruthy();
-    expect(field('npf-box').value).toBe('box-1');
-    expect(document.getElementById('npf-box-name')).toBeNull();
-    await clickSubmit();
-    expect(mocks.api.createBox).not.toHaveBeenCalled();
-    expect(mocks.api.createProject).toHaveBeenCalledWith(expect.objectContaining({ instanceId: 'box-1' }));
-  });
 });
 
 describe('new project form: a name an archived project holds on the box', () => {
@@ -463,8 +466,7 @@ describe('multi-repo projects (multi-repo-projects-enabled)', () => {
   async function fillPrimary() {
     mocks.flags = { 'multi-repo-projects-enabled': true };
     await renderForm({ initialBoxId: 'box-1' });
-    await act(async () => { choose('npf-start', '__custom__'); });
-    await act(async () => { typeInto(field('npf-url') as HTMLInputElement, 'https://github.com/acme/api'); });
+    await act(async () => { typeInto(field('npf-paste') as HTMLInputElement, 'https://github.com/acme/api'); });
     await act(async () => { addButton()!.click(); });
   }
 
@@ -498,7 +500,7 @@ describe('the repository list as a multi-select (multi-repo-projects-enabled)', 
   const lastBody = () => mocks.api.createProject.mock.lastCall![0] as Record<string, unknown>;
 
   async function renderList(multi = true) {
-    mocks.flags = { 'repo-first-picker-enabled': true, ...(multi && { 'multi-repo-projects-enabled': true }) };
+    mocks.flags = { ...(multi && { 'multi-repo-projects-enabled': true }) };
     mocks.api.repos.mockResolvedValue({
       status: 'ok',
       groups: [
@@ -526,7 +528,7 @@ describe('the repository list as a multi-select (multi-repo-projects-enabled)', 
   });
 
   it('sizes a new box for a multi-repo project by every ticked repository, not the first alone (Bugbot, #883)', async () => {
-    mocks.flags = { 'repo-first-picker-enabled': true, 'multi-repo-projects-enabled': true };
+    mocks.flags = { 'multi-repo-projects-enabled': true };
     mocks.api.repos.mockResolvedValue({
       status: 'ok',
       groups: [{ owner: 'acme', kind: 'org', status: 'ok', repos: [{ fullName: 'acme/api', defaultBranch: 'main' }, { fullName: 'acme/web', defaultBranch: 'trunk' }] }],
@@ -622,6 +624,102 @@ describe('the repository list as a multi-select (multi-repo-projects-enabled)', 
   });
 });
 
+describe('new project form: an environment', () => {
+  const FULL_STACK = {
+    id: 'e1', name: 'full-stack', createdAt: '', updatedAt: '', createdBy: null, updatedBy: null, visibility: 'personal' as const, owner: null,
+    kind: 'pointer', file: { repo: 'example-org/webapp', branch: 'main', path: '.termag/full-stack/environment.json' },
+  };
+  beforeEach(() => { mocks.flags = {}; mocks.environments.mockResolvedValue([FULL_STACK]); });
+  afterEach(() => { mocks.environments.mockResolvedValue([]); });
+
+  it('makes the project from the environment picked, named after it, instead of the repository fields', async () => {
+    await renderForm();
+    expect(field('npf-environment').value).toBe('');
+    await act(async () => { choose('npf-environment', 'full-stack'); });
+    await settle();
+    expect(document.getElementById('npf-start')).toBeNull();
+    expect(field('npf-name').value).toBe('full-stack');
+    // Its name only, and no helper copy about it.
+    expect([...(field('npf-environment') as HTMLSelectElement).options].map(o => o.textContent)).toEqual(['None', 'full-stack']);
+    expect(container.textContent).not.toMatch(/holds full-stack|repositories, each cloned/);
+    await clickSubmit();
+    const body = mocks.api.createProject.mock.calls[0][0];
+    expect(body).toMatchObject({ name: 'full-stack', instanceId: 'created', environment: 'full-stack', environmentRepos: [{ repo: 'example-org/webapp', branch: 'main' }] });
+    expect(mocks.resolved).toHaveBeenCalledWith('e1');
+    expect(body).not.toHaveProperty('repos');
+    expect(body.repoUrl ?? null).toBeNull();
+  });
+
+  it("makes a new box for it sized by the environment's file", async () => {
+    await renderForm();
+    await act(async () => { choose('npf-environment', 'full-stack'); });
+    await act(async () => { choose('npf-box', '__new__'); });
+    await settle();
+    await clickSubmit();
+    expect(mocks.api.createBox).toHaveBeenCalledWith(expect.any(String), 'ec2', expect.objectContaining({ environment: 'full-stack', repo: null }));
+    expect(mocks.api.createProject).toHaveBeenCalledWith(expect.objectContaining({ instanceId: 'created', environment: 'full-stack', environmentRepos: [{ repo: 'example-org/webapp', branch: 'main' }] }));
+  });
+
+  it('says so and reads them again when the create finds the environment changed since', async () => {
+    mocks.api.createProject.mockRejectedValueOnce({ response: { status: 409, data: { error: "full-stack's repositories changed since you looked; read them again", code: 'environment_repos_changed' } } });
+    await renderForm();
+    await act(async () => { choose('npf-environment', 'full-stack'); });
+    await settle();
+    const reads = mocks.resolved.mock.calls.length;
+    await clickSubmit();
+    expect(document.body.textContent).toContain('changed since you looked');
+    expect(mocks.resolved.mock.calls.length).toBe(reads + 1);
+  });
+
+  it('lists the checkouts it will clone, and holds Create, saying why, when they could not be read', async () => {
+    mocks.resolved.mockResolvedValueOnce({ repos: [{ repo: 'example-org/webapp', branch: 'main' }, { repo: 'acme/web', path: 'frontend' }], size: null, warnings: [] });
+    await renderForm();
+    await act(async () => { choose('npf-environment', 'full-stack'); });
+    await settle();
+    expect(document.querySelector('.npf-checkouts')?.textContent).toBe('Clones example-org/webapp at main, acme/web in frontend');
+    act(() => root.unmount());
+    root = createRoot(container);
+    mocks.resolved.mockRejectedValueOnce(new Error('GitHub did not answer'));
+    await renderForm();
+    await act(async () => { choose('npf-environment', 'full-stack'); });
+    await settle();
+    expect(document.body.textContent).toContain('Could not read full-stack');
+    expect(submitButton().disabled).toBe(true);
+    expect(mocks.api.createProject).not.toHaveBeenCalled();
+  });
+
+  it('offers no environment field while there are none', async () => {
+    mocks.environments.mockResolvedValue([]);
+    await renderForm();
+    expect(document.getElementById('npf-environment')).toBeNull();
+  });
+
+  it('offers none to an automation, even after this tab has read the list', async () => {
+    await renderForm();
+    expect(document.getElementById('npf-environment')).not.toBeNull();
+    act(() => root.unmount());
+    root = createRoot(container);
+    await renderForm({ mode: 'automation' });
+    expect(document.getElementById('npf-environment')).toBeNull();
+    expect(document.querySelector('.npf-repo')).not.toBeNull();
+  });
+
+  it('offers the field with environment-selection-enabled on (its fallback), and none with it off, nor reads the list', async () => {
+    mocks.flags = { 'environment-selection-enabled': true };
+    await renderForm();
+    expect(document.getElementById('npf-environment')).not.toBeNull();
+    act(() => root.unmount());
+    root = createRoot(container);
+    mocks.environments.mockClear();
+    mocks.flags = { 'environment-selection-enabled': false };
+    await renderForm();
+    await settle();
+    expect(document.getElementById('npf-environment')).toBeNull();
+    expect(document.querySelector('.npf-repo')).not.toBeNull();
+    expect(mocks.environments).not.toHaveBeenCalled();
+  });
+});
+
 describe('the new box\'s disk (GET /api/instances/sizes disk)', () => {
   const DISK = { minGiB: 50, maxGiB: 300, defaultGiB: 120, diskGiB: 120 };
   const typeDisk = (value: string) => {
@@ -664,7 +762,7 @@ describe('the new box\'s disk (GET /api/instances/sizes disk)', () => {
   });
 
   it('says another disk launches a new box only while a ready one is waiting', async () => {
-    mocks.flags = { 'repo-first-picker-enabled': true, 'warm-pool-enabled': true };
+    mocks.flags = {};
     mocks.api.warmPool.mockResolvedValue({ warm: 2, warming: 0, target: 2 });
     mocks.api.sizes.mockResolvedValue({ enabled: false, default: null, sizes: [], disk: DISK });
     await renderForm();

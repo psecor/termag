@@ -85,7 +85,7 @@ export function FileChat({ space, path }: { space: string; path: string }) {
   // The space's agent sessions that take a message here, in the sidebar's order.
   const targets = useMemo<Target[]>(() => {
     if (!data?.spaces.loaded) return [];
-    const { items, spaces, live, setupOf, titlesShown } = data;
+    const { items, spaces, live, setupOf } = data;
     // A chat is in its own space's group (chat/chatSpaces.ts chatHomeSpace), as the sidebar shows it.
     const spaceOf = (c: Parameters<typeof itemKey>[0]) => {
       const row = byKey.get(itemKey(c));
@@ -102,7 +102,7 @@ export function FileChat({ space, path }: { space: string; path: string }) {
       const project = projects.find(p => p.id === item.projectId);
       if (seen.has(k) || !row || !project || !isSdkChat(project, item.workstream)) continue;
       seen.add(k);
-      const named = chatRowName(row, titlesShown);
+      const named = chatRowName(row);
       // The project (and workstream), whatever the row puts under its title.
       const where = agentLabel(row);
       const line = sidebarLine(row, live.get(chatLiveKey(row.projectId, row.workstream)), setupOf.get(row.projectId));
@@ -216,7 +216,7 @@ function FileChatSession({ target, project, space, path, agentPicker, away }: {
   // The pre-ready queue as it is now, with how many bubbles carry its text once the history is in.
   const queueCount = queued != null && history === 'ok' ? countSent(chat, queued) : null;
   useEffect(() => {
-    dispatchStrip(key, { type: 'queue', text: queued, error: queueError, count: queueCount });
+    dispatchStrip(key, { type: 'queue', text: s.queuedText, error: queueError, count: queueCount });
   }, [key, queued, queueError, queueCount]);
   const model = useStripModel(key);
   const strip = stripState(model, chat);

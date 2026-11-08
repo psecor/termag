@@ -3,11 +3,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ flags: {} as Record<string, boolean>, api: { settings: vi.fn(), saveSettings: vi.fn() } }));
-vi.mock('../flags', () => ({
-  FLAGS: { prLinkShares: 'browser-pane-pr-link-shares-enabled' },
-  useFlag: (key: string, fallback: boolean) => (key in mocks.flags ? mocks.flags[key] : fallback),
-}));
+const mocks = vi.hoisted(() => ({ api: { settings: vi.fn(), saveSettings: vi.fn() } }));
 vi.mock('../services/api', () => ({ previewSharesApi: mocks.api }));
 
 import { PrPreviewSettings } from './PrPreviewSettings';
@@ -23,7 +19,6 @@ function type(field: HTMLInputElement, value: string) {
 const save = () => [...el.querySelectorAll('button')].find(b => b.textContent === 'Save') as HTMLButtonElement;
 
 beforeEach(() => {
-  mocks.flags = { 'browser-pane-pr-link-shares-enabled': true };
   mocks.api.settings.mockReset();
   mocks.api.saveSettings.mockReset();
   el = document.createElement('div');
@@ -33,14 +28,6 @@ beforeEach(() => {
 afterEach(() => { act(() => root.unmount()); el.remove(); });
 
 describe('PR preview settings', () => {
-  it('shows nothing, and asks nothing, with PR link shares off', async () => {
-    mocks.flags = {};
-    act(() => root.render(<PrPreviewSettings projectId="p1" />));
-    await flush();
-    expect(el.textContent).toBe('');
-    expect(mocks.api.settings).not.toHaveBeenCalled();
-  });
-
   it('loads the project\'s settings, saves only a change, and shows what the server kept', async () => {
     mocks.api.settings.mockResolvedValue({ prLinksEnabled: false, pathFilter: ['static/'], reviewerAccountHint: null, recipe: null });
     act(() => root.render(<PrPreviewSettings projectId="p1" />));

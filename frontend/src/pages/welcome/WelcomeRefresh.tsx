@@ -11,7 +11,6 @@ import { blocksManagedBox } from '../../boxGate';
 import { credentialsApi, type CredentialsStatus } from '../../services/api';
 import { recordProductEvent } from '../../observability';
 import { recordUiMode } from '../../chat/uiMode';
-import { FLAGS, useFlag } from '../../flags';
 import { LP_THEME } from '../../launchpad/theme';
 import { ensureLaunchPadSprite } from '../../launchpad/sprite';
 import type { SshKeysSectionHandle } from '../settings/SshKeysSection';
@@ -23,8 +22,6 @@ import './welcome.css';
  * one optional row; how you work, termag (the chat UI, preselected) or Lab
  * (the terminal workspace); and the start. termag ends on the chat UI's New
  * session; Lab keeps the New project form and opens the project in Lab.
- * Where the chat UI is off (simple-ui-enabled) there is nothing to choose, so
- * setup is GitHub, then a Lab project.
  */
 
 export type WorkMode = 'termag' | 'lab';
@@ -36,12 +33,11 @@ type SetupExit = 'session' | 'project' | 'branch-off' | 'skip';
 export default function WelcomeRefresh() {
   const { user, setOnboarded } = useAuth();
   const navigate = useNavigate();
-  const chatUi = useFlag(FLAGS.simpleUi, false);
-  const steps: StepId[] = chatUi ? ['github', 'mode', 'start'] : ['github', 'start'];
+  const steps: StepId[] = ['github', 'mode', 'start'];
   const [step, setStep] = useState<StepId>('github');
   const at = steps.indexOf(step);
   const [chosen, setMode] = useState<WorkMode>('termag');
-  const mode: WorkMode = chatUi ? chosen : 'lab';
+  const mode: WorkMode = chosen;
   // Continue waits for this: until it answers, nobody knows whether GitHub is
   // required, and a failed check is retried rather than skipped past.
   const [cred, setCred] = useState<CredentialsStatus | null>(null);
@@ -153,7 +149,7 @@ export default function WelcomeRefresh() {
                 : githubBlocked
                   ? <Text className="wel-foot-note">Connect GitHub to continue. termag needs it to set up your boxes.</Text>
                   : <span />}
-              <Button variant={githubConnected ? 'primary' : 'default'} size="large" isDisabled={!cred || githubBlocked || sshBusy} onPress={() => leave(() => setStep(chatUi ? 'mode' : 'start'))}>
+              <Button variant={githubConnected ? 'primary' : 'default'} size="large" isDisabled={!cred || githubBlocked || sshBusy} onPress={() => leave(() => setStep('mode'))}>
                 Continue
               </Button>
             </footer>
@@ -209,7 +205,7 @@ export default function WelcomeRefresh() {
                 onGithubRequired={() => { void loadCred(); setStep('github'); }}
                 submitLabel="Create project"
                 quiet
-                actions={<Button variant="minimal" onPress={() => setStep(chatUi ? 'mode' : 'github')}>Back</Button>}
+                actions={<Button variant="minimal" onPress={() => setStep('mode')}>Back</Button>}
                 onBranchOff={projectId => void finish(`/?project=${encodeURIComponent(projectId)}&branchOff=1`, 'lab', 'branch-off')}
                 onCreated={project => finish(`/?project=${encodeURIComponent(project.id)}`, 'lab', 'project')}
               />

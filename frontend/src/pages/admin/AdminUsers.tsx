@@ -93,7 +93,7 @@ export function AdminUsers({ range, now }: { range: AdminRange; now: number }) {
           {detail && (
             <>
               <KeyValues items={[
-                ['id', detail.id],
+                ['id', <span className="admin-mono">{detail.id}</span>],
                 ['seen / joined', `${fmtAgo(detail.lastSeenAt, now)} / ${fmtAgo(detail.createdAt, now)}`],
                 ['this range', `${fmtMs(detail.agentMs)} agent · ${fmtMs(detail.humanMs)} human · ${fmtTok(detail.tokens)} tokens · ${fmtPct(detail.cacheRatio)} cached`],
                 ['integrations', `${detail.slack ? 'slack' : ''} ${detail.discord ? 'discord' : ''}`.trim() || 'none'],
@@ -115,7 +115,8 @@ export function AdminUsers({ range, now }: { range: AdminRange; now: number }) {
       </div>
       <section className="dash-section">
         <div className="dash-section-title">Users {users.data && <span className="dash-count">{users.data.length}</span>}</div>
-        <DataTable rows={users.data ?? []} columns={cols} rowKey={r => r.id} defaultSort="agent" empty={users.data ? 'no users' : pendingText(users)} />
+        <DataTable rows={users.data ?? []} columns={cols} rowKey={r => r.id} defaultSort="agent" selectedKey={selected}
+          search="filter users" storageKey="users" resetKey={range} empty={users.data ? 'no users' : pendingText(users)} />
       </section>
     </>
   );

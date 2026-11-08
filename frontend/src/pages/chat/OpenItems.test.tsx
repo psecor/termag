@@ -5,7 +5,7 @@ import { MemoryRouter, Route, Routes, useLocation, useMatch } from 'react-router
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SpaceTree } from '../../services/api';
 import type { Project } from '../../types';
-import { openItemsKey } from '../../chat/openItems';
+import { newTabId, openItemsKey } from '../../chat/openItems';
 import { statusKey } from '../../utils/statusKey';
 import { sessionName } from '../../utils/sessionName';
 import { spaceColor } from '../../chat/spaceColors';
@@ -17,6 +17,7 @@ import { ChatRoute } from './ChatRoute';
 import { SidePanel } from './SidePanel';
 import { SimpleDataProvider, useSimpleData } from './simpleData';
 import { resetUnfoldedRuns } from '../../chat/automationRunGroups';
+import { rowKey as inboxRowKey } from '../../mobile/inbox';
 
 function project(id: string, lastActiveAt: string): Project {
   return {
@@ -46,13 +47,22 @@ const mocks = vi.hoisted(() => ({
   links: [] as Array<{ projectId: string; workstream: string; parentProjectId: string; parentWorkstream: string }>,
   open: vi.fn(),
   tree: null as null | ((space: string, prefix: string) => Promise<SpaceTree>),
-  titles: false,
   /** chat-session-references-enabled. */
   refs: false,
   members: vi.fn(),
   status: {} as Record<string, { status: string }>,
+  /** Review sessions (reviewsData's sessionKeys), by mobile/inbox rowKey. */
+  reviewKeys: new Set<string>(),
 }));
 
+// A new tab's id is random (newTabId); a test that asserts one names it first with
+// nextTabId, so it can say exactly which tab opened instead of "any but e1".
+vi.mock('../../chat/openItems', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../chat/openItems')>();
+  return { ...actual, newTabId: vi.fn(actual.newTabId) };
+});
+/** The next new tab's id: one that starts like the tab it is opened from, which a pattern on the id can't tell apart. */
+const nextTabId = (id = 'e1next') => { vi.mocked(newTabId).mockReturnValueOnce(id); return id; };
 vi.mock('../../contexts/AuthContext', () => ({ useAuth: () => ({ user: { id: 'u1', unixUsername: 'ada' } }) }));
 vi.mock('../../contexts/ProjectContext', () => ({ useProjects: () => ({ projects: mocks.projects, projectsLoaded: true, statusMap: mocks.status }) }));
 vi.mock('../../chat/useChatSpaces', () => ({
@@ -74,6 +84,10 @@ vi.mock('../../services/api', async importOriginal => {
     automationsApi: { ...actual.automationsApi, list: async () => [] },
   };
 });
+vi.mock('./reviewsData', async importOriginal => {
+  const actual = await importOriginal<typeof import('./reviewsData')>();
+  return { ...actual, useReviewsData: () => ({ ...actual.useReviewsData(), sessionKeys: mocks.reviewKeys }) };
+});
 vi.mock('./SdkChatView', () => ({ SdkChatView: () => <section className="chat-conv" data-testid="chat" /> }));
 vi.mock('./ChatView', () => ({ ChatView: () => <section className="chat-conv" data-testid="chat" /> }));
 vi.mock('../../services/spaceTransfer', () => ({ downloadFile: vi.fn(), errorMessage: (_e: unknown, f: string) => f }));
@@ -81,8 +95,7 @@ vi.mock('../../flags', async () => {
   const actual = await vi.importActual<typeof import('../../flags')>('../../flags');
   return {
     ...actual,
-    useFlag: <T,>(key: string, fallback: T) => (key === 'simple-ui-side-panel-enabled' ? true as T : key === 'simple-ui-session-titles-enabled' ? mocks.titles as T
-      : key === 'chat-session-references-enabled' ? mocks.refs as T : fallback),
+    useFlag: <T,>(key: string, fallback: T) => (key === 'chat-session-references-enabled' ? mocks.refs as T : fallback),
   };
 });
 
@@ -311,7 +324,7 @@ describe('tabs sidebar', () => {
     expect(host.querySelector('.chat-group-head .chat-item-close, .chat-group-head button[aria-label^="Close"]')).toBeNull();
   });
 
-  it('closes a tab from its X as Close tab does: the open one goes to the next tab in its space, the session and file stay', async () => {
+  it('closes a tab from its X as Close tab does: with no tab shown before, the open one goes to the next tab in its space; the session and file stay', async () => {
     mocks.projects = [project('a', '2026-10-20T00:00:00Z'), project('b', '2026-10-10T00:00:00Z')];
     mocks.index = new Map([['box-a', ['notes']], ['box-b', ['notes']]]);
     await render('/chat/f/notes/README.md');
@@ -349,27 +362,19 @@ describe('tabs sidebar', () => {
     expect(document.activeElement).toBe(tab('b'));
   });
 
-  it('leads a tab with Claude\'s title for its session when titles are on, the project after it', async () => {
+  it('leads a tab with Claude\'s title for its session, the project after it', async () => {
     const titled = (title: string | null) => [{
       ...project('a', '2026-10-20T00:00:00Z'),
       workstreams: [{ id: 'w1', projectId: 'a', name: 'main', branch: 'main', archived: false, sessionTitle: title }],
     } as unknown as Project];
     mocks.projects = titled('Login rate limiting');
-    mocks.titles = true;
-    try {
-      await render();
-      expect(groups()).toEqual([['assets', []], ['notes', ['Login rate limiting · a']]]);
-      expect(host.querySelector('.chat-item-name .chat-row-ws')!.textContent).toBe(' · a');
-      expect(dots('Login rate limiting · a')).not.toBeNull();
+    await render();
+    expect(groups()).toEqual([['assets', []], ['notes', ['Login rate limiting · a']]]);
+    expect(host.querySelector('.chat-item-name .chat-row-ws')!.textContent).toBe(' · a');
+    expect(dots('Login rate limiting · a')).not.toBeNull();
 
-      // No title yet: the project, as with titles off.
-      mocks.projects = titled(null);
-      await render();
-      expect(groups()).toEqual([['assets', []], ['notes', ['a']]]);
-    } finally {
-      mocks.titles = false;
-    }
-    mocks.projects = titled('Login rate limiting');
+    // No title yet: the project.
+    mocks.projects = titled(null);
     await render();
     expect(groups()).toEqual([['assets', []], ['notes', ['a']]]);
   });
@@ -1195,20 +1200,6 @@ describe('tabs sidebar', () => {
     }
   });
 
-  it('gives the same No space group with spaces off, without waiting for spaces that never load', async () => {
-    mocks.projects = [project('a', '2026-10-20T00:00:00Z')];
-    mocks.spaces = false;
-    mocks.spacesLoaded = false;
-    try {
-      await render();
-      expect(host.querySelector('.chat-items')!.textContent).not.toContain('Loading…');
-      expect(groups()).toEqual([['No space', ['a']]]);
-      expect(host.querySelector('.chat-group[data-space="none"] .chat-group-menu')).not.toBeNull();
-    } finally {
-      mocks.spacesLoaded = true;
-    }
-  });
-
   it('says there are no sessions yet to a user with no spaces and nothing open', async () => {
     mocks.projects = [];
     mocks.list = [];
@@ -1439,9 +1430,10 @@ describe('the explorer', () => {
     expect(stored().items.filter(i => i.id === 'e1')).toEqual([expect.objectContaining({ kind: 'file', path: 'README.md' })]);
     if (panelRow('docs').getAttribute('aria-expanded') !== 'true') act(() => panelRow('docs').click());
     await settle();
+    const fresh = nextTabId();
     click(panelRow('q3.pdf'));
     await settle();
-    expect(location).toMatch(/^\/chat\/f\/notes\/docs\/q3\.pdf\?tab=(?!e1)[a-z0-9]+$/);
+    expect(location).toBe(`/chat/f/notes/docs/q3.pdf?tab=${fresh}`);
     expect(groups()).toContainEqual(['notes', ['q3.pdf', 'README.md', 'boss', 'kid']]);
     click(panelRow('README.md'));
     await settle();
@@ -1510,10 +1502,12 @@ describe('the explorer', () => {
     act(() => panelRow('README.md').focus());
     key(panelRow('README.md'), 'ContextMenu');
     expect(menuLabels()).toEqual(['Open', 'Open in new tab', 'Open in new browser tab']);
+    const fresh = nextTabId();
     act(() => menuItem('Open in new tab').click());
     await settle();
     expect(groups()).toContainEqual(['notes', ['README.md', 'New tab', 'boss', 'kid']]);
-    expect(location).toMatch(/^\/chat\/f\/notes\/README\.md\?tab=(?!e1)[a-z0-9]+$/);
+    expect(location).toBe(`/chat/f/notes/README.md?tab=${fresh}`);
+    expect(stored().items.find(i => i.id === 'e1')).toMatchObject({ kind: 'explorer', space: 'notes' });
   });
 
   it('opens an item\'s menu from its ⋮ without opening the item, the same menu as a right click', async () => {
@@ -1702,7 +1696,7 @@ describe('the explorer', () => {
     const hints = () => [...document.querySelectorAll('.chat-ctx-menu [role=menuitem]')].map(b => [b.querySelector('.chat-add-label')!.textContent, b.querySelector('.chat-add-hint')?.textContent ?? null, b.getAttribute('aria-disabled') === 'true']);
 
     it('puts Share space third in the space head\'s ⋮ menu, between New tab and the tab actions', async () => {
-      mocks.members.mockResolvedValue({ sharing: true, members: [{ userId: 'u1', email: 'ada@example.com', displayName: 'Ada', role: 'owner', addedAt: '' }], invites: [] });
+      mocks.members.mockResolvedValue({ members: [{ userId: 'u1', email: 'ada@example.com', displayName: 'Ada', role: 'owner', addedAt: '' }], invites: [] });
       await render();
       act(() => dots('notes').click());
       expect(menuLabels()).toEqual(['New agent', 'New tab', 'Share space', 'Close all tabs', 'Close file tabs']);
@@ -1752,3 +1746,134 @@ describe('the explorer', () => {
   });
 });
 
+
+describe('closing the open tab goes back to the tab shown before it', () => {
+  beforeEach(() => {
+    mocks.spaces = true;
+    mocks.list = [space('notes')];
+    mocks.projects = [project('a', '2026-10-20T00:00:00Z'), project('b', '2026-10-10T00:00:00Z')];
+    mocks.index = new Map([['box-a', ['notes']], ['box-b', ['notes']]]);
+    mocks.links = [];
+    localStorage.setItem(openItemsKey('u1'), JSON.stringify({ v: 2, seeded: true, items: [
+      { kind: 'file', space: 'notes', path: 'README.md', id: 'tf', openedAt: 3 },
+      { kind: 'chat', projectId: 'a', workstream: 'main', id: 'ta', openedAt: 2 },
+      { kind: 'chat', projectId: 'b', workstream: 'main', id: 'tb', openedAt: 1 },
+    ] }));
+  });
+  const headerBack = () => host.querySelector<HTMLButtonElement>('header.chat-header button.chat-page-back')!;
+
+  it('is a back arrow, the first control of the header, before its title, named Close and go back', async () => {
+    await render('/chat/f/notes/README.md?tab=tf');
+    const back = headerBack();
+    const header = back.closest('header')!;
+    expect(header.firstElementChild).toBe(back);
+    expect(back.compareDocumentPosition(header.querySelector('.chat-title')!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(back.getAttribute('aria-label')).toBe('Close and go back');
+    expect(back.getAttribute('data-tip')).toBe('Close and go back');
+    expect(back.getAttribute('aria-keyshortcuts')).toBeNull();
+    // No X in the actions any more.
+    expect(header.querySelector('.chat-header-actions .chat-page-close, .chat-header-actions .chat-page-back')).toBeNull();
+  });
+
+  it('is the same button as Reload in the header: the element, its classes but Reload\'s own, and a 14px icon', async () => {
+    await render('/chat/f/notes/README.md?tab=tf');
+    const back = headerBack();
+    const reload = host.querySelector<HTMLButtonElement>('header.chat-header button.fv-reload')!;
+    expect(back.tagName).toBe(reload.tagName);
+    const classes = (b: Element, own: string) => [...b.classList].filter(c => c !== own).sort();
+    expect(classes(back, 'chat-page-back')).toEqual(classes(reload, 'fv-reload'));
+    const icon = (b: Element) => b.querySelector('svg')!;
+    for (const a of ['width', 'height', 'viewBox']) expect(icon(back).getAttribute(a)).toBe(icon(reload).getAttribute(a));
+    expect(back.childElementCount).toBe(1);
+  });
+
+  it.each([['a space\'s explorer', '/chat/files/notes'], ['No space\'s explorer', '/chat/agents']])('is the first control of %s\'s header too, before its title', async (_name, path) => {
+    await render(path);
+    const back = headerBack();
+    expect(back.closest('header')!.firstElementChild).toBe(back);
+    expect(back.nextElementSibling!.classList.contains('chat-title')).toBe(true);
+    expect([...back.classList].sort()).toEqual(['btn-ghost', 'chat-page-back', 'fv-icon-btn']);
+  });
+
+  it('closes a space file\'s tab and goes back to the chat tab shown before it, not the next in its space', async () => {
+    await render('/chat/p/b?tab=tb');
+    act(() => tab('README.md').click());
+    await settle();
+    expect(location).toBe('/chat/f/notes/README.md?tab=tf');
+    act(() => headerBack().click());
+    await settle();
+    expect(location).toBe('/chat/p/b?tab=tb');
+    expect(groups()).toContainEqual(['notes', ['a', 'b']]);
+    expect(stored().items.map(i => i.id)).toEqual(['ta', 'tb']);
+  });
+
+  it('goes back past a tab closed since', async () => {
+    await render('/chat/p/b?tab=tb');
+    act(() => tab('a').click());
+    await settle();
+    act(() => tab('README.md').click());
+    await settle();
+    act(() => close('a').click());
+    await settle();
+    act(() => headerBack().click());
+    await settle();
+    expect(location).toBe('/chat/p/b?tab=tb');
+  });
+
+  it('closed from the sidebar\'s X, goes back to the tab shown before it too', async () => {
+    await render('/chat/p/b?tab=tb');
+    act(() => tab('README.md').click());
+    await settle();
+    act(() => close('README.md').click());
+    await settle();
+    expect(location).toBe('/chat/p/b?tab=tb');
+    expect(stored().items.map(i => i.id)).toEqual(['ta', 'tb']);
+  });
+
+  it('closed from the tab\'s menu, Close tab goes back to the tab shown before it too', async () => {
+    await render('/chat/p/b?tab=tb');
+    act(() => tab('README.md').click());
+    await settle();
+    rightClick(tab('README.md'));
+    act(() => menuItem('Close tab').click());
+    await settle();
+    expect(location).toBe('/chat/p/b?tab=tb');
+  });
+
+  it('goes back to an open review session, which is in Reviews rather than its space', async () => {
+    mocks.projects = [...mocks.projects, project('r', '2026-10-05T00:00:00Z')];
+    mocks.index = new Map([...mocks.index, ['box-r', ['notes']]]);
+    mocks.reviewKeys = new Set([inboxRowKey('r', 'main')]);
+    const raw = JSON.parse(localStorage.getItem(openItemsKey('u1'))!) as { items: unknown[] };
+    localStorage.setItem(openItemsKey('u1'), JSON.stringify({ ...raw, items: [...raw.items, { kind: 'chat', projectId: 'r', workstream: 'main', id: 'tr', openedAt: 0 }] }));
+    try {
+      await render('/chat/p/r?tab=tr');
+      act(() => tab('README.md').click());
+      await settle();
+      act(() => headerBack().click());
+      await settle();
+      expect(location).toBe('/chat/p/r?tab=tr');
+    } finally {
+      mocks.reviewKeys = new Set();
+    }
+  });
+
+  it('with no tab shown before, goes where the tab strip\'s X goes: the first left in its space', async () => {
+    await render('/chat/f/notes/README.md?tab=tf');
+    act(() => headerBack().click());
+    await settle();
+    expect(location).toBe('/chat/p/a?tab=ta');
+  });
+
+  it('is on a space\'s explorer tab too, and closes it', async () => {
+    await render('/chat/p/b?tab=tb');
+    act(() => groupDots('notes').click());
+    act(() => menuItem('New tab').click());
+    await settle();
+    expect(location).toMatch(/^\/chat\/files\/notes\?tab=/);
+    act(() => headerBack().click());
+    await settle();
+    expect(location).toBe('/chat/p/b?tab=tb');
+    expect(stored().items.some(i => i.kind === 'explorer')).toBe(false);
+  });
+});

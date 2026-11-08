@@ -60,6 +60,10 @@ describe('launchpadComponentsCss', () => {
     // The components termag uses, and the ones new UI reaches for first.
     const has = (local: string) => prefixes.some(p => out.includes(`.${p}_${local}{`) || out.includes(`.${p}_${local}[`) || out.includes(`.${p}_${local} `));
     for (const local of ['slider', 'button', 'menu', 'popover', 'tooltip', 'tabs']) expect(has(local), local).toBe(true);
+    // Modules whose hash holds a `_`: Group (the box a SearchField's input sits in) lost every rule while it read as no module.
+    expect(prefixes.filter(p => p.replace(/^_/, '').includes('_')).length).toBeGreaterThan(0);
+    for (const local of ['group', 'search']) expect(has(local), local).toBe(true);
+    expect(out).toMatch(/\.[A-Za-z0-9_-]{6}_group input\[data-rac\]/);
     // Nothing that styles termag's own elements: every selector names a LaunchPad class.
     postcss.parse(out).walkRules(rule => {
       if (rule.parent?.type === 'atrule' && (rule.parent as AtRule).name === 'keyframes') return;

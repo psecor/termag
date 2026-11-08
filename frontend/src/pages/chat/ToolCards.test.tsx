@@ -61,11 +61,25 @@ describe('ToolRun', () => {
     expect(host.querySelector('.sdk-run-failed')!.hasAttribute('title')).toBe(false);
   });
 
-  it('shows the call running now under a closed run', () => {
+  it('says the call running now on the step line of a closed run, not in a card that comes and goes', () => {
     const tools = [bash('1', 'ls'), bash('2', 'make test', { done: false, result: null })];
-    act(() => root.render(<ToolRun runKey="run:tool:t" tools={tools} />));
+    act(() => root.render(<ToolRun runKey="run:tool:t" tools={tools} settled={false} live />));
     expect(host.querySelector('.sdk-run')!.getAttribute('data-state')).toBe('running');
-    expect(cards()).toEqual(['make test']);
+    expect(cards()).toEqual([]);
+    expect(host.querySelector('.sdk-run-body')).toBeNull();
+    expect(host.querySelector('.sdk-run-step')!.textContent).toBe('Bash');
+  });
+
+  it('keeps a live run one height as its calls start and end: the step line stays, no card comes in or goes', () => {
+    const shape = () => ({ body: host.querySelector('.sdk-run-body') != null, step: host.querySelector('.sdk-run-step')?.textContent ?? null });
+    const run = (tools: ToolItem[]) => act(() => root.render(<ToolRun runKey="run:tool:t" tools={tools} settled={false} live />));
+    run([bash('1', 'ls', {}, 'List the root'), bash('2', 'npm test', { done: false, result: null }, 'Run the tests')]);
+    expect(shape()).toEqual({ body: false, step: 'Run the tests' });
+    // That call ends; Claude thinks before the next one.
+    run([bash('1', 'ls', {}, 'List the root'), bash('2', 'npm test', {}, 'Run the tests')]);
+    expect(shape()).toEqual({ body: false, step: 'Run the tests' });
+    run([bash('1', 'ls', {}, 'List the root'), bash('2', 'npm test', {}, 'Run the tests'), bash('3', 'git diff', { done: false, result: null }, 'Show the diff')]);
+    expect(shape()).toEqual({ body: false, step: 'Show the diff' });
   });
 });
 
@@ -102,7 +116,8 @@ describe('ToolRun: described calls', () => {
     act(() => root.render(<ToolRun runKey="run:tool:t" tools={running} settled={false} />));
     expect(host.querySelector('.sdk-run-title')!.textContent).toBe("List the repository root · Wait for the sign-in agent's reply");
     expect(host.querySelector('.sdk-run-step')!.textContent).toBe("Wait for the sign-in agent's reply");
-    expect(intents()).toEqual(["Wait for the sign-in agent's reply"]);
+    // Said once, on that line: no card of its own while the run is shut.
+    expect(intents()).toEqual([]);
   });
 
   it('keeps the counts, with no hover text, for calls that say nothing', () => {

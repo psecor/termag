@@ -20,21 +20,28 @@ const mocks = vi.hoisted(() => ({
   previewSchedule: vi.fn(),
   flags: {} as Record<string, unknown>,
   search: '',
+  locationState: null as unknown,
   reloadProjects: vi.fn(async () => {}),
   upsert: vi.fn(),
   reloadBoxes: vi.fn(async () => {}),
   listSpaces: vi.fn(async () => ({ spaces: [] as Array<{ id: string; name: string; description: null; createdAt: string; usedBytes: number; quotaBytes: number; role: 'owner'; readOnly: boolean }> })),
   addSpaceBox: vi.fn(async () => ({})),
   openTab: vi.fn(),
+  // Every environment: none unless a test says so.
+  environments: vi.fn(async (): Promise<unknown[]> => []),
+  // What an environment resolves to (GET /api/environments/:id/resolved).
+  resolved: vi.fn(async (): Promise<{ repos: Array<{ repo: string; path?: string; branch?: string }>; size: unknown; warnings: string[] }> => ({ repos: [{ repo: 'acme/web' }, { repo: 'acme/api', path: 'backend' }], size: 'large', warnings: [] })),
   projects: [] as Array<Record<string, unknown>>,
   createWorkstream: vi.fn(),
   warmPool: vi.fn(async () => ({ warm: 0, warming: 0, target: 0 })),
 }));
 
+import { resetEnvironmentsForTests } from '../../hooks/useEnvironments';
+import { readPermissionPick, writePermissionPick } from '../../chat/newChat';
 vi.mock('react-router-dom', () => ({
   useNavigate: () => mocks.navigate,
   useSearchParams: () => [new URLSearchParams(mocks.search)],
-  useLocation: () => ({ pathname: '/chat/new', search: '', hash: '', state: null, key: 'visit' }),
+  useLocation: () => ({ pathname: '/chat/new', search: '', hash: '', state: mocks.locationState, key: 'visit' }),
   Link: ({ to, children, ...rest }: { to: string; children: React.ReactNode }) => <a href={to} {...rest}>{children}</a>,
 }));
 vi.mock('../../flags', async () => {
@@ -61,6 +68,7 @@ vi.mock('../../services/api', () => ({
   automationsApi: { create: mocks.createAutomation, preview: mocks.previewSchedule },
   spacesApi: { list: mocks.listSpaces, create: vi.fn(), addBox: mocks.addSpaceBox },
   warmPoolApi: { get: mocks.warmPool },
+  environmentsApi: { list: mocks.environments, resolved: mocks.resolved },
 }));
 vi.mock('../../observability', () => ({ replaySessionId: async () => null }));
 // No organisation's repositories start trusted on a deployment by default
@@ -162,6 +170,13 @@ beforeEach(() => {
   mocks.list.mockResolvedValue(catalog);
   mocks.listSpaces.mockResolvedValue({ spaces: [] });
   mocks.addSpaceBox.mockResolvedValue({});
+  mocks.environments.mockReset();
+  mocks.resolved.mockReset();
+  mocks.resolved.mockResolvedValue({ repos: [{ repo: 'acme/web' }, { repo: 'acme/api', path: 'backend' }], size: 'large', warnings: [] });
+  mocks.environments.mockResolvedValue([]);
+  mocks.search = '';
+  mocks.locationState = null;
+  resetEnvironmentsForTests();
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -234,6 +249,47 @@ describe('NewChat box size (box-default-size)', () => {
     expect(sizeShown()).toBe('Small · 2 vCPU, 8 GB RAM');
     await send();
     expect(mocks.createBox).toHaveBeenCalledWith(expect.any(String), 'ec2', expect.objectContaining({ size: 'small' }));
+    mocks.sizes.mockResolvedValue({ enabled: false, default: null, sizes: [] });
+  });
+
+  it('calls a new box whose size was changed by its name, marked new, in the strip and in its choice', async () => {
+    mocks.sizes.mockResolvedValue(OPTIONS);
+    await render();
+    await flush();
+    await typePrompt();
+    await chooseRepo('acme/web');
+    await act(async () => { (document.querySelector('.chat-launch-trigger') as HTMLButtonElement).click(); });
+    await vi.waitFor(() => expect(sizeTrigger()).not.toBeNull());
+    const choice = () => document.querySelector('.chat-launch-new [role="radio"]')!;
+    const trigger = () => document.querySelector('.chat-launch-trigger')!;
+    // The sparkle marks both; it is named for a screen reader only beside the box's own name.
+    const mark = (el: Element) => el.querySelector('.chat-launch-new-mark')!;
+    // Nothing changed: New box, marked new, with no line of details (they are in its tooltip).
+    expect(boxLabel()).toBe('New box');
+    expect(choice().querySelector('.chat-launch-box-name')?.textContent).toBe('New box');
+    expect(choice().querySelector('small')).toBeNull();
+    for (const el of [trigger(), choice()]) expect(mark(el).getAttribute('aria-hidden')).toBe('true');
+    await pickSize(0);
+    expect(boxLabel()).toBe('web');
+    expect(choice().querySelector('.chat-launch-box-name')?.textContent).toBe('web');
+    expect(choice().querySelector('small')).toBeNull();
+    for (const el of [trigger(), choice()]) expect(mark(el).getAttribute('aria-label')).toBe('New box');
+    mocks.sizes.mockResolvedValue({ enabled: false, default: null, sizes: [] });
+  });
+
+  it('opens the new box choice\'s tooltip when the choice takes the keyboard focus, which hangs on the ref LaunchChoice forwards', async () => {
+    mocks.sizes.mockResolvedValue(OPTIONS);
+    await render();
+    await flush();
+    await typePrompt();
+    await chooseRepo('acme/web');
+    await act(async () => { (document.querySelector('.chat-launch-trigger') as HTMLButtonElement).click(); });
+    await vi.waitFor(() => expect(sizeTrigger()).not.toBeNull());
+    const choice = document.querySelector('.chat-launch-new [role="radio"]') as HTMLButtonElement;
+    // Focusable hangs the tooltip on the choice's button by the ref LaunchChoice forwards; if
+    // that stopped reaching the button, every other test would stay green and this would not.
+    await act(async () => { choice.focus(); });
+    await vi.waitFor(() => expect(document.body.textContent).toContain('A new box of its own'));
     mocks.sizes.mockResolvedValue({ enabled: false, default: null, sizes: [] });
   });
 
@@ -320,7 +376,7 @@ describe('NewChat box disk', () => {
     await act(async () => { button.click(); });
     await flush();
   }
-  afterEach(() => { delete mocks.flags['warm-pool-enabled']; mocks.sizes.mockResolvedValue(OFF); mocks.warmPool.mockResolvedValue({ warm: 0, warming: 0, target: 0 }); });
+  afterEach(() => { mocks.sizes.mockResolvedValue(OFF); mocks.warmPool.mockResolvedValue({ warm: 0, warming: 0, target: 0 }); });
 
   it('shows the new box\'s disk, 120 GB, with sizes off too, and launches with the disk typed', async () => {
     mocks.sizes.mockResolvedValue({ ...OFF, disk: DISK });
@@ -356,7 +412,6 @@ describe('NewChat box disk', () => {
   });
 
   it('says another disk launches a new box while a warm one is ready', async () => {
-    mocks.flags = { ...mocks.flags, 'warm-pool-enabled': true };
     mocks.warmPool.mockResolvedValue({ warm: 1, warming: 0, target: 1 });
     mocks.sizes.mockResolvedValue({ ...OFF, disk: DISK });
     await render();
@@ -417,9 +472,10 @@ describe('NewChat composer', () => {
       defaultBranch: 'main',
       claudeModel: 'opus',
       chatTrusted: false,
+      chatSpace: null,
     });
     expect(mocks.navigate).toHaveBeenCalledWith('/chat/p/proj-1', undefined);
-    expect(document.querySelector('.chat-new-space')).toBeNull();
+    expect(document.querySelector('.chat-new-space')).not.toBeNull();
     // No space: no tab is opened ahead of the route.
     expect(mocks.openTab).not.toHaveBeenCalled();
   });
@@ -545,8 +601,7 @@ describe('NewChat composer', () => {
     expect(document.activeElement).toBe(document.querySelector('textarea.chat-compose-input'));
   });
 
-  it('offers an effort beside the model with chat-effort-enabled, and hands it to the new session\'s first message', async () => {
-    mocks.flags['chat-effort-enabled'] = true;
+  it('offers an effort beside the model, and hands it to the new session\'s first message', async () => {
     mocks.createBox.mockResolvedValue({ claimed: false, instance: { id: 'box-1', name: 'web' } });
     mocks.createProject.mockResolvedValue({ id: 'proj-1' });
     await render();
@@ -579,15 +634,7 @@ describe('NewChat composer', () => {
     expect(JSON.parse(localStorage.getItem('termag-chat-last-start') ?? '{}').effort).toBe('xhigh');
   });
 
-  it('offers no effort without chat-effort-enabled', async () => {
-    await render();
-    await act(async () => { buttonByText('Sonnet 5.5').click(); });
-    expect(document.querySelector('[role="listbox"][aria-label="Model"]')).not.toBeNull();
-    expect(document.querySelector('.chat-effort')).toBeNull();
-  });
-
   it('opens on the model and effort last picked, even when no session started with them', async () => {
-    mocks.flags['chat-effort-enabled'] = true;
     localStorage.setItem('termag-chat-last-start', JSON.stringify({ pick: null, space: null, model: 'haiku', effort: 'low' }));
     localStorage.setItem('termag-chat-last-pick', JSON.stringify({ model: 'sonnet', effort: 'max' }));
     await render();
@@ -595,7 +642,6 @@ describe('NewChat composer', () => {
   });
 
   it('falls back to the last start\'s model and effort when nothing was picked since', async () => {
-    mocks.flags['chat-effort-enabled'] = true;
     localStorage.setItem('termag-chat-last-start', JSON.stringify({ pick: null, space: null, model: 'haiku', effort: 'low' }));
     await render();
     expect(buttonByText('Haiku 4.5 · Low')).toBeTruthy();
@@ -627,32 +673,7 @@ describe('NewChat composer', () => {
     expect(send.disabled).toBe(false);
   });
 
-  it('offers only New box, and launches one, while chat-existing-box-enabled is off', async () => {
-    boxes.push({ id: 'b1', name: 'dev', kind: 'ec2', status: 'ready', createdAt: '', projects: [] });
-    mocks.createBox.mockResolvedValue({ claimed: false, instance: { id: 'box-1', name: 'web' } });
-    mocks.createProject.mockResolvedValue({ id: 'proj-1' });
-    await render();
-    await act(async () => { await Promise.resolve(); });
-    await act(async () => { buttonByText('Choose a repository').click(); });
-    await act(async () => { buttonByText('acme/web').click(); });
-
-    await openBoxDialog();
-    expect([...document.querySelectorAll('.chat-launch-box')].map(b => b.querySelector('.chat-launch-box-name')?.textContent)).toEqual(['New box']);
-    expect(document.querySelector('[role="dialog"]')?.textContent).not.toContain('Your boxes');
-
-    const input = document.querySelector('textarea')!;
-    await act(async () => {
-      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(input, 'fix the build');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-    await act(async () => { (document.querySelector('button[type="submit"]') as HTMLButtonElement).click(); });
-    await flush();
-    expect(mocks.createBox).toHaveBeenCalledTimes(1);
-    expect(mocks.createProject).toHaveBeenCalledWith(expect.objectContaining({ instanceId: 'box-1' }));
-  });
-
   it('keeps a chosen box that drops out of the list, and never launches a new box for it', async () => {
-    mocks.flags['chat-existing-box-enabled'] = true;
     boxes.push({ id: 'b1', name: 'dev', kind: 'ec2', status: 'ready', createdAt: '' });
     mocks.createProject.mockResolvedValue({ id: 'proj-1' });
     await render();
@@ -692,7 +713,6 @@ describe('NewChat composer', () => {
   });
 
   it('keeps the session name editable after a launched box\'s start was refused, and retries on that box', async () => {
-    mocks.flags['chat-existing-box-enabled'] = true;
     boxes.push({ id: 'b1', name: 'dev', kind: 'ec2', status: 'ready', createdAt: '' });
     mocks.createBox.mockResolvedValue({ claimed: false, instance: { id: 'box-1', name: 'web' } });
     mocks.createProject
@@ -730,7 +750,6 @@ describe('NewChat composer', () => {
   });
 
   it('starts on one of your boxes from the drawer instead of launching a new one', async () => {
-    mocks.flags['chat-existing-box-enabled'] = true;
     boxes.push({ id: 'b1', name: 'dev', kind: 'ec2', status: 'ready', createdAt: '', projects: [{ id: 'p0', name: 'other' }] });
     mocks.createProject.mockResolvedValue({ id: 'proj-1' });
     await render();
@@ -763,7 +782,6 @@ describe('NewChat composer', () => {
   });
 
   it('wakes an asleep box when it is picked, and waits for it to be up', async () => {
-    mocks.flags['chat-existing-box-enabled'] = true;
     boxes.push({ id: 'b2', name: 'big', kind: 'ec2', ec2InstanceId: 'i-big', status: 'hibernated', createdAt: '' });
     await render();
     await act(async () => { await Promise.resolve(); });
@@ -789,7 +807,6 @@ describe('NewChat composer', () => {
   });
 
   it('says a refused wake did not happen, and tries again when the box is picked again', async () => {
-    mocks.flags['chat-existing-box-enabled'] = true;
     boxes.push({ id: 'b2', name: 'big', kind: 'ec2', ec2InstanceId: 'i-big', status: 'stopped', createdAt: '' });
     mocks.startBox.mockRejectedValueOnce({ response: { data: { error: 'The box is still stopping' } } });
     await render();
@@ -817,7 +834,6 @@ describe('NewChat composer', () => {
   });
 
   it('never wakes, or offers, an asleep box the start route cannot take', async () => {
-    mocks.flags['chat-existing-box-enabled'] = true;
     boxes.push({ id: 'b3', name: 'ext', kind: 'external', status: 'stopped', createdAt: '' });
     await render();
     await act(async () => { await Promise.resolve(); });
@@ -829,7 +845,6 @@ describe('NewChat composer', () => {
   });
 
   it('picks a space from a dialog in the drawer, like the box', async () => {
-    mocks.flags['spaces-enabled'] = true;
     mocks.listSpaces.mockResolvedValue({
       spaces: [{ id: '1', name: 'notes', description: null, createdAt: '', usedBytes: 0, quotaBytes: 1, role: 'owner', readOnly: false }],
     });
@@ -1053,7 +1068,6 @@ describe('NewChat composer', () => {
   it('makes the space picked the automation\'s with simple-ui-automations-enabled, so it is listed there', async () => {
     mocks.flags['automations-enabled'] = true;
     mocks.flags['simple-ui-automations-enabled'] = true;
-    mocks.flags['spaces-enabled'] = true;
     mocks.listSpaces.mockResolvedValue({
       spaces: [{ id: '1', name: 'notes', description: null, createdAt: '', usedBytes: 0, quotaBytes: 1, role: 'owner', readOnly: false }],
     });
@@ -1094,7 +1108,6 @@ describe('New chat defaults', () => {
   }
 
   it('a session started in No space is recorded as No space for good, and opens no tab ahead of the route (plan-outbox #38)', async () => {
-    mocks.flags['spaces-enabled'] = true;
     mocks.listSpaces.mockResolvedValue({
       spaces: [{ id: '1', name: 'notes', description: null, createdAt: '', usedBytes: 0, quotaBytes: 1, role: 'owner', readOnly: false }],
     });
@@ -1117,7 +1130,6 @@ describe('New chat defaults', () => {
   });
 
   it('remembers a picked repository and space before the session starts', async () => {
-    mocks.flags['spaces-enabled'] = true;
     mocks.listSpaces.mockResolvedValue({
       spaces: [{ id: '1', name: 'notes', description: null, createdAt: '', usedBytes: 0, quotaBytes: 1, role: 'owner', readOnly: false }],
     });
@@ -1152,7 +1164,6 @@ describe('New chat defaults', () => {
   });
 
   it('opens on the repository, space and model the last session started with', async () => {
-    mocks.flags['spaces-enabled'] = true;
     mocks.listSpaces.mockResolvedValue({
       spaces: [{ id: '1', name: 'notes', description: null, createdAt: '', usedBytes: 0, quotaBytes: 1, role: 'owner', readOnly: false }],
     });
@@ -1431,6 +1442,25 @@ describe('New chat trust default', () => {
       expect(localStorage.getItem('termag-chat-queued:proj-1')).toBe('fix the flag');
     });
 
+    it('is off on a chosen box with termag setup off, and never asks for an orchestrator chat there', async () => {
+      boxes.push({ id: 'b9', name: 'bare', kind: 'ec2', status: 'ready', createdAt: '', setupEnabled: false });
+      await render();
+      await openRepoMenu();
+      await act(async () => { buttonByText('example-org/webapp').click(); });
+      expect(toggle()!.getAttribute('aria-disabled')).toBeNull();
+      await openBoxDialog();
+      const bare = [...document.querySelectorAll('.chat-launch-box')].find(b => b.textContent?.startsWith('bare')) as HTMLButtonElement;
+      await act(async () => { bare.click(); });
+      await act(async () => { (document.querySelector('.chat-launch-dialog-actions button') as HTMLButtonElement).click(); });
+      expect(toggle()!.getAttribute('aria-disabled')).toBe('true');
+      await act(async () => { toggle()!.click(); });
+      expect(toggle()!.getAttribute('aria-checked')).toBe('false');
+      // Nothing in the UI says "minimal": setup on or off is the CLI's, the API's and environment.json's.
+      expect(document.body.textContent?.toLowerCase()).not.toContain('minimal');
+      await send('fix the flag');
+      expect(mocks.createProject.mock.calls[0][0]).not.toHaveProperty('chatOrchestrator');
+    });
+
     it('asks for an orchestrator chat when switched on, and leaves the first message as typed', async () => {
       await render();
       await openRepoMenu();
@@ -1669,6 +1699,234 @@ describe('New chat on a phone', () => {
   });
 });
 
+describe('NewChat from an environment', () => {
+  const FULL_STACK = {
+    id: 'e1', name: 'full-stack', createdAt: '', updatedAt: '', createdBy: null, updatedBy: null, visibility: 'personal' as const, owner: null,
+    kind: 'pointer', file: { repo: 'acme/web', branch: null, path: '.termag/full-stack/environment.json' },
+  };
+
+  async function typeAndSend() {
+    mocks.createBox.mockResolvedValue({ claimed: false, instance: { id: 'box-1', name: 'full-stack' } });
+    mocks.createProject.mockResolvedValue({ id: 'proj-1' });
+    const input = document.querySelector('textarea')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(input, 'wire it up');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const button = document.querySelector('button[type="submit"]') as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    await act(async () => { button.click(); });
+    await flush();
+  }
+
+  it("opens on ?environment=, names the session after it, and makes the box and project from it, not from the picker", async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-launch-environment')?.textContent).toBe('full-stack');
+    expect(document.querySelector('.chat-env-trigger')?.textContent).toContain('full-stack');
+    expect(mocks.resolved).toHaveBeenCalledWith('e1');
+    await typeAndSend();
+    expect(mocks.createBox).toHaveBeenCalledWith(expect.stringMatching(/^full-stack/), 'ec2', expect.objectContaining({ environment: 'full-stack', repo: null }));
+    const body = mocks.createProject.mock.calls[0][0];
+    expect(body).toMatchObject({ name: expect.stringMatching(/^full-stack/), environment: 'full-stack' });
+    expect(body).not.toHaveProperty('repoUrl');
+    expect(body).not.toHaveProperty('repos');
+  });
+
+  it('offers no environment with environment-selection-enabled off: no picker, and ?environment= names none', async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.flags['environment-selection-enabled'] = false;
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-launch-environment')).toBeNull();
+    expect(document.querySelector('.chat-env-trigger')).toBeNull();
+    expect(mocks.environments).not.toHaveBeenCalled();
+    expect(mocks.resolved).not.toHaveBeenCalled();
+  });
+
+  it('offers no picker with environment-selection-enabled off even with no environment, where it is otherwise shown for New environment', async () => {
+    mocks.flags['environment-selection-enabled'] = false;
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-env-trigger')).toBeNull();
+  });
+
+  it('offers the picker with environment-selection-enabled on', async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.flags['environment-selection-enabled'] = true;
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-env-trigger')).not.toBeNull();
+  });
+
+  it('follows ?environment= when it changes on the mounted page: a later New session has none', async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-launch-environment')?.textContent).toBe('full-stack');
+    // New session from the sidebar: the same route, without the query.
+    mocks.search = '';
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-launch-environment')).toBeNull();
+    expect(document.querySelector('.chat-env-trigger')?.textContent).not.toContain('full-stack');
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-launch-environment')?.textContent).toBe('full-stack');
+  });
+
+  it('grants Full access for the repositories it showed, naming them in the create so the server can hold it to them', async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    const pill = document.querySelector('.chat-permission-btn') as HTMLButtonElement;
+    await act(async () => { pill.click(); });
+    const full = [...document.querySelectorAll('.chat-permission-option')].find(o => o.textContent?.startsWith('Full access')) as HTMLButtonElement;
+    await act(async () => { full.click(); });
+    await typeAndSend();
+    expect(mocks.createProject.mock.calls[0][0]).toMatchObject({ environment: 'full-stack', chatTrusted: true, environmentRepos: [{ repo: 'acme/web' }, { repo: 'acme/api' }] });
+  });
+
+  it("starts a company repository on its default branch on Read only too, and a remembered Full access pick doesn't carry in", async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.resolved.mockResolvedValue({ repos: [{ repo: 'example-org/webapp' }], size: null, warnings: [] });
+    // Picked for the repository on its own, earlier: that choice is for the repository picker, not for what an environment names.
+    writePermissionPick(localStorage, 'https://github.com/example-org/webapp', 'full');
+    expect(readPermissionPick(localStorage, 'https://github.com/example-org/webapp')).toBe('full');
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-permission-btn')?.getAttribute('data-choice')).toBe('read');
+    await typeAndSend();
+    // Read only still names the checkouts: an ask of the project runs them without asking, whenever it comes.
+    expect(mocks.createProject.mock.calls[0][0]).toMatchObject({ environment: 'full-stack', chatTrusted: false, environmentRepos: [{ repo: 'example-org/webapp' }] });
+  });
+
+  it("starts a company repository on another branch on Read only, names the branch in the menu, and grants Full access for that branch", async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.resolved.mockResolvedValue({ repos: [{ repo: 'example-org/webapp', branch: 'someones-branch' }], size: null, warnings: [] });
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    // example-org/ on its default branch starts on Full access; a branch a shared environment names does not.
+    expect(document.querySelector('.chat-permission-btn')?.getAttribute('data-choice')).toBe('read');
+    const pill = document.querySelector('.chat-permission-btn') as HTMLButtonElement;
+    await act(async () => { pill.click(); });
+    expect(document.querySelector('.chat-permission-menu')?.textContent).toContain('example-org/webapp at someones-branch');
+    const full = [...document.querySelectorAll('.chat-permission-option')].find(o => o.textContent?.startsWith('Full access')) as HTMLButtonElement;
+    await act(async () => { full.click(); });
+    await typeAndSend();
+    expect(mocks.createProject.mock.calls[0][0]).toMatchObject({ chatTrusted: true, environmentRepos: [{ repo: 'example-org/webapp', branch: 'someones-branch' }] });
+  });
+
+  it("says so and reads the repositories again when the create finds they changed since Full access was given", async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    const pill = document.querySelector('.chat-permission-btn') as HTMLButtonElement;
+    await act(async () => { pill.click(); });
+    const full = [...document.querySelectorAll('.chat-permission-option')].find(o => o.textContent?.startsWith('Full access')) as HTMLButtonElement;
+    await act(async () => { full.click(); });
+    const reads = mocks.resolved.mock.calls.length;
+    mocks.createBox.mockResolvedValue({ claimed: false, instance: { id: 'box-1', name: 'full-stack' } });
+    mocks.createProject.mockRejectedValueOnce({ response: { status: 409, data: { error: "full-stack's repositories changed since you looked; read them again before giving Full access", code: 'environment_repos_changed' } } });
+    const input = document.querySelector('textarea')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(input, 'wire it up');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => { (document.querySelector('button[type="submit"]') as HTMLButtonElement).click(); });
+    await flush();
+    expect(document.body.textContent).toContain('changed since you looked');
+    expect(mocks.resolved.mock.calls.length).toBe(reads + 1);
+  });
+
+  it("lists the checkouts it will clone under the heading before Send, Read only included", async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.resolved.mockResolvedValue({ repos: [{ repo: 'acme/web' }, { repo: 'acme/api', branch: 'next', path: 'backend' }], size: null, warnings: [] });
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    expect(document.querySelector('.chat-permission-btn')?.getAttribute('data-choice')).toBe('read');
+    expect(document.querySelector('.chat-launch-checkouts')?.textContent).toBe('Clones acme/web, acme/api at next in backend');
+  });
+
+  it('asks the server for the size an environment\'s box gets, by its name', async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.search = 'environment=full-stack';
+    mocks.sizes.mockClear();
+    await render();
+    await flush();
+    await vi.waitFor(() => expect(mocks.sizes).toHaveBeenLastCalledWith(null, 'full-stack'));
+  });
+
+  it("holds Send, saying why, when the environment resolves to no repository", async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    mocks.resolved.mockResolvedValueOnce({ repos: [], size: null, warnings: ["full-stack's file names gitlab/x, which is not a GitHub repository"] });
+    mocks.search = 'environment=full-stack';
+    await render();
+    await flush();
+    const input = document.querySelector('textarea')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(input, 'hi');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect((document.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true);
+    expect(document.querySelector('.chat-compose-why')?.textContent).toContain('not a GitHub repository');
+  });
+
+  it("renders an environment's page's New session with the environment, and the space slot, on its first frame (no pop-in)", async () => {
+    // Neither list has answered yet.
+    mocks.environments.mockReturnValue(new Promise(() => {}));
+    mocks.listSpaces.mockReturnValue(new Promise(() => {}));
+    mocks.resolved.mockReturnValueOnce(new Promise(() => {}));
+    mocks.search = 'environment=full-stack';
+    mocks.locationState = { environment: FULL_STACK };
+    await act(async () => { root.render(<NewChat />); });
+    expect(document.querySelector('.chat-launch-environment')?.textContent).toBe('full-stack');
+    expect(document.querySelector('.chat-env-trigger')?.textContent).toContain('full-stack');
+    expect(document.querySelector('.chat-launch-ask')?.textContent).toContain('What are we doing in');
+    // The permission pill holds its place, disabled, while the environment's repositories are read.
+    expect((document.querySelector('button.chat-permission-btn') as HTMLButtonElement | null)?.disabled).toBe(true);
+    expect(document.querySelector('button.chat-permission-btn')?.getAttribute('data-choice')).toBe('read');
+    // The space's trigger holds its place, disabled, until the spaces load.
+    const space = document.querySelector('button.chat-space-trigger') as HTMLButtonElement | null;
+    expect(space).not.toBeNull();
+    expect(space!.disabled).toBe(true);
+  });
+
+  it("renders a renamed environment on its first frame, though this tab read the list under its old name", async () => {
+    mocks.environments.mockResolvedValue([FULL_STACK]);
+    await render();
+    await flush();
+    act(() => root.unmount());
+    root = createRoot(container);
+    // Renamed on its page; the list hasn't been read again yet.
+    const renamed = { ...FULL_STACK, name: 'whole-stack' };
+    mocks.environments.mockReturnValue(new Promise(() => {}));
+    mocks.resolved.mockReturnValueOnce(new Promise(() => {}));
+    mocks.search = 'environment=whole-stack';
+    mocks.locationState = { environment: renamed };
+    await act(async () => { root.render(<NewChat />); });
+    expect(document.querySelector('.chat-launch-environment')?.textContent).toBe('whole-stack');
+  });
+
+  it('offers the environment picker while there are none, on No environment, and leaves the repository picker as it was', async () => {
+    await render();
+    await flush();
+    // Its dialog's New environment is how one gets made from here.
+    expect(document.querySelector('.chat-env-trigger')?.textContent).toBe('No environment');
+    expect(document.querySelector('.chat-launch-environment')).toBeNull();
+    expect(document.querySelector('.chat-launch-ask')?.textContent).not.toContain('What are we doing in');
+  });
+});
 describe('New session as a worktree of a project already on the box', () => {
   const webapp = {
     id: 'p-gon', name: 'webapp', archived: false, instanceId: 'b1', kind: 'normal', role: 'owner',
@@ -1704,7 +1962,6 @@ describe('New session as a worktree of a project already on the box', () => {
   const checkout = () => document.querySelector('.chat-checkout-trigger') as HTMLButtonElement | null;
 
   beforeEach(() => {
-    mocks.flags['chat-existing-box-enabled'] = true;
     mocks.flags['chat-worktree-sessions-enabled'] = true;
   });
 
@@ -1766,7 +2023,7 @@ describe('New session as a worktree of a project already on the box', () => {
     await typeAndSendAll('Fix the flag toggle on Safari please');
     expect(mocks.createProject).not.toHaveBeenCalled();
     expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', {
-      name: 'fix-the-flag-toggle-on', baseRef: 'origin/main', fetch: { remoteBranch: 'main', fullAccess: false },
+      name: 'fix-the-flag-toggle-on', baseRef: 'origin/main', fetch: { remoteBranch: 'main', fullAccess: false }, chatSpace: null,
     });
     expect(localStorage.getItem('termag-chat-queued:p-gon@fix-the-flag-toggle-on')).toBe('Fix the flag toggle on Safari please');
     // The worktree's own chat sends the first message, on the model and effort picked here (the default effort is no entry).
@@ -1784,7 +2041,7 @@ describe('New session as a worktree of a project already on the box', () => {
     expect(pill()?.getAttribute('data-choice')).toBe('full');
     await typeAndSendAll('first try');
     expect(mocks.createWorkstream).toHaveBeenLastCalledWith('p-gon', {
-      name: 'first-try', baseRef: 'origin/main', fetch: { remoteBranch: 'main', fullAccess: true },
+      name: 'first-try', baseRef: 'origin/main', fetch: { remoteBranch: 'main', fullAccess: true }, chatSpace: null,
     });
   });
 
@@ -1797,7 +2054,7 @@ describe('New session as a worktree of a project already on the box', () => {
     expect(JSON.parse(localStorage.getItem('termag-chat-permissions') ?? '{}')['example-org/webapp']).toBe('read');
     await typeAndSendAll('just look');
     expect(mocks.createWorkstream).toHaveBeenLastCalledWith('p-gon', {
-      name: 'just-look', baseRef: 'origin/main', fetch: { remoteBranch: 'main', fullAccess: false },
+      name: 'just-look', baseRef: 'origin/main', fetch: { remoteBranch: 'main', fullAccess: false }, chatSpace: null,
     });
   });
 
@@ -1808,11 +2065,10 @@ describe('New session as a worktree of a project already on the box', () => {
     await chooseWorktree("webapp's checkout");
     expect(pill()?.textContent).toBe('As webapp');
     await typeAndSendAll('off the checkout');
-    expect(mocks.createWorkstream).toHaveBeenLastCalledWith('p-gon', { name: 'off-the-checkout' });
+    expect(mocks.createWorkstream).toHaveBeenLastCalledWith('p-gon', { name: 'off-the-checkout', chatSpace: null });
   });
 
-  it('hands the model and effort picked here to the worktree\'s own chat, with chat-effort-enabled', async () => {
-    mocks.flags['chat-effort-enabled'] = true;
+  it('hands the model and effort picked here to the worktree\'s own chat', async () => {
     localStorage.setItem('termag-chat-last-pick', JSON.stringify({ model: 'opus', effort: 'xhigh' }));
     mocks.createWorkstream.mockImplementation(async (_pid: string, body: { name: string }) => ({ id: 'w-new', name: body.name }));
     await onDevWithWebapp();
@@ -1844,7 +2100,7 @@ describe('New session as a worktree of a project already on the box', () => {
     expect([...document.querySelectorAll('.chat-checkout-base-option')].map(o => o.textContent)).toEqual(['origin/trunk', "webapp's checkout"]);
     await act(async () => { (document.querySelector('.chat-checkout-dialog .chat-launch-dialog-actions button') as HTMLButtonElement).click(); });
     await typeAndSendAll('look at trunk');
-    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'look-at-trunk', baseRef: 'origin/trunk', fetch: { remoteBranch: 'trunk', fullAccess: false } });
+    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'look-at-trunk', baseRef: 'origin/trunk', fetch: { remoteBranch: 'trunk', fullAccess: false }, chatSpace: null });
   });
 
   it('offers only the checkout, and fetches nothing, when no default branch is known', async () => {
@@ -1869,7 +2125,7 @@ describe('New session as a worktree of a project already on the box', () => {
     expect(bases[0].getAttribute('aria-checked')).toBe('true');
     await act(async () => { (document.querySelector('.chat-checkout-dialog .chat-launch-dialog-actions button') as HTMLButtonElement).click(); });
     await typeAndSendAll('look around');
-    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'look-around' });
+    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'look-around', chatSpace: null });
   });
 
   it("counts no extra repository ticks for a worktree: its pick is the one repository's, and it starts one workstream", async () => {
@@ -1898,7 +2154,7 @@ describe('New session as a worktree of a project already on the box', () => {
     expect(pill()?.getAttribute('data-choice')).toBe('full');
     await typeAndSendAll('one repo only');
     expect(mocks.createWorkstream).toHaveBeenLastCalledWith('p-gon', {
-      name: 'one-repo-only', baseRef: 'origin/main', fetch: { remoteBranch: 'main', fullAccess: true },
+      name: 'one-repo-only', baseRef: 'origin/main', fetch: { remoteBranch: 'main', fullAccess: true }, chatSpace: null,
     });
     expect(mocks.createProject).not.toHaveBeenCalled();
   });
@@ -1916,11 +2172,10 @@ describe('New session as a worktree of a project already on the box', () => {
     });
     await act(async () => { (document.querySelector('.chat-launch-dialog-actions button') as HTMLButtonElement).click(); });
     await typeAndSendAll('check the flag toggle');
-    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'check-the-flag-toggle' });
+    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'check-the-flag-toggle', chatSpace: null });
   });
 
   it("starts a worktree session in the space picked, as a clone's chat is (Bugbot)", async () => {
-    mocks.flags['spaces-enabled'] = true;
     mocks.listSpaces.mockResolvedValue({
       spaces: [{ id: '1', name: 'notes', description: null, createdAt: '', usedBytes: 0, quotaBytes: 1, role: 'owner', readOnly: false }],
     });
@@ -1950,7 +2205,7 @@ describe('New session as a worktree of a project already on the box', () => {
     expect(document.querySelector('.chat-launch-dialog .chat-new-error')).toBeNull();
     await act(async () => { (document.querySelector('.chat-launch-dialog-actions button') as HTMLButtonElement).click(); });
     await typeAndSendAll('go');
-    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'fix-the-login' });
+    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'fix-the-login', chatSpace: null });
   });
 
   it("starts from the project's checkout when asked, takes a typed name made unique, and says so when the branch-off fails", async () => {
@@ -1969,7 +2224,7 @@ describe('New session as a worktree of a project already on the box', () => {
     await act(async () => { (document.querySelector('.chat-launch-dialog-actions button') as HTMLButtonElement).click(); });
     await typeAndSendAll('again');
     // Off the checkout, as Branch off… does: no fetch.
-    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'fix-the-flag-2' });
+    expect(mocks.createWorkstream).toHaveBeenCalledWith('p-gon', { name: 'fix-the-flag-2', chatSpace: null });
     expect(document.querySelector('[role="alert"]')?.textContent).toBe('Box agent is not connected');
     expect(mocks.navigate).not.toHaveBeenCalled();
     await act(async () => { (document.querySelector('button[type="submit"]') as HTMLButtonElement).click(); });

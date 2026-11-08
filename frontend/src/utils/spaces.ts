@@ -218,7 +218,42 @@ const ACTIONS: Record<string, string> = {
   'box.remove': 'removed box',
   'space.rename': 'renamed space',
   'space.delete': 'deleted space',
+  // Spaces in Slack; these come with surface 'slack'.
+  'slack.enable': 'turned on Slack for the space',
+  'slack.disable': 'turned off Slack for the space',
+  'slack.channel_link': 'linked a Slack channel',
+  'slack.channel_unlink': 'unlinked a Slack channel',
+  'slack.channel_create': 'created a Slack channel',
+  'slack.channel_pause': 'paused a Slack channel',
+  'slack.pause': 'paused the space in Slack',
+  'slack.resume': 'resumed the space in Slack',
+  'slack.suspend': 'suspended the space in Slack',
+  'slack.ask': 'asked an agent from Slack',
+  'slack.approve': 'approved a Slack request',
+  'slack.deny': 'declined a Slack request',
 };
+
+const SURFACES: Record<string, string> = { slack: 'Slack' };
+
+/**
+ * Who did a space event, as the activity list says it: the actor (and the box
+ * it acted through), then "via Slack" for a Slack-originated event and "for
+ * <name>" when the actor acted for another member. `nameOf` gives a user id's
+ * name, or null when the user is not a member any more.
+ */
+export function eventWho(
+  e: { actorUserId: string | null; actorInstanceId: string | null; surface?: string | null; onBehalfOfUserId?: string | null },
+  nameOf: (userId: string) => string | null,
+  boxName: (instanceId: string) => string | null,
+): string {
+  const person = (e.actorUserId && nameOf(e.actorUserId)) || 'someone';
+  let who = e.actorInstanceId ? `${boxName(e.actorInstanceId) ?? 'a box'} (${person})` : person;
+  if (e.surface) who += ` via ${SURFACES[e.surface] ?? e.surface}`;
+  if (e.onBehalfOfUserId && e.onBehalfOfUserId !== e.actorUserId) {
+    who += `${e.surface ? ',' : ''} for ${nameOf(e.onBehalfOfUserId) ?? 'a former member'}`;
+  }
+  return who;
+}
 
 export function actionLabel(action: string): string {
   return ACTIONS[action] ?? action;

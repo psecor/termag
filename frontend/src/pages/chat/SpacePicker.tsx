@@ -13,6 +13,7 @@ import { SPACE_NAME_HINT } from '../../utils/spaces';
 import { Dialog } from '../../components/Dialog';
 import { Tooltip } from '../../components/Tooltip';
 import { SpaceSwatch } from './SpaceSwatch';
+import { LaunchChoice, LaunchChoiceMark } from './LaunchChoice';
 
 export function SpacePicker({ value, onChange, spaces, error, disabled, menuEpoch = 0, onOpen }: {
   value: SpaceChoice;
@@ -101,41 +102,32 @@ export function SpacePicker({ value, onChange, spaces, error, disabled, menuEpoc
             A space is a shared file store. This session's box can read and write it, and so can a box it starts.
           </p>
           <div className="chat-launch-boxes" role="radiogroup" aria-label="Spaces">
-            <button
-              type="button"
-              role="radio"
-              aria-checked={value.kind === 'none'}
-              className="chat-launch-box chat-space-choice"
+            <LaunchChoice
+              checked={value.kind === 'none'}
+              mark={<SpaceSwatch space={null} />}
+              name="No space"
               onClick={() => commit({ kind: 'none' })}
-            >
-              <span className="chat-launch-box-name"><SpaceSwatch space={null} />No space</span>
-            </button>
+            />
             {options.length > 0 && <div className="chat-menu-heading">Your spaces</div>}
             {options.map(s => (
-              <button
+              <LaunchChoice
                 key={s.id}
-                type="button"
-                role="radio"
-                aria-checked={value.kind === 'existing' && value.name === s.name}
-                className="chat-launch-box chat-space-choice"
+                checked={value.kind === 'existing' && value.name === s.name}
+                mark={<SpaceSwatch space={s.name} />}
+                name={s.name}
+                line={s.description}
                 onClick={() => commit({ kind: 'existing', name: s.name })}
-              >
-                <span className="chat-launch-box-name"><SpaceSwatch space={s.name} />{s.name}</span>
-                {s.description && <small>{s.description}</small>}
-              </button>
+              />
             ))}
             {/* New space and its name are one choice: the name field opens inside it once picked. */}
             <div className="chat-launch-new" data-checked={value.kind === 'new' || undefined}>
-              <button
-                type="button"
-                role="radio"
-                aria-checked={value.kind === 'new'}
-                className="chat-launch-box chat-space-choice"
+              <LaunchChoice
+                checked={value.kind === 'new'}
+                mark={<LaunchChoiceMark kind="new" />}
+                name="New space"
+                line="Made when the session starts"
                 onClick={chooseNew}
-              >
-                <span className="chat-launch-box-name"><span className="chat-space-plus" aria-hidden="true">+</span>New space</span>
-                <small>Made when the session starts</small>
-              </button>
+              />
               {value.kind === 'new' && (
                 <div className="chat-launch-new-name">
                   <label className="chat-new-field chat-launch-new-field">

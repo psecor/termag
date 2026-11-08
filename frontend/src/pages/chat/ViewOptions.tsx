@@ -1,6 +1,6 @@
 // The sidebar's view options under the chrome refresh
 // (chat/sidebarView.ts), beside Search, all
-// LaunchPad: rows Compact or Standard, grouped by Space or Status, and whether
+// LaunchPad: rows Compact or Standard, grouped by Space, Project or Status, and whether
 // files and new tabs, and agents that aren't running, are shown.
 import React from 'react';
 import {
@@ -50,7 +50,7 @@ export function ViewOptions() {
             options={[['compact', 'Compact', 'list'], ['standard', 'Standard', 'layout-stack']]}
             onChange={density => setSidebarView({ density })} />
           <Segment label="Group by" value={view.groupBy}
-            options={[['space', 'Space', 'folders'], ['status', 'Status', 'progress-check']]}
+            options={[['space', 'Space', 'folders'], ['project', 'Project', 'code'], ['status', 'Status', 'progress-check']]}
             onChange={groupBy => setSidebarView({ groupBy })} />
           <Separator className="chat-view-sep" />
           <Switch isSelected={view.showFiles} onChange={showFiles => setSidebarView({ showFiles })} className="chat-view-switch">

@@ -62,6 +62,11 @@ describe('a workstream name from a branch', () => {
     expect(workstreamNameFromBranch('/leading//double/')).toBe('leading-double');
     expect(workstreamNameFromBranch('plain_name')).toBe('plain_name');
   });
+  it('suggests nothing for a name the backend refuses: main, a run name, an ask thread name', () => {
+    expect(workstreamNameFromBranch('main')).toBe('');
+    expect(workstreamNameFromBranch('ask-cmvpvr0by19t1ex4aevd9iv3e')).toBe('');
+    expect(workstreamNameFromBranch('ask/20261020/0900')).toBe('ask-20261020-0900');
+  });
   it('stays a name the backend takes: at most 64 characters, never a trailing dash', () => {
     const long = workstreamNameFromBranch(`skz/${'x'.repeat(59)}/more`);
     expect(long).toHaveLength(63);

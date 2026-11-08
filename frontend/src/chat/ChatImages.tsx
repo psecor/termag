@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { isEdgeSessionExpired } from '../contexts/ConnectionContext';
 import { CHAT_PDF_TYPE, createImageCache, storedImageUrl, type LoadedImage, type PreparedImage } from './chatImageData';
+import { formatFileSize, textFileKind, type BoxFile, type SentBoxFile, type TextFile } from './chatTextFiles';
 import { ImageLightbox } from './ImageLightbox';
 import type { ChatImage } from './sdkChat';
 
@@ -76,14 +77,59 @@ function MessagePdf({ pdf }: { pdf: ChatImage }) {
     : <span className="sdk-file" title={name}><span className="sdk-file-kind">PDF</span><span className="sdk-file-name">{name}</span></span>;
 }
 
-/** The attachments of a user message, above its text: its PDFs, then its images. */
-export function MessageImages({ images: all, projectId, workstream }: { images: ChatImage[]; projectId: string; workstream: string }) {
+type SentTextFile = Pick<TextFile, 'name' | 'text'>;
+
+/**
+ * A text file in a message (chat/chatTextFiles.ts): its name, a download of
+ * its text, which the message itself holds, so it is there from the history too.
+ */
+function MessageTextFile({ file }: { file: SentTextFile }) {
+  const [url, setUrl] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    if (typeof URL.createObjectURL !== 'function') return;
+    const made = URL.createObjectURL(new Blob([file.text], { type: 'text/plain;charset=utf-8' }));
+    setUrl(made);
+    return () => URL.revokeObjectURL(made);
+  }, [file.text]);
+  const title = `${file.name} · ${formatFileSize(new TextEncoder().encode(file.text).length)}`;
+  const inner = <><span className="sdk-file-kind">{textFileKind(file.name)}</span><span className="sdk-file-name">{file.name}</span></>;
+  return url
+    ? <a className="sdk-file" data-text-file="" href={url} download={file.name} title={title}>{inner}</a>
+    : <span className="sdk-file" data-text-file="" title={title}>{inner}</span>;
+}
+
+/** A file the box keeps for a message (chat/chatTextFiles.ts): its name, and where on the box, which this browser can't fetch. */
+function MessageBoxFile({ file }: { file: SentBoxFile }) {
+  return (
+    <span className="sdk-file" data-box-file="" title={`${file.name} · ${file.size} · on the box at ${file.path}`}>
+      <span className="sdk-file-kind">{textFileKind(file.name)}</span><span className="sdk-file-name">{file.name}</span>
+    </span>
+  );
+}
+
+/** A message's text files and box files alone, as chips above its text: for a bubble with no images to show (Not sent). */
+export function MessageTextFiles({ files, boxFiles = [] }: { files: SentTextFile[]; boxFiles?: SentBoxFile[] }) {
+  if (!files.length && !boxFiles.length) return null;
+  return (
+    <div className="sdk-files">
+      {files.map((file, i) => <MessageTextFile key={`${i}:${file.name}`} file={file} />)}
+      {boxFiles.map(file => <MessageBoxFile key={file.path} file={file} />)}
+    </div>
+  );
+}
+
+/** The attachments of a user message, above its text: its PDFs and text files, then its images. */
+export function MessageImages({ images: all, files = [], boxFiles = [], projectId, workstream }: { images: ChatImage[]; files?: SentTextFile[]; boxFiles?: SentBoxFile[]; projectId: string; workstream: string }) {
   const pdfs = all.filter(isPdf);
   const images = all.filter(i => !isPdf(i));
   return (
     <>
-      {pdfs.length > 0 && (
-        <div className="sdk-files">{pdfs.map((pdf, i) => <MessagePdf key={pdf.path ?? i} pdf={pdf} />)}</div>
+      {(pdfs.length > 0 || files.length > 0 || boxFiles.length > 0) && (
+        <div className="sdk-files">
+          {pdfs.map((pdf, i) => <MessagePdf key={pdf.path ?? i} pdf={pdf} />)}
+          {files.map((file, i) => <MessageTextFile key={`${i}:${file.name}`} file={file} />)}
+          {boxFiles.map(file => <MessageBoxFile key={file.path} file={file} />)}
+        </div>
       )}
       {images.length > 0 && <MessageImageList images={images} projectId={projectId} workstream={workstream} />}
     </>
@@ -124,9 +170,9 @@ function MessageImageList({ images, projectId, workstream }: { images: ChatImage
   );
 }
 
-/** The composer's attached images, each with a remove button. */
-export function ComposerImages({ images, onRemove, disabled }: { images: PreparedImage[]; onRemove: (id: string) => void; disabled?: boolean }) {
-  if (!images.length) return null;
+/** The composer's attached images, PDFs and text files, each with a remove button. */
+export function ComposerImages({ images, files = [], boxFiles = [], onRemove, disabled }: { images: PreparedImage[]; files?: TextFile[]; boxFiles?: BoxFile[]; onRemove: (id: string) => void; disabled?: boolean }) {
+  if (!images.length && !files.length && !boxFiles.length) return null;
   return (
     <div className="chat-attachments" aria-label="Attachments">
       {images.map(image => (
@@ -138,6 +184,25 @@ export function ComposerImages({ images, onRemove, disabled }: { images: Prepare
             onClick={() => onRemove(image.id)}>×</button>
         </div>
       ))}
+      {files.map(file => (
+        <div key={file.id} className="chat-attachment" data-file="" data-text-file="" title={`${file.name} · goes in the message as text`}>
+          <span className="sdk-file-kind">{textFileKind(file.name)}</span><span className="chat-attachment-name">{file.name}</span>
+          <button type="button" className="chat-attachment-remove" aria-label={`Remove ${file.name}`} disabled={disabled}
+            onClick={() => onRemove(file.id)}>×</button>
+        </div>
+      ))}
+      {boxFiles.map(file => {
+        // Where it is: on its way, waiting for the box to wake, or there (the message will name its path).
+        const status = file.status === 'kept' ? 'on the box' : file.status === 'waking' ? 'waking the box…' : 'uploading…';
+        return (
+          <div key={file.id} className="chat-attachment" data-file="" data-box-file={file.status} title={`${file.name} · ${typeof file.size === 'number' ? formatFileSize(file.size) : file.size} · ${status}`}>
+            <span className="sdk-file-kind">{textFileKind(file.name)}</span><span className="chat-attachment-name">{file.name}</span>
+            {file.status !== 'kept' && <span className="chat-attachment-status" role="status">{status}</span>}
+            <button type="button" className="chat-attachment-remove" aria-label={`Remove ${file.name}`} disabled={disabled}
+              onClick={() => onRemove(file.id)}>×</button>
+          </div>
+        );
+      })}
     </div>
   );
 }

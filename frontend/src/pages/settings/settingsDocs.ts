@@ -13,6 +13,8 @@ export const SETTINGS_DOCS_ANCHORS = [
   'dotfiles',
   'cli-sign-ins',
   'notifications',
+  'box-notices',
+  'telemetry',
   'appearance',
   'account',
 ] as const;

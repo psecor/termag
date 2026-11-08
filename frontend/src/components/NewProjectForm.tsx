@@ -2,9 +2,12 @@ import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } fro
 import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useProjects } from '../contexts/ProjectContext';
-import { automationsApi, credentialsApi, instancesApi, projectsApi, warmPoolApi, ProjectTemplateInfo, WarmPoolStatus } from '../services/api';
+import { automationsApi, credentialsApi, environmentsApi, instancesApi, projectsApi, warmPoolApi, WarmPoolStatus, type EnvironmentRepoView } from '../services/api';
+import { useEnvironmentPool } from '../hooks/useEnvironmentPool';
+import { poolHasBox, POOL_READY_HINT } from '../utils/environmentPool';
 import { AutomationFields } from './AutomationFields';
 import { draftBody, draftCron, emptyDraft, type AutomationDraft } from '../utils/automationDraft';
+import { isSetupOff } from '../utils/boxSetup';
 import { CONNECT_GITHUB_TO_ADD_BOX, blocksManagedBox, type BoxGateState } from '../boxGate';
 import type { Instance, Project } from '../types';
 import { PROVIDERS, SELECTABLE_PROVIDER_IDS, isSelectableProvider } from '../providers/registry';
@@ -20,9 +23,8 @@ import {
   boxNameTaken,
   projectNameError,
 } from '../utils/newProjectBox';
-import { archivedNameClash, boxIsUsableForProject, funnyProjectName, isBoxFailedRefusal, pickDefaultBox, unusableBoxAdvice, type ArchivedNameClash } from '../utils/projectStart';
-import { nameFromRepo } from '../utils/repoName';
-import { createBody, sameRepoMatches, suggestedName, type RepoPick } from '../utils/repoPick';
+import { archivedNameClash, boxIsUsableForProject, funnyProjectName, isBoxFailedRefusal, unusableBoxAdvice, type ArchivedNameClash } from '../utils/projectStart';
+import { createBody, sameRepoMatches, suggestedName, type CreateRepoBody, type RepoPick } from '../utils/repoPick';
 import { boxIsSettling, claimUpdateLive } from '../utils/boxFeed';
 import { showsBoxError } from '../utils/boxPower';
 import { RepoPicker } from './RepoPicker';
@@ -33,6 +35,9 @@ import { BoxSizeField } from './BoxSizePicker';
 import { BoxDiskField } from './BoxDiskField';
 import { useBoxDiskPick, useBoxSizePick, useBoxSizes } from '../hooks/useBoxSizes';
 import { sizeToSend } from '../utils/boxSize';
+import { useEnvironments } from '../hooks/useEnvironments';
+import { EnvironmentCheckouts } from './EnvironmentCheckouts';
+import { checkoutsPin, visibilityGroups } from '../utils/environments';
 import { diskInputError, diskNote, diskToSend } from '../utils/boxDisk';
 
 /**
@@ -54,8 +59,6 @@ import { diskInputError, diskNote, diskToSend } from '../utils/boxDisk';
  * running (MainLayout does; Welcome starts it itself).
  */
 
-const EMPTY = '__empty__';
-const CUSTOM = '__custom__';
 const NEW_BOX = '__new__';
 const THIS_HOST = '__host__';
 
@@ -132,18 +135,17 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const { user } = useAuth();
   const { projects: contextProjects } = useProjects();
   const isAdmin = user?.role === 'admin';
-  const pickerOn = useFlag(FLAGS.repoFirstPicker, false);
   const multiRepoOn = useFlag(FLAGS.multiRepo, false) && !automation;
   const [extraRepos, setExtraRepos] = useState<ExtraRepo[]>([]);
   const [fetchedProjects, setFetchedProjects] = useState<Project[] | null>(null);
   useEffect(() => {
-    if (!pickerOn || contextProjects.length > 0) return;
+    if (contextProjects.length > 0) return;
     let cancelled = false;
     projectsApi.list()
       .then(list => { if (!cancelled) setFetchedProjects(list); })
       .catch(() => { if (!cancelled) setFetchedProjects([]); });
     return () => { cancelled = true; };
-  }, [pickerOn, contextProjects.length]);
+  }, [contextProjects.length]);
   const projects = contextProjects.length > 0 ? contextProjects : (fetchedProjects ?? []);
   const pickerNoted = useRef(false);
   // Set when the user picks a box, or when this submit has created one, so a
@@ -152,38 +154,41 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const boxChoiceTouched = useRef(false);
   const advancedRef = useRef<HTMLDetailsElement>(null);
   useEffect(() => {
-    if (!pickerOn || pickerNoted.current) return;
+    if (pickerNoted.current) return;
     pickerNoted.current = true;
     notePickerMounted();
-  }, [pickerOn]);
+  }, []);
 
   // ── Start from ──────────────────────────────────────────────────────────
-  const [templates, setTemplates] = useState<ProjectTemplateInfo[]>([]);
-  const [start, setStart] = useState<string>(EMPTY);
-  const [customUrl, setCustomUrl] = useState('');
   const [pickerPick, setPickerPick] = useState<RepoPick>(EMPTY_PICK);
   // Listed repositories ticked after the pick: with multi-repo-projects-enabled
   // the list is a multi-select, and two or more make a multi-repo project.
   const [pickerMore, setPickerMore] = useState<ListedPick[]>([]);
-  const multiSelect = multiRepoOn && pickerOn;
+  const multiSelect = multiRepoOn;
   const more = multiSelect ? pickerMore : [];
   const [name, setName] = useState('');
   const [nameTouched, setNameTouched] = useState(false);
+  const pick = pickerPick;
+  // An environment names the repositories itself: picked, the
+  // repository fields give way, and the project and its new box are made from it.
+  const environments = useEnvironments(!automation);
+  const [environmentName, setEnvironmentName] = useState('');
+  const environment = environments.find(e => e.name === environmentName) ?? null;
+  // Its checkouts now (a pointer's file is read on the server), each repository at its branch: listed under the
+  // field before Create, and the create is held to them, since an ask of the project runs them without asking.
+  // Read again after a 409 environment_repos_changed; a failed read holds Create, saying so, and sends nothing.
+  const [checkouts, setCheckouts] = useState<{ id: string; repos: EnvironmentRepoView[]; error?: string } | null>(null);
+  const [checkoutReads, setCheckoutReads] = useState(0);
   useEffect(() => {
-    if (pickerOn) return;
-    projectsApi.templates().then(setTemplates).catch(() => {});
-  }, [pickerOn]);
-  const legacyRepoUrl = useMemo(() => {
-    if (start === EMPTY) return '';
-    if (start === CUSTOM) return customUrl.trim();
-    return templates.find(t => t.id === start)?.repoUrl ?? '';
-  }, [start, customUrl, templates]);
-  const legacyPick = useMemo((): RepoPick => {
-    if (start === EMPTY) return EMPTY_PICK;
-    if (start === CUSTOM) return { kind: 'pasted', url: customUrl };
-    return { kind: 'starter', templateId: start, url: legacyRepoUrl };
-  }, [start, customUrl, legacyRepoUrl]);
-  const pick = pickerOn ? pickerPick : legacyPick;
+    if (!environment) return;
+    let cancelled = false;
+    environmentsApi.resolved(environment.id)
+      .then(r => { if (!cancelled) setCheckouts({ id: environment.id, repos: r.repos, ...(r.repos.length ? {} : { error: r.warnings.join('; ') || `${environment.name} names no repository` }) }); })
+      .catch(() => { if (!cancelled) setCheckouts({ id: environment.id, repos: [], error: `Could not read ${environment.name}'s repositories; pick it again to retry` }); });
+    return () => { cancelled = true; };
+  }, [environment?.id, checkoutReads]);
+  const shownCheckouts = environment && checkouts?.id === environment.id ? checkouts : null;
+  const environmentRepos = shownCheckouts && !shownCheckouts.error ? checkoutsPin(shownCheckouts.repos) : null;
   function choosePick(next: RepoPick) {
     if (pickIdentity(pickerPick) !== pickIdentity(next)) setNameTouched(false);
     setPickerPick(next.kind === 'empty' ? EMPTY_PICK : next);
@@ -202,14 +207,14 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   // one each time the start-from choice changes back to empty).
   useEffect(() => {
     if (nameTouched) return;
-    if (!pickerOn) {
-      setName(legacyRepoUrl ? nameFromRepo(legacyRepoUrl) : funnyProjectName());
+    if (environment) {
+      setName(environment.name);
       return;
     }
     const suggested = suggestedName(pickerPick);
     if (suggested) setName(suggested);
     else if (pickerPick.kind === 'empty') setName(funnyProjectName());
-  }, [nameTouched, pickerOn, legacyRepoUrl, pickerPick]);
+  }, [nameTouched, pickerPick, environment]);
 
   // ── Agent ───────────────────────────────────────────────────────────────
   // A stored default that is no longer selectable (codex) must not leak into
@@ -248,8 +253,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const usable = useMemo(() => boxes.filter(boxIsUsableForProject), [boxes]);
   // Until the user picks, the box of the project the user is on is the
   // default when Create can go on it now, so a new project skips a box's
-  // setup time. Otherwise the picker path starts a new box and the flag-off
-  // form prefers a ready box, keeping that choice across reloads. An
+  // setup time. Otherwise the form starts a new box. An
   // initialBoxId (Pick a repository) is an explicit box and wins over all of
   // these.
   const [boxChoice, setBoxChoice] = useState<string | null>(null);
@@ -273,12 +277,8 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
       setBoxChoice(defaultBoxId!);
       return;
     }
-    if (pickerOn) {
-      setBoxChoice(NEW_BOX);
-      return;
-    }
-    setBoxChoice(prev => prev ?? (pickDefaultBox(usable)?.id ?? NEW_BOX));
-  }, [boxesLoaded, feedLoaded, usable, boxes, initialBoxId, defaultBoxId, pickerOn]);
+    setBoxChoice(NEW_BOX);
+  }, [boxesLoaded, feedLoaded, boxes, initialBoxId, defaultBoxId]);
   const choice = boxChoice ?? '';
   const chosenBox = boxes.find(b => b.id === choice) ?? null;
   const boxReady = choice === THIS_HOST || chosenBox?.status === 'ready';
@@ -290,13 +290,12 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   );
   const boxAdvice = chosenBox ? unusableBoxAdvice(chosenBox, waitingOnBox.length) : null;
 
-  // null follows the default: the project name on the picker path, else
-  // "<unix user>-box". A string, including "", is what the user typed.
+  // null follows the default, the project name. A string, including "", is
+  // what the user typed.
   const [boxNameOverride, setBoxNameOverride] = useState<string | null>(null);
-  const legacyBoxName = user ? `${user.unixUsername}-box` : '';
   const newBoxName = boxNameOverride !== null
     ? boxNameOverride
-    : (pickerOn ? boxNameFromProject(name) : legacyBoxName);
+    : boxNameFromProject(name);
   const nameError = projectNameError(name);
   // An illegal box name clears as the user types. API failures are boxError
   // and must not keep Create disabled on their own.
@@ -304,9 +303,9 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   const takenBox = choice === NEW_BOX ? boxNameTaken(newBoxName, boxes) : undefined;
   const conflictError = takenBox ? boxNameConflictMessage(newBoxName.trim()) : '';
   useEffect(() => {
-    if (!pickerOn || (!conflictError && !nameError)) return;
+    if (!conflictError && !nameError) return;
     if (advancedRef.current && !advancedRef.current.open) advancedRef.current.open = true;
-  }, [pickerOn, conflictError, nameError]);
+  }, [conflictError, nameError]);
   const [boxBusy, setBoxBusy] = useState(false);
   const [boxError, setBoxError] = useState('');
   const [boxHint, setBoxHint] = useState('');
@@ -320,35 +319,37 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   }, []);
   const addBoxBlocked = blocksManagedBox(boxGate);
 
-  const warmPoolEnabled = useFlag(FLAGS.warmPool, false);
   // The new box's size: the dropdown shows only while box-default-size is on, preselecting what the
   // server says a box for the picked repository launches at (its .termag/environment.json, utils/boxSize.ts).
   // A multi-repo project's box is sized for every repository (the server takes the largest), else the one.
-  const sizeRepos = (multiRepoOn ? selectionRepos({ pick, more }, extraRepos) : null)?.map(r => r.url) ?? createBody(pick)?.repoUrl;
-  const { sizes: boxSizes, disk: boxDisk } = useBoxSizes(choice === NEW_BOX, sizeRepos);
-  const [boxSize, setBoxSize] = useBoxSizePick(sizeRepos);
+  // An environment's box is sized by its one file instead (the server reads it).
+  const sizeRepos = environment ? null : (multiRepoOn ? selectionRepos({ pick, more }, extraRepos) : null)?.map(r => r.url) ?? createBody(pick)?.repoUrl;
+  const { sizes: boxSizes, disk: boxDisk } = useBoxSizes(choice === NEW_BOX, sizeRepos, environment?.name);
+  const [boxSize, setBoxSize] = useBoxSizePick(sizeRepos, environment?.name);
   // The new box's disk: what the person typed, else the repository's diskGiB or 120 (utils/boxDisk.ts).
-  const [diskTyped, setDiskTyped] = useBoxDiskPick(sizeRepos);
+  const [diskTyped, setDiskTyped] = useBoxDiskPick(sizeRepos, environment?.name);
   const diskError = choice === NEW_BOX ? diskInputError(boxDisk, diskTyped) : null;
+  const environmentPool = useEnvironmentPool(choice === NEW_BOX && environment?.visibility === 'shared' ? environment.id : null);
   const [warmPool, setWarmPool] = useState<WarmPoolStatus | null>(null);
   useEffect(() => {
-    if (!warmPoolEnabled || choice !== NEW_BOX) return;
+    if (choice !== NEW_BOX) return;
     let cancelled = false;
     warmPoolApi.get().then(p => { if (!cancelled) setWarmPool(p); }).catch(() => {});
     return () => { cancelled = true; };
-  }, [warmPoolEnabled, choice]);
+  }, [choice]);
 
   /** The new box, or null with the reason shown. */
   // Whether the box this submit created came from the warm pool, for the
   // project.created event's warmClaimed (backend services/productEvents.ts).
   const lastBoxClaimed = useRef<boolean | null>(null);
 
-  async function createBox(boxName = newBoxName.trim()): Promise<Instance | null> {
+  // setupOff: a Try again of a failed box with termag setup off relaunches it so.
+  async function createBox(boxName = newBoxName.trim(), setupOff = false): Promise<Instance | null> {
     if (!boxName || boxBusy || boxNameError || addBoxBlocked) return null;
     setBoxBusy(true); setBoxError(''); setBoxHint('');
     noteAddBoxClick();
     try {
-      const r = await instancesApi.create(boxName, 'ec2', { size: sizeToSend(boxSizes, boxSize), diskGiB: diskToSend(boxDisk, diskTyped), repo: sizeRepos });
+      const r = await instancesApi.create(boxName, 'ec2', { size: sizeToSend(boxSizes, boxSize), diskGiB: diskToSend(boxDisk, diskTyped), repo: sizeRepos, environment: environment?.name, ...(setupOff ? { setupEnabled: false } : {}) });
       // Into the list now, ahead of the feed's next poll: a claimed box is
       // already ready and the form should say so at once; a provisioning one
       // starts the feed polling.
@@ -360,7 +361,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
       boxChoiceTouched.current = true;
       setBoxChoice(r.instance.id);
       if (r.hint) setBoxHint(r.hint);
-      if (r.claimed) setBoxHint('A warm box was waiting, so it is ready now.');
+      if (r.claimed) setBoxHint(r.pool === 'environment' ? `A box with ${environment?.name ?? 'the environment'}'s setup already run was waiting; it is starting now.` : 'A warm box was waiting, so it is ready now.');
       // A list fetch that was in flight when the box was created (the mount
       // reload, a poll) would replace the list without it; fetch again so the
       // row is authoritative, not just painted.
@@ -380,14 +381,15 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
   // ── Submit ──────────────────────────────────────────────────────────────
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const body = createBody(pick);
-  const workspaceRepos = multiRepoOn ? selectionRepos({ pick, more }, extraRepos) : null;
+  const body: CreateRepoBody | null = environment ? { repoUrl: null } : createBody(pick);
+  const workspaceRepos = !environment && multiRepoOn ? selectionRepos({ pick, more }, extraRepos) : null;
   const newBoxOk = choice === NEW_BOX && !!newBoxName.trim() && !boxNameError && !diskError && !addBoxBlocked && !conflictError && !nameError;
   const retryOk = boxAdvice === 'try-again' && !addBoxBlocked;
   const automationOk = !automation || (!!draft.prompt.trim() && draftCron(draft) !== null && !!draft.timezone && (draft.tier !== 'full' || fullTierTicked));
   // An automation runs on a box (the chat runner needs one): "this host" is not offered.
-  const canSubmit = !busy && !nameError && (boxReady || boxBooting || newBoxOk || retryOk) && !!name.trim() && body !== null && automationOk && !(automation && choice === THIS_HOST);
-  const matches = !choice || choice === NEW_BOX || workspaceRepos
+  const canSubmit = !busy && !nameError && (boxReady || boxBooting || newBoxOk || retryOk) && !!name.trim() && body !== null && automationOk && !(automation && choice === THIS_HOST)
+    && (!environment || environmentRepos !== null);
+  const matches = !choice || choice === NEW_BOX || workspaceRepos || environment
     ? []
     : sameRepoMatches(pick, projects, choice === THIS_HOST ? null : choice);
 
@@ -412,12 +414,12 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
       // it rather than on a second new box; a failed one is launched again
       // under its own name.
       lastBoxClaimed.current = null;
-      const box = await createBox(choice === NEW_BOX ? undefined : chosenBox?.name);
+      const box = choice === NEW_BOX ? await createBox() : await createBox(chosenBox?.name, isSetupOff(chosenBox));
       if (!box) { setBusy(false); return; }
       instanceId = box.id;
       warmClaimed = lastBoxClaimed.current ?? undefined;
     }
-    if (pickerOn && instanceId) notePickerSubmitted(instanceId);
+    if (instanceId) notePickerSubmitted(instanceId);
     let project: Project;
     try {
       if (automation) {
@@ -440,7 +442,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
           replaySessionId: await replaySessionId(),
           ...(warmClaimed !== undefined && { warmClaimed }),
           ...(archivedName && { archivedName }),
-          ...(workspaceRepos ? { repos: workspaceRepos } : body),
+          ...(environment ? { environment: environment.name, environmentRepos: environmentRepos ?? [] } : workspaceRepos ? { repos: workspaceRepos } : body),
         });
       }
     } catch (err) {
@@ -453,6 +455,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
         await boxFeed.reload();
       } else {
         setError(apiError(err, 'Could not create the project'));
+        if ((err as { response?: { data?: { code?: string } } })?.response?.data?.code === 'environment_repos_changed') setCheckoutReads(n => n + 1);
       }
       setBusy(false);
       return;
@@ -470,27 +473,26 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
 
   return (
     <form className="npf" onSubmit={e => void submit(e)}>
-      {pickerOn ? (
-        <RepoPicker value={pickerPick} onChange={choosePick} autoFocus={autoFocus} showPaste={false} more={more} onToggle={multiSelect ? toggleListed : undefined} />
-      ) : (
-        <>
-          <div className="npf-field">
-            <label htmlFor="npf-start">Start from</label>
-            <select id="npf-start" value={start} autoFocus={autoFocus} onChange={e => { setStart(e.target.value); setNameTouched(false); }}>
-              <option value={EMPTY}>empty: a fresh directory with AGENTS.md and CLAUDE.md</option>
-              {templates.map(t => <option key={t.id} value={t.id}>{t.label}: {t.blurb}</option>)}
-              <option value={CUSTOM}>custom: a GitHub repo URL</option>
-            </select>
-          </div>
-          {start === CUSTOM && (
-            <div className="npf-field">
-              <label htmlFor="npf-url">Repository URL</label>
-              <input id="npf-url" value={customUrl} onChange={e => setCustomUrl(e.target.value)} placeholder="https://github.com/owner/repo" />
-            </div>
-          )}
-        </>
+      {environments.length > 0 && (
+        <div className="npf-field">
+          <label htmlFor="npf-environment">Environment</label>
+          <select id="npf-environment" value={environmentName} onChange={e => { setEnvironmentName(e.target.value); setNameTouched(false); }}>
+            <option value="">None</option>
+            {/* Personal first, then shared. */}
+            {visibilityGroups(environments).map(g => (
+              <optgroup key={g.visibility} label={g.label}>
+                {g.items.map(e => <option key={e.id} value={e.name}>{e.name}</option>)}
+              </optgroup>
+            ))}
+          </select>
+          {shownCheckouts?.error ? <div className="error-text">{shownCheckouts.error}</div>
+            : shownCheckouts ? <EnvironmentCheckouts repos={shownCheckouts.repos} className="usage-dim npf-checkouts" /> : null}
+        </div>
       )}
-      {multiRepoOn && (
+      {!environment && (
+        <RepoPicker value={pickerPick} onChange={choosePick} autoFocus={autoFocus} showPaste={false} more={more} onToggle={multiSelect ? toggleListed : undefined} />
+      )}
+      {multiRepoOn && !environment && (
         <ExtraReposField value={extraRepos} onChange={setExtraRepos} primaryCount={body?.repoUrl ? 1 + more.length : 0} />
       )}
       {(() => {
@@ -500,7 +502,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
               <label htmlFor="npf-name">Project name</label>
               <input id="npf-name" value={name} onChange={e => { setName(e.target.value); setNameTouched(true); }} placeholder="letters, digits, - and _" />
             </div>
-            {pickerOn && (
+            {!environment && (
               <div className="npf-field">
                 <label htmlFor="npf-paste">Paste a URL</label>
                 <input
@@ -553,7 +555,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
             </div>
             {choice === NEW_BOX && (
               <div className="npf-field npf-inline">
-                <label htmlFor="npf-box-name">{pickerOn ? 'Box name' : 'New box name'}</label>
+                <label htmlFor="npf-box-name">Box name</label>
                 <input
                   id="npf-box-name"
                   value={newBoxName}
@@ -561,25 +563,28 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
                   placeholder="e.g. dev01"
                   disabled={boxBusy}
                 />
-                {warmPoolEnabled && warmPool && (
-                  <span className="npf-note usage-dim">{warmPool.warm > 0 && !diskNote(boxDisk, diskTyped, true) ? 'ready now' : 'a few minutes'}</span>
-                )}
+                {/* A pooled environment's box starts a stopped one with its setup already run. */}
+                {poolHasBox(environmentPool) && !diskNote(boxDisk, diskTyped, true)
+                  ? <span className="npf-note usage-dim">{POOL_READY_HINT}</span>
+                  : warmPool && (
+                    <span className="npf-note usage-dim">{warmPool.warm > 0 && !diskNote(boxDisk, diskTyped, true) ? 'ready now' : 'a few minutes'}</span>
+                  )}
               </div>
             )}
             {choice === NEW_BOX && boxSizes && (
               <BoxSizeField options={boxSizes} picked={boxSize} onPick={setBoxSize} disabled={boxBusy} />
             )}
             {choice === NEW_BOX && boxDisk && (
-              <BoxDiskField disk={boxDisk} typed={diskTyped} onType={setDiskTyped} warmBoxReady={warmPoolEnabled && (warmPool?.warm ?? 0) > 0} disabled={boxBusy} />
+              <BoxDiskField disk={boxDisk} typed={diskTyped} onType={setDiskTyped} warmBoxReady={(warmPool?.warm ?? 0) > 0} disabled={boxBusy} />
             )}
           </>
         );
-        return pickerOn ? (
+        return (
           <details className="npf-advanced" ref={advancedRef}>
             <summary>Advanced settings</summary>
             <div className="npf-advanced-body">{choices}</div>
           </details>
-        ) : choices;
+        );
       })()}
       {choice === NEW_BOX && addBoxBlocked && (
         <div className="error-text">
@@ -628,7 +633,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
       {(nameError || conflictError || boxNameError || boxError) && (
         <div className="error-text">
           {nameError || conflictError || boxNameError || boxError}
-          {pickerOn && conflictError && !nameError && ' Choose that box, or another box name, in Advanced settings.'}
+          {conflictError && !nameError && ' Choose that box, or another box name, in Advanced settings.'}
         </div>
       )}
 
@@ -639,7 +644,7 @@ export function NewProjectForm({ onCreated, submitLabel = 'Create project', acti
         </div>
       ))}
       {automation && <AutomationFields draft={draft} onChange={setDraft} showEnabled idPrefix="npf-af" onFullTierTick={setFullTierTicked} />}
-      {!quiet && <div className="usage-dim npf-note">
+      {!quiet && !environment && <div className="usage-dim npf-note">
         {automation
           ? <>Each run gets its own branch under this project and shows up as a conversation in termag. Nothing runs until the schedule's first occurrence; use Run now on the automation to try it.</>
           : workspaceRepos

@@ -5,10 +5,13 @@ import type { OrgAccess } from '../pages/settings/githubOrgCopy';
 import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance, InstanceKind, BoxLifecycle, AutoTerminatedBox, Workstream, CloudSession, CloudSessionEvent, HandoffMode } from '../types';
 import type { BoxGateState } from '../boxGate';
 import type { WorkspaceRepoInput } from '../utils/multiRepo';
+import type { ProjectRepoView } from '../utils/projectRepos';
 import type { BoxSize, BoxSizeOptions } from '../utils/boxSize';
-import type { BoxResizeInfo, ResizeView } from '../utils/boxResize';
+import { projectKindTraits, type ProjectKind } from '../utils/projectKind';
+import type { BoxResizeInfo, GrowView, ResizeView } from '../utils/boxResize';
 import { chatModelWire, type ChatEffortWire, type ChatModelId } from '../chat/composer';
 import type { ChatAskThread } from '../chat/asks';
+import type { PaneSubagentsAnswer } from '../chat/paneSubagents';
 import { sendClientHeader } from '../buildInfo';
 
 const api = axios.create({
@@ -46,12 +49,17 @@ export interface PreferencesPatch {
   pushMutesChat?: boolean;
   /** Notify when a chat finishes its turn. */
   chatTurnNotify?: boolean;
+  /** Settings > Telemetry: chat session titles in termag's telemetry (docs/agents/observability.md, session.titled). */
+  telemetryTitles?: boolean;
+  /** Settings > Box notices: Slack DMs before and after termag stops a box on its own. */
+  boxIdleNotify?: boolean;
   /** Where later visits open; refused while onboarding-refresh-enabled is off. */
   uiMode?: 'simple' | 'full' | null;
 }
 
 export const authApi = {
-  me: (): Promise<User> => api.get('/auth/me').then(r => r.data),
+  // Sign-in sends this browser's zone (viewerTimeZone), kept as User.timeZone: working time's day, the tool sweep's night.
+  me: (): Promise<User> => api.get('/auth/me', { params: { tz: viewerTimeZone() } }).then(r => r.data),
   logout: () => api.post('/auth/logout').then(r => r.data),
   updatePreferences: (data: PreferencesPatch): Promise<User> =>
     api.put('/auth/me/preferences', data).then(r => r.data),
@@ -90,7 +98,8 @@ export const featureFlagsApi = {
 export interface ProjectTemplateInfo { id: string; label: string; repoUrl: string; blurb: string }
 
 export const projectsApi = {
-  list: (): Promise<Project[]> => api.get('/api/projects').then(r => r.data),
+  // A space orchestrator's project is never listed (utils/projectKind.ts); the backend leaves it out too.
+  list: (): Promise<Project[]> => api.get('/api/projects').then(r => (r.data as Project[]).filter(p => projectKindTraits(p.kind).inProjectLists)),
   create: (data: {
     name: string;
     description?: string;
@@ -106,6 +115,10 @@ export const projectsApi = {
     chatTrusted?: boolean;
     /** Several repositories in one project (multi-repo-projects-enabled); replaces repoUrl/defaultBranch. */
     repos?: WorkspaceRepoInput[];
+    /** An environment's name: the project holds its repositories; replaces repoUrl, defaultBranch and repos. */
+    environment?: string | null;
+    /** With environment, required: the checkouts it was read as (and any Full access granted for), each repository at its branch; a 409 environment_repos_changed when it now resolves to others. */
+    environmentRepos?: Array<{ repo: string; branch?: string }>;
     /** Simple-UI chat: opus, sonnet, haiku, or null for Claude's default. */
     claudeModel?: 'opus' | 'sonnet' | 'haiku' | null;
     /** New session's "Act as an orchestrator" (backend: kept only with chatTrusted). */
@@ -138,6 +151,12 @@ export const projectsApi = {
     api.post(`/api/projects/${id}/clone/retry`).then(r => r.data),
   startEmpty: (id: string): Promise<Project> =>
     api.post(`/api/projects/${id}/clone/start-empty`).then(r => r.data),
+  /** A multi-repo project's repositories (backend routes/projectRepos.ts). */
+  repos: (id: string): Promise<{ repos: ProjectRepoView[] }> =>
+    api.get(`/api/projects/${id}/repos`).then(r => r.data),
+  /** Clones it beside the running sessions, then adds a worktree of it to each workstream. */
+  addRepo: (id: string, repo: { url: string; name?: string }): Promise<{ repo: ProjectRepoView }> =>
+    api.post(`/api/projects/${id}/repos`, repo).then(r => r.data),
 };
 
 export interface ModelChoice { id: string; label: string; context?: number }
@@ -193,6 +212,9 @@ export const workstreamsApi = {
   /** Rename the worktree dir + tmux sessions + row; the git branch is left alone. */
   rename: (projectId: string, workstreamId: string, name: string): Promise<Workstream> =>
     api.post(`/api/projects/${projectId}/workstreams/${workstreamId}/rename`, { name }).then(r => r.data),
+  /** Archive a session from a space's Files, or bring it back (chat-nested-agents-enabled): only Files' list changes. */
+  explorerArchive: (projectId: string, workstreamId: string, archived: boolean): Promise<{ id: string; explorerArchivedAt: string | null }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/workstreams/${encodeURIComponent(workstreamId)}/explorer-archive`, { archived }).then(r => r.data),
   /**
    * The files the session's checkout has changed that its upstream lacks (backend
    * routes/workstreamChanges.ts); `branch`, the session's PR head, reads the worktree on it.
@@ -284,6 +306,8 @@ export interface InstanceTerminateConflict {
 export interface InstanceCreated {
   instance: Instance;
   claimed?: boolean;    // true when create() took a warm box already ready
+  /** `environment` when the box came from an environment pool (backend services/envPoolClaim.ts): a stopped box with its setup run, starting now. */
+  pool?: 'environment';
   token?: string;       // present for external (and the legacy no-AWS ec2 path)
   agentWsUrl?: string;  // present for external — the wss://…/ws/agent URL
   hint?: string;
@@ -299,18 +323,23 @@ export const instancesApi = {
   // default; repo: the repository the box is made for, for its default size.
   // repo: one repository, or a multi-repo project's list, whose largest .termag/environment.json size the box takes.
   // diskGiB: what the New box disk field had typed (utils/boxDisk.ts), absent for the repo's or the default.
-  create: (name: string, kind: InstanceKind = 'ec2', opts: { size?: BoxSize; diskGiB?: number; repo?: string | readonly string[] | null } = {}): Promise<InstanceCreated> =>
+  // setupEnabled: false only to relaunch a failed box that had termag setup off:
+  // the UI has no control for it, and never sends useRepoSetup, so a repository's setting doesn't apply here.
+  // environment: an environment's name: its one file sizes the box instead of repo's.
+  create: (name: string, kind: InstanceKind = 'ec2', opts: { size?: BoxSize; diskGiB?: number; repo?: string | readonly string[] | null; setupEnabled?: boolean; environment?: string | null } = {}): Promise<InstanceCreated> =>
     api.post('/api/instances', {
       name, kind,
       ...(opts.size ? { size: opts.size } : {}),
       ...(opts.diskGiB !== undefined ? { diskGiB: opts.diskGiB } : {}),
       ...(opts.repo?.length ? { repo: opts.repo } : {}),
+      ...(opts.environment ? { environment: opts.environment } : {}),
+      ...(opts.setupEnabled === false ? { setupEnabled: false } : {}),
     }).then(r => r.data),
-  // repo: what the box is made for (one, or a list sent as repeated ?repo=), so the answer says what it is sized at.
-  sizes: (repo?: string | readonly string[] | null): Promise<BoxSizeOptions> => {
+  // repo: what the box is made for (one, or a list sent as repeated ?repo=), so the answer says what it is sized at; environment: or that environment's file.
+  sizes: (repo?: string | readonly string[] | null, environment?: string | null): Promise<BoxSizeOptions> => {
     const repos = repo == null ? [] : typeof repo === 'string' ? [repo] : [...repo];
-    const query = repos.length ? `?${repos.map(r => `repo=${encodeURIComponent(r)}`).join('&')}` : '';
-    return api.get(`/api/instances/sizes${query}`).then(r => r.data);
+    const params = [...repos.map(r => `repo=${encodeURIComponent(r)}`), ...(environment ? [`environment=${encodeURIComponent(environment)}`] : [])];
+    return api.get(`/api/instances/sizes${params.length ? `?${params.join('&')}` : ''}`).then(r => r.data);
   },
   terminate: (id: string, confirmed = false) =>
     api.delete(`/api/instances/${id}`, { data: { confirmed } }).then(r => r.data),
@@ -331,6 +360,11 @@ export const instancesApi = {
     api.get(`/api/instances/${id}/resize`).then(r => r.data),
   resize: (id: string, size: BoxSize, force = false): Promise<{ resize: ResizeView }> =>
     api.post(`/api/instances/${id}/resize`, force ? { size, force } : { size }).then(r => r.data),
+  // Grow the box's disk (backend services/boxDisk.ts), with the box up: 202 with the grow as it starts;
+  // 409 disk_cooldown inside EBS's six hours, 400 invalid_disk for a shrink or past the cap.
+  // 200 with `alreadyGb` and `grow: null` when the disk already has that size and there is nothing to finish.
+  growDisk: (id: string, sizeGb: number): Promise<{ grow: GrowView | null; alreadyGb?: number }> =>
+    api.post(`/api/instances/${id}/disk`, { sizeGb }).then(r => r.data),
   // A missing key leaves that setting alone; null turns it off.
   setLifecycle: (
     id: string,
@@ -630,7 +664,7 @@ export interface RecentRow {
   access: 'owner' | 'collaborator';
   instanceId: string | null;
   archived: boolean;
-  kind?: 'normal' | 'metaterm' | 'automation';
+  kind?: ProjectKind;
   color?: string | null;
   lastVisitedAt: string;
   status: 'working' | 'waiting' | 'idle' | 'not_running';
@@ -755,7 +789,10 @@ export interface SessionRow {
 export interface PaneSearchMatch { line: number; text: string; before: string[]; after: string[] }
 export interface PaneSearchHit {
   projectId: string; projectName: string; owner: string; access: string;
-  workstream: string; role: string; session: string; status: string;
+  workstream: string; role: string; session: string;
+  /** The pane's slot within its role (backend services/sessionInventory.ts): a review slot, or a terminal slot past the ctrl pane. */
+  slot?: number;
+  status: string;
   matchCount: number; matches: PaneSearchMatch[];
 }
 export interface PaneSearchResult {
@@ -771,12 +808,14 @@ export interface ChatHistory {
   sessionId: string | null;
   /** A turn is running on the box now; its events arrive on the status socket. */
   running: boolean;
+  /** The box left older entries out (agent chat-history-pages-v1): chatApi.earlier pages them in. */
+  more?: boolean;
   /** The box's answer for each run of tool calls' heading, by run key: Haiku's heading, or that it failed after `calls` calls (agent/tool-group-headings.js); absent from an older box. */
   headings?: Record<string, { heading: string } | { failed: true; calls?: number }>;
   queued: number;
   /** A message sent while a turn runs goes into that turn (agent chat-live-v1); else it waits for the turn to end. */
   liveInput?: boolean;
-  /** A message this viewer sends can go into a live turn (their chat-live-input-enabled, an agent with chat-live-v1). */
+  /** A message this viewer sends can go into a live turn (an agent with chat-live-v1). */
   sendsLive?: boolean;
   /** The box's agent can stop only a live turn's current work (chat-interrupt-v1). */
   stopsTurn?: boolean;
@@ -784,14 +823,20 @@ export interface ChatHistory {
   contextActions?: 'ready' | 'update';
   /** What this chat can never do, and why (another engine, or another backend for Compact). */
   contextRefusals?: Partial<Record<'clear' | 'compact' | 'resume', string>>;
-  /** This viewer's composer offers images (their chat-image-input-enabled, an agent with chat-images-v1). */
+  /** This viewer's composer offers images (an agent with chat-images-v1). */
   imageInput?: boolean;
   /** It offers PDFs as well (an agent with chat-pdfs-v1). */
   pdfInput?: boolean;
+  /** It offers any other file, kept on the box (chat-file-attachments-enabled, an agent with chat-files-v1; backend services/chatFiles.ts). */
+  fileInput?: boolean;
+  /** Why not, where the flag is on but this box or chat can't. */
+  fileRefusal?: string;
   /** Whether the model menu offers an effort for this chat (backend services/chatEffort.ts). */
   effortInput?: boolean;
   /** The box holds queued messages from before its agent restarted, waiting for this (live) chat to resume them. */
   parked?: boolean;
+  /** The messages waiting behind the running turn, oldest first, shown as queued bubbles; absent from an older agent. */
+  waiting?: Array<{ text: string; images?: unknown[] }>;
   /** A repo chat's checkout is there; its first turn waits for it (a pane clone finishes after setup). */
   checkoutReady: boolean;
   /** The runner's record of each turn (cost, duration), oldest first; absent from an older agent. */
@@ -831,8 +876,12 @@ export interface ChatContinuation {
   phase?: 'starting-box' | 'restoring' | 'starting';
   /** A stored chat's send is taken (held while its box comes back), so a message queued before the history came goes out. */
   takesSends?: boolean;
-  /** Messages waiting for the chat to take them, oldest first; one the chat refused keeps its error. */
-  held?: Array<{ id: string; text: string; error: string | null }>;
+  /**
+   * Messages waiting for the chat to take them, oldest first, on the orchestrator: every tab shows them.
+   * One the chat refused keeps its error until its sender takes it back (chatApi.takeHeld). `images`: their
+   * types, each fetched from heldImageUrl.
+   */
+  held?: Array<{ id: string; text: string; error: string | null; mine?: boolean; images?: Array<{ mediaType: string }> }>;
   /** Why this viewer can't send here: only the owner continues a chat whose box is gone or down. */
   sendRefusal?: { code: string; reason: string };
 }
@@ -851,6 +900,11 @@ export interface ArchivedChat {
   storedHistory?: boolean;
 }
 
+/** Where a held message's image is read (routes/chat.ts chatHeldImageFor). */
+export function heldImageUrl(projectId: string, workstream: string, heldId: string, n: number): string {
+  return `/termag/api/projects/${encodeURIComponent(projectId)}/chat/held/${encodeURIComponent(heldId)}/images/${n}?workstream=${encodeURIComponent(workstream)}`;
+}
+
 /** The simple UI's chat lifecycle (backend routes/chats.ts): archive stops the box when it can. Delete terminates the box only when this chat is the last project on it. */
 export const chatsApi = {
   archived: (): Promise<ArchivedChat[]> => api.get('/api/chats/archived').then(r => r.data),
@@ -867,22 +921,53 @@ export const chatApi = {
   /** The owner trusts the project's repository. The JSON body is the trust action; an empty POST is not. */
   trust: (projectId: string): Promise<{ trust: ChatTrust }> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/trust`, { trust: true }).then(r => r.data),
+  /** A held message the box refused, back to its sender: its text, images and why. 404 once another tab took it. */
+  /** One file for the next message, kept in the chat's checkout on its box; answers the path the message names (backend chatFilePutFor). */
+  putFile: (projectId: string, workstream: string, file: File): Promise<{ path: string; name: string; size: number }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/files`, file, {
+      params: { workstream, name: file.name || 'file' },
+      headers: { 'Content-Type': 'application/octet-stream' },
+      // A file may be 20 MB: give its upload, and the box's write, the time they take.
+      timeout: 120_000,
+    }).then(r => r.data),
+  takeHeld: (projectId: string, workstream: string, heldId: string): Promise<{ text: string; images: Array<{ mediaType: string; data: string }>; error: string }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/held/${encodeURIComponent(heldId)}/take`, null, { params: { workstream } }).then(r => r.data),
   history: (projectId: string, workstream: string): Promise<ChatHistory> =>
     api.get(`/api/projects/${encodeURIComponent(projectId)}/chat`, { params: { workstream } }).then(r => r.data),
   /** The asks this chat sent, and any of the caller's the chat's `termag ask` calls named. */
   asks: (projectId: string, workstream: string, threads: readonly string[]): Promise<{ threads: ChatAskThread[] }> =>
     api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/asks`, { params: { workstream, ...(threads.length ? { threads: threads.join(',') } : {}) } }).then(r => r.data),
+  /**
+   * The page of history before the entry whose uuid is `before`, oldest first;
+   * `done` once there is nothing older. `cursor` (the last page's) lets the box
+   * read on from where that page began.
+   */
+  earlier: (projectId: string, workstream: string, before: string, cursor?: string): Promise<{ entries: unknown[]; done: boolean; cursor?: string }> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/earlier`, { params: { workstream, before, ...(cursor ? { cursor } : {}) } }).then(r => r.data),
+  /** The lines in this chat's timeline that are neither yours nor the agent's: a tool update's restart notice. */
+  notices: (projectId: string, workstream: string): Promise<{ notices: unknown[] }> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/notices`, { params: { workstream } }).then(r => r.data),
   /** A subagent's own transcript from the chat's box: its messages as history entries. */
   subagent: (projectId: string, workstream: string, agentId: string): Promise<{ agentId: string; entries: unknown[]; meta?: { agentType?: string; description?: string; finished?: boolean } }> =>
     api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/subagents/${encodeURIComponent(agentId)}`, { params: { workstream } }).then(r => r.data),
+  /** A pane chat's subagents, read from beside its Claude's session by its box. */
+  paneSubagents: (projectId: string, workstream: string): Promise<PaneSubagentsAnswer> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/pane-subagents`, { params: { workstream } }).then(r => r.data),
+  /** One of a pane chat's subagents' transcripts, as `subagent` reads a chat's. */
+  paneSubagent: (projectId: string, workstream: string, agentId: string): Promise<{ agentId: string; entries: unknown[] }> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/pane-subagents/${encodeURIComponent(agentId)}`, { params: { workstream } }).then(r => r.data),
+  /** A session running alongside a pane chat's Claude, its own transcript. */
+  paneSession: (projectId: string, workstream: string, sessionId: string): Promise<{ sessionId: string; entries: unknown[] }> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/chat/pane-sessions/${encodeURIComponent(sessionId)}`, { params: { workstream } }).then(r => r.data),
   /**
    * `images`: base64 PNG/JPEG/GIF/WebP (chat/chatImageData.ts), only when the history said imageInput; PDFs too when it said pdfInput.
    * `model`: the chat switches to it from this message's turn on; omitted, the turn keeps the chat's model.
    * `effort`: this turn's --effort (only when the history said effortInput); omitted, Claude Code's default.
    * The chat's memory is its own space's, which the server keeps (backend services/chatSpace.ts): a send names none.
    */
-  send: (projectId: string, workstream: string, text: string, images: Array<{ mediaType: string; data: string; name?: string }> = [], model?: ChatModelId | null, effort?: ChatEffortWire | null): Promise<{ queued: boolean; turnId?: string; position?: number; held?: boolean; phase?: ChatContinuation['phase'] }> =>
-    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/messages`, { workstream, text, ...(images.length ? { images } : {}), ...(model ? chatModelWire(model) : {}), ...(effort ? { effort } : {}) }).then(r => r.data),
+  /** `sendId`: the same for every try of one message, which the box then takes once (chat/newChat.ts queuedSendId). */
+  send: (projectId: string, workstream: string, text: string, images: Array<{ mediaType: string; data: string; name?: string }> = [], model?: ChatModelId | null, effort?: ChatEffortWire | null, sendId?: string): Promise<{ queued: boolean; turnId?: string; position?: number; held?: boolean; phase?: ChatContinuation['phase']; duplicate?: boolean }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/messages`, { workstream, text, ...(images.length ? { images } : {}), ...(model ? chatModelWire(model) : {}), ...(effort ? { effort } : {}), ...(sendId ? { sendId } : {}) }).then(r => r.data),
   /** `turn` stops only a live turn's current work; `all` (the default) stops the turn and its background tasks. */
   interrupt: (projectId: string, workstream: string, scope: 'turn' | 'all' = 'all'): Promise<{ interrupted: boolean; scope?: 'turn' | 'all'; dropped?: string[] }> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/chat/interrupt`, { workstream, scope }).then(r => r.data),
@@ -1034,8 +1119,11 @@ export const reviewApi = {
   // `slot` / `replaced`: which of the workstream's review panes, and whether
   // it replaced a review there; absent from an older backend (slot 1). A 409 `reviews_full`: all panes in use.
   // `slot` in the body: that pane, replacing whatever runs there (the phone, which shows one, sends 1).
-  start: (projectId: string, body: { workstream: string; pr: number; url?: string | null; prompt?: string; reviewer?: string; group?: { name: string; members: PrGroupMemberInput[] }; slot?: number }): Promise<{ ok: true; session: string; slot?: number; replaced?: boolean; pr: number; url: string | null; reviewer?: string; startedAt: string }> =>
+  start: (projectId: string, body: { workstream: string; pr: number; url?: string | null; prompt?: string; reviewer?: string; group?: { name: string; members: PrGroupMemberInput[] }; slot?: number }): Promise<{ ok: true; session: string; slot?: number; replaced?: boolean; pr: number; url: string | null; reviewer?: string; startedAt: string; held?: boolean; box?: string; state?: string }> =>
     api.post(`/api/projects/${encodeURIComponent(projectId)}/review`, body).then(r => r.data),
+  // A start the route held while its box wakes (202 from start, box-wake-on-action-enabled): its state, or null.
+  held: (projectId: string, workstream: string): Promise<{ state: 'waking' | 'starting' | 'failed'; box: string; error?: string; since?: number } | null> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/review/held`, { params: { workstream } }).then(r => r.data.held ?? null),
   /** `session`: which review pane; absent is the first. */
   stop: (projectId: string, workstream: string, session?: string): Promise<{ ok: true }> =>
     api.delete(`/api/projects/${encodeURIComponent(projectId)}/review`, { params: { workstream, ...(session ? { session } : {}) } }).then(r => r.data),
@@ -1049,6 +1137,21 @@ export const statusApi = {
   /** Drop a session's "PR opened — compact or clear?" milestone without acting on it. */
   dismissMilestone: (session: string, instanceId?: string | null): Promise<{ ok: true }> =>
     api.post('/api/status/milestone/dismiss', { session, instanceId: instanceId ?? null }).then(r => r.data),
+};
+
+/** Terminal slots: the workspace's terminal tab list —
+ *  the ctrl pane (slot 1) plus the shells the user adds with + and closes with ✕. */
+export interface TerminalSlotInfo { session: string; slot: number; label: string }
+export const terminalApi = {
+  /** The live slots (one tmux-list through the owner's agent); 503 while the agent is offline — keep what you have. */
+  list: (projectId: string, workstream: string): Promise<{ terminals: TerminalSlotInfo[]; max: number }> =>
+    api.get(`/api/projects/${encodeURIComponent(projectId)}/terminals`, { params: { workstream } }).then(r => r.data),
+  /** Add a tab: the lowest free slot, created in the workstream's directory. 409 `terminals_full` when all are in use. */
+  add: (projectId: string, workstream: string): Promise<{ ok: true; session: string; slot: number; label: string }> =>
+    api.post(`/api/projects/${encodeURIComponent(projectId)}/terminals`, { workstream }).then(r => r.data),
+  /** Close a tab (slot ≥ 2): kills the pane, programs running in it included. */
+  close: (projectId: string, workstream: string, slot: number): Promise<{ ok: true; session: string }> =>
+    api.delete(`/api/projects/${encodeURIComponent(projectId)}/terminals`, { params: { workstream, slot } }).then(r => r.data),
 };
 
 export const sharingApi = {
@@ -1075,7 +1178,7 @@ export interface PreviewShareView {
   audience?: 'user' | 'link';
   workstream: string;
   grantee: { id: string; email: string; name: string } | null;
-  recipe: { kind: 'webapp-dev-stack' } | { kind: 'manual'; origins: string[] };
+  recipe: { kind: 'webapp-dev-stack' } | { kind: 'repo' } | { kind: 'manual'; origins: string[] };
   expiresAt: string;
   revokedAt: string | null;
   endedAt: string | null;
@@ -1252,27 +1355,50 @@ export const credentialsApi = {
 };
 
 // MCP connectors through the termag MCP broker (backend routes/mcpConnectors.ts).
-// Every route answers 404 while mcp-broker-enabled is off.
 // Secrets are write-only: the API lists their names, never their values.
 export interface McpConnector {
   id: string;
+  // The connector name: the mcpServers key on boxes and the mcp__<name>__ tool prefix.
   name: string;
+  // The name as typed ("Claude Docs"); the connector name when none was typed.
+  displayName: string;
   upstream: string;
   authType: 'static' | 'oauth';
+  // 'api': a provider's REST API for the API broker (Google), not an MCP server.
+  kind?: 'mcp' | 'api';
   headers: Record<string, string>;
   // null when the stored secrets could not be read.
   secretNames: string[] | null;
   missingSecrets: string[];
   brokerUrl: string | null;
   updatedAt: string;
+  // oauth only: the server is on the user's mcp-oauth-loopback-servers list, so its
+  // sign-in ends on a localhost page whose address is pasted into Settings.
+  pasteLink?: boolean;
   // oauth only: whether the user has signed in to the server through termag.
   linkStatus?: 'linked' | 'needs_link';
   linkError?: string | null;
-  oauth?: { issuer: string; scopes: string[] } | null;
+  oauth?: McpConnectorOAuth | null;
+}
+// A scope the server advertises, with its label (the raw name where termag has
+// none; backend services/mcpOAuthScopes.ts).
+export interface McpScopeOption { name: string; label: string }
+export interface McpScopeName { name: string; label: string }
+export interface McpConnectorOAuth {
+  issuer: string;
+  scopes: string[];
+  // The checklist shown before the redirect; null when there is nothing to choose
+  // (fewer than two scopes, or the orchestrator pins them).
+  scopeChoice: { options: McpScopeOption[] } | null;
+  // The last sign-in's scopes: what it asked for, and what the server said it
+  // granted (null when its token response named none).
+  requestedScopes: McpScopeName[] | null;
+  grantedScopes: McpScopeName[] | null;
 }
 // A server the orchestrator offers every user (the mcp-default-connectors flag) that this
 // user hasn't connected yet. Settings lists it under "Available to connect".
-export interface McpCatalogServer { name: string; upstream: string }
+// `label` is the display name the catalog gives; `name` is the connector name.
+export interface McpCatalogServer { name: string; label?: string; upstream: string; kind?: 'api' }
 export interface McpConnectorList { available: boolean; storeAvailable: boolean; connectors: McpConnector[]; catalog?: McpCatalogServer[] }
 export interface McpConnectorInput {
   name?: string;
@@ -1281,21 +1407,32 @@ export interface McpConnectorInput {
   // A value sets the secret; null or '' deletes it.
   secrets?: Record<string, string | null>;
 }
+/** Where a sign-in returns the browser: Settings when unset, or the setup wizard's MCP step. */
+export type McpReturnTo = 'welcome';
+
 export const mcpConnectorsApi = {
   list: (): Promise<McpConnectorList> => api.get('/api/mcp-connectors').then(r => r.data),
   create: (input: McpConnectorInput): Promise<McpConnector> => api.post('/api/mcp-connectors', input).then(r => r.data),
   update: (id: string, input: McpConnectorInput): Promise<McpConnector> =>
     api.patch(`/api/mcp-connectors/${encodeURIComponent(id)}`, input).then(r => r.data),
   remove: (id: string): Promise<void> => api.delete(`/api/mcp-connectors/${encodeURIComponent(id)}`).then(() => undefined),
-  // The server's sign-in page; the browser goes there and comes back to /settings/mcp.
-  startOAuth: (id: string): Promise<string> =>
-    api.post(`/api/mcp-connectors/${encodeURIComponent(id)}/oauth/start`).then(r => r.data.authorizeUrl as string),
+  // The server's sign-in page, asking for `scopes` (every advertised scope when
+  // undefined); the browser goes there and comes back to /settings/mcp, or to
+  // the setup wizard's MCP step with returnTo 'welcome'.
+  startOAuth: (id: string, scopes?: string[], returnTo?: McpReturnTo): Promise<string> =>
+    api.post(`/api/mcp-connectors/${encodeURIComponent(id)}/oauth/start`, { ...(scopes ? { scopes } : {}), ...(returnTo ? { returnTo } : {}) })
+      .then(r => r.data.authorizeUrl as string),
   // Connects a catalog server: creates the user's OAuth connector for it and
-  // returns the server's sign-in URL.
-  connectCatalog: (name: string): Promise<string> =>
-    api.post(`/api/mcp-connectors/catalog/${encodeURIComponent(name)}/connect`).then(r => r.data.authorizeUrl as string),
+  // returns the server's sign-in URL. With chooseScopes, a server that offers
+  // a choice of scopes answers no URL, so the caller shows the checklist first.
+  // returnTo is as for startOAuth.
+  connectCatalog: (name: string, opts: { chooseScopes?: boolean; returnTo?: McpReturnTo } = {}): Promise<{ id: string; authorizeUrl: string | null; connector: McpConnector }> =>
+    api.post(`/api/mcp-connectors/catalog/${encodeURIComponent(name)}/connect`, opts).then(r => r.data),
   unlinkOAuth: (id: string): Promise<McpConnector> =>
     api.delete(`/api/mcp-connectors/${encodeURIComponent(id)}/oauth`).then(r => r.data),
+  // Where Settings' paste form posts the localhost address a sign-in ended on.
+  // A form post, not XHR: the answer is the callback's redirect back to Settings.
+  pasteLinkAction: (id: string): string => `${api.defaults.baseURL}/api/mcp-connectors/${encodeURIComponent(id)}/oauth/paste`,
 };
 
 // The PR pipeline (backend routes/prs.ts): the user's
@@ -1336,6 +1473,10 @@ export interface PrRow {
   requestedAt: string | null;
   /** The review lanes: the request names me (needs_my_review, counted) or only a team I am on (team_review); absent from older backends and other lanes. */
   askedYou?: boolean;
+  /** An open PR's GitHub review decision (APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, or null when the repo requires none), in every lane; absent from merged and branch rows and older backends. */
+  reviewDecision?: string | null;
+  /** The review lanes: who has reviewed it, null when unread; absent from older backends and other lanes. */
+  reviewers?: PrReviewers | null;
   reviewTarget: PrWorkstreamLink | null;
 }
 export interface PrLane { id: PrLaneId; label: string; rows: PrRow[] }
@@ -1765,6 +1906,85 @@ export interface AutomationOptions {
 export interface SchedulePreview {
   normalised: string; timezone: string; next: string[]; minGapMinutes: number | null; tooFrequent: number | null; keepsBoxUpMinutesPerDay: number | null;
 }
+/** A repository an environment's definition lists: owner/name, and optionally the branch and checkout directory. */
+export interface EnvironmentRepoView { repo: string; branch?: string; path?: string }
+export interface EnvironmentPerson { id: string; email: string; name: string }
+/** A pointer: a file in a repository, read from that branch (null: its default) when a box is made. */
+export interface EnvironmentFileView { repo: string; branch: string | null; path: string }
+/** The stored fields, which an environment's events hold before and after: an inline definition, or a pointer. */
+export type EnvironmentFieldsView =
+  | { name: string; kind: 'inline'; definition: Record<string, unknown> }
+  | { name: string; kind: 'pointer'; file: EnvironmentFileView };
+/** Personal: only its owner sees and uses it. Shared: everyone signed in, from a file on its repository's default branch. */
+export type EnvironmentVisibility = 'personal' | 'shared';
+export type EnvironmentView = EnvironmentFieldsView & {
+  id: string;
+  visibility: EnvironmentVisibility;
+  /** Its creator, who alone switches it between personal and shared. */
+  owner: EnvironmentPerson | null;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: EnvironmentPerson | null;
+  updatedBy: EnvironmentPerson | null;
+};
+export interface EnvironmentEventView {
+  id: string;
+  at: string;
+  action: 'environment.create' | 'environment.update' | 'environment.delete' | 'environment.visibility';
+  actor: EnvironmentPerson | null;
+  environmentId: string;
+  environmentName: string | null;
+  /** The stored fields, with who it was for (absent from an event written before an environment had one). */
+  before: EnvironmentSnapshotView | null;
+  after: EnvironmentSnapshotView | null;
+}
+export type EnvironmentSnapshotView = EnvironmentFieldsView & { visibility?: EnvironmentVisibility; ownerUserId?: string | null };
+/** What an environment resolves to now: its repositories, its resources, and what of it was left out. */
+export interface EnvironmentResolvedView { repos: EnvironmentRepoView[]; size: unknown; warnings: string[] }
+/** An environment's pool (backend services/envPool.ts envPoolView): null when it has none. */
+export interface EnvironmentPoolView {
+  target: number;
+  ready: number;
+  preparing: number;
+  preparedAt: string | null;
+  preparedCommit: Record<string, string> | null;
+  lastFailure: { at: string; log: string } | null;
+  nextRefreshAt: string | null;
+}
+/** What a create or edit sends: an inline definition (JSON or its text), or a pointer (an empty path is `.termag/environment.json`). */
+export type EnvironmentInput =
+  | { name: string; kind: 'inline'; definition: unknown }
+  | { name: string; kind: 'pointer'; file: { repo: string; branch?: string; path?: string } };
+
+/**
+ * Environments (backend routes/environments.ts): the caller's personal ones (theirs alone), then the shared ones
+ * (anyone's to use and edit); only an environment's owner makes it personal or shared.
+ */
+export const environmentsApi = {
+  list: (): Promise<EnvironmentView[]> => api.get('/api/environments').then(r => r.data.environments),
+  get: (id: string): Promise<EnvironmentView> => api.get(`/api/environments/${encodeURIComponent(id)}`).then(r => r.data.environment),
+  /** What it resolves to for this user: a pointer's file read from GitHub now. */
+  resolved: (id: string): Promise<EnvironmentResolvedView> => api.get(`/api/environments/${encodeURIComponent(id)}/resolved`).then(r => r.data),
+  /** Its environment pool: stopped boxes with its setup already run; null when it has none. */
+  pool: (id: string): Promise<EnvironmentPoolView | null> => api.get(`/api/environments/${encodeURIComponent(id)}/pool`).then(r => r.data.pool ?? null),
+  /** The audit log: every environment's changes, newest first, or one environment's. */
+  events: (environmentId?: string | null): Promise<EnvironmentEventView[]> =>
+    api.get('/api/environments/events', { params: environmentId ? { environment: environmentId } : {} }).then(r => r.data.events),
+  /** What a save would refuse in an inline definition (JSON, the schema, its repos), nothing stored. */
+  validate: (definition: unknown): Promise<string[]> => api.post('/api/environments/validate', { definition }).then(r => r.data.errors),
+  /** Personal unless `visibility` is shared, which a 400 environment_not_shareable refuses for anything but a file on its repository's default branch. */
+  create: (input: EnvironmentInput, visibility: EnvironmentVisibility = 'personal'): Promise<EnvironmentView> =>
+    api.post('/api/environments', { ...input, visibility }).then(r => r.data.environment),
+  /** The owner's switch; sharing answers 400 environment_not_shareable, with the rule, when it can't be shared. */
+  setVisibility: (id: string, visibility: EnvironmentVisibility, updatedAt?: string): Promise<EnvironmentView> =>
+    api.post(`/api/environments/${encodeURIComponent(id)}/visibility`, { visibility, ...(updatedAt ? { updatedAt } : {}) }).then(r => r.data.environment),
+  /** updatedAt: the version the edit was made from; a newer one answers 409 environment_changed. */
+  update: (id: string, input: EnvironmentInput, updatedAt?: string): Promise<EnvironmentView> =>
+    api.put(`/api/environments/${encodeURIComponent(id)}`, { ...input, ...(updatedAt ? { updatedAt } : {}) }).then(r => r.data.environment),
+  remove: (id: string, updatedAt?: string): Promise<void> =>
+    api.delete(`/api/environments/${encodeURIComponent(id)}`, { data: updatedAt ? { updatedAt } : {} }).then(() => undefined),
+};
+
 export const automationsApi = {
   list: (): Promise<AutomationView[]> => api.get('/api/automations').then(r => r.data),
   /**
@@ -1807,8 +2027,7 @@ export const briefingsApi = {
 };
 
 // Spaces: shared file stores across boxes (backend routes/spaces.ts).
-// Every route answers 404 while the spaces-enabled flag is
-// off for the user. Bytes never pass through here: these return presigned S3
+// Bytes never pass through here: these return presigned S3
 // URLs that the browser uses directly.
 export interface SpaceView {
   id: string;
@@ -1848,6 +2067,11 @@ export interface SpaceEvent {
   actorUserId: string | null;
   actorInstanceId: string | null;
   via: string | null;
+  /** Where the action came from: 'slack', or null (the web UI, the CLI, a box; every event before spaces in Slack). */
+  surface: string | null;
+  /** The member the actor (a space's Slack runner) acted for, or null. */
+  onBehalfOfUserId: string | null;
+  note?: string;
 }
 export interface SpaceSignedUrl { url: string; expiresAt: string; size: number; contentType: string | null }
 /** How the file view shows a file (backend spacePaths.viewResponseHeaders). */
@@ -1879,8 +2103,7 @@ export const spacesApi = {
   /** One space, as the caller may see it; 404 when they can't (and for no such space). */
   get: (space: string): Promise<{ space: SpaceView }> => api.get(sp(space)).then(r => r.data),
 
-  /** `sharing`: spaces-sharing-enabled for the caller, which POST /members checks. */
-  members: (space: string): Promise<{ sharing: boolean; members: SpaceMember[]; invites: SpaceInvite[] }> =>
+  members: (space: string): Promise<{ members: SpaceMember[]; invites: SpaceInvite[] }> =>
     api.get(`${sp(space)}/members`).then(r => r.data),
   addMember: (space: string, email: string, role: string): Promise<{ member?: SpaceMember; invite?: SpaceInvite }> =>
     api.post(`${sp(space)}/members`, { email, role }).then(r => r.data),

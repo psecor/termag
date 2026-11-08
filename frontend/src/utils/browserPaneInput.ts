@@ -143,7 +143,7 @@ export function shouldCaptureKey(e: KeyLike): boolean {
 /** What the pane says when its socket closes with this code. */
 export function browserPaneCloseMessage(code: number, reason: string): string {
   switch (code) {
-    case BROWSER_PANE_CLOSE.DISABLED: return 'The browser pane is off for this box (browser-pane-enabled).';
+    case BROWSER_PANE_CLOSE.DISABLED: return 'Reviewer browsers are switched off right now.';
     case BROWSER_PANE_CLOSE.UNSUPPORTED: return "This box's agent needs an update before it can run a browser pane.";
     // The backend's own message (the `exit` frame ahead of the close) says
     // whose box it is; this fallback only names its state.

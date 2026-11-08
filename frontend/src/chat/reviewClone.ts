@@ -257,6 +257,45 @@ export function useReviewClone(repo: string | null | undefined): CloneProgress |
   );
 }
 
+// ── where a clone's review went, for the page that waits on it (pages/chat/ReviewCloneStart.tsx) ──
+
+/**
+ * A review on a repository with no project opens at once on a page of its own, which shows the clone's steps
+ * (its progress, above) and hands over to the session once the review starts there. `pending`: started, no step
+ * reported yet. `to`: the session, and the state its page opens with. `error`: why it couldn't, with what to do.
+ */
+export type CloneOutcome =
+  | { pending: true }
+  | { to: { projectId: string; workstream: string; state: Record<string, unknown> } }
+  | { error: string };
+const outcomes = new Map<string, CloneOutcome>();
+const outcomeKey = (repo: string, number: number) => `${key(repo)}#${number}`;
+
+/** The page a review on `repo`'s PR `number` waits on while its project is made. */
+export function cloneStartHref(repo: string, number: number): string {
+  return `/chat/review-start/${repo}/${number}`;
+}
+
+/** Records how the clone's review for a PR is going; null forgets it (the page took it). */
+export function noteCloneOutcome(repo: string, number: number, outcome: CloneOutcome | null) {
+  if (outcome) outcomes.set(outcomeKey(repo, number), outcome); else outcomes.delete(outcomeKey(repo, number));
+  emit();
+}
+
+/** How the clone's review for a PR is going, or null (outside React: the Review button's own guard). */
+export function cloneOutcomeFor(repo: string, number: number): CloneOutcome | null {
+  return outcomes.get(outcomeKey(repo, number)) ?? null;
+}
+
+/** How the clone's review for a PR is going, or null: none started from this page load. */
+export function useCloneOutcome(repo: string, number: number): CloneOutcome | null {
+  return useSyncExternalStore(
+    fn => { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    () => outcomes.get(outcomeKey(repo, number)) ?? null,
+    () => null,
+  );
+}
+
 /** What the Review button says while the clone runs. */
 export function cloneProgressText(p: CloneProgress): string {
   if (p.phase === 'waking') return `Waking ${p.box} to clone ${p.repo}…`;

@@ -42,7 +42,7 @@ describe('routerEntry', () => {
   });
 });
 
-const base = { flagOn: true, mode: 'simple' as const, entry: '/', here: '/', locationKey: 'default' };
+const base = { mode: 'simple' as const, entry: '/', here: '/', locationKey: 'default' };
 
 describe('shouldOpenSimpleUi', () => {
 
@@ -52,7 +52,6 @@ describe('shouldOpenSimpleUi', () => {
 
   it('keeps the workspace when the full UI was last used or the flag is off', () => {
     expect(shouldOpenSimpleUi({ ...base, mode: 'full' })).toBe(false);
-    expect(shouldOpenSimpleUi({ ...base, flagOn: false })).toBe(false);
   });
 
   it('keeps deep links into the workspace', () => {
@@ -75,19 +74,20 @@ describe('shouldOpenSimpleUi', () => {
 });
 
 describe('simpleUiShareHandoff', () => {
-  const on = { flagOn: true, sidePanelOn: true, mode: 'simple' as const };
+  const on = { mode: 'simple' as const };
   const link = '?project=p1&ws=feature-x&browser=open&browserShare=cshare0000000001&browserAt=%2Fprojects%2Fx%3Fenv%3Dprod';
 
   it('takes a share link its owner opened to the chat, with the handoff for its side panel', () => {
     expect(simpleUiShareHandoff({ ...on, search: link }))
       .toBe('/chat/p/p1?ws=feature-x&browser=open&browserShare=cshare0000000001&browserAt=%2Fprojects%2Fx%3Fenv%3Dprod');
     expect(simpleUiShareHandoff({ ...on, search: '?project=p%2F1&browser=open' })).toBe('/chat/p/p%2F1?ws=main&browser=open');
+    // An environment's port link (browserPortHref) carries the page to open.
+    expect(simpleUiShareHandoff({ ...on, search: '?project=p1&ws=main&browser=open&browserUrl=http%3A%2F%2Flocalhost%3A5174%2F' }))
+      .toBe('/chat/p/p1?ws=main&browser=open&browserUrl=http%3A%2F%2Flocalhost%3A5174%2F');
   });
 
   it('leaves it to the workspace when the full UI was last, or either flag is off', () => {
     expect(simpleUiShareHandoff({ ...on, mode: 'full', search: link })).toBeNull();
-    expect(simpleUiShareHandoff({ ...on, flagOn: false, search: link })).toBeNull();
-    expect(simpleUiShareHandoff({ ...on, sidePanelOn: false, search: link })).toBeNull();
   });
 
   it('leaves every other workspace URL alone', () => {

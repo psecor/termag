@@ -5,14 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Instance, InstanceStatus } from '../types';
 
 const mocks = vi.hoisted(() => ({
-  flags: {} as Record<string, boolean>,
   boxes: [] as Instance[],
   list: vi.fn(),
   start: vi.fn(),
-}));
-vi.mock('../flags', () => ({
-  FLAGS: { boxOpenStart: 'box-open-start-enabled' },
-  useFlag: (key: string, fallback: boolean) => (key in mocks.flags ? mocks.flags[key] : fallback),
 }));
 vi.mock('../services/api', () => ({ instancesApi: { list: mocks.list, start: mocks.start } }));
 
@@ -40,7 +35,6 @@ const setBoxes = async (...boxes: Instance[]) => { mocks.boxes = boxes; await ac
 beforeEach(async () => {
   seq += 1;
   id = (name: string) => `${name}-t${seq}`;
-  mocks.flags = { 'box-open-start-enabled': true };
   mocks.boxes = [];
   mocks.list.mockReset().mockImplementation(async () => mocks.boxes);
   mocks.start.mockReset().mockResolvedValue({ ok: true, status: 'starting' });
@@ -66,14 +60,6 @@ describe('useStartParkedBoxOnOpen', () => {
 
   it('sends nothing for a box that is already starting', async () => {
     await setBoxes(box('b1', 'starting'));
-    act(() => root.render(<Open projectId="p1" instanceId="b1" />));
-    await flush();
-    expect(mocks.start).not.toHaveBeenCalled();
-  });
-
-  it('does nothing with the flag off', async () => {
-    mocks.flags = {};
-    await setBoxes(box('b1', 'hibernated'));
     act(() => root.render(<Open projectId="p1" instanceId="b1" />));
     await flush();
     expect(mocks.start).not.toHaveBeenCalled();
@@ -175,7 +161,7 @@ describe('useStartParkedBoxOnOpen in a view that shows the stored transcript', (
     expect(mocks.start).not.toHaveBeenCalled();
   });
 
-  it('starts the box on open when nothing is stored (an old box, or chat-transcripts-enabled off for its owner)', async () => {
+  it('starts the box on open when nothing is stored (an old box, or a chat from before the store)', async () => {
     await setBoxes(box('b1', 'stopped'));
     act(() => root.render(<Open projectId={`p-t${seq}`} instanceId="b1" showsStored />));
     await flush();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { customKeySequence, SHIFT_ENTER_SEQUENCE } from './terminalKeys';
+import { customKeySequence, SHIFT_ENTER_SEQUENCE, touchTypingAttributes } from './terminalKeys';
 
 const key = (over: Partial<Parameters<typeof customKeySequence>[0]>) => ({
   type: 'keydown', key: 'Enter', shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, ...over,
@@ -30,5 +30,15 @@ describe('customKeySequence', () => {
   it('ignores other keys', () => {
     expect(customKeySequence(key({ key: 'Tab', shiftKey: true }))).toBeNull();
     expect(customKeySequence(key({ key: 'v', shiftKey: true }))).toBeNull();
+  });
+});
+
+describe('touchTypingAttributes', () => {
+  it('turns autocapitalise, autocorrect and spellcheck off on a touch screen', () => {
+    expect(touchTypingAttributes(true)).toEqual({ autocapitalize: 'off', autocorrect: 'off', autocomplete: 'off', spellcheck: 'false' });
+  });
+
+  it('changes nothing on a desktop', () => {
+    expect(touchTypingAttributes(false)).toEqual({});
   });
 });

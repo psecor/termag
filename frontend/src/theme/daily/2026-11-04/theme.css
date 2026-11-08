@@ -1,0 +1,19 @@
+/* Autumn leaves: amber accents in both UIs and both palettes. Contrast:
+   #f2a33a on the dark surfaces is 7.4:1 or more; #b45309 on the light ones
+   4.7:1 or more; white on #b45309 is 5.0:1, on #a1460a 6.2:1. */
+
+html[data-daily-theme="2026-11-04"],
+html[data-daily-theme="2026-11-04"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-04"] .lp-theme {
+  --accent: #f2a33a;
+  --accent-dim: #b45309;
+  --accent-rgb: 242, 163, 58;
+}
+
+html[data-daily-theme="2026-11-04"][data-palette="light"],
+html[data-daily-theme="2026-11-04"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-04"][data-palette="light"] .lp-theme {
+  --accent: #b45309;
+  --accent-dim: #a1460a;
+  --accent-rgb: 180, 83, 9;
+}

@@ -1,4 +1,4 @@
-// A space's explorer in the simple UI (simple-ui-side-panel-enabled): one
+// A space's explorer in the simple UI: one
 // tree with the space's agents beside its files. An agent another agent
 // started (or an ask it sent) is under it, the way a file is under its
 // folder, shown until its starter is folded; folders load as
@@ -33,6 +33,7 @@ import type { InboxRow } from '../../mobile/inbox';
 import { spaceRecents } from '../../chat/recents';
 import { FILE_SHARE_EVENT, type FileShareChange } from '../../chat/fileShare';
 import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
+import { CloseAndBackButton } from './TabClose';
 import { AgentIcon, FileIcon, FolderIcon, plainClick } from './OpenItems';
 import { useSpaceListingLive } from './SpaceFileLive';
 import { useSimpleData, WithSimpleData } from './simpleData';
@@ -409,6 +410,7 @@ function NewTab({ space }: { space: string }) {
     <div className="chat-view">
       <section className="chat-conv">
         <header className="chat-header">
+          <CloseAndBackButton />
           <ChatHistoryButton />
           <div className="chat-title"><span className="chat-title-name">New tab</span><span className="chat-title-repo">{space}</span></div>
           <div className="chat-header-actions">

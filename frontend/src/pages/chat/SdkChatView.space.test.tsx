@@ -13,12 +13,11 @@ const mocks = vi.hoisted(() => ({
   send: vi.fn(),
   models: vi.fn(),
   noBoxes: [] as unknown[],
-  sidePanel: true,
 }));
 
 vi.mock('../../flags', async importOriginal => {
   const actual = await importOriginal<typeof import('../../flags')>();
-  return { ...actual, useFlag: <T,>(key: string, fallback: T) => (key === actual.FLAGS.chatSidePanel ? mocks.sidePanel as T : fallback) };
+  return { ...actual, useFlag: <T,>(_key: string, fallback: T) => fallback };
 });
 
 vi.mock('../../services/api', async importOriginal => ({
@@ -76,7 +75,7 @@ async function flush() {
 
 const sp = (id: string, name: string) => ({ id, name, description: null, createdAt: '', usedBytes: 0, quotaBytes: 1, role: 'owner' as const, readOnly: false });
 const shared: SharedChatSpaces = {
-  enabled: true, loaded: true, current: true, spaces: [sp('s1', 'alpha'), sp('s2', 'beta')],
+  loaded: true, current: true, spaces: [sp('s1', 'alpha'), sp('s2', 'beta')],
   index: new Map([['box1', ['alpha', 'beta']]]), colorOf: spaceColor,
 };
 

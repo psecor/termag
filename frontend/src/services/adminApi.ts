@@ -124,7 +124,7 @@ export interface ActiveUsers { days: ActiveUsersDay[]; totals: Record<string, nu
 /** UTC buckets; weeks start on Monday (backend services/admin/userGrowth.ts). */
 export type GrowthBucket = 'day' | 'week' | 'month';
 // ── Deployed software ──
-export type SoftwareState = 'current' | 'behind' | 'outdated' | 'ahead' | 'missing' | 'unknown';
+export type SoftwareState = 'current' | 'behind' | 'outdated' | 'ahead' | 'pending' | 'missing' | 'unknown';
 export interface SoftwareCell { version: string | null; raw: string | null; path: string | null; state: SoftwareState; observedAt: string }
 export interface SoftwareHost {
   hostKey: string; kind: 'orchestrator' | 'box' | 'agent'; name: string; owner: string | null;
@@ -141,10 +141,10 @@ export interface SoftwareMatrix {
   generatedAt: string;
 }
 export interface SoftwareHostDetail { host: SoftwareHost; changes: Array<{ component: string; from: string | null; to: string | null; at: string }> }
-// Tool updates from the Software tab, one
-// component at a time. The routes answer 404 {code: 'claude_update_off'} while the tool's enabled flag
-// (claude-code-update-enabled, codex-update-enabled, cursor-update-enabled, devin-update-enabled, pi-update-enabled, gh-update-enabled, aws-update-enabled, node-update-enabled) is off for the host's owner and box.
-export type UpdatableTool = 'claude' | 'codex' | 'cursor' | 'devin' | 'pi' | 'gh' | 'aws' | 'node';
+// Tool updates from the Software tab ("Manual"), one
+// component at a time. The routes answer 404 {code: 'claude_update_off'} while the tool's policy flag
+// (<tool>-update-policy, claude-code-update-policy for Claude Code) has mode off for the host's owner and box.
+export type UpdatableTool = 'claude' | 'codex' | 'cursor' | 'devin' | 'pi' | 'gh' | 'aws' | 'node' | 'python' | 'docker';
 export type ToolRestart = 'none' | 'idle' | 'force';
 export type ToolUpdateScope = 'below-floor' | 'behind' | 'all';
 export interface ToolUpdatePreview {
@@ -156,17 +156,26 @@ export interface ToolUpdatePreview {
   runnerHeld?: boolean;
   /** The orchestrator host with no version pinned in orchestrator-claude-update-policy: a run only brings it up to the floor; nothingToDo when it is already there. */
   floorOnly?: boolean; nothingToDo?: boolean;
+  /** A tool updated only at the box's start (Docker): a run is queued for it, never run on the running box. */
+  atStart?: boolean;
 }
 export interface SoftwareUpdateRun {
   id: string; hostKey: string; instanceId: string | null; component: UpdatableTool;
   trigger: 'manual' | 'boot' | 'guard' | 'floor' | 'resume' | 'nightly'; requestedById: string | null; restart: ToolRestart;
+  /** Why an automatic run (floor, resume, nightly) was made, in words; null for the others. */
+  reason?: string | null;
   status: 'requested' | 'running' | 'done' | 'failed' | 'refused' | 'expired';
+  /** Requested, and waiting for its box's next start (a tool updated only then: Docker). */
+  waitingForStart?: boolean;
   outcome: 'updated' | 'current' | 'partial' | 'failed' | 'floor-only' | null;
   target: string | null; fromVersion: string | null; toVersion: string | null; detail: string | null;
   sessions: { stopped: number; resumed: number; fresh: number; cut: number; typed: number; other: number; runnersLeft: number } | null;
   requestedAt: string; startedAt: string | null; finishedAt: string | null;
 }
-export interface FleetToolUpdate { runs: Array<{ hostKey: string; runId: string }>; skipped: Array<{ hostKey: string; reason: string }> }
+/** Why the fleet update skipped a host (backend services/toolUpdate/fleet.ts, FleetSkip). */
+export type FleetSkipReason = 'claude_update_off' | 'offline' | 'not_capable' | 'run_in_flight' | 'not_installed' | 'version_unreadable' | 'no_inventory' | 'unknown_version';
+// `string` too: an orchestrator newer than this page can name a reason it doesn't know yet.
+export interface FleetToolUpdate { runs: Array<{ hostKey: string; runId: string }>; skipped: Array<{ hostKey: string; reason: FleetSkipReason | (string & {}) }>; atStart?: boolean }
 export interface ClientVersionRow { userId: string; user: string | null; kind: string; version: string; state: SoftwareState; lastSeenAt: string }
 // ── PR analytics ──
 export type PrView = 'credited' | 'humans' | 'all';
@@ -246,7 +255,7 @@ export interface SessionSummary {
   byHost: Record<string, number>; rateLimited: number; offlineHosts: number;
 }
 
-export type TokenGroup = 'day' | 'user' | 'provider' | 'host' | 'project';
+export type TokenGroup = 'day' | 'user' | 'provider' | 'host' | 'project' | 'model' | 'backend';
 export interface TokenTotals { input: number; output: number; cacheRead: number; cacheCreate: number; calls: number; total: number; cacheRatio: number | null; estimated: number }
 export type SegmentName = 'New' | 'Power' | 'Active' | 'Passive' | 'Dormant' | 'Service';
 export interface SegmentDayCount { date: string; counts: Array<{ segment: string; n: number }>; total: number }
@@ -418,7 +427,7 @@ export interface AdminsResponse {
   envConfigured: boolean;
   admins: Array<{ id: string; unixUsername: string; email: string; displayName: string; source: string; lastSeenAt: string | null; demotable: boolean }>;
 }
-export interface AuditRow { id: string; at: string; actorId: string; actor: string; tokenId: string | null; surface: string; action: string; args: Record<string, unknown> | null; outcome: string; status: number | null }
+export interface AuditRow { id: string; at: string; actorId: string; actor: string; tokenId: string | null; boxId?: string | null; surface: string; action: string; args: Record<string, unknown> | null; outcome: string; status: number | null }
 
 // ── Box cost; mirrors backend/src/services/boxCost/report.ts ──
 export interface BoxCostMoney { active: number; idle: number; pool: number; boot: number; orphan: number; compute: number; storage: number; total: number }
@@ -544,6 +553,9 @@ export const adminApi = {
   instance: (id: string): Promise<AdminInstanceDetail> => api.get(`/api/admin/fleet/instances/${encodeURIComponent(id)}`).then(r => r.data),
   quarantineBox: (id: string, reason: string): Promise<QuarantineResult> =>
     api.post(`/api/admin/fleet/instances/${encodeURIComponent(id)}/quarantine`, { reason, confirm: true }).then(r => r.data),
+  /** End one preview link by its name or id (SR15, routes/admin/previewLinkEnd.ts): session-only, with confirm. */
+  endPreviewLink: (ref: { name: string } | { id: string }): Promise<{ link: { id: string; name: string; endedAt: string | null; endReason: string | null }; alreadyEnded?: boolean }> =>
+    api.post('/api/admin/preview-links/end', { ...ref, confirm: true }).then(r => r.data),
   terminateQuarantinedBox: (id: string): Promise<{ ok: true; archivedProjects: number }> =>
     api.post(`/api/admin/fleet/instances/${encodeURIComponent(id)}/terminate`, { confirm: true }).then(r => r.data),
   boxDisk: (id: string): Promise<BoxDisk> => api.get(`/api/admin/fleet/instances/${encodeURIComponent(id)}/disk`).then(r => r.data),
@@ -586,7 +598,7 @@ export const adminApi = {
   clientVersions: (): Promise<{ runningCommit: string | null; clients: ClientVersionRow[] }> => api.get('/api/admin/software/clients').then(r => r.data),
   refreshSoftware: () => api.post('/api/admin/software/refresh').then(r => r.data),
   toolUpdatePreview: (component: UpdatableTool, hostKey: string): Promise<ToolUpdatePreview> => api.get(`/api/admin/software/hosts/${encodeURIComponent(hostKey)}/update-preview`, { params: { component } }).then(r => r.data),
-  updateTool: (component: UpdatableTool, hostKey: string, restart: ToolRestart): Promise<{ runId: string; acknowledged: boolean }> => api.post(`/api/admin/software/hosts/${encodeURIComponent(hostKey)}/update`, { component, restart }).then(r => r.data),
+  updateTool: (component: UpdatableTool, hostKey: string, restart: ToolRestart): Promise<{ runId: string; acknowledged: boolean; atStart?: boolean }> => api.post(`/api/admin/software/hosts/${encodeURIComponent(hostKey)}/update`, { component, restart }).then(r => r.data),
   updateToolFleet: (component: UpdatableTool, scope: ToolUpdateScope, restart: ToolRestart): Promise<FleetToolUpdate> => api.post('/api/admin/software/update', { component, scope, restart }).then(r => r.data),
   softwareUpdates: (component: UpdatableTool, limit = 50): Promise<{ runs: SoftwareUpdateRun[] }> => api.get('/api/admin/software/updates', { params: { component, limit } }).then(r => r.data),
   /** `from`/`to` are inclusive UTC day keys; the Spend tab picks 7, 30 or 90 days ending today. */

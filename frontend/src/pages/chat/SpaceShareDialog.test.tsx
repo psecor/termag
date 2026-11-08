@@ -60,7 +60,6 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   localStorage.clear();
   mocks.members.mockResolvedValue({
-    sharing: true,
     members: [person('ada', 'owner', 'Ada Lovelace'), person('bo', 'editor', 'Bo Ito')],
     invites: [{ id: 'inv1', email: 'cy@example.com', role: 'editor', addedAt: '' }],
   });
@@ -149,14 +148,6 @@ describe('the Share dialog, as an owner', () => {
     expect(leave.title).toBe('Make someone else an owner first');
   });
 
-  it('says sharing is off when the server says so, and still lists and manages', async () => {
-    mocks.members.mockResolvedValue({ sharing: false, members: [person('ada', 'owner'), person('bo', 'editor')], invites: [] });
-    await open('owner');
-    expect(dialog().querySelector('form.chat-share-add')).toBeNull();
-    expect(dialog().querySelector('.chat-share-gate')!.textContent).toBe('Sharing spaces with other people is not turned on for you yet. You can still add your own boxes.');
-    expect(dialog().querySelector('select[aria-label="Role of bo@example.com"]')).not.toBeNull();
-  });
-
   it('shows the boxes, with those started from them, and adds one of the user\'s own', async () => {
     await open('owner');
     expect(dialog().querySelector('.chat-share-box-dot')).toBeNull();
@@ -184,7 +175,7 @@ describe('the Share dialog, as an owner', () => {
 
 describe('the Share dialog, as someone else', () => {
   it('is a read-only list for a viewer, who may leave', async () => {
-    mocks.members.mockResolvedValue({ sharing: true, members: [person('ada', 'owner', 'Ada Lovelace'), person('vi', 'viewer')], invites: [] });
+    mocks.members.mockResolvedValue({ members: [person('ada', 'owner', 'Ada Lovelace'), person('vi', 'viewer')], invites: [] });
     await open('viewer', { userId: 'vi' });
     expect(dialog().querySelector('.chat-share-title')!.textContent).toBe('Share notes');
     expect(dialog().querySelector('.chat-share-gate')!.textContent).toBe('You can view this space. Only its owners add people: ask Ada Lovelace.');

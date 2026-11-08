@@ -2,6 +2,7 @@
 // are tmux KEY NAMES go through send-keys with literal:false and no Enter;
 // digits (Claude Code's numbered permission options) are typed literally.
 import type { AgentStatusValue } from '../types';
+import { KEY_LABELS, type KeyLabel } from './keyLabels';
 
 export interface QuickKey {
   label: string;
@@ -11,15 +12,15 @@ export interface QuickKey {
   title: string;
 }
 
-const key = (label: string, keys: string, title: string): QuickKey => ({ label, keys, literal: false, enter: false, title });
+const key = ({ label, title }: KeyLabel, keys: string): QuickKey => ({ label, keys, literal: false, enter: false, title });
 const digit = (d: string, title: string): QuickKey => ({ label: d, keys: d, literal: true, enter: false, title });
 
 const COMMON: QuickKey[] = [
-  key('Enter', 'Enter', 'Press Enter'),
-  key('Esc', 'Escape', 'Press Escape'),
-  key('↑', 'Up', 'Arrow up'),
-  key('↓', 'Down', 'Arrow down'),
-  key('^C', 'C-c', 'Ctrl-C (interrupt)'),
+  key(KEY_LABELS.enter, 'Enter'),
+  key(KEY_LABELS.escape, 'Escape'),
+  key(KEY_LABELS.up, 'Up'),
+  key(KEY_LABELS.down, 'Down'),
+  key(KEY_LABELS.interrupt, 'C-c'),
 ];
 
 /**

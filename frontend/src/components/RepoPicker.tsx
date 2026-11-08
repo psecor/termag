@@ -21,6 +21,7 @@ export function RepoPicker({
   dropdown = false,
   more = [],
   onToggle,
+  addOnly,
 }: {
   value: RepoPick;
   onChange: (next: RepoPick) => void;
@@ -37,6 +38,12 @@ export function RepoPicker({
    * toggles as the only pick; empty clears the selection.
    */
   onToggle?: (repo: ListedPick) => void;
+  /**
+   * With onToggle, Add repository… on a multi-repo project (AddRepoDialog):
+   * only the listed repositories, those already in the project (`locked`,
+   * by lower-case owner/name) ticked and not clickable, with `hint` as why.
+   */
+  addOnly?: { locked: ReadonlySet<string>; hint: string };
 }) {
   const [templates, setTemplates] = useState<ProjectTemplateInfo[]>([]);
   const [catalog, setCatalog] = useState<RepoCatalog | null>(null);
@@ -85,7 +92,10 @@ export function RepoPicker({
       : { kind: 'starter', templateId: template.id, url: template.repoUrl });
   }
 
+  const lockedRow = (fullName: string) => !!addOnly?.locked.has(fullName.toLowerCase());
+
   function listedSelected(fullName: string): boolean {
+    if (lockedRow(fullName)) return true;
     return (value.kind === 'listed' && value.fullName === fullName) || more.some(r => r.fullName === fullName);
   }
 
@@ -105,8 +115,8 @@ export function RepoPicker({
   return (
     <div className="npf-field">
       <label htmlFor="npf-repo-search">Repository</label>
-      {toggle && <div className="npf-note usage-dim">Pick one, or several to work across them.</div>}
-      <button
+      {toggle && !addOnly && <div className="npf-note usage-dim">Pick one, or several to work across them.</div>}
+      {!addOnly && <><button
         type="button"
         className={value.kind === 'empty' ? 'npf-repo is-selected' : 'npf-repo'}
         aria-pressed={toggle ? value.kind === 'empty' : undefined}
@@ -124,7 +134,7 @@ export function RepoPicker({
         >
           {template.label} — {template.blurb}
         </button>
-      ))}
+      ))}</>}
       {dropdown ? (
         <RepoDropdown catalog={catalog} value={value} onChange={onChange} autoFocus={autoFocus} onRefresh={() => load(true)} />
       ) : (
@@ -158,6 +168,8 @@ export function RepoPicker({
                   type="button"
                   className={listedSelected(repo.fullName) ? 'npf-repo is-selected' : 'npf-repo'}
                   aria-pressed={toggle ? listedSelected(repo.fullName) : undefined}
+                  disabled={lockedRow(repo.fullName)}
+                  title={lockedRow(repo.fullName) ? addOnly!.hint : undefined}
                   onClick={() => chooseListed(repo)}
                 >
                   {repo.fullName}
@@ -169,7 +181,7 @@ export function RepoPicker({
       </div>
       </>
       )}
-      {showPaste && (
+      {showPaste && !addOnly && (
         <>
           <label htmlFor="npf-paste">Paste a URL</label>
           <input

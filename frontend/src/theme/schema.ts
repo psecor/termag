@@ -35,6 +35,12 @@ export interface ThemeSettings {
   // Projects list. Off (the default) folds them behind the list's "Show
   // stopped (N)" toggle.
   sidebarShowStopped: boolean;
+  // Ask chats — the worktree-less `ask-<thread>` sessions an ask run takes on
+  // its target project (backend services/askChat.ts) — in the full UI's
+  // session lists: the sidebar's workstream rows, the status strip's popovers
+  // and the ⌘K palette. Off (the default): they have no pane to open here, so
+  // all they add is noise; the conversations live in the simple UI.
+  sidebarAskChats: boolean;
   // Leave boxes and projects made for `termag ask` (createdFor 'ask') out of
   // the full UI's Projects list, so it shows only what the person started.
   // Off by default: everything is listed.
@@ -43,6 +49,11 @@ export interface ThemeSettings {
   // Absent means off, and off is stored that way, like palette. Opt-in,
   // offered behind thanksgiving-turkeys-enabled.
   starfieldTurkeys?: boolean;
+  // Theme of the day: the dated reskin under
+  // frontend/src/theme/daily/ for today's Pacific date, when there is one.
+  // Absent means off, and off is stored that way, like palette. Opt-in,
+  // offered behind daily-theme-enabled.
+  dailyTheme?: boolean;
   // Terminals' font. Absent means Maple Mono, and Maple Mono is stored that
   // way, like palette, so DEFAULT_THEME and every older theme read as it.
   terminalFont?: TerminalFont;
@@ -66,6 +77,7 @@ export const DEFAULT_THEME: ThemeSettings = {
   sidebarActivity: false,
   sidebarMetaTerm: false,
   sidebarShowStopped: false,
+  sidebarAskChats: false,
   sidebarHideAskBoxes: false,
 };
 
@@ -73,7 +85,7 @@ export const DEFAULT_THEME: ThemeSettings = {
 // default). PUT /auth/me/preferences fills absent ones from the stored theme
 // (mergeStoredThemeKeys), so a tab loaded before a key existed keeps the
 // user's choice instead of resetting it.
-export const OPTIONAL_THEME_KEYS = ['palette', 'sidebarActivity', 'sidebarMetaTerm', 'sidebarShowStopped', 'sidebarHideAskBoxes', 'starfieldTurkeys', 'terminalFont'] as const;
+export const OPTIONAL_THEME_KEYS = ['palette', 'sidebarActivity', 'sidebarMetaTerm', 'sidebarShowStopped', 'sidebarHideAskBoxes', 'sidebarAskChats', 'starfieldTurkeys', 'dailyTheme', 'terminalFont'] as const;
 
 const HEX6 = /^#[0-9a-f]{6}$/;
 const HEX3 = /^#[0-9a-f]{3}$/;
@@ -124,7 +136,7 @@ export function validateTheme(input: unknown): ThemeValidation {
   const bg = validateBackground(input.background);
   if (!bg.ok) return bg;
   // Optional so a tab loaded before these keys existed can still save its background.
-  for (const key of ['sidebarActivity', 'sidebarMetaTerm', 'sidebarShowStopped', 'sidebarHideAskBoxes', 'starfieldTurkeys'] as const) {
+  for (const key of ['sidebarActivity', 'sidebarMetaTerm', 'sidebarShowStopped', 'sidebarHideAskBoxes', 'sidebarAskChats', 'starfieldTurkeys', 'dailyTheme'] as const) {
     if (key in input && typeof input[key] !== 'boolean') return { ok: false, error: `${key} must be a boolean` };
   }
   if ('palette' in input && input.palette !== 'dark' && input.palette !== 'light') {
@@ -142,8 +154,10 @@ export function validateTheme(input: unknown): ThemeValidation {
       sidebarActivity: input.sidebarActivity === true,
       sidebarMetaTerm: input.sidebarMetaTerm === true,
       sidebarShowStopped: input.sidebarShowStopped === true,
+      sidebarAskChats: input.sidebarAskChats === true,
       sidebarHideAskBoxes: input.sidebarHideAskBoxes === true,
       ...(input.starfieldTurkeys === true ? { starfieldTurkeys: true } : {}),
+      ...(input.dailyTheme === true ? { dailyTheme: true } : {}),
       ...(input.terminalFont === 'jetbrains' ? { terminalFont: 'jetbrains' as const } : {}),
     },
   };
@@ -175,8 +189,10 @@ export function normalizeTheme(input: unknown): ThemeSettings {
     sidebarActivity: input.sidebarActivity === true,
     sidebarMetaTerm: input.sidebarMetaTerm === true,
     sidebarShowStopped: input.sidebarShowStopped === true,
+    sidebarAskChats: input.sidebarAskChats === true,
     sidebarHideAskBoxes: input.sidebarHideAskBoxes === true,
     ...(input.starfieldTurkeys === true ? { starfieldTurkeys: true } : {}),
+    ...(input.dailyTheme === true ? { dailyTheme: true } : {}),
     ...(input.terminalFont === 'jetbrains' ? { terminalFont: 'jetbrains' as const } : {}),
   };
 }

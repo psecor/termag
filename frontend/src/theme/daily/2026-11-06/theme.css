@@ -1,0 +1,22 @@
+/* Sunset by five: rose-pink afterglow accents in both UIs and both palettes. Contrast:
+   dark: #ff9eb5 on #0d1117 9.74:1, #161b22 8.90:1, #21262d 7.83:1, simple UI #181a1f 8.96:1,
+   #23252a 7.89:1; white on #c2416b 4.93:1, on its hover mix #cd6386 3.9:1; #c2416b as a border or
+   outline on #21262d 3.09:1, #23252a 3.11:1.
+   light: #b02a59 on #ffffff 6.32:1, #f6f8fa 5.94:1, #eaeef2 5.42:1, simple UI #f7f9fb 5.99:1;
+   white on #9e2550 7.41:1. */
+
+html[data-daily-theme="2026-11-06"],
+html[data-daily-theme="2026-11-06"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-06"] .lp-theme {
+  --accent: #ff9eb5;
+  --accent-dim: #c2416b;
+  --accent-rgb: 255, 158, 181;
+}
+
+html[data-daily-theme="2026-11-06"][data-palette="light"],
+html[data-daily-theme="2026-11-06"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-06"][data-palette="light"] .lp-theme {
+  --accent: #b02a59;
+  --accent-dim: #9e2550;
+  --accent-rgb: 176, 42, 89;
+}

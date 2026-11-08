@@ -4,7 +4,7 @@
 // (components/) imports it without a cycle through the catalog.
 import React, { createContext, useState } from 'react';
 import { useBoundProp, useStateStore, type BaseComponentProps } from '@json-render/react';
-import type { z } from 'zod';
+import { z } from 'zod';
 import { LP_THEME } from '../../launchpad/theme';
 import { REPEAT_MAX_ITEMS, REPEAT_PATH_PROP } from './limits';
 
@@ -44,10 +44,33 @@ function BadElement({ type, error }: { type: string; error: z.ZodError }) {
 }
 
 /**
- * The component behind its props check. A separate element, so a flip
- * between valid and not never reorders hooks. A repeated element (readSpec
- * gives it its list's path) draws a note instead once the list is longer than
- * REPEAT_MAX_ITEMS: a press can set state the spec was not read with.
+ * The props, less any optional one the agent set to "" or null where that
+ * fails its schema: read as left out, the agent's "nothing yet" (a RadioGroup
+ * with nothing picked, a Tabs on its first tab) draws as the default instead
+ * of a note. Only where leaving it out passes, so a required prop, and a
+ * value nested inside one (an option's own value), are still checked as given.
+ */
+export function withoutBlanks(schema: z.ZodType, props: Record<string, unknown>): Record<string, unknown> {
+  if (!(schema instanceof z.ZodObject)) return props;
+  let out = props;
+  for (const [key, field] of Object.entries(schema.shape as Record<string, z.ZodType>)) {
+    const v = props[key];
+    if ((v === '' || v === null) && !field.safeParse(v).success && field.safeParse(undefined).success) {
+      if (out === props) out = { ...props };
+      delete out[key];
+    }
+  }
+  return out;
+}
+
+/**
+ * The component behind its props check (after withoutBlanks). A separate
+ * element, so a flip between valid and not never reorders hooks. One that
+ * fails draws a note and still draws its children, each behind its own check,
+ * so one bad prop on a Card does not take the form inside it. A repeated
+ * element (readSpec gives it its list's path) draws a note instead once the
+ * list is longer than REPEAT_MAX_ITEMS: a press can set state the spec was
+ * not read with.
  */
 export function guardedBy<P>(type: string, schema: z.ZodType, Impl: React.ComponentType<Ctx<P>>) {
   return (ctx: Ctx<Record<string, unknown>>) => {
@@ -57,8 +80,8 @@ export function guardedBy<P>(type: string, schema: z.ZodType, Impl: React.Compon
     if (Array.isArray(items) && items.length > REPEAT_MAX_ITEMS) {
       return <div className="genui-bad" role="note">{type} could not be drawn (its list has more than {REPEAT_MAX_ITEMS} items)</div>;
     }
-    const parsed = schema.safeParse(ctx.props);
-    if (!parsed.success) return <BadElement type={type} error={parsed.error} />;
+    const parsed = schema.safeParse(withoutBlanks(schema, ctx.props));
+    if (!parsed.success) return <><BadElement type={type} error={parsed.error} />{ctx.children}</>;
     return <Impl {...ctx} props={parsed.data as P} />;
   };
 }

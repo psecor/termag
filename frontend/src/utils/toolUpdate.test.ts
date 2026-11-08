@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  compareVersions, conflictText, fleetButtonLabel, fleetConfirmText, fleetResultLines, hostConfirmText, hostRequestedText, hostUpdateAction, isUpdateOff,
+  compareVersions, conflictText, hostButtonLabel, fleetButtonLabel, fleetConfirmText, fleetResultLines, hostConfirmText, hostUpdateAction, followedRunLine, runReason, runInFlight, isUpdateOff,
   defaultRestart, latestRunByHost, restartChoices, restartLabel, runAt, runClass, runSessionsText, runStateText, runVersions, scopeCount, toolForInventory, updateTool, UPDATE_TOOLS,
 } from './toolUpdate';
 import type { ToolUpdatePreview, SoftwareHost, SoftwareState, SoftwareUpdateRun } from '../services/adminApi';
@@ -46,12 +46,6 @@ describe('the host panel action', () => {
     expect(conflictText(httpError(409, 'something_new'), claude)).toBe('Refused (something_new).');
     expect(conflictText(httpError(500), claude)).toBeNull();
   });
-  it('tells a started update from one whose acknowledgement was lost, neither as an error', () => {
-    expect(hostRequestedText({ runId: 'r1', acknowledged: true })).toEqual({ text: 'update started (run r1)', className: '' });
-    const lost = hostRequestedText({ runId: 'r2', acknowledged: false });
-    expect(lost.text).toBe('update sent, but the box’s acknowledgement was lost (run r2): it may be running; the runs list will say');
-    expect(lost.className).toBe('admin-warn');
-  });
   it('confirms with the versions, the session counts and what the restart does', () => {
     const text = hostConfirmText(claude, 'ada-box', preview(), 'force');
     expect(text).toContain('Update Claude Code on ada-box?');
@@ -59,6 +53,8 @@ describe('the host panel action', () => {
     expect(text).toContain('3 live Claude Code sessions, 1 busy.');
     expect(text).toContain('Restart: restart sessions now. Restarting now cuts the 1 running turn.');
     expect(hostConfirmText(claude, 'b', preview({ liveSessions: 1, busySessions: 0 }), 'none')).toContain('1 live Claude Code session, 0 busy.');
+    // Node's are its tools' sessions (Devin on #1166).
+    expect(hostConfirmText(updateTool('node'), 'b', preview({ liveSessions: 2, busySessions: 1 }), 'idle')).toContain('2 live Claude Code, Codex and pi sessions, 1 busy.');
     expect(hostConfirmText(claude, 'b', preview(), 'idle')).toContain('Restart: restart sessions when idle. Sessions restart as each goes idle.');
   });
 });
@@ -94,6 +90,8 @@ describe('the fleet action', () => {
     expect(out.summary).toBe('1 run requested, 2 skipped');
     expect(out.skipped).toEqual(['b: offline', 'z: weird']);
     expect(fleetResultLines({ runs: [], skipped: [] }, (k: string) => k).summary).toBe('0 runs requested');
+    const why = fleetResultLines({ runs: [], skipped: (['not_installed', 'version_unreadable', 'no_inventory', 'unknown_version', 'offline'] as const).map(reason => ({ hostKey: reason, reason })) }, (k: string) => k);
+    expect(why.skipped).toEqual(['not_installed: not installed', 'version_unreadable: version unreadable', 'no_inventory: no recent inventory', 'unknown_version: no version to compare with', 'offline: offline']);
   });
 });
 
@@ -137,6 +135,8 @@ describe('per tool', () => {
       ['gh', 'GitHub CLI', 'gh', 'tool-update-gh-v1'],
       ['aws', 'AWS CLI', 'aws', 'tool-update-aws-v1'],
       ['node', 'Node', 'node', 'tool-update-node-v1'],
+      ['python', 'Python', 'python', 'tool-update-python-v1'],
+      ['docker', 'Docker', 'docker', 'tool-update-docker-v1'],
     ]);
     expect(toolForInventory('codex')).toBe(codex);
     expect(toolForInventory('cursor-agent')).toBe(updateTool('cursor'));
@@ -145,8 +145,15 @@ describe('per tool', () => {
     expect(toolForInventory('gh')).toBe(updateTool('gh'));
     expect(toolForInventory('aws')).toBe(updateTool('aws'));
     expect(toolForInventory('node')).toBe(updateTool('node'));
-    expect(toolForInventory('python')).toBeUndefined();
-    expect(restartChoices(updateTool('node')).map(c => c.value)).toEqual(['none']);
+    expect(toolForInventory('python')).toBe(updateTool('python'));
+    expect(toolForInventory('rust')).toBeUndefined();
+    // Python: no sessions, so binary only.
+    expect(restartChoices(updateTool('python')).map(c => c.value)).toEqual(['none']);
+    expect(defaultRestart(updateTool('python'))).toBe('none');
+    // Node: every choice, for the sessions of the tools that run on it, starting at none.
+    expect(restartChoices(updateTool('node')).map(c => c.value)).toEqual(['none', 'idle', 'force']);
+    expect(restartChoices(updateTool('node'))[1].note).toBe('each Claude Code, Codex and pi session on the old Node restarts once its turn ends');
+    expect(defaultRestart(updateTool('node'))).toBe('none');
     expect(restartChoices(updateTool('aws')).map(c => c.value)).toEqual(['none']);
     expect(defaultRestart(updateTool('aws'))).toBe('none');
   });
@@ -222,5 +229,71 @@ describe('per tool', () => {
     expect(scopeCount(codex, hosts, 'behind', { floor: '0.131.0', target: 'latest' })).toBe(1);
     expect(scopeCount(codex, hosts, 'below-floor', { floor: '0.131.0', target: 'latest' })).toBe(0);
     expect(scopeCount(claude, hosts, 'behind', null)).toBe(1);
+  });
+});
+
+describe('the host panel\'s line, following its run', () => {
+  const ack = { runId: 'r1', acknowledged: true };
+  it('maps the update scripts\' reason codes to words, with the version they name', () => {
+    expect(runReason('policy=ok restart=none(nothing installed) npm=1.0.2->FAILED:unpinned:1.5.0 runners=0')).toEqual({ text: 'not pinned', version: '1.5.0' });
+    expect(runReason('inst=2.60.0->FAILED:not-in-repo:2.61.0')).toEqual({ text: 'not in the package repo', version: '2.61.0' });
+    expect(runReason('npm=none->FAILED:not-in-npm-global')).toEqual({ text: 'not in the npm global', version: null });
+    expect(runReason('inst=1->FAILED:some-new-code:2')).toEqual({ text: 'some new code', version: '2' });
+    expect(runReason('policy=refused:401 restart=none target=-->-')).toEqual({ text: 'policy refused (401)', version: null });
+    expect(runReason('policy=unreachable restart=none')).toEqual({ text: 'policy unreachable', version: null });
+    expect(runReason('policy=ok inst=v20->pin-mismatch')).toEqual({ text: 'pin mismatch', version: null });
+    expect(runReason('policy=ok npm=2.1.300->FAILED state=below-floor lock=held-by-another-run')).toEqual({ text: 'another run held the lock', version: null });
+    // A plain FAILED, or the orchestrator's sentence on an expired run: no reason (the hover has the detail).
+    expect(runReason('policy=ok npm=2.1.300->FAILED state=below-floor')).toBeNull();
+    expect(runReason('the box did not fetch its policy within 15 minutes')).toBeNull();
+    expect(runReason(null)).toBeNull();
+  });
+  it('says updating while the run is asked for or running, and its end after', () => {
+    expect(runInFlight(run({ status: 'requested', outcome: null }))).toBe(true);
+    expect(runInFlight(run())).toBe(false);
+    expect(followedRunLine(ack, undefined)).toMatchObject({ state: 'updating…', className: '', inFlight: true, runId: 'r1' });
+    expect(followedRunLine(ack, run({ id: 'r1', status: 'running', outcome: null }))).toMatchObject({ state: 'updating…', inFlight: true });
+    expect(followedRunLine(ack, run({ id: 'r1' }))).toMatchObject({ state: 'updated', versions: '2.1.300 → 2.1.320', className: 'admin-ok', reason: null, inFlight: false });
+    expect(followedRunLine(ack, run({ id: 'r1', outcome: 'current', fromVersion: '2.1.320' }))).toMatchObject({ state: 'current', versions: '2.1.320', className: 'admin-ok' });
+    const failed = followedRunLine(ack, run({ id: 'r1', status: 'failed', outcome: 'failed', fromVersion: '1.0.2', toVersion: '1.0.2', detail: 'npm=1.0.2->FAILED:unpinned:1.5.0' }));
+    expect(failed).toMatchObject({ state: 'failed', reason: { text: 'not pinned', version: '1.5.0' }, versions: '1.0.2', className: 'admin-bad' });
+    expect(failed.title).toContain('npm=1.0.2->FAILED:unpinned:1.5.0');
+    expect(followedRunLine(ack, run({ id: 'r1', status: 'expired', outcome: null, fromVersion: null, toVersion: null, detail: 'the box did not fetch its policy within 15 minutes' })))
+      .toMatchObject({ state: 'expired', reason: null, versions: '→ 2.1.320', className: 'admin-warn' });
+  });
+  it('says a lost acknowledgement until the run starts, then follows it the same way', () => {
+    const lost = { runId: 'r2', acknowledged: false };
+    expect(followedRunLine(lost, undefined)).toMatchObject({ className: 'admin-warn', inFlight: true });
+    expect(followedRunLine(lost, undefined).state).toMatch(/acknowledgement was lost: it may be running/);
+    expect(followedRunLine(lost, run({ id: 'r2', status: 'requested', outcome: null })).className).toBe('admin-warn');
+    expect(followedRunLine(lost, run({ id: 'r2', status: 'running', outcome: null }))).toMatchObject({ state: 'updating…', className: '' });
+    expect(followedRunLine(lost, run({ id: 'r2' }))).toMatchObject({ state: 'updated', className: 'admin-ok' });
+  });
+});
+
+describe('Docker, updated only at the box\'s start', () => {
+  const docker = updateTool('docker');
+  it('is a sessionless tool whose actions queue a run for the next start', () => {
+    expect(docker).toMatchObject({ label: 'Docker', inventory: 'docker', capability: 'tool-update-docker-v1', sessions: false, atStart: true });
+    expect(toolForInventory('docker')).toBe(docker);
+    expect(hostButtonLabel(docker)).toBe('Update Docker at next start');
+    expect(hostButtonLabel(claude)).toBe('Update Claude Code');
+  });
+  it('says in the confirms that it is queued and reports after the start', () => {
+    const one = hostConfirmText(docker, 'ada-box', preview({ current: '29.8.1', target: 'latest', floor: '27.1.1', atStart: true }), 'none');
+    expect(one).toContain('Queue a Docker update for ada-box’s next start?');
+    expect(one).toContain('29.8.1 → latest (floor 27.1.1)');
+    expect(one).toContain('installs at the box’s next start');
+    expect(one).toContain('Its report arrives after that start.');
+    const fleet = fleetConfirmText(docker, 'behind', 140, 'none', { floor: '27.1.1', target: '29.9.3' });
+    expect(fleet).toContain('Queue a Docker update for the next start of about 140 boxes behind the target 29.9.3?');
+    expect(fleet).toContain('the orchestrator host, are skipped');
+    expect(fleetResultLines({ runs: [{ hostKey: 'a', runId: 'r' }], skipped: [], atStart: true }, k => k).summary).toBe('1 run queued for each box’s next start');
+  });
+  it('reads a queued run as waiting for the start, and the panel as already queued', () => {
+    expect(followedRunLine({ runId: 'r1', acknowledged: false, atStart: true }, undefined).state).toBe('queued: installs at the box’s next start, and reports after it');
+    expect(followedRunLine({ runId: 'r1', acknowledged: false, atStart: true }, run({ status: 'requested', outcome: null, waitingForStart: true, component: 'docker' })).className).toBe('');
+    expect(runStateText(run({ status: 'requested', outcome: null, waitingForStart: true }))).toBe('queued for the box’s next start');
+    expect(hostUpdateAction(preview({ runInFlight: true, atStart: true }))).toEqual({ kind: 'disabled', reason: 'an update is already queued for the next start' });
   });
 });

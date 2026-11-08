@@ -1,0 +1,38 @@
+/* Preview links in the Share dialog (previewLinks/). Text is in the UI font,
+ * even in the full UI's monospace body; only URLs, hosts and ports are mono.
+ * Colours are termag's: LaunchPad's tokens come from .lp-theme
+ * (launchpad/theme.css). */
+.preview-links { font-family: var(--font-ui); display: flex; flex-direction: column; gap: 12px; }
+.preview-links-lede { color: var(--text-secondary); font-size: 13px; margin: 0; }
+.preview-links-mono, .preview-links-url { font-family: var(--font-mono); }
+.preview-links-publish { display: flex; flex-direction: column; gap: 14px; }
+.preview-links-port { display: flex; align-items: flex-end; gap: 6px; }
+.preview-links-port-select { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.preview-links-select-button { width: 100%; justify-content: space-between; }
+.preview-links-hint { color: var(--text-secondary); font-size: 12px; margin: 0; }
+.preview-links-error { color: var(--danger); font-size: 12px; margin: 0; }
+.preview-links-warning { color: var(--warning); font-size: 12px; margin: 0 0 0 28px; }
+.preview-links-audience { display: flex; flex-direction: column; gap: 6px; }
+.preview-links-number { display: flex; align-items: center; gap: 4px; max-width: 180px; }
+.preview-links-advanced-head { margin: 0; }
+.preview-links-actions { display: flex; justify-content: flex-end; }
+.preview-links-result { min-width: 0; }
+.preview-links-result-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; align-self: stretch; }
+.preview-links-copy { display: flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; }
+.preview-links-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 12px; }
+.preview-links-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.share-delivery { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; font-family: var(--font-ui); }
+.share-delivery-choices { display: flex; gap: 16px; }
+.preview-links-answering { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.preview-links-list { display: flex; flex-direction: column; gap: 16px; font-family: var(--font-ui); }
+.preview-links-section { display: flex; flex-direction: column; gap: 8px; }
+.preview-links-section-title { margin: 0; font-size: 13px; color: var(--text-secondary); }
+.preview-links-row { display: flex; flex-direction: column; gap: 8px; padding: 10px 0; border-top: 1px solid var(--border); }
+.preview-links-row p { margin: 0; }
+.preview-links-row-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.preview-links-row-ended { opacity: 0.7; }
+.preview-links-row-actions { flex-shrink: 0; }
+.preview-links-viewers { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.preview-links-viewers li { display: flex; align-items: center; gap: 6px; }
+.preview-links-note { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
+.preview-links-note blockquote { margin: 2px 0 0; padding: 4px 8px; border-left: 2px solid var(--border); color: var(--text-primary); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 8em; overflow: auto; }

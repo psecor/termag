@@ -25,9 +25,11 @@ import { reviewStateLabel, reviewStateText } from '../../utils/review';
 import { recordProductEventOnce } from '../../observability';
 import { ringStateFor } from '../../utils/reviewRing';
 import { optOutOfMobile } from '../../mobile/redirect';
+import { openInChatHref, opensInChat, showsAsChat } from '../../mobile/chatLinks';
+import { isSdkChat } from '../../chat/simpleChat';
 import { ActionSheet, ConfirmSheet, Sheet, apiError } from './Sheet';
 import { HeaderPrPills } from './HeaderPrPills';
-import { ReviewSheet } from './ReviewSheet';
+import { heldNext, ReviewSheet } from './ReviewSheet';
 import { HandoffSheet } from './HandoffSheet';
 import { FLAGS, useFlag } from '../../flags';
 import { projectKindTraits } from '../../utils/projectKind';
@@ -74,12 +76,64 @@ export function Conversation() {
     enabled: Boolean(project && hasAgent),
   });
   const reviewAlive = Boolean(review.status?.alive);
+  // A review the start route holds while it wakes the box (box-wake-on-action-enabled): said in a banner, and
+  // followed through GET …/review/held until it runs (the review tab opens) or fails, which shows as the action error.
+  // The start it follows: the conversation it was held for, whatever this page shows next.
+  const [reviewWaking, setReviewWaking] = useState<{ box: string; projectId: string; ws: string; started: { pr: number; url: string | null; session: string } } | null>(null);
+  // It ran while something was typed here: the review tab isn't opened over the draft (a pane switch drops it); a
+  // banner offers it instead.
+  const [reviewReady, setReviewReady] = useState(false);
+  const draftRef = useRef('');
+  // The conversation on screen now, for a /held read answering after the page moved (before the banner's state does).
+  const shownRef = useRef({ projectId: project?.id, ws });
+  shownRef.current = { projectId: project?.id, ws };
+  // Shown while that review runs (hidden until its status says so); looking at it, any way, or its ending (alive,
+  // then not) puts the offer away.
+  const wasAlive = useRef(reviewAlive);
+  useEffect(() => {
+    if (role === 'review' || (wasAlive.current && !reviewAlive)) setReviewReady(false);
+    wasAlive.current = reviewAlive;
+  }, [role, reviewAlive]);
+  // Another conversation opened here: the banner was that start's, not this one's.
+  useEffect(() => {
+    setReviewWaking(w => (w && (w.projectId !== project?.id || w.ws !== ws) ? null : w));
+    setReviewReady(false);
+  }, [project?.id, ws]);
+  useEffect(() => {
+    if (!reviewWaking) return;
+    let live = true;
+    const timer = setInterval(() => {
+      reviewApi.held(reviewWaking.projectId, reviewWaking.ws).then(h => {
+        // A read that answers after the banner went (another conversation, or an earlier read ended it), or once another
+        // conversation is on screen, says nothing.
+        if (!live || shownRef.current.projectId !== reviewWaking.projectId || shownRef.current.ws !== reviewWaking.ws) return;
+        const next = heldNext(h);
+        if (next.waking) return;
+        setReviewWaking(null);
+        if (next.error) setActionError(next.error);
+        // It ran: shown as a normal start is (its started guess bridges the moment before its status lists it),
+        // unless a draft is in the composer, when it's offered instead.
+        else if (draftRef.current.trim()) { review.refresh(); setReviewReady(true); }
+        else { review.markStarted(reviewWaking.started); setRole('review'); }
+      }, () => { /* read again on the next tick */ });
+    }, 4_000);
+    return () => { live = false; clearInterval(timer); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- review.refresh: called on the change, not on its identity
+  }, [reviewWaking]);
   const reviewDock = reviewStateLabel({ alive: reviewAlive, state: review.status?.state ?? null });
   const reviewKey = reviewKeyLabel(reviewDock);
   const stopCopy = reviewStopCopy(reviewDock);
+  // A chat-runner session has no agent pane: its
+  // conversation is in the simple UI, so the agent tab neither captures nor
+  // types. Its ctrl shell and review pane still work. chatRunner follows
+  // chatProvider's fallback, so an automation's main (no agent of its own; its
+  // runs are chat runners) has no pane either. Only sdkChat, a session the
+  // simple UI lists, offers the Open in Chat banner.
+  const chatRunner = project != null && isSdkChat(project, ws);
+  const sdkChat = project != null && showsAsChat(project, ws);
   // The ctrl shell exists for every project; the agent pane needs an agent
-  // workflow; the review pane needs a running review.
-  const paneAvailable = role === 'ctrl' || (role === 'review' ? reviewAlive : hasAgent);
+  // workflow that is not a chat runner; the review pane needs a running review.
+  const paneAvailable = role === 'ctrl' || (role === 'review' ? reviewAlive : hasAgent && !chatRunner);
 
   const capture = useCapture({
     projectId: project?.id ?? null,
@@ -165,6 +219,7 @@ export function Conversation() {
 
   // Composer + key bar.
   const [text, setText] = useState('');
+  draftRef.current = text;
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   // "Image pasted into the pane" after a photo attach (below).
@@ -218,7 +273,7 @@ export function Conversation() {
   };
   const offline = capture.error === 'offline';
   const send = useCallback(async (body: { keys: string; enter: boolean; literal: boolean }, sent: string | null) => {
-    if (!project || sending) return;
+    if (!project || sending || !paneAvailable) return;
     setSending(true);
     setSendError(null);
     setAttachNote(null);
@@ -232,7 +287,7 @@ export function Conversation() {
     } finally {
       setSending(false);
     }
-  }, [project, role, ws, sending, capture.refresh]);
+  }, [project, role, ws, sending, paneAvailable, capture.refresh]);
 
   const onSend = (withEnter: boolean) => {
     const keys = flattenForSend(text);
@@ -318,12 +373,19 @@ export function Conversation() {
   // The key bar's Review button always asks for the PR, like the desktop's:
   // the sheet names the running review (if any) and starting replaces it.
   const onReviewButton = () => setReviewOpen(true);
-  const onReviewStarted = (r: { pr: number; url: string | null; session: string }) => { review.markStarted(r); setRole('review'); };
+  const onReviewStarted = (r: { pr: number; url: string | null; session: string; waking?: string | null }) => {
+    // Held while the box wakes: no review runs yet, so the phone doesn't claim one (its started guess lasts seconds,
+    // and the box can take minutes). It stays where it is, with the banner, and opens the review once it runs.
+    if (r.waking && project) { setReviewWaking({ box: r.waking, projectId: project.id, ws, started: { pr: r.pr, url: r.url, session: r.session } }); return; }
+    setReviewWaking(null);
+    review.markStarted(r); setRole('review');
+  };
   const stopReview = async () => {
     if (!project) return;
     try {
       await reviewApi.stop(project.id, ws);
       review.markStopped();
+      setReviewReady(false);
       if (role === 'review') setRole('agent');
     } catch (err) {
       setActionError(apiError(err, 'Could not stop the review'));
@@ -396,6 +458,18 @@ export function Conversation() {
         </div>
       </header>
       {actionError && !branchOpen && <div className="m-banner" data-connection="offline" role="alert" onClick={() => setActionError('')}>{actionError} · tap to dismiss</div>}
+      {reviewWaking && !actionError && <div className="m-banner m-banner-chat" role="status">Waking {reviewWaking.box}… Devin starts the review once it's up.</div>}
+      {reviewReady && reviewAlive && role !== 'review' && (
+        <div className="m-banner m-banner-chat" role="status">
+          Devin's review is running · <button type="button" className="m-link" onClick={() => { setReviewReady(false); setRole('review'); }}>open it</button>
+        </div>
+      )}
+      {/* A chat-runner session has no agent pane to capture; its conversation is in the simple UI. */}
+      {sdkChat && (
+        <div className="m-banner m-banner-chat" role="note">
+          This session is a chat. <Link to={openInChatHref({ projectId, workstream: ws })}>Open it in Chat</Link>
+        </div>
+      )}
       {handoff && showHandoffStrip(handoff, nowTick) && (
         <div className="m-banner" data-connection={handoff.state === 'failed' || handoff.state === 'aborted' ? 'offline' : undefined} role="status">
           {handoffStateLabel(handoff)}
@@ -416,6 +490,7 @@ export function Conversation() {
             { label: 'Archive project…', onClick: () => setArchiveOpen(true), danger: true, disabled: !projectKindTraits(project.kind).canArchive || project.role === 'collaborator' },
             ...(lastReply ? [{ label: 'Share the last reply…', onClick: () => { void shareText(lastReply.text, `${project.name} · ${agentLabel}`); } }] : []),
             ...(wakeLockSupported() ? [{ label: keepAwake ? 'Let the screen sleep' : 'Keep screen on', onClick: () => setKeepAwake(k => !k) }] : []),
+            ...(opensInChat({ kind: project.kind, workstream: ws }) ? [{ label: 'Open in Chat', onClick: () => navigate(openInChatHref({ projectId, workstream: ws })) }] : []),
             { label: 'Open in Lab', onClick: openFull },
             { label: 'Reload app', onClick: reloadApp },
           ]}
@@ -509,7 +584,11 @@ export function Conversation() {
         {!paneAvailable && project && (
           role === 'review'
             ? <div className="m-empty">No review is running for this workstream.</div>
-            : <div className="m-empty">This project has no agent workflow. The ctrl tab still works.</div>
+            : sdkChat
+              ? <div className="m-empty">This session's agent runs as a chat, not in a pane. Open it in Chat; the ctrl tab still works.</div>
+              : chatRunner
+                ? <div className="m-empty">This automation's main runs no agent; each run is its own chat. The ctrl tab still works.</div>
+                : <div className="m-empty">This project has no agent workflow. The ctrl tab still works.</div>
         )}
         {paneAvailable && parsed == null && !capture.error && <div className="m-empty">Loading…</div>}
         {paneAvailable && !history.exhausted && (
@@ -534,7 +613,7 @@ export function Conversation() {
       {unseen && <button className="m-jump" onClick={jumpToBottom}>↓ new output</button>}
 
       <div className="m-keybar" role="toolbar" aria-label="Keys">
-        {keys.map(k => (
+        {paneAvailable && keys.map(k => (
           <button key={k.label} className="m-key" onClick={() => onQuick(k)} disabled={sending || offline || !project} title={k.title}>{k.label}</button>
         ))}
         <span className="m-keybar-spacer" aria-hidden="true" />
@@ -587,7 +666,7 @@ export function Conversation() {
           spellCheck
           disabled={offline || !project || !paneAvailable}
         />
-        <button type="submit" className="m-send" data-analytics="mobile-send" disabled={sending || offline || !text.trim()} aria-label="Send">➤</button>
+        <button type="submit" className="m-send" data-analytics="mobile-send" disabled={sending || offline || !paneAvailable || !text.trim()} aria-label="Send">➤</button>
       </form>
       {(sendError || attachNote || text.length > MAX_KEYS - 500) && (
         <div className="m-composer-note" data-error={sendError ? '' : undefined} role={sendError ? 'alert' : 'status'}>

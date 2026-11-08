@@ -42,6 +42,14 @@ export interface BoxSizeOptions {
 /** The preselection for an orchestrator from before `default` too. */
 const OLD_UI_DEFAULT: BoxSize = 'medium';
 
+const GITHUB_RE = /^(?:https:\/\/github\.com\/|git@github\.com:)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/;
+
+/** owner/name, lower case, from a GitHub URL; null for anything else. */
+export function repoSlug(url: string | null | undefined): string | null {
+  const m = url ? GITHUB_RE.exec(url.trim()) : null;
+  return m ? `${m[1]}/${m[2]}`.toLowerCase() : null;
+}
+
 /**
  * What the New box dropdowns preselect: the server's answer for the repo, so
  * the dropdown shows what a box with nothing picked launches at. The repo

@@ -2,7 +2,7 @@
    variables from App.css. Prose is in the system font — monospace at phone
    widths is hard to read — and tool output / plain panes stay monospace. */
 
-/* Top and height follow the visual viewport (mobile/useVisualViewport.ts):
+/* Top and height follow the visual viewport (hooks/useVisualViewport.ts):
    iOS overlays the keyboard instead of resizing, and scrolls the layout
    viewport, which slid a plain `inset: 0` header off screen. */
 .m-root {
@@ -90,6 +90,8 @@
   border-bottom: 1px solid var(--border);
 }
 .m-banner[data-connection="offline"] { background: color-mix(in srgb, var(--danger) 15%, transparent); color: var(--danger); }
+.m-banner-chat { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--text-secondary); }
+.m-banner-chat a { color: var(--accent); }
 
 /* ── Inbox ────────────────────────────────────────────────── */
 .m-segments {

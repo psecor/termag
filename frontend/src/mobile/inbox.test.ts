@@ -147,6 +147,20 @@ describe('buildHome', () => {
     expect(other.slice(2)).toEqual(['p3|main']);
   });
 
+  it('drops the ask chats, counts included, when hideAskChats is set, and keeps them otherwise', () => {
+    const askHost = project({ id: 'p9', name: 'ask-host', instanceId: 'box1', workstreams: [
+      { id: 'ws-p9-main', projectId: 'p9', name: 'main', branch: 'main', archived: false, lastActiveAt: at(5), createdAt: at(600), updatedAt: at(5) },
+      { id: 'ws-p9-ask', projectId: 'p9', name: 'ask-cmvpvr0by19t1ex4aevd9iv3e', branch: 'ask', archived: false, lastActiveAt: at(2), createdAt: at(600), updatedAt: at(2) },
+    ]});
+    const s = { ...statusMap, [statusKey('box1', 'psecor-ask-host-ask-cmvpvr0by19t1ex4aevd9iv3e-agent')]: st('working', 1) };
+    const shown = buildHome([askHost], s, 'psecor');
+    expect(shown.rows.map(r => r.key)).toEqual(['p9|ask-cmvpvr0by19t1ex4aevd9iv3e', 'p9|main']);
+    expect(shown.counts).toEqual({ attention: 0, running: 1, reviewing: 0 });
+    const hidden = buildHome([askHost], s, 'psecor', { hideAskChats: true });
+    expect(hidden.rows.map(r => r.key)).toEqual(['p9|main']);
+    expect(hidden.counts).toEqual({ attention: 0, running: 0, reviewing: 0 });
+  });
+
   it('labels each row with its state', () => {
     const label = (key: string) => statusLabel(home.rows.find(r => r.key === key)!);
     expect(label('p2|main')).toBe('Needs approval');

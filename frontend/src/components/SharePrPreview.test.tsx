@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
   api: { createLink: vi.fn(), revoke: vi.fn() },
 }));
 vi.mock('../flags', () => ({
-  FLAGS: { previewShare: 'browser-pane-preview-share-enabled', prLinkShares: 'browser-pane-pr-link-shares-enabled' },
+  FLAGS: {},
   useFlag: (key: string, fallback: boolean) => (key in mocks.flags ? mocks.flags[key] : fallback),
 }));
 vi.mock('../services/api', () => ({
@@ -42,7 +42,7 @@ function mount(r: PrRow) {
 }
 
 beforeEach(() => {
-  mocks.flags = { 'browser-pane-preview-share-enabled': true, 'browser-pane-pr-link-shares-enabled': true };
+  mocks.flags = {};
   mocks.api.createLink.mockReset();
   mocks.api.revoke.mockReset();
   writeText.mockClear();
@@ -64,9 +64,6 @@ describe('Share preview in the PR overlay', () => {
       mount(r);
       expect(button('Share preview'), r.lane).toBeUndefined();
     }
-    mocks.flags['browser-pane-pr-link-shares-enabled'] = false;
-    mount(row());
-    expect(button('Share preview')).toBeUndefined();
   });
 
   it('shares the PR, copies its link, says it is on the PR, and can stop it', async () => {

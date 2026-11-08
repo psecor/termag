@@ -8,7 +8,6 @@ import React from 'react';
 import { IconButton, Menu, MenuItem, MenuTrigger, Popover, ProgressBar, Text } from '@launchpad-ui/components';
 import { Icon } from '@launchpad-ui/icons';
 import type { Instance, Project } from '../../types';
-import { FLAGS, useFlag } from '../../flags';
 import { LP_THEME } from '../../launchpad/theme';
 import { ChatBoxTag } from './ChatBoxTag';
 import { SidePanelButton, useChatChrome } from './chatChrome';
@@ -36,10 +35,9 @@ export interface SessionHeaderProps {
 export function SessionHeader({ project, workstream, repo, box, working, opening, onOpenFull, archive, resize }: SessionHeaderProps) {
   const desktopHref = desktopSessionHref({ projectId: project.id, workstream, shared: project.role === 'collaborator' });
   const { sidePanel } = useChatChrome();
-  // Claude's own title for the session, where session titles are on, as in the sidebar.
-  const titlesShown = useFlag(FLAGS.sessionTitles, false);
+  // Claude's own title for the session, as in the sidebar.
   const wsRow = project.workstreams?.find(w => w.name === workstream);
-  const title = titlesShown ? wsRow?.sessionTitle?.trim() || null : null;
+  const title = wsRow?.sessionTitle?.trim() || null;
   // A review session: Reviews / the PR, on its own branch.
   const review = useReviewOf(project.id, workstream);
   return (

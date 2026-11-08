@@ -24,3 +24,13 @@ export function chatHistoryMode(pathname: string, narrow: boolean): ChatHistoryM
 export function historyListHidden(mode: ChatHistoryMode, historyOpen: boolean): boolean {
   return mode === 'drawer' && !historyOpen;
 }
+
+/**
+ * Whether the simple UI lifts the viewport's zoom lock (hooks/useZoomableViewport.ts):
+ * on a phone (`MOBILE_MEDIA_QUERY`, a coarse pointer at a phone width; a narrow desktop
+ * window is not one), and not while the side panel is open as the phone's full-screen
+ * overlay, whose terminal and browser take the touches a pinch would make.
+ */
+export function chatZoomable(phone: boolean, overlayOpen: boolean): boolean {
+  return phone && !overlayOpen;
+}

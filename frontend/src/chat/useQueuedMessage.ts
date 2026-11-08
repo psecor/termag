@@ -6,17 +6,17 @@
 // and leaves the open chat alone.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { flattenForSend, sendErrorText } from './compose';
-import { claimHeldUntil, claimQueued, finishQueued, isQueueKey, queueKey, readQueued, releaseQueued, writeQueued } from './newChat';
+import { CLAIM_RENEW_MS, claimHeldUntil, claimQueued, finishQueued, isQueueKey, queueKey, queuedSendId, readQueued, releaseQueued, renewClaim, writeQueued } from './newChat';
 
 const store = () => (typeof localStorage !== 'undefined' ? localStorage : null);
 
-function newTabId(): string {
+function randomId(): string {
   return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : Math.random().toString(36).slice(2);
 }
 
 // Per page, not per mounted hook, so a chat view that remounts (New chat and
 // back) is still the tab that holds the claim and sees its own send in flight.
-const TAB_ID = newTabId();
+const TAB_ID = randomId();
 const inFlight = new Set<string>();
 // Same-tab storage writes fire no `storage` event; this one tells every mounted
 // hook a send for that project settled.
@@ -29,8 +29,12 @@ export interface QueuedMessageOptions {
   /** Claude can take a message now. */
   up: boolean;
   offline: boolean;
-  /** Hands the message to Claude: types it into the agent pane, or a chat-runner turn. */
-  send: (projectId: string, workstream: string, keys: string) => Promise<void>;
+  /**
+   * Hands the message to Claude: types it into the agent pane, or a chat-runner turn.
+   * `sendId` is the same for every try of the same queued text (chat/newChat.ts queuedSendId):
+   * the chat runner takes a message once however often it is sent with its id.
+   */
+  send: (projectId: string, workstream: string, keys: string, sendId?: string) => Promise<void>;
   /** Send the text as typed (newlines kept) rather than flattened for a pane, for the chat runner. */
   raw?: boolean;
 }
@@ -102,9 +106,15 @@ export function useQueuedMessage(o: QueuedMessageOptions): QueuedMessage {
       return () => clearTimeout(t);
     }
     const keys = raw ? text.trim() : flattenForSend(text);
+    // A send whose answer never came (the box may have taken it) goes again with the same id, on Retry or from another tab.
+    const sendId = queuedSendId(store(), key, text, randomId) ?? undefined;
     inFlight.add(key);
+    // The claim stays this tab's while the send is in flight, however long the orchestrator holds it,
+    // so no other tab sends the message again meanwhile. Not cleared by this effect's cleanup: the send
+    // outlives a re-render or unmount, and the claim with it; it stops when the send settles.
+    const renew = setInterval(() => renewClaim(store(), key, TAB_ID, Date.now()), CLAIM_RENEW_MS);
     // The key is the queue's (project@workstream for a worktree); the send is the project's.
-    send(projectId!, workstream, keys)
+    send(projectId!, workstream, keys, sendId)
       .then(() => {
         finishQueued(store(), key, text);
         if (current.current === key) setEcho(keys);
@@ -114,6 +124,7 @@ export function useQueuedMessage(o: QueuedMessageOptions): QueuedMessage {
         if (current.current === key) setError(sendErrorText(err));
       })
       .finally(() => {
+        clearInterval(renew);
         inFlight.delete(key);
         if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(SETTLED_EVENT, { detail: key }));
       });

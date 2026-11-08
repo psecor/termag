@@ -16,7 +16,7 @@ export function currentPermission(): NotificationPermission | 'unsupported' {
 
 let pushConfigEnabled: Promise<boolean> | null = null;
 
-/** Whether the server would push to this person (VAPID keys and mobile-web-push-enabled), asked once per page. */
+/** Whether the server would push to this person (it has VAPID keys), asked once per page. */
 export function pushConfigured(): Promise<boolean> {
   pushConfigEnabled ??= pushApi.config().then(c => !!c.enabled && !!c.publicKey).catch(() => false);
   return pushConfigEnabled;

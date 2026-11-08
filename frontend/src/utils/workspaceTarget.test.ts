@@ -45,6 +45,11 @@ describe('which review pane (docs/parallel-reviews.md)', () => {
     expect(hitTarget({ projectId: 'p1', workstream: 'main', role: 'review', session: 'u-p-review-5' })).toMatchObject({ pane: 'review', session: 'u-p-review-5' });
     expect(hitTarget({ projectId: 'p1', workstream: 'main', role: 'ctrl', session: 'u-p-ctrl' })).not.toHaveProperty('session');
   });
+  it('a terminal-slot hit names its slot; the ctrl pane and slot 1 do not', () => {
+    expect(hitTarget({ projectId: 'p1', workstream: 'main', role: 'ctrl', session: 'u-p-ctrl-3', slot: 3 })).toMatchObject({ pane: 'ctrl', slot: 3 });
+    expect(hitTarget({ projectId: 'p1', workstream: 'main', role: 'ctrl', session: 'u-p-ctrl', slot: 1 })).not.toHaveProperty('slot');
+    expect(hitTarget({ projectId: 'p1', workstream: 'main', role: 'ctrl' })).not.toHaveProperty('slot');
+  });
 });
 
 describe('isSearchShortcut', () => {

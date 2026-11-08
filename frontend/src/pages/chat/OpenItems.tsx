@@ -1,5 +1,4 @@
-// The simple UI's sidebar of tabs (simple-ui-side-panel-enabled,
-// chat/openItems.ts), grouped by space: agents, space files and new tabs,
+// The simple UI's sidebar of tabs (chat/openItems.ts), grouped by space: agents, space files and new tabs,
 // one fixed-height line each, in the person's order. A chat's tab is in the
 // chat's own space (chat/chatSpaces.ts chatHomeSpace), wherever it was opened
 // from; a chat in no space of its own is in the space its tab was opened from
@@ -32,7 +31,7 @@ import { useBoxOf } from '../../chat/useBoxOf';
 import { chatLiveKey } from '../../chat/chatLiveStatus';
 import { canStartChatIn, chatHomeSpace, groupKey, readCollapsedSpaces, toggleCollapsedSpace } from '../../chat/chatSpaces';
 import { agentLabel, workstreamLabel, workstreamTip } from '../../chat/explorerAgents';
-import { groupOpenItems, itemHref, itemKey, newTabId, NO_SPACE_EXPLORER, type OpenItem } from '../../chat/openItems';
+import { itemHref, itemKey, newTabId, NO_SPACE_EXPLORER, type OpenItem } from '../../chat/openItems';
 import { moveShown, useIncrementalWindows, type IncrementalList } from '../../chat/incrementalList';
 import { chatRowName, sidebarLine } from '../../chat/simpleChat';
 import { noteSettledBoxes } from '../../chat/noSpaceAgents';
@@ -54,7 +53,7 @@ import { stateSince } from '../../mobile/inbox';
 import { fmtAge } from '../../utils/format';
 import { useSidebarView } from '../../chat/sidebarView';
 import { viewGroups, type ViewGroup } from '../../chat/sidebarGroups';
-import { useReviewsData } from './reviewsData';
+import { useCloseTabs, useTabGroups } from './TabClose';
 import { Icon } from '@launchpad-ui/icons';
 import { IconButton } from '@launchpad-ui/components';
 import { LP_THEME } from '../../launchpad/theme';
@@ -142,7 +141,7 @@ const STATUS_GROUP = '\u0000state:';
 
 /** The groups and their tabs. */
 export function OpenItemsGroups() {
-  const { items, rows, live, setupOf, spaces, activeTab, titlesShown, links, unseen } = useSimpleData();
+  const { items, rows, live, setupOf, spaces, activeTab, links, unseen } = useSimpleData();
   const [foldedAgents, setFoldedAgents] = useState(() => readFoldedAgents(typeof localStorage === 'undefined' ? null : localStorage));
   const boxOf = useBoxOf();
   // A session's tab dragged into a composer puts a reference to it in the message (chat/sessionRef.ts).
@@ -151,26 +150,10 @@ export function OpenItemsGroups() {
   const { refresh } = useChatChrome();
   const navigate = useNavigate();
   const byKey = useMemo(() => new Map(rows.map(r => [rowKey(r), r])), [rows]);
-  // A review session is in the sidebar's Reviews section (ReviewsSidebar.tsx), not its space.
-  const { sessionKeys: reviewSessions } = useReviewsData();
-  const tabs = useMemo(
-    () => (reviewSessions.size ? items.state.items.filter(i => i.kind !== 'chat' || !reviewSessions.has(inboxRowKey(i.projectId, i.workstream))) : items.state.items),
-    [items.state.items, reviewSessions],
-  );
-  const groups = useMemo(
-    // Nothing until the spaces load: every tab would show under No space first.
-    () => {
-      if (!spaces.loaded) return [];
-      const spaceOf = (c: Parameters<typeof itemKey>[0]) => {
-        const row = byKey.get(itemKey(c));
-        return row ? chatHomeSpace(row, spaces.spaces, spaces.index) : undefined;
-      };
-      return groupOpenItems(tabs, spaces.spaces.map(s => s.name), spaceOf);
-    },
-    [tabs, spaces.loaded, spaces.spaces, spaces.index, byKey],
-  );
+  // By space, with review sessions in Reviews instead (TabClose.tsx).
+  const groups = useTabGroups();
   // Under the refresh, the view options (chat/sidebarView.ts): Compact or Standard rows,
-  // by space (filtered) or by state; off, the spaces' groups as they are.
+  // by space (filtered), by project or by state; off, the spaces' groups as they are.
   const view = useSidebarView();
   const standard = refresh && view.density === 'standard';
   const shownGroups: ViewGroup[] = refresh
@@ -178,7 +161,7 @@ export function OpenItemsGroups() {
       if (i.kind !== 'chat') return null;
       const r = byKey.get(itemKey(i));
       return r ? chatRowState(r, live.get(chatLiveKey(r.projectId, r.workstream)), setupOf.get(r.projectId), unseen.has(r.key)).kind : null;
-    }, activeTab)
+    }, activeTab, i => byKey.get(itemKey(i))?.projectName ?? null)
     : groups.map(g => ({ space: g.space, status: null, items: g.items, total: g.items.length }));
   /**
    * A group's whole order, for Close other tabs and Close tabs below: a space's
@@ -236,7 +219,7 @@ export function OpenItemsGroups() {
   // explorer lists them (its box reaches it), once the index is current for every box.
   const { place } = items;
   useEffect(() => {
-    if (!spaces.enabled || !spaces.current || spaces.spaces.length === 0) return;
+    if (!spaces.current || spaces.spaces.length === 0) return;
     const known = new Set(spaces.spaces.map(s => s.name));
     place(i => {
       const row = byKey.get(itemKey(i));
@@ -244,7 +227,7 @@ export function OpenItemsGroups() {
       const listedIn = (row.instanceId ? spaces.index.get(row.instanceId) ?? [] : []).filter(s => known.has(s));
       return { home: chatHomeSpace(row, spaces.spaces, spaces.index), listedIn };
     });
-  }, [items.state.items, byKey, spaces.enabled, spaces.current, spaces.spaces, spaces.index, place]);
+  }, [items.state.items, byKey, spaces.current, spaces.spaces, spaces.index, place]);
 
   const list = useRef<HTMLUListElement>(null);
   const [drag, setDrag] = useState<{ group: string; id: string; label: string } | null>(null);
@@ -278,24 +261,17 @@ export function OpenItemsGroups() {
 
   const nameOf = (space: string | null) => space ?? 'No space';
 
+  const close = useCloseTabs(groups);
   /**
    * Closes `ids`, from `groupName`. When that closes the open tab, it goes to
-   * `stay` (the tab acted on, when it stays open), else the first tab left in
-   * the open tab's space, else the first left anywhere, else Home. Returns the tab it goes to, if it goes.
+   * `stay` (the tab acted on, when it stays open), else the tab shown most
+   * recently that stays open, else the first tab left in the open tab's space,
+   * else the first left anywhere, else Home (openItems.tabAfterClose).
+   * Returns the tab it goes to, if it goes.
    */
   function closeTabs(ids: readonly string[], groupName: string, stay?: OpenItem): OpenItem | undefined {
-    if (ids.length === 0) return;
-    const gone = new Set(ids);
     if (ids.length > 1) setAnnounce(`Closed ${ids.length} tabs in ${groupName}`);
-    if (!activeTab || !gone.has(activeTab)) { items.dismiss(ids); return; }
-    const left = (list: readonly OpenItem[]) => list.find(i => !gone.has(i.id));
-    const own = groups.find(g => g.items.some(i => i.id === activeTab));
-    const next = (stay && !gone.has(stay.id) ? stay : undefined) ?? left(own?.items ?? []) ?? left(groups.flatMap(g => g.items));
-    startTransition(() => {
-      items.dismiss(ids);
-      navigate(next ? itemHref(next, next.id) : '/chat');
-    });
-    return next;
+    return close(ids, { stay });
   }
 
   // Each group's whole order, its window, and what is on screen (only the open tab
@@ -414,7 +390,7 @@ export function OpenItemsGroups() {
       icon = state ? <StatusMark kind={state.kind} /> : <AgentIcon status={line.glyph} />;
       // One line: Claude's title for the session with the project after it, or the project as before.
       // Under the refresh, the title alone; the project is in its tooltip.
-      const named = chatRowName(r, titlesShown);
+      const named = chatRowName(r);
       // An ask leads with its title (Claude's title for its session after it); otherwise as named.
       name = run?.name ? run.name : named.title
         ? <>{named.title}{named.where && !refresh && <span className="chat-row-ws"> · {named.where}</span>}</>
@@ -460,7 +436,7 @@ export function OpenItemsGroups() {
         onContextMenu={menu}
         onDragStart={e => {
           // A session's tab also goes into a composer as a reference, a copy; a tab that can't move only does that.
-          if (refRow) putSessionRef(e, refRow, boxOf(refRow), titlesShown);
+          if (refRow) putSessionRef(e, refRow, boxOf(refRow));
           e.dataTransfer.setData('text/plain', label);
           if (!movable) { e.dataTransfer.effectAllowed = 'copy'; return; }
           e.dataTransfer.effectAllowed = refRow ? 'copyMove' : 'move';

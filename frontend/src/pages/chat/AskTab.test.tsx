@@ -9,18 +9,22 @@ import type { AskView } from '../../chat/asks';
 const api = vi.hoisted(() => ({ history: vi.fn() }));
 vi.mock('../../services/api', () => ({ chatApi: { history: api.history } }));
 
-import { AskTab, askTurns } from './AskTab';
+import { AskTab, askTurns, waitingNote } from './AskTab';
 import { askStore, askTabId } from '../../chat/askStore';
 import { subagentStore } from '../../chat/subagentStore';
 
 const T1 = 'cmvtr5x6r0i0lafsfuclk9ed5';
 const chat = 'p2|main';
-const project = { id: 'p2', name: 'titanic-research', workflows: [] } as never;
+const projectOf = (provider: string) => ({
+  id: 'p2', name: 'titanic-research', workstreams: [{ id: 'w1', name: 'main' }],
+  workflows: [{ id: 'f1', type: 'agent', workstreamId: 'w1', provider }],
+}) as never;
+const project = projectOf('claude-chat');
 
 const view = (over: Partial<AskView> = {}): AskView => ({
   thread: T1, title: 'Titanic wreck: discovery', target: 'box-1/sample', chat: { projectId: 'p1', workstream: `ask-${T1}` },
   state: 'working', turns: 1, error: null, startedAt: new Date(Date.now() - 30_000).toISOString(), completedAt: null,
-  waiting: 'nobody', noWait: true, reply: 'pending', prs: [], known: true, ...over,
+  waiting: 'nobody', noWait: true, reply: 'pending', notice: 'none', prs: [], known: true, ...over,
 });
 
 const user = (text: string, key: string): ChatItem => ({ kind: 'user', key, text });
@@ -49,10 +53,10 @@ beforeEach(() => {
 });
 afterEach(() => { act(() => root.unmount()); askStore.publish(chat, null); });
 
-const render = async (v: AskView) => {
+const render = async (v: AskView, p = project) => {
   askStore.publish(chat, new Map([[v.thread, v]]));
   await act(async () => {
-    root.render(<MemoryRouter><AskTab project={project} workstream="main" agent={{ chat, id: askTabId(v.thread), title: v.title }} /></MemoryRouter>);
+    root.render(<MemoryRouter><AskTab project={p} workstream="main" agent={{ chat, id: askTabId(v.thread), title: v.title }} /></MemoryRouter>);
   });
 };
 
@@ -81,10 +85,38 @@ describe('the ask tab', () => {
     expect(host.querySelector('.ask-waiting-note')?.textContent).toContain('Not sent back to Claude.');
   });
 
+  it('shows the note\'s command as code', async () => {
+    await render(view({ state: 'done', completedAt: new Date().toISOString(), reply: 'stored' }));
+    expect(host.querySelector('.ask-waiting-note code')?.textContent).toBe('termag ask --reply');
+  });
+
+  it('names the chat\'s own agent: who asked, whose brief, and who is waiting', async () => {
+    api.history.mockResolvedValue({ sessionId: 's1', entries: [{ type: 'user', message: { role: 'user', content: 'Research how the wreck was found.' } }] });
+    await render(view({ notice: 'due' }), projectOf('codex'));
+    expect(host.textContent).toContain('Asked by Codex');
+    expect(host.querySelector('.agent-brief-head')?.textContent).toContain('Codex’s brief');
+    expect(host.querySelector('.ask-waiting-note')?.textContent).toBe('Codex is told when it finishes. Codex sent it with --no-wait and carried on. '
+      + 'When the ask finishes, termag tells the chat, and Codex reads its reply then.');
+    expect(host.textContent).not.toContain('Claude');
+  });
+
+  it('says the agent where the chat\'s provider is unknown', async () => {
+    await render(view(), { id: 'p2', name: 'titanic-research', workstreams: [], workflows: [] } as never);
+    expect(host.textContent).toContain('Asked by the agent');
+    expect(host.querySelector('.ask-waiting-note strong')?.textContent).toBe('The agent isn’t waiting for a reply.');
+  });
+
   it('says Claude is waiting while a call waits for it', async () => {
-    await render(view({ waiting: 'claude', noWait: false }));
+    await render(view({ waiting: 'agent', noWait: false }));
     expect(host.querySelector('.ask-waiting-note')?.getAttribute('data-tone')).toBe('waiting');
     expect(host.querySelector('.ask-waiting-note')?.textContent).toContain('Claude is waiting.');
+  });
+
+  it('has no Show in chat for a pane chat\'s ask, which has no row there', async () => {
+    await render(view({ noRow: true }));
+    expect(host.querySelector('.agent-panel-jump')).toBeNull();
+    await render(view());
+    expect(host.querySelector('.agent-panel-jump')?.textContent).toContain('Show in chat');
   });
 
   it('waits for the chat\'s views, and says so', async () => {
@@ -113,7 +145,66 @@ describe('the ask tab before and after its views', () => {
   });
 
   it('leads with a delivered reply even while the call that got it is still returning', async () => {
-    await render(view({ state: 'done', completedAt: new Date().toISOString(), reply: 'delivered', waiting: 'claude', noWait: false }));
+    await render(view({ state: 'done', completedAt: new Date().toISOString(), reply: 'delivered', waiting: 'agent', noWait: false }));
     expect(host.querySelector('.ask-waiting-note')?.textContent).toBe('Returned to Claude. A command in the chat got its reply.');
+  });
+});
+
+describe('waitingNote', () => {
+  const ended = (over: Partial<AskView>) => view({ state: 'done', completedAt: '2026-10-29T13:25:48.000Z', ...over });
+  const note = (v: AskView, agent = 'Claude') => { const n = waitingNote(v, agent); return n && `${n.lead}. ${n.text}`; };
+
+  it('says a --no-wait ask whose sender gets a finish notice is read when the notice comes', () => {
+    expect(note(view({ notice: 'due' }))).toBe('Claude is told when it finishes. Claude sent it with --no-wait and carried on. '
+      + 'When the ask finishes, termag tells the chat, and Claude reads its reply then.');
+    expect(note(ended({ notice: 'due', reply: 'stored' }))).toBe('Telling Claude it finished. The ask has finished, and termag tells the chat in a moment. Claude reads its reply then.');
+  });
+
+  it('says the notice was sent, and whether Claude has read the reply since', () => {
+    expect(note(ended({ notice: 'sent', reply: 'stored' }))).toBe('Claude was told it finished. termag told the chat the ask finished. '
+      + 'Claude hasn’t read its reply yet, and `termag ask --reply` reads it for 14 days. Its answer is below.');
+    expect(note(ended({ notice: 'sent', reply: 'delivered' }))).toBe('Returned to Claude. A command in the chat got its reply.');
+    expect(note(ended({ state: 'failed', error: 'box_offline', notice: 'sent', reply: 'none' }))).toBe('Claude was told it ended. termag told the chat the ask ended.');
+  });
+
+  it('says nobody is waiting only when no notice goes, and that the reply is kept', () => {
+    expect(note(view())).toBe('Claude isn’t waiting for a reply. Claude sent it with --no-wait and carried on, and nothing tells the chat when it finishes. '
+      + 'Its reply is kept for 14 days: `termag ask --reply` reads it, and its answer shows here.');
+    expect(note(ended({ reply: 'stored' }))).toBe('Not sent back to Claude. Claude sent it with --no-wait and carried on, so nothing has read its reply. '
+      + 'It is kept for 14 days, and `termag ask --reply` reads it. Its answer is below.');
+    expect(note(ended({ reply: 'stored', notice: 'unsent' }))).toBe('Not sent back to Claude. Claude sent it with --no-wait and carried on, and termag’s finish notice couldn’t reach the chat. '
+      + 'Its reply is kept for 14 days, and `termag ask --reply` reads it. Its answer is below.');
+    expect(note(ended({ reply: 'dropped', noWait: false }))).toBe('Not sent back to Claude. Nothing in the chat is waiting for it any more, so nothing got the reply, and it is no longer kept. Its answer is below.');
+    for (const n of [note(view()), note(ended({ reply: 'stored' }))]) expect(n).not.toContain('goes to nobody');
+  });
+
+  it('names a Codex chat\'s agent in the lead and the text', () => {
+    expect(note(view({ notice: 'due' }), 'Codex')).toBe('Codex is told when it finishes. Codex sent it with --no-wait and carried on. '
+      + 'When the ask finishes, termag tells the chat, and Codex reads its reply then.');
+    expect(note(ended({ notice: 'sent', reply: 'stored' }), 'Codex')).toBe('Codex was told it finished. termag told the chat the ask finished. '
+      + 'Codex hasn’t read its reply yet, and `termag ask --reply` reads it for 14 days. Its answer is below.');
+    expect(note(view(), 'Codex')).toBe('Codex isn’t waiting for a reply. Codex sent it with --no-wait and carried on, and nothing tells the chat when it finishes. '
+      + 'Its reply is kept for 14 days: `termag ask --reply` reads it, and its answer shows here.');
+    expect(note(view({ waiting: 'agent', noWait: false }), 'Codex')).toBe('Codex is waiting. A command in the chat is waiting for its reply, and Codex reads it when the ask finishes.');
+    expect(note(ended({ reply: 'delivered' }), 'Codex')).toBe('Returned to Codex. A command in the chat got its reply.');
+  });
+
+  it('never says whether a command in a pane chat waits, which it can\'t tell', () => {
+    const pane = (over: Partial<AskView>) => ({ noRow: true, noWait: false, ...over });
+    expect(note(view(pane({ notice: 'due' })))).toBe('Claude is told when it finishes. When the ask finishes, termag tells the chat, and Claude reads its reply then.');
+    expect(note(view(pane({})))).toBeNull();
+    expect(note(ended(pane({ reply: 'stored' })))).toBe('Not sent back to Claude. Nothing has read its reply. It is kept for 14 days, and `termag ask --reply` reads it. Its answer is below.');
+    expect(note(ended(pane({ reply: 'stored', notice: 'unsent' })))).toBe('Not sent back to Claude. termag’s finish notice couldn’t reach the chat. '
+      + 'Its reply is kept for 14 days, and `termag ask --reply` reads it. Its answer is below.');
+    expect(note(ended(pane({ reply: 'dropped' })))).toBe('Not sent back to Claude. Nothing got the reply, and it is no longer kept. Its answer is below.');
+  });
+
+  it('starts a sentence about an unknown agent with a capital', () => {
+    expect(note(view({ notice: 'due' }), 'the agent')).toBe('The agent is told when it finishes. The agent sent it with --no-wait and carried on. '
+      + 'When the ask finishes, termag tells the chat, and the agent reads its reply then.');
+  });
+
+  it('says Claude is waiting while a call waits for it, whatever the notice', () => {
+    expect(note(view({ waiting: 'agent', noWait: false, notice: 'due' }))).toBe('Claude is waiting. A command in the chat is waiting for its reply, and Claude reads it when the ask finishes.');
   });
 });

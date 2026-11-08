@@ -18,10 +18,21 @@ interface Props {
   currentPr?: number | null;
   /** Jump to the running review's tab instead of starting another. */
   onOpenCurrent?: () => void;
-  onStarted: (r: { pr: number; url: string | null; session: string }) => void;
+  /** `waking`: the start route holds the review while it wakes this box (box-wake-on-action-enabled), by name. */
+  onStarted: (r: { pr: number; url: string | null; session: string; waking?: string | null }) => void;
   /** A PR handed in from outside (a share): wins over the guess. */
   initialValue?: string;
   onClose: () => void;
+}
+
+/**
+ * What the phone does with GET …/review/held while a review waits for its box: keep waiting (`waking`), or stop,
+ * because it ran (nothing held: its pane is coming) or failed (`error`, with what to do).
+ */
+export function heldNext(h: { state: 'waking' | 'starting' | 'failed'; error?: string } | null): { waking: boolean; error?: string } {
+  if (!h) return { waking: false };
+  if (h.state === 'failed') return { waking: false, error: h.error ?? 'The review could not start' };
+  return { waking: true };
 }
 
 export function ReviewSheet({ projectId, projectName, workstream, hasReview, currentPr, onOpenCurrent, onStarted, initialValue, onClose }: Props) {
@@ -62,7 +73,7 @@ export function ReviewSheet({ projectId, projectName, workstream, hasReview, cur
     try {
       // slot 1: the phone shows one review pane until it learns several.
       const r = await reviewApi.start(projectId, { workstream, pr, url: target.url, slot: 1 });
-      onStarted({ pr: r.pr, url: r.url, session: r.session });
+      onStarted({ pr: r.pr, url: r.url, session: r.session, waking: r.held ? r.box ?? 'its box' : null });
       onClose();
     } catch (err) {
       setError(apiError(err, 'Could not start the review'));

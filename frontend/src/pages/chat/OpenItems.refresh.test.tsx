@@ -28,7 +28,7 @@ vi.mock('../../contexts/ProjectContext', () => ({
 }));
 vi.mock('../../chat/useChatSpaces', () => ({
   useSharedChatSpaces: () => ({
-    enabled: true, loaded: true, current: true,
+    loaded: true, current: true,
     spaces: [{ id: 'id-notes', name: 'notes', role: 'owner', readOnly: false }],
     index: new Map([['box-a', ['notes']], ['box-b', ['notes']], ['box-c', ['notes']]]),
     colorOf: spaceColor,
@@ -44,7 +44,7 @@ vi.mock('../../services/api', async importOriginal => {
 });
 vi.mock('../../flags', async () => {
   const actual = await vi.importActual<typeof import('../../flags')>('../../flags');
-  return { ...actual, useFlag: <T,>(key: string, fallback: T) => (key === 'simple-ui-side-panel-enabled' ? true as T : fallback) };
+  return { ...actual, useFlag: <T,>(_key: string, fallback: T) => fallback };
 });
 
 function project(id: string, lastActiveAt: string): Project {

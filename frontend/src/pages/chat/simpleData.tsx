@@ -30,10 +30,6 @@ export interface SimpleData {
   setupOf: ReadonlyMap<string, string | null | undefined>;
   /** ChatApp's spaces (ChatSpacesProvider), with their boxes and colours. */
   spaces: SharedChatSpaces;
-  /** The tabs replace the session list: simple-ui-side-panel-enabled is on, with or without spaces. */
-  itemsShown: boolean;
-  /** Rows lead with Claude's title for the session: simple-ui-session-titles-enabled. */
-  titlesShown: boolean;
   /** Which agent started which: spawns (GET /api/spawns/parents) and ask threads (their sender), for chat/agentTree.ts and the explorer. */
   links: readonly SpawnLink[];
   /** The tab the route shows, or null. */
@@ -50,11 +46,9 @@ const SimpleDataContext = createContext<SimpleData | null>(null);
 export function SimpleDataProvider({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
   const { projects, projectsLoaded, statusMap } = useProjects();
-  const sidePanelOn = useFlag(FLAGS.chatSidePanel, false);
-  const titlesShown = useFlag(FLAGS.sessionTitles, false);
-  const items = useOpenItems(sidePanelOn ? user?.id : null);
+  const items = useOpenItems(user?.id);
   const { pathname, search } = useLocation();
-  const route = sidePanelOn ? itemForRoute(pathname, search) : null;
+  const route = itemForRoute(pathname, search);
   const tab = tabForRoute(search);
   useOpenOnRoute(items, route, tab);
 
@@ -71,21 +65,18 @@ export function SimpleDataProvider({ children }: { children: React.ReactNode }) 
     () => chatListRows(projects, statusMap, user?.unixUsername ?? '', new Set(openKeys.split('\n')), usedMains.current),
     [projects, statusMap, user?.unixUsername, openKeys],
   );
-  // With spaces-enabled off there are none to wait for: the tabs are one group, as for a user with no spaces.
-  const shared = useSharedChatSpaces();
-  const spaces = useMemo(() => (shared.enabled ? shared : { ...shared, loaded: true, current: true }), [shared]);
-  const itemsShown = sidePanelOn;
+  const spaces = useSharedChatSpaces();
   const live = useChatLiveStatuses();
   const setupOf = useMemo(() => new Map(projects.map(p => [p.id, p.setupStatus])), [projects]);
 
   // The first load seeds the tabs from every session; later loads close the ones that are gone.
   const { seed, reconcile } = items;
   useEffect(() => {
-    if (!itemsShown || !projectsLoaded) return;
+    if (!projectsLoaded) return;
     const lastActive = new Map(projects.map(p => [p.id, p.lastActiveAt ? Date.parse(p.lastActiveAt) : null]));
     seed(rows.map(r => ({ projectId: r.projectId, workstream: r.workstream, lastActiveAt: lastActive.get(r.projectId) ?? null })));
     reconcile(new Set(rows.map(r => itemKey({ kind: 'chat', projectId: r.projectId, workstream: r.workstream }))));
-  }, [itemsShown, projectsLoaded, projects, rows, seed, reconcile]);
+  }, [projectsLoaded, projects, rows, seed, reconcile]);
 
   const sessionsKey = useMemo(() => rows.map(r => r.key).sort().join(','), [rows]);
   // Every list nests a child under its parent (chat/agentTree.ts): spawns by
@@ -125,8 +116,8 @@ export function SimpleDataProvider({ children }: { children: React.ReactNode }) 
 
   const active = activeTab(items.state, route, tab);
   const value = useMemo<SimpleData>(() => ({
-    items, rows, live, setupOf, spaces, itemsShown, titlesShown, links, activeTab: active, unseen,
-  }), [items, rows, live, setupOf, spaces, itemsShown, titlesShown, links, active, unseen]);
+    items, rows, live, setupOf, spaces, links, activeTab: active, unseen,
+  }), [items, rows, live, setupOf, spaces, links, active, unseen]);
   return <SimpleDataContext.Provider value={value}>{children}</SimpleDataContext.Provider>;
 }
 

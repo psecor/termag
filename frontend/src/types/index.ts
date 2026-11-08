@@ -1,5 +1,6 @@
 import type { ResizeView } from '../utils/boxResize';
 import type { ThemeSettings } from '../theme/schema';
+import type { ProjectKind } from '../utils/projectKind';
 
 export interface User {
   id: string;
@@ -11,6 +12,10 @@ export interface User {
   pushMutesChat?: boolean;
   /** Notify when a chat this user can see finishes its turn. Absent on older backends. */
   chatTurnNotify?: boolean;
+  /** Settings > Telemetry: chat session titles go to termag's telemetry; on unless turned off. Absent on older backends. */
+  telemetryTitles?: boolean;
+  /** Settings > Box notices: Slack DMs before and after termag stops a box on its own; on unless turned off. Absent on older backends. */
+  boxIdleNotify?: boolean;
   dotfilesRepoUrl: string | null;
   theme: ThemeSettings;
   /** Effective role from /auth/me; drives the admin nav entry only (the server re-checks). */
@@ -53,7 +58,7 @@ export interface Workstream {
   branch: string;
   slackChannelId?: string | null;
   archived: boolean;
-  /** Claude's own title for the workstream's chat session (simple-ui-session-titles-enabled); null before its first. */
+  /** Claude's own title for the workstream's chat session; null before its first. */
   sessionTitle?: string | null;
   /** Its chat has a stored transcript; absent from orchestrators before it. */
   hasTranscript?: boolean;
@@ -63,6 +68,8 @@ export interface Workstream {
   spaceId?: string | null;
   /** When that was decided; unset only from an older backend, before the chat's first listing. */
   spaceFixedAt?: string | null;
+  /** When its owner archived it from a space's Files (chat-nested-agents-enabled); null or absent: listed there. */
+  explorerArchivedAt?: string | null;
   /** The ask thread whose chat this is; absent on every other workstream. */
   askThread?: {
     id: string; title: string | null;
@@ -90,8 +97,12 @@ export interface Project {
   instanceId?: string | null;
   repoUrl?: string | null;
   repoDefaultBranch?: string | null;
+  /** 'workspace': a folder of repositories, its repoUrl null. */
+  layout?: 'repo' | 'workspace';
   setupStatus?: SetupStatus | null;
   setupError?: string | null;
+  /** The box's last report of the environment file's steps (utils/environmentStatus.ts). */
+  environmentStatus?: EnvironmentStatus | null;
   workflows: Workflow[];
   workstreams: Workstream[];
   ownerUsername?: string;
@@ -99,8 +110,9 @@ export interface Project {
   /** The owner's chat trust tick (Project.chatTrustedAt): only on the owner's own projects. */
   chatTrusted?: boolean;
   // 'metaterm' = the per-user pinned control-tower singleton; 'automation' = a
-  // project whose runs a schedule starts; absent/'normal' otherwise.
-  kind?: 'normal' | 'metaterm' | 'automation';
+  // project whose runs a schedule starts; 'space-orchestrator' =
+  // a space's Slack orchestrator, never listed (utils/projectKind.ts); absent/'normal' otherwise.
+  kind?: ProjectKind;
 }
 
 export type InstanceStatus =
@@ -147,6 +159,9 @@ export interface Instance {
   // The root disk in GB it was made with (backend services/boxDiskSize.ts);
   // null for older and external boxes.
   diskGiB?: number | null;
+  // termag setup, fixed at launch: false delivers no
+  // skills, agent config or credentials. Absent from older orchestrators: on.
+  setupEnabled?: boolean;
   // Fixed at launch: only boxes launched hibernation-capable can hibernate. A
   // resize to a type with more RAM than it launched with turns it off.
   hibernationConfigured?: boolean;
@@ -161,8 +176,11 @@ export interface Instance {
   // Automatic lifecycle; on the list response only.
   lifecycle?: BoxLifecycle;
   _count?: { projects: number };
+  /** Live projects termag manages for a space on this box, labelled; the Stop warning names them (GET /api/instances). */
+  managedProjects?: Array<{ id: string; name: string; label: string }>;
   // Only present on the single-box (getOne) response, used for delete-confirm.
-  projects?: Array<{ id: string; name: string }>;
+  /** `label` names a project termag manages, e.g. "space orchestrator for <space>" (backend spaceSlack/projectLabels.ts). */
+  projects?: Array<{ id: string; name: string; label?: string }>;
 }
 
 export interface BoxLifecycle {
@@ -178,7 +196,7 @@ export interface BoxLifecycle {
   // Set when the setting is on but the box can't hibernate, so it never fires.
   warning: string | null;
   // When the sweep next parks it as things stand, and how: its own hours
-  // hibernate it, box-idle-stop-enabled's window stops it. An orchestrator
+  // hibernate it, the default window stops it. An orchestrator
   // from an older orchestrator leaves these out.
   parkAt?: string | null;
   parkAction?: 'hibernate' | 'stop' | null;
@@ -392,3 +410,24 @@ export const STATUS_LABEL: Record<AgentStatusValue, string> = {
   idle: 'Ready',
   not_running: 'Not running',
 };
+
+/** One step of an environment file on the box (agent/environment-run.js). */
+export interface EnvironmentPhase { state: 'none' | 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped'; startedAt?: string; finishedAt?: string; durationMs?: number; exitCode?: number; error?: string }
+
+/** Project.environmentStatus (backend services/projectEnvironment.ts): the steps, their times, the ports' health. */
+export interface EnvironmentStatus {
+  /** Why it's held (a `held` state), e.g. `untrusted`: waiting for the owner's Full access. */
+  held?: string;
+  /** What started the chain: the claim, the owner's trust, or termag-env. */
+  trigger?: 'claim' | 'trust' | 'cli';
+  state: 'none' | 'pending' | 'held' | 'setup' | 'starting' | 'waiting' | 'seeding' | 'up' | 'ready' | 'failed' | 'stopped';
+  file?: string;
+  setup: EnvironmentPhase;
+  run: EnvironmentPhase;
+  seed: EnvironmentPhase;
+  /** host: '::1' when the box found the app there alone; its links open at [::1]. */
+  ports: Array<{ name: string; port: number; path: string; healthy: boolean; host?: '::1'; checkedAt?: string }>;
+  secrets: { resolved: string[]; missing: string[] };
+  warnings: string[];
+  updatedAt?: string;
+}

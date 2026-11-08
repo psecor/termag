@@ -45,7 +45,7 @@ export function BoxLifecycleDialog({ box, onClose, onSaved }: {
       >
         <div className="np-dialog-title" id="lc-title">Auto-park “{box.name}”</div>
         <div className="npf">
-          {/* box-idle-stop-enabled is server-only, so this cannot say the box stops after two hours. */}
+          {/* The default window's hours are server-only, so this cannot say the box stops after two hours. */}
           <div className="npf-note">
             A stop does not keep memory, and starting the box again takes about 10–20 seconds.
           </div>

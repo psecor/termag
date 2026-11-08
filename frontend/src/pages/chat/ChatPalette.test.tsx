@@ -9,13 +9,13 @@ import { readRecentSearches, writeRecentSearches } from '../../mobile/recentSear
 import type { PaletteAction } from '../../utils/searchPalette';
 import { ChatSearch } from './ChatSearch';
 
-const mocks = vi.hoisted(() => ({ refresh: true, titlesShown: true, unseen: new Set<string>() }));
+const mocks = vi.hoisted(() => ({ refresh: true, unseen: new Set<string>() }));
 vi.mock('../../observability', () => ({ trackEvent: () => {} }));
 vi.mock('../../hooks/useRecents', () => ({ useRecents: () => ({ rows: [], loading: false, refresh: () => {} }) }));
 vi.mock('../../services/api', () => ({ sessionsApi: { search: vi.fn() }, prsApi: { list: () => Promise.resolve({ connected: false }) } }));
 vi.mock('./chatChrome', () => ({ useChatChrome: () => ({ refresh: mocks.refresh }) }));
 vi.mock('./simpleData', () => ({
-  useSimpleDataIfAny: () => ({ live: new Map(), setupOf: new Map(), titlesShown: mocks.titlesShown, unseen: mocks.unseen }),
+  useSimpleDataIfAny: () => ({ live: new Map(), setupOf: new Map(), unseen: mocks.unseen }),
 }));
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -51,7 +51,6 @@ const render = () => act(() => root.render(
 beforeEach(() => {
   actions = [];
   mocks.refresh = true;
-  mocks.titlesShown = true;
   mocks.unseen = new Set();
   localStorage.clear();
   container = document.createElement('div');
@@ -125,18 +124,7 @@ describe('ChatPalette', () => {
     expect(input()).toBeNull();
   });
 
-  it('names an untitled session after its project, and ignores titles while they are hidden', async () => {
-    mocks.titlesShown = false;
-    render();
-    await open();
-    type('flaky');
-    expect(titles()).toEqual([]);
-    type('o');
-    expect(titles()).toEqual(['webapp', 'js-core', 'Review the vault client']);
-  });
-
-  it('finds an ask thread by its title, which shows whether or not session titles do', async () => {
-    mocks.titlesShown = false;
+  it('finds an ask thread by its title', async () => {
     render();
     await open();
     type('vault client');

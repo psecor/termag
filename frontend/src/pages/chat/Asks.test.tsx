@@ -21,7 +21,7 @@ const write: ToolItem = { kind: 'tool', key: 'tool:w', id: 'w', name: 'Write', i
 
 const view = (thread: string, title: string, over: Partial<AskView> = {}): AskView => ({
   thread, title, target: 'termag-4/termag-4', chat: { projectId: 'p4', workstream: `ask-${thread}` }, state: 'working', turns: 1, error: null,
-  startedAt: new Date(Date.now() - 64_000).toISOString(), completedAt: null, waiting: 'nobody', noWait: true, reply: 'pending', prs: [], known: true, ...over,
+  startedAt: new Date(Date.now() - 64_000).toISOString(), completedAt: null, waiting: 'nobody', noWait: true, reply: 'pending', notice: 'none', prs: [], known: true, ...over,
 });
 
 const calls = [fire('1', T1, 'Titanic wreck: discovery'), fire('2', T2, 'Titanic wreck: location'), fire('3', T3, 'Titanic wreck: expeditions')];
@@ -31,7 +31,7 @@ function ui(views: AskView[], open = vi.fn()): AsksUi {
     calls: c,
     byCall: new Map(calls.map((t, i) => [t.id, [[T1, T2, T3][i]]])),
     views: new Map(views.map(v => [v.thread, v])),
-    open, shownThread: null,
+    open, shownThread: null, agent: 'Claude',
   };
 }
 
@@ -77,6 +77,24 @@ describe('a run that sent asks, shut', () => {
     act(() => root.render(<AsksContext.Provider value={ui(done)}><ToolRun runKey="run:w" tools={[write, ...calls]} /></AsksContext.Provider>));
     expect(line()?.querySelector('.ask-waiting')?.textContent).toBe('Not sent back to Claude');
   });
+
+  it('names the chat\'s own agent on the line and its rows', () => {
+    act(() => root.render(<AsksContext.Provider value={{ ...ui(working), agent: 'Codex' }}><ToolRun runKey="run:w" tools={[write, ...calls]} /></AsksContext.Provider>));
+    expect(line()?.querySelector('.ask-waiting')?.textContent).toBe('Codex isn’t waiting for replies');
+    act(() => line()!.querySelector<HTMLButtonElement>('.ask-line-head')!.click());
+    expect(rows()[0].querySelector('.ask-waiting')?.textContent).toBe('Codex isn’t waiting for a reply');
+    expect(rows()[2].querySelector('.ask-waiting')?.textContent).toBe('Not sent back to Codex');
+    expect(host.textContent).not.toContain('Claude');
+  });
+
+  it('never says nobody is waiting for asks whose finish termag tells the chat', () => {
+    const told = working.map(v => ({ ...v, notice: 'due' as const }));
+    act(() => root.render(<AsksContext.Provider value={ui(told)}><ToolRun runKey="run:w" tools={[write, ...calls]} /></AsksContext.Provider>));
+    expect(line()?.querySelector('.ask-waiting')).toBeNull();
+    act(() => line()!.querySelector<HTMLButtonElement>('.ask-line-head')!.click());
+    expect(rows()[0].querySelector('.ask-waiting')?.textContent).toBe('Claude is told when it finishes');
+    expect(rows()[2].querySelector('.ask-waiting')?.textContent).toBe('Telling Claude it finished');
+  });
 });
 
 describe('an ask call on its own', () => {
@@ -98,7 +116,7 @@ describe('an ask call on its own', () => {
   });
 
   it('says Claude is waiting while a call waits for it', () => {
-    act(() => root.render(<AsksContext.Provider value={ui([view(T1, 'Titanic wreck: discovery', { waiting: 'claude', noWait: false })])}><ToolCard item={calls[0]} /></AsksContext.Provider>));
+    act(() => root.render(<AsksContext.Provider value={ui([view(T1, 'Titanic wreck: discovery', { waiting: 'agent', noWait: false })])}><ToolCard item={calls[0]} /></AsksContext.Provider>));
     expect(rows()[0].querySelector('.ask-waiting')?.textContent).toBe('Claude is waiting');
   });
 
@@ -134,11 +152,11 @@ describe('asks kept in view', () => {
 
   it('never repeats the lead, and says Claude is waiting when it is', async () => {
     const { AsksDrawer } = await import('./Asks');
-    const waited = [view(T1, 'One', { waiting: 'claude', noWait: false }), view(T2, 'Two', { state: 'starting', waiting: 'claude', noWait: false })];
+    const waited = [view(T1, 'One', { waiting: 'agent', noWait: false }), view(T2, 'Two', { state: 'starting', waiting: 'agent', noWait: false })];
     act(() => root.render(<AsksDrawer list={waited} ui={ui(waited)} />));
     expect(host.querySelector('.agent-drawer-lead')?.textContent).toBe('2 asks working');
     expect(host.querySelector('.agent-drawer-now')?.textContent).toBe('· Claude is waiting');
-    const mixed = [view(T1, 'One', { waiting: 'claude', noWait: false }), view(T2, 'Two', { state: 'done', reply: 'delivered', waiting: 'nobody', noWait: false })];
+    const mixed = [view(T1, 'One', { waiting: 'agent', noWait: false }), view(T2, 'Two', { state: 'done', reply: 'delivered', waiting: 'nobody', noWait: false })];
     act(() => root.render(<AsksDrawer list={mixed} ui={ui(mixed)} />));
     expect(host.querySelector('.agent-drawer-now')?.textContent).toBe('· 1 done');
   });

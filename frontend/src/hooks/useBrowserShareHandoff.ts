@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { browserHandoff, type BrowserShareHandoff } from '../utils/browserPaneConnection';
+import { browserHandoff, handoffBrowserKey, type BrowserShareHandoff } from '../utils/browserPaneConnection';
+import { rememberBrowserUrl } from '../components/BrowserDock';
 
 /**
  * A share link's handoff to its owner's own pane:
@@ -19,7 +20,14 @@ export function useBrowserShareHandoff(opts: {
   showCtrl: () => void;
 }): { openShare: BrowserShareHandoff | null; consumeOpenShare: () => void } {
   const { browserKey, isNarrow, expandDock, showCtrl } = opts;
-  const [handoff] = useState(() => browserHandoff(window.location.search));
+  const [handoff] = useState(() => {
+    const h = browserHandoff(window.location.search);
+    // `browserUrl` (an environment's port link, browserPortHref): the page the pane opens, written
+    // where the pane reads its last URL before any pane has mounted, in this first render.
+    const key = h?.url ? handoffBrowserKey(window.location.pathname, window.location.search) : null;
+    if (h?.url && key) rememberBrowserUrl(key, h.url);
+    return h;
+  });
   const [openShare, setOpenShare] = useState<BrowserShareHandoff | null>(handoff?.share ?? null);
   const handedOff = useRef(false);
   useEffect(() => {
@@ -31,6 +39,7 @@ export function useBrowserShareHandoff(opts: {
     sp.delete('browser');
     sp.delete('browserShare');
     sp.delete('browserAt');
+    sp.delete('browserUrl');
     const q = sp.toString();
     window.history.replaceState(window.history.state, '', `${window.location.pathname}${q ? `?${q}` : ''}`);
   }, [handoff, browserKey, isNarrow, expandDock, showCtrl]);

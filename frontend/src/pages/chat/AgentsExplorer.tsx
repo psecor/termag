@@ -1,7 +1,6 @@
-// The explorer of agents in no space (simple-ui-side-panel-enabled,
-// chat/noSpaceAgents.ts): what a space's explorer (FileExplorer.tsx) is for a
+// The explorer of agents in no space (chat/noSpaceAgents.ts): what a space's explorer (FileExplorer.tsx) is for a
 // space, with only agents, since no space means no files. For a person with
-// no spaces, or with spaces off, it lists every agent; for someone with
+// no spaces, it lists every agent; for someone with
 // spaces, the agents under No space. An agent another agent started is under
 // it, and the search matches agent names at every depth.
 //
@@ -22,6 +21,7 @@ import { chatLiveKey } from '../../chat/chatLiveStatus';
 import { sidebarLine } from '../../chat/simpleChat';
 import type { InboxRow } from '../../mobile/inbox';
 import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
+import { CloseAndBackButton } from './TabClose';
 import { AgentIcon, plainClick } from './OpenItems';
 import { useSimpleData, WithSimpleData } from './simpleData';
 import { SearchIcon, sessionKey, useAgentTree, type AgentKey } from './ExplorerTree';
@@ -128,6 +128,7 @@ function NewTab() {
     <div className="chat-view">
       <section className="chat-conv">
         <header className="chat-header">
+          <CloseAndBackButton />
           <ChatHistoryButton />
           <div className="chat-title"><span className="chat-title-name">New tab</span><span className="chat-title-repo">{name}</span></div>
           <div className="chat-header-actions">

@@ -22,7 +22,7 @@ import { reduceHold, refusalFromSend, statusBesideHold, type HoldState } from '.
 import { chatLiveKey, publishChatStatus } from '../../chat/chatLiveStatus';
 import { bootEstimateMinutes, boxComingUp, setupSteps } from '../../chat/newChat';
 import { recordChatAction, recordTypedChatCommand } from '../../usageEvents';
-import { addPending, applyEvent, applyFrame, chatCostTotal, chatStatus, contextActions, desktopTurnStatus, emptyChat, fromHistory, lastAssistantText, liveFrameAction, mergeHistory, rememberedUsage, rememberUsage, retryMessage, sdkReadiness, seedLiveTurn, stopChoices, stopControl, withKeptUsage, type ChatItem, type ChatState, type ContextAction, type FrameCursor, type HistoryLoad } from '../../chat/sdkChat';
+import { addPending, applyEvent, applyFrame, chatCostTotal, chatStatus, contextActions, desktopStepReloads, desktopTurnStatus, desktopTurnStep, emptyChat, carryEarlier, firstUuid, fromHistory, lastAssistantText, liveFrameAction, mergeHistory, rememberedUsage, rememberUsage, retryMessage, sdkReadiness, seedLiveTurn, stopChoices, stopControl, withEarlier, withKeptUsage, withWaiting, type ChatItem, type ChatState, type ContextAction, type FrameCursor, type HistoryLoad } from '../../chat/sdkChat';
 import type { ContextControls } from '../../chat/ContextRing';
 import { chromeFromHistory, composerChrome, rememberChrome, rememberedChrome, updateRememberedChrome, type ComposerChrome } from '../../chat/composerChrome';
 import { fullUiHref, repoSlug } from '../../chat/simpleChat';
@@ -32,10 +32,15 @@ import { useDictation } from '../../chat/useDictation';
 import { useQueuedMessage } from '../../chat/useQueuedMessage';
 import { readModelPick, useChatModel } from '../../chat/useChatModel';
 import { readEffortPick, useChatEffort } from '../../chat/useChatEffort';
-import { writeLastPick } from '../../chat/newChat';
+import { queueKey, readQueued, writeLastPick } from '../../chat/newChat';
 import { chatEffortWire, chatModelTakesPdfs, type ChatEffortId, type ChatEffortWire, type ChatModelId } from '../../chat/composer';
 import { useChatModelOptions } from '../../chat/useChatModelOptions';
-import { admitImages, CHAT_PDF_TYPE, MAX_CHAT_IMAGES, dragHasFiles, filesOf, prepareAttachment, type PreparedImage } from '../../chat/chatImageData';
+import { CHAT_PDF_TYPE, MAX_CHAT_IMAGES, type PreparedImage } from '../../chat/chatImageData';
+import { useComposerAttachments } from '../../chat/useComposerAttachments';
+import { attachmentsPhrase, finishFirstMessage, firstImages, firstMessageText, releaseFirstImages } from '../../chat/firstImages';
+import { heldBoxFiles, heldTextFiles, messageTooLong, queueJoinRefusal, splitTextFiles, withTextFiles, type BoxFile, type TextFile } from '../../chat/chatTextFiles';
+import type { BoxFileUpload } from '../../chat/useComposerAttachments';
+import { FLAGS, useFlag } from '../../flags';
 import type { Project } from '../../types';
 import { useSimpleDataIfAny } from './simpleData';
 import { useChatChrome } from './chatChrome';
@@ -44,6 +49,15 @@ import { createHeadingStore, headingOfEvent } from '../../chat/toolGroupHeadings
 import { boxDownText, boxIsDown, reportStoredOpen, START_WAIT_MS, startDidNotTake, startDue, storedOpenAnswer } from '../../chat/storedOpen';
 
 const HISTORY_POLL_MS = 2000;
+
+// Refused held messages taken back off the orchestrator, per chat (`${projectId}|${workstream}`), for the
+// page's life: a take-back that answers after its view left the chat (a switch remounts it) lands in that
+// chat's composer the next time it shows, rather than being lost once the orchestrator has deleted it.
+type TakenBack = { id: string; text: string; images: Array<{ mediaType: string; data: string }>; error: string };
+const takenBackFor = new Map<string, TakenBack[]>();
+// Held messages whose take-back is out, across this page's views, so a remount doesn't ask again.
+const takingBack = new Set<string>();
+const takenBackListeners = new Set<() => void>();
 // How long a compact the box took may go without its turn-start frame before the view stops waiting and asks again.
 const COMPACT_START_MS = 15000;
 
@@ -55,6 +69,9 @@ function compactedDividers(items: readonly ChatItem[]): number {
 // agent socket dropped); refetch to settle it. Longer than any gap a healthy
 // streaming turn produces, so a live turn never triggers it.
 const RUNNING_STALE_MS = 15000;
+// A desktop turn's steps read the history again at most this often: its tool
+// posts can come many a second, and each read goes to the box.
+const DESKTOP_RELOAD_MS = 2000;
 export const MAX_TEXT = MAX_KEYS * 25;
 
 export function errorOf(err: unknown, fallback: string): { code: string | null; text: string } {
@@ -66,6 +83,16 @@ const isPdf = (i: PreparedImage) => i.mediaType === CHAT_PDF_TYPE;
 /** A composer attachment as its pending bubble shows it, and as the send carries it (a PDF with its name). */
 const pendingImage = (i: PreparedImage) => ({ mediaType: i.mediaType, src: i.src, ...(isPdf(i) ? { name: i.name } : {}) });
 const sentImage = (i: PreparedImage) => ({ mediaType: i.mediaType, data: i.data, ...(isPdf(i) ? { name: i.name } : {}) });
+
+/** The send's refusals of its attachments (backend services/chatImages.ts, chatRunner.ts): a text-only Retry can go. */
+const ATTACHMENT_REFUSALS = new Set(['images-unsupported', 'pdfs-unsupported', 'bad-image', 'bad-image-type', 'image-too-large', 'too-many-images']);
+
+const browserStore = () => (typeof localStorage !== 'undefined' ? localStorage : null);
+
+/** A queued send's failure as useQueuedMessage shows it (chat/compose.ts sendErrorText). */
+function queueRefusal(text: string) {
+  return { response: { data: { error: text } } };
+}
 
 /** The effort argument a send carries: the chat's choice, where the chat takes one (backend services/chatEffort.ts). */
 function effortArgs(offered: boolean, id: ChatEffortId): [] | [ChatEffortWire] {
@@ -146,6 +173,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // Whether the context popover offers Clear, Compact and Resume (the history's contextActions), and what this chat can never do.
   const [contextOffer, setContextOffer] = useState<'ready' | 'update' | null>(null);
   const [contextRefusals, setContextRefusals] = useState<Partial<Record<ContextAction, string>>>({});
+  // Whether the composer sends other files to the box (GET …/chat fileInput), or why it can't (fileRefusal).
+  const [fileOffer, setFileOffer] = useState<{ fileInput: boolean; fileRefusal?: string }>({ fileInput: false });
   // The history's trust, effort, image input and model for the composer, null
   // until it answers; until then what this page kept for the chat stands in
   // (chat/composerChrome.ts). `effortInput`: whether the model menu offers an effort.
@@ -196,6 +225,17 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // updaters run later, so a gap could not be read back from them).
   const cursor = useRef<FrameCursor>({ turnId: null, seq: 0 });
 
+  // Another chat's pages, and its asks still on their way, are not this one's.
+  const earlierFor = useRef(chatId);
+  useEffect(() => {
+    earlierFor.current = chatId;
+    older.current = null;
+    snapshotEntries.current = [];
+    landing.current = false;
+    earlierBusy.current = false;
+    setEarlier({ more: false, loading: false, loaded: 0, settled: 0, error: null, stopped: false });
+  }, [chatId]);
+
   // History from the box once the project is set up, again on every switch,
   // and again every two seconds while setup or a pane clone is still running.
   useEffect(() => {
@@ -219,6 +259,17 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // replayed on the snapshot (mergeHistory): a hard replace would drop them,
   // and a turn that ended meanwhile would come back as running.
   const liveDuringLoad = useRef<Array<{ turnId: string | null; seq?: number | null; event: unknown }> | null>(null);
+  // Older history paged in from the box (chatApi.earlier), joined onto each
+  // snapshot before its entry `before`; `cursor` is the box's for the oldest page.
+  // `loaded` counts the loads that drew a new page, `settled` the asks that
+  // ended without one; `error` is the last ask's refusal, and `stopped` says
+  // it was one asking again cannot fix (an agent too old, a bad request).
+  const older = useRef<{ before: string; entries: unknown[]; done: boolean; cursor?: string } | null>(null);
+  const snapshotEntries = useRef<unknown[]>([]);
+  const landing = useRef(false);
+  const earlierBusy = useRef(false);
+  const [earlier, setEarlier] = useState<{ more: boolean; loading: boolean; loaded: number; settled: number; error: string | null; stopped: boolean }>(
+    { more: false, loading: false, loaded: 0, settled: 0, error: null, stopped: false });
   useEffect(() => {
     // A project still setting up loads no history: nothing stored to show instead of its box.
     if (held) reportStoredOpen(chatId, 'none');
@@ -232,11 +283,30 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
         headingStore.load(h.headings);
         const live = liveDuringLoad.current ?? [];
         liveDuringLoad.current = null;
+        const prevEntries = snapshotEntries.current;
+        snapshotEntries.current = h.entries;
+        let joined = withEarlier(h.entries, older.current);
+        if (!joined && older.current) {
+          const carried = carryEarlier(prevEntries, h.entries, older.current);
+          if (carried) {
+            older.current = { ...older.current, ...carried };
+            joined = withEarlier(h.entries, older.current);
+          }
+        }
+        if (!joined) older.current = null;
+        const entries = joined ?? h.entries;
+        const landed = landing.current;
+        landing.current = false;
+        const more = older.current ? !older.current.done : h.more === true;
+        setEarlier(e => ({
+          ...e, more: !e.stopped && more,
+          ...(landed ? { loading: false, loaded: e.loaded + 1, error: null } : {}),
+        }));
         if (h.turn) {
           // A durable runner replays the running turn from its log; frames
           // that arrived during the load continue from that cursor. A frame
           // that is a real gap asks for one more load, after this one.
-          let state = fromHistory(h.entries, h.sessionId, h.turn, h.turns ?? [], { running: h.running, liveInput: h.liveInput });
+          let state = withWaiting(fromHistory(entries, h.sessionId, h.turn, h.turns ?? [], { running: h.running, liveInput: h.liveInput }), h.waiting);
           let again = false;
           for (const frame of live) {
             if ((frame.event as { type?: unknown } | null)?.type === 'queue-parked') again = true;
@@ -249,7 +319,7 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
           setChat(prev => withKeptUsage(prev, next, rememberedUsage(chatId)));
           if (again) setPoll(n => n + 1);
         } else {
-          const next = seedLiveTurn(mergeHistory({ entries: h.entries, sessionId: h.sessionId, running: h.running, turns: h.turns ?? [] }, live.map(f => f.event)), h.liveInput);
+          const next = seedLiveTurn(mergeHistory({ entries, sessionId: h.sessionId, running: h.running, turns: h.turns ?? [], waiting: h.waiting }, live.map(f => f.event)), h.liveInput);
           setChat(prev => withKeptUsage(prev, next, rememberedUsage(chatId)));
           cursor.current = { turnId: null, seq: 0 };
           if (live.some(f => (f.event as { type?: unknown } | null)?.type === 'queue-parked')) setPoll(n => n + 1);
@@ -259,6 +329,7 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
         setStopsTurn(h.stopsTurn === true);
         setContextOffer(h.contextActions ?? null);
         setContextRefusals(h.contextRefusals ?? {});
+        setFileOffer({ fileInput: h.fileInput === true, ...(h.fileRefusal ? { fileRefusal: h.fileRefusal } : {}) });
         setHold(prev => {
           const next = reduceHold(prev, h.terminalHolds);
           return { held: next.held, refused: next.refused };
@@ -278,6 +349,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
       .catch(err => {
         if (cancelled) return;
         liveDuringLoad.current = null;
+        landing.current = false;
+        setEarlier(e => (e.loading ? { ...e, loading: false, settled: e.settled + 1 } : e));
         reportStoredOpen(chatId, 'none');
         const e = errorOf(err, 'Could not load the session');
         // Still setting up, or a reopened chat's box still starting: keep
@@ -328,6 +401,45 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // still running, and settle it if it is not. Claude can think well past this
   // gap before its first token, so we never rebuild the transcript here: that
   // would drop streamed text the JSONL does not have yet.
+  const loadEarlier = useCallback(() => {
+    const oldest = () => firstUuid(older.current?.entries ?? snapshotEntries.current);
+    const before = oldest();
+    if (earlierBusy.current || !before) return false;
+    earlierBusy.current = true;
+    const askedFor = earlierFor.current;
+    const current = () => earlierFor.current === askedFor;
+    setEarlier(e => ({ ...e, loading: true, error: null }));
+    const settle = (patch: Partial<typeof earlier> = {}) => setEarlier(e => ({ ...e, ...patch, loading: false, settled: e.settled + 1 }));
+    chatApi.earlier(project.id, workstream, before, older.current?.cursor)
+      .then(page => {
+        if (!current()) return;
+        // A history load meanwhile moved the oldest entry: this page no longer joins on.
+        if (oldest() !== before) { settle(); return; }
+        const prev = older.current;
+        if (!page.entries.length) {
+          // Not done: the box gave up looking for where this page starts, and may find it next time.
+          if (!page.done) { settle({ error: 'Could not load earlier messages' }); return; }
+          if (prev) older.current = { ...prev, done: true };
+          settle({ more: false });
+          return;
+        }
+        older.current = { before: prev?.before ?? before, entries: [...page.entries, ...(prev?.entries ?? [])], done: page.done, cursor: page.cursor };
+        landing.current = true;
+        setPoll(n => n + 1);
+      })
+      .catch(err => {
+        if (!current()) return;
+        // An away box, a timeout or a server error may answer next time; an
+        // agent too old or a refused request will not, so paging stops.
+        const e = errorOf(err, 'Could not load earlier messages');
+        const status = (err as { response?: { status?: number } } | null)?.response?.status;
+        const retry = e.code === 'box-away' || status == null || status >= 500;
+        settle(retry ? { error: e.text } : { error: e.text, more: false, stopped: true });
+      })
+      .finally(() => { if (current()) earlierBusy.current = false; });
+    return true;
+  }, [project.id, workstream]);
+
   useEffect(() => {
     if (!chat.running || recovery) return;
     lastFrameAt.current = Date.now();
@@ -353,12 +465,49 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // The message waiting for the runner: New chat's first message, or anything
   // typed before the runner was ready. One sender across tabs, never twice,
   // and a failure waits for Retry.
-  const sendQueued = useCallback(async (pid: string, ws: string, text: string) => {
+  // The last queued message sent, as queued and as it went (chat/firstImages.ts firstMessageText), for its echo.
+  const sentFirst = useRef<{ queued: string; shown: string } | null>(null);
+  const sendQueued = useCallback(async (pid: string, ws: string, text: string, sendId?: string) => {
     const picked = readModelPick(`${pid}|${ws}`);
     // New session's effort, or one chosen while the message waited.
     const offered = effortInputRef.current;
     const at = readEffortPick(`${pid}|${ws}`);
-    const answer = await chatApi.send(pid, ws, text, [], picked, ...effortArgs(offered, at));
+    // New session's images go with its first message (chat/firstImages.ts).
+    const key = queueKey(pid, ws);
+    const first = firstImages(browserStore(), key);
+    // A first message of attachments alone is queued as ATTACHMENTS_ONLY and goes with no text.
+    const typed = firstMessageText(browserStore(), key, text);
+    // What Retry does once the attachments are let go: send the text, or, with none, drop the message.
+    const retryWithout = typed ? 'Retry sends the text alone' : 'and the message has no text: Retry drops it';
+    if (first.lost) {
+      releaseFirstImages(browserStore(), key);
+      throw queueRefusal(`this page no longer has ${attachmentsPhrase(first.lost)} (it was reloaded, or another tab took the message)${typed ? '. ' : ', '}${retryWithout}; attach them again in the composer.`);
+    }
+    // Nothing left to send: the message was attachments alone, and they were let go above on an earlier try.
+    if (!typed && !first.images.length) {
+      // Dropped, not sent: its echo shows nothing.
+      sentFirst.current = { queued: text.trim(), shown: '' };
+      finishFirstMessage(browserStore(), key);
+      return;
+    }
+    let answer: Awaited<ReturnType<typeof chatApi.send>>;
+    try {
+      answer = await chatApi.send(pid, ws, typed, first.images.map(sentImage), picked, effortArgs(offered, at)[0] ?? null, sendId);
+    } catch (err) {
+      // Attachments refused (the box or the viewer takes none, or one the box can't read): the text stays queued, and Retry sends it without them.
+      const e = errorOf(err, 'Send failed');
+      if (first.images.length && e.code && ATTACHMENT_REFUSALS.has(e.code)) {
+        releaseFirstImages(browserStore(), key);
+        throw queueRefusal(typed
+          ? `${e.text.replace(/\.$/, '')}. Retry sends the text without ${attachmentsPhrase(first.images)}.`
+          : `${e.text.replace(/\.$/, '')}, and the message has no text: Retry drops it.`);
+      }
+      throw err;
+    }
+    releaseFirstImages(browserStore(), key);
+    // The queue echoes what it sent (the stand-in included); the echo shows what went.
+    sentFirst.current = { queued: text.trim(), shown: typed };
+    finishFirstMessage(browserStore(), key);
     noteSent?.({ projectId: pid, workstream: ws });
     // Held while the chat's box comes back: look again for the phase, as a send from the composer does.
     if (answer.held && `${pid}|${ws}` === chatId) { void reloadProjects().catch(() => {}); void boxFeed.reload(); setPoll(n => n + 1); }
@@ -493,23 +642,61 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // Messages Stop took back before they went: shown as "Not sent" until sent or discarded.
   const [unsent, setUnsent] = useState<string[]>([]);
   // Images attached in the composer (chat/chatImageData.ts), sent with the next message.
-  const [images, setImages] = useState<PreparedImage[]>([]);
-  const [imageNote, setImageNote] = useState<string | null>(null);
-  const [dragging, setDragging] = useState(false);
-  const picker = useRef<HTMLInputElement>(null);
-  const imagesRef = useRef(images);
-  imagesRef.current = images;
-  useEffect(() => { setSendError(null); setUnsent([]); setImages([]); setImageNote(null); setDragging(false); setHold({ held: false, refused: false }); }, [chatId]);
+  // Images of take-backs still on their way (below), whose room the composer keeps for them.
+  const imagesComing = useRef(0);
+  // Other files go to the chat's box as they are attached (backend services/chatFiles.ts). One for a box that
+  // is asleep wakes it, its chip saying so, and goes once the box is up (the rule: the wait shows where it is).
+  const filesOn = useFlag(FLAGS.chatFileAttachments, false);
+  const upload = useCallback<BoxFileUpload>(async (file, waiting) => {
+    for (let tries = 0; ; tries++) {
+      try {
+        return await chatApi.putFile(project.id, workstream, file);
+      } catch (err) {
+        const e = errorOf(err, 'the upload failed');
+        if (e.code !== 'offline' || tries >= 100) throw new Error(e.text);
+        waiting();
+        askStart();
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+  }, [project.id, workstream, askStart]);
+  const attachments = useComposerAttachments({
+    pdfs: pdfInput, coming: imagesComing,
+    upload: filesOn && fileOffer.fileInput ? upload : undefined,
+    uploadRefusal: filesOn ? fileOffer.fileRefusal : undefined,
+  });
+  const { images, setImages, files, setFiles, boxFiles, setBoxFiles, uploading, note: imageNote, setNote: setImageNote, dragging, setDragging, imagesRef, attach } = attachments;
+  useEffect(() => {
+    setSendError(null); setUnsent([]); setImageNote(null); setDragging(false); setHold({ held: false, refused: false });
+    // New session's images whose text this browser would not queue come with its draft, into the composer (chat/firstImages.ts).
+    const key = queueKey(project.id, workstream);
+    const handed = readQueued(browserStore(), key) == null ? firstImages(browserStore(), key).images : [];
+    if (handed.length) releaseFirstImages(browserStore(), key);
+    setImages(handed);
+    // A draft handed over the same way (New session's, which this browser would not queue) carries its text
+    // files folded into it (chat/chatTextFiles.ts): they go back into the composer as files.
+    const draft = splitTextFiles(text);
+    setFiles(draft.files.length ? heldTextFiles(draft.files, `draft-${chatId}`) : []);
+    setBoxFiles(draft.boxFiles ? heldBoxFiles(draft.boxFiles, `draft-${chatId}`) : []);
+    if (draft.files.length || draft.boxFiles) setText(draft.text);
+  }, [chatId]);
 
   // Sends one message. A failure puts it back where it came from: the
   // composer, or the "Not sent" list. Sending always follows the transcript
   // to the bottom, where the message shows. Nothing goes out while Open in
   // full UI is handing the session to the pane. True once it went (or is
   // queued for when Claude is ready), for a generative-UI answer to lock on.
-  const deliver = useCallback(async (raw: string, from: 'composer' | 'unsent' | 'retry', attached: PreparedImage[] = []): Promise<boolean> => {
+  // Text files (chat/chatTextFiles.ts) go in the message's text, after what was typed.
+  // Other files, kept on the box, go as the path each was kept at; a message waits for one still on its way.
+  const deliver = useCallback(async (raw: string, from: 'composer' | 'unsent' | 'retry', attached: PreparedImage[] = [], textFiles: TextFile[] = [], onBox: BoxFile[] = []): Promise<boolean> => {
     const typed = raw.trim();
-    const message = decorated(typed, attached.length > 0);
+    const pendingFile = onBox.find(f => !f.path);
+    if (pendingFile) { setSendError(`${pendingFile.name} is still on its way to the box: send once its chip says it is there`); return false; }
+    const kept = onBox.map(f => ({ path: f.path!, size: f.size }));
+    const message = withTextFiles(decorated(typed, attached.length > 0 || textFiles.length > 0 || kept.length > 0), textFiles, kept);
     if ((!message && !attached.length) || sendingRef.current || openingRef.current || reclaimingRef.current || recovery) return false;
+    const tooLong = messageTooLong(message);
+    if (tooLong) { setSendError(tooLong); return false; }
     if (from === 'composer') recordTypedChatCommand(typed, 'sdk');
     // A stored chat whose box is down: the send starts the box, and the message
     // waits for it in the queue as it would for a runner not ready yet. Unless
@@ -521,7 +708,10 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
       if (attached.length) { setSendError('Images can be sent once Claude is ready'); return false; }
       // Only the main workstream has a queue: the text stays in the composer for when the box is up.
       if (forBox && workstream !== 'main') { setSendError('Starting the box. Send this again once Claude is ready.'); return false; }
-      if (enqueue(message)) { if (from === 'composer') setText(''); extra.current.onSend?.({ phase: 'queued', message }); return true; }
+      // It joins the message already waiting, and the two go as one: never with files, and within one message's length.
+      const joinRefusal = queued ? queueJoinRefusal(queued, message) : null;
+      if (joinRefusal) { setSendError(joinRefusal); return false; }
+      if (enqueue(message)) { if (from === 'composer') { setText(''); setFiles([]); setBoxFiles([]); } extra.current.onSend?.({ phase: 'queued', message }); return true; }
       setSendError('This browser would not hold the message until Claude is ready. Send it again once it is.');
       return false;
     }
@@ -535,7 +725,7 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     // composer empties at once, so the message is seen to go.
     const pendingContext = contextPendingRef.current;
     if (pendingContext) {
-      if (from === 'composer') { setText(''); setImages([]); setImageNote(null); }
+      if (from === 'composer') { setText(''); setImages([]); setFiles([]); setBoxFiles([]); setImageNote(null); }
       await pendingContext;
     }
     jumpToBottom();
@@ -544,7 +734,7 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     const occurrence = countSent(chatNow.current, message) + 1;
     extra.current.onSend?.({ phase: 'sending', message, occurrence });
     setChat(s => addPending(s, message, attached.map(pendingImage), pendingKey));
-    if (from === 'composer') { setText(''); setImages([]); setImageNote(null); }
+    if (from === 'composer') { setText(''); setImages([]); setFiles([]); setBoxFiles([]); setImageNote(null); }
     const picked = modelPick;
     const at = effort;
     try {
@@ -566,7 +756,7 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
           : s.items.findIndex(it => it.kind === 'user' && it.pending && it.text === message);
         return i >= 0 ? { ...s, items: [...s.items.slice(0, i), ...s.items.slice(i + 1)] } : s;
       });
-      if (from === 'composer' && extra.current.keepsFailed?.() !== false) { setText(typed); setImages(attached); }
+      if (from === 'composer' && extra.current.keepsFailed?.() !== false) { setText(typed); setImages(attached); setFiles(textFiles); setBoxFiles(onBox); }
       if (from === 'unsent') setUnsent(u => [...u, message]);
       const e = errorOf(err, 'Send failed');
       if (refusalFromSend(e.code)) setHold(h => ({ ...h, refused: true }));
@@ -575,8 +765,63 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     } finally {
       sendingRef.current = false;
     }
-  }, [runnerReady, history, enqueue, setText, jumpToBottom, project.id, project.name, project.instanceId, workstream, recovery, modelPick, modelSent, effort, effortInput, effortSent, noteSent, boxDown, continuation, askStart]);
-  const send = () => { dictation.detach(); return deliver(text, 'composer', images); };
+  }, [runnerReady, history, enqueue, queued, setText, jumpToBottom, project.id, project.name, project.instanceId, workstream, recovery, modelPick, modelSent, effort, effortInput, effortSent, noteSent, boxDown, continuation, askStart]);
+  const send = () => { dictation.detach(); return deliver(text, 'composer', images, files, boxFiles); };
+  // A held message the box refused comes back to its sender's composer, text and images, with why (#971).
+  // The first of their tabs to ask takes it off the orchestrator, once; the others see it gone.
+  const takenBack = useRef(new Set<string>());
+  const textNow = useRef(text);
+  textNow.current = text;
+  // A take-back whose images won't fit the composer (MAX_CHAT_IMAGES, counting imagesComing) waits
+  // on the orchestrator, shown with why, until there is room, rather than coming back without them.
+  useEffect(() => {
+    for (const m of continuation?.held ?? []) {
+      if (!m.error || !m.mine || takenBack.current.has(m.id) || takingBack.has(m.id)) continue;
+      const count = m.images?.length ?? 0;
+      if (count > 0 && imagesRef.current.length + imagesComing.current + count > MAX_CHAT_IMAGES) continue;
+      takenBack.current.add(m.id);
+      takingBack.add(m.id);
+      imagesComing.current += count;
+      const forChat = chatId;
+      chatApi.takeHeld(project.id, workstream, m.id).finally(() => { imagesComing.current -= count; takingBack.delete(m.id); }).then(back => {
+        // Into the page's store, not this view: whichever view shows the chat next applies it (below).
+        takenBackFor.set(forChat, [...(takenBackFor.get(forChat) ?? []), { id: m.id, ...back }]);
+        takenBackListeners.forEach(l => l());
+      }, err => {
+        // 404: another tab took it back. Anything else (the network, a 5xx): ask again on the next look.
+        if ((err as { response?: { status?: number } } | null)?.response?.status === 404) return;
+        takenBack.current.delete(m.id);
+        setTimeout(() => setPoll(n => n + 1), CONTINUATION_POLL_MS);
+      });
+    }
+  }, [continuation, project.id, workstream, chatId, images.length]);
+  // What was taken back for this chat goes into its composer: now, or when the chat shows again.
+  const [takeBackTick, setTakeBackTick] = useState(0);
+  useEffect(() => {
+    const l = () => setTakeBackTick(n => n + 1);
+    takenBackListeners.add(l);
+    return () => { takenBackListeners.delete(l); };
+  }, []);
+  useEffect(() => {
+    const list = takenBackFor.get(chatId);
+    if (!list?.length) return;
+    takenBackFor.delete(chatId);
+    for (const back of list) {
+      // Several can come back at once: each joins what the ones before it left, not the last render's text.
+      // Its text files go back into the composer as files (chat/chatTextFiles.ts).
+      const split = splitTextFiles(back.text);
+      const joined = [textNow.current.trim(), split.text.trim()].filter(Boolean).join('\n\n');
+      textNow.current = joined;
+      setText(joined);
+      if (split.files.length) setFiles(prev => [...prev, ...heldTextFiles(split.files, `held-${back.id}`)]);
+      if (split.boxFiles) setBoxFiles(prev => [...prev, ...heldBoxFiles(split.boxFiles!, `held-${back.id}`)]);
+      setImages(prev => [...prev, ...back.images.map((i, n) => ({
+        id: `held-${back.id}-${n}`, mediaType: i.mediaType, data: i.data, src: `data:${i.mediaType};base64,${i.data}`, name: 'image',
+      }))]);
+      setSendError(`Not sent: ${back.error}`);
+    }
+    setPoll(n => n + 1);
+  }, [takeBackTick, chatId, setText]);
 
   // The context popover's actions (POST …/chat/context), with no confirm.
   // Clear and Resume answer with what changed, and this view folds it in at
@@ -645,8 +890,14 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     dictation.detach();
     const typed = text.trim();
     const attached = images;
-    const message = decorated(typed, attached.length > 0);
+    const textFiles = files;
+    const onBox = boxFiles;
+    const pendingFile = onBox.find(f => !f.path);
+    if (pendingFile) { setSendError(`${pendingFile.name} is still on its way to the box: send once its chip says it is there`); return; }
+    const message = withTextFiles(decorated(typed, attached.length > 0 || textFiles.length > 0 || onBox.length > 0), textFiles, onBox.map(f => ({ path: f.path!, size: f.size })));
     const drafting = Boolean(message || attached.length);
+    const tooLong = drafting ? messageTooLong(message) : null;
+    if (tooLong) { setSendError(tooLong); return; }
     reclaimingRef.current = true;
     setReclaiming(true);
     setSendError(null);
@@ -657,6 +908,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
       setChat(s => addPending(s, message, attached.map(pendingImage), pendingKey));
       setText('');
       setImages([]);
+      setFiles([]);
+      setBoxFiles([]);
       setImageNote(null);
       jumpToBottom();
     }
@@ -671,6 +924,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
       if (extra.current.keepsFailed?.() !== false) {
         setText(typed);
         setImages(attached);
+        setFiles(textFiles);
+        setBoxFiles(onBox);
       }
     };
     try {
@@ -700,17 +955,6 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     }
   };
 
-  // Dropped, pasted or picked files: the images (and, where taken, PDFs) among them, made small enough to send.
-  const attach = useCallback(async (files: File[]) => {
-    if (!files.length) return;
-    const { take, note } = admitImages(imagesRef.current.length, files, pdfInput);
-    setImageNote(note);
-    const ready: PreparedImage[] = [];
-    for (const f of take) {
-      try { ready.push(await prepareAttachment(f)); } catch (err) { setImageNote((err as Error).message); }
-    }
-    if (ready.length) setImages(held => [...held, ...ready].slice(0, MAX_CHAT_IMAGES));
-  }, [pdfInput]);
   const sendUnsent = (i: number) => {
     const message = unsent[i];
     setUnsent(u => u.filter((_, j) => j !== i));
@@ -829,6 +1073,26 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // The desktop app's thread on this session's turn, while this chat's own runner rests.
   const desktopSession = statusMap?.[statusKey(project.instanceId, sessionName(project.ownerUsername ?? viewer?.unixUsername ?? '', project.name, 'agent', workstream))];
   const desktopTurn = chat.running ? null : desktopTurnStatus(desktopSession);
+  // That turn writes the session file, not this chat's runner, so no chat frame
+  // shows it here: each of its steps reads the history again, at most every
+  // DESKTOP_RELOAD_MS, and its last (the stop) brings the reply.
+  const desktopStep = chat.running ? null : desktopTurnStep(desktopSession);
+  const shownDesktopStep = useRef<{ chatId: string; step: string | null } | null>(null);
+  const lastDesktopReload = useRef(0);
+  useEffect(() => {
+    const due = desktopStepReloads(shownDesktopStep.current, chatId, desktopStep);
+    if (!due) {
+      if (shownDesktopStep.current?.chatId !== chatId) shownDesktopStep.current = { chatId, step: desktopStep };
+      return;
+    }
+    const wait = Math.max(0, lastDesktopReload.current + DESKTOP_RELOAD_MS - Date.now());
+    const id = setTimeout(() => {
+      shownDesktopStep.current = { chatId, step: desktopStep };
+      lastDesktopReload.current = Date.now();
+      setPoll(n => n + 1);
+    }, wait);
+    return () => clearTimeout(id);
+  }, [chatId, desktopStep]);
   const status = statusBesideHold(showHold, chat.running, recovery
     ? { tone: 'error' as const, text: recovery.message }
     : loading ? { tone: 'idle' as const, text: 'Loading the conversation…' }
@@ -853,7 +1117,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   const heldShown = heldToShow(continuation, [
     ...chat.items.flatMap(it => (it.kind === 'user' && it.pending ? [it.text] : [])),
     ...(continuation?.held?.length && lastUser?.kind === 'user' ? [lastUser.text] : []),
-  ]);
+  // This viewer's refused ones on their way back to the composer; one waiting for room stays shown.
+  ]).filter(m => !(m.error && m.mine && takenBack.current.has(m.id)));
   const total = chatCostTotal(chat);
   const actionState = recovery ? null : contextActions({
     offered: contextOffer, refusals: contextRefusals, runnerReady, running: chat.running, held: showHold,
@@ -863,26 +1128,17 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // Resume on the divider too: the newest one, while it is on offer.
   const resumeKey = actionState?.resume ? [...chat.items].reverse().find(it => it.kind === 'divider')?.key ?? null : null;
   const replies = Object.keys(chat.costs).length;
-  const echoShown = echo && !queued && !chat.items.some(it => it.kind === 'user' && it.text === echo);
+  // A first message of attachments alone has no text to echo: its turn shows its images.
+  const echoText = echo == null ? null : echo === sentFirst.current?.queued ? sentFirst.current.shown : echo;
+  const echoShown = Boolean(echoText) && !queued && !chat.items.some(it => it.kind === 'user' && it.text === echoText);
   const settingUp = showSteps && !runnerReady && !loadError && !recovery;
   const retry = retryMessage(chat);
   const takesImages = imageInput && runnerReady && canSend;
   const onResumeCleared = () => { void runContextAction('resume'); };
   const onRetryLast = () => { if (retry) void deliver(retry.text, 'retry', retry.images.map((im, k) => ({ ...im, id: `retry${k}`, name: 'image' }))); };
   // Send shows only once there is something to send: text, or images where they are taken.
-  const hasDraft = text.trim() !== '' || (takesImages && images.length > 0);
-  const dropHandlers = takesImages ? {
-    onDragEnter: (e: React.DragEvent) => { if (dragHasFiles(e.dataTransfer.types)) { e.preventDefault(); setDragging(true); } },
-    onDragOver: (e: React.DragEvent) => { if (dragHasFiles(e.dataTransfer.types)) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } },
-    onDragLeave: (e: React.DragEvent) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false); },
-    onDrop: (e: React.DragEvent) => {
-      if (!dragHasFiles(e.dataTransfer.types)) return;
-      e.preventDefault();
-      setDragging(false);
-      void attach(filesOf(e.dataTransfer.files));
-      composer.current?.focus();
-    },
-  } : {};
+  const hasDraft = text.trim() !== '' || (takesImages && (images.length > 0 || files.length > 0 || boxFiles.length > 0));
+  const dropHandlers = takesImages ? attachments.dropHandlers(() => composer.current?.focus()) : {};
 
   // The sidebar row shows exactly this status line and Claude's last words.
   const liveKey = chatLiveKey(project.id, workstream);
@@ -975,7 +1231,11 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     setOpening,
     openingRef,
     queued,
-    echo,
+    // New session's images waiting with the queued first message (chat/firstImages.ts).
+    // The queued message's text as it is shown, without New session's attachments-only stand-in.
+    queuedText: queued == null ? null : firstMessageText(browserStore(), queueKey(project.id, workstream), queued),
+    queuedImages: queued ? firstImages(browserStore(), queueKey(project.id, workstream)).images : [],
+    echo: echoText,
     queueError,
     enqueue,
     retryQueued,
@@ -1006,11 +1266,15 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     setUnsent,
     images,
     setImages,
+    files,
+    boxFiles,
+    uploading,
+    removeAttachment: attachments.remove,
     imageNote,
     setImageNote,
     dragging,
     setDragging,
-    picker,
+    onPasteImages: attachments.onPaste,
     imagesRef,
     deliver,
     send,
@@ -1055,6 +1319,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     chatId,
     repo,
     jumpToBottom,
+    earlier,
+    loadEarlier,
   };
 }
 

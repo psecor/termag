@@ -108,7 +108,7 @@ function BugList({ now }: { now: number }) {
         </select>
       </div>
       {list.error && list.data ? <div className="admin-error">refresh failed: {errorText(list.error)}</div> : null}
-      <DataTable rows={rows} columns={cols} rowKey={r => r.id} defaultSort="status" defaultDesc={false}
+      <DataTable rows={rows} columns={cols} rowKey={r => r.id} defaultSort="status" defaultDesc={false} storageKey="bugs" resetKey={params.toString()}
         onRowClick={r => navigate(`/admin/bugs/${encodeURIComponent(r.id)}`)}
         empty={list.data ? (Object.keys(filters).length ? 'no reports match' : 'no bug reports yet: agents file them with `termag bug report`') : pendingText(list)} />
     </section>
@@ -219,13 +219,13 @@ function BugDetailView({ id, now }: { id: string; now: number }) {
 
           <ChartCard title="Context">
             <KeyValues items={[
-              ['termag CLI', r.cliVersion ?? '—'],
-              ['agent version', r.agentVersion ?? '—'],
+              ['termag CLI', r.cliVersion ? <span className="admin-mono">{r.cliVersion}</span> : '—'],
+              ['agent version', r.agentVersion ? <span className="admin-mono">{r.agentVersion}</span> : '—'],
               ['box agent', r.boxAgentCommit ? <code className="admin-mono">{r.boxAgentCommit.slice(0, 12)}</code> : '—'],
               ['capabilities', r.boxAgentCapabilities.length
                 ? <details className="admin-bug-caps"><summary>{r.boxAgentCapabilities.length}</summary>{r.boxAgentCapabilities.join(' ')}</details>
                 : '—'],
-              ['box image', r.boxImage ?? '—'],
+              ['box image', r.boxImage ? <span className="admin-mono">{r.boxImage}</span> : '—'],
               ...(r.redacted.length ? [['redacted', <span className="admin-warn">{r.redacted.join(', ')}</span>] as [string, React.ReactNode]] : []),
             ]} />
           </ChartCard>

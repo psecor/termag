@@ -1,5 +1,5 @@
-// One space file in the simple UI's main pane (/chat/f/<space>/<path>,
-// simple-ui-side-panel-enabled), opened from the file explorer, the sidebar
+// One space file in the simple UI's main pane (/chat/f/<space>/<path>),
+// opened from the file explorer, the sidebar
 // or a space link in a reply. The server signs a 30-minute presigned S3 URL
 // and says how to show it. PDFs are the src
 // of an unsandboxed iframe and the browser's own viewer renders them. Text
@@ -24,9 +24,11 @@
 // in the explorer replaces this one in the same tab. The breadcrumb is the
 // header's only title line. Reload and Download are icons (named by their
 // aria-label, with a tooltip on hover or focus). The buttons go Reload,
-// Download, Share | 🔗, then Tools at the right edge, beside the panel it
-// opens, as in every chat header; on a phone (or a header too narrow for
-// them) they are under ⋮ in the same order, as an agent's actions are.
+// Download, Share | 🔗, then Tools, beside the panel it opens, as in every
+// chat header; on a phone (or a header too narrow for them) they are under ⋮
+// in the same order, as an agent's actions are. The back arrow at the
+// header's left, before the breadcrumb and the same button as Reload, closes
+// the file's tab and goes back to the tab shown before it (TabClose.tsx).
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { spacesApi, type SpaceViewUrl } from '../../services/api';
@@ -43,6 +45,7 @@ import { isMermaidPath } from '../../chat/mermaidFence';
 import { LiveCue, useSpaceFileLive } from './SpaceFileLive';
 import { REPLAY_BLOCK_CLASS } from '../../observability';
 import { ChatHistoryButton, SidePanelButton, useChatChrome } from './chatChrome';
+import { CloseAndBackButton } from './TabClose';
 import { menuButtonKeys, useCoarsePointer, useContextMenu, type MenuTrigger } from './ContextMenu';
 import { FileComposeLinks, SpaceFileChat } from './FileChat';
 import { SpaceMarkdownImages } from './SpaceMarkdownImage';
@@ -383,6 +386,7 @@ export function SpaceFileView() {
       <section className="chat-conv">
         <LiveCue space={space} cue={live.cue} onReload={live.applyPending} />
         <header ref={headerRef} className="chat-header fv-header" data-compact={compact || undefined}>
+          <CloseAndBackButton />
           <ChatHistoryButton />
           <div ref={titleRef} className="chat-title">
             <FileBreadcrumb space={space} path={path} revealDir={member ? sidePanel?.revealDir : undefined} onFoldedWidth={setFoldedWidth} />

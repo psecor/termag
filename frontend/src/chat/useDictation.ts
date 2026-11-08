@@ -2,7 +2,6 @@
 // note under the box, and the keys a composer hands it first.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type React from 'react';
-import { FLAGS, useFlag } from '../flags';
 import { Dictation, dictationEngine, dictationErrorText, engineMemory, isBlockedError, isDictationShortcut, type DictationState } from './dictation';
 import { localRecognitionCtor } from './localRecognition';
 
@@ -16,7 +15,7 @@ export interface DictationInput {
 }
 
 export interface DictationControl {
-  /** Shown at all: the flag is on and this browser can recognise speech. */
+  /** Shown at all: this browser can recognise speech. */
   available: boolean;
   /** The microphone is refused for this site until the person allows it. */
   blocked: boolean;
@@ -48,12 +47,11 @@ function browserStorage() {
 }
 
 export function useDictation({ text, setText, max, chatKey }: DictationInput): DictationControl {
-  const flagOn = useFlag(FLAGS.chatVoiceInput, false);
   const Ctor = useMemo(() => {
     const win = browserWindow();
     return dictationEngine(win as Parameters<typeof dictationEngine>[0], localRecognitionCtor(win as Parameters<typeof localRecognitionCtor>[0]), engineMemory(browserStorage()));
   }, []);
-  const available = flagOn && Ctor != null;
+  const available = Ctor != null;
 
   const [state, setState] = useState<DictationState>('idle');
   const [error, setError] = useState<string | null>(null);

@@ -10,15 +10,14 @@
 // deploy now. Defer a day puts a row off as the overlay's does: it sinks to
 // the foot of its lane, marked, and leaves the inbox's PR count.
 //
-// Review groups (pr-review-groups-enabled):
-//  each open group is a folded card at the top of My review, whose
-// grouped rows then show only in it; elsewhere a grouped row's line names its
-// place ("Desktop bridge 2/5"). A row's ⋯ offers Add to group…, and the card
-// Review next and Review all with Devin.
+// Review groups: each open group is a
+// folded card at the top of My review, whose grouped rows then show only in
+// it; elsewhere a grouped row's line names its place ("Desktop bridge 2/5"). A
+// row's ⋯ offers Add to group…, and the card Review next and Review all with
+// Devin.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { prsApi, reviewApi, type PrGroupMember, type PrGroupSuggestion, type PrLaneId, type PrReviewGroup, type PrRow, type PrWorkstreamLink } from '../../services/api';
-import { FLAGS, useFlag } from '../../flags';
 import { groupKey, groupPill, groupPlaces, groupReviewBody, groupReviewPlan, memberInputs, memberLabel, openGroups, suggestionsOf } from '../../utils/prReviewGroups';
 import { AddToGroupSheet, MobileGroupCard, MobileSuggestionRow, SuggestionSheet } from './PrGroups';
 import { usePolled } from '../dashboard/useDashboardData';
@@ -69,7 +68,6 @@ export function Prs() {
   const closeOverview = useCallback(() => setOverview(null), []);
   const closeMenu = useCallback(() => setMenu(null), []);
   const closeConfirm = useCallback(() => setConfirm(null), []);
-  const groupsOn = useFlag(FLAGS.prReviewGroups, false);
   const [addTo, setAddTo] = useState<PrRow | null>(null);
   // By id: the confirm reads the group from each new answer, so a refresh that checks its last member off is seen.
   const [confirmGroupId, setConfirmGroupId] = useState<string | null>(null);
@@ -94,9 +92,9 @@ export function Prs() {
     setParams(next, { replace: true });
   };
   // Review groups: their cards head My review, which then leaves grouped rows to them.
-  const places = groupsOn ? groupPlaces(prs.data) : new Map<string, never>();
-  const cards = groupsOn && selected === 'needs_my_review' ? openGroups(prs.data) : [];
-  const suggested = groupsOn && selected === 'needs_my_review' ? suggestionsOf(prs.data) : [];
+  const places = groupPlaces(prs.data);
+  const cards = selected === 'needs_my_review' ? openGroups(prs.data) : [];
+  const suggested = selected === 'needs_my_review' ? suggestionsOf(prs.data) : [];
   const viewer = prs.data?.connected ? prs.data.viewer : null;
   const laneRows = (lanes.find(l => l.id === selected)?.rows ?? []).filter(r => cards.length === 0 || !places.has(groupKey(r) ?? ''));
   // Deferred rows last, in their own order.
@@ -181,7 +179,7 @@ export function Prs() {
     if (r.url) out.push({ label: 'Open on GitHub', onClick: () => { window.open(r.url!, '_blank', 'noopener'); } });
     if (r.workstream) out.push({ label: `Open conversation · ${wsLabel(r.workstream)}`, onClick: () => navigate(conversationHref(r.workstream!)) });
     if (isReviewLane(r.lane) && r.reviewTarget) out.push({ label: 'Review with Devin…', onClick: () => setConfirm(r) });
-    if (groupsOn && r.kind === 'pr') {
+    if (r.kind === 'pr') {
       const place = places.get(groupKey(r) ?? '');
       out.push({ label: place ? `Review group: ${groupPill(place)}…` : 'Add to group…', onClick: () => setAddTo(r) });
     }

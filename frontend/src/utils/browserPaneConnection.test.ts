@@ -59,10 +59,10 @@ describe('preview shares', () => {
 
   it('reads the share link\'s handoff to the owner\'s own pane', () => {
     expect(browserHandoff('?project=p1&ws=feat&browser=open&browserShare=cshare0000000001&browserAt=%2Fflags'))
-      .toEqual({ open: true, share: { shareId: 'cshare0000000001', at: '/flags' } });
+      .toEqual({ open: true, share: { shareId: 'cshare0000000001', at: '/flags' }, url: null });
     expect(browserHandoff('?project=p1&browser=open&browserShare=cshare0000000001&browserAt=%2F%2Fevil'))
-      .toEqual({ open: true, share: { shareId: 'cshare0000000001', at: null } });
-    expect(browserHandoff('?project=p1&browser=open&browserShare=../x')).toEqual({ open: true, share: null });
+      .toEqual({ open: true, share: { shareId: 'cshare0000000001', at: null }, url: null });
+    expect(browserHandoff('?project=p1&browser=open&browserShare=../x')).toEqual({ open: true, share: null, url: null });
     expect(browserHandoff('?project=p1')).toBeNull();
   });
 
@@ -70,5 +70,20 @@ describe('preview shares', () => {
     const q = new URLSearchParams(browserSocketParams({ mode: 'owner', projectId: 'p1', workstream: 'main', openShare: { shareId: 'cshare0000000001', at: '/flags' } }, 'about:blank', { width: 800, height: 600 }));
     expect([q.get('openShare'), q.get('at'), q.get('projectId')]).toEqual(['cshare0000000001', '/flags', 'p1']);
     expect(new URLSearchParams(browserSocketParams({ mode: 'owner', projectId: 'p1', workstream: 'main' }, 'about:blank', { width: 800, height: 600 })).has('openShare')).toBe(false);
+  });
+});
+
+describe('environment port links (browserPortHref, loopbackUrl, handoffBrowserKey)', async () => {
+  const { browserPortHref, loopbackUrl, handoffBrowserKey } = await import('./browserPaneConnection');
+  it("link to the owner's own pane on the project, at a loopback URL only", () => {
+    expect(browserPortHref('p1', 'main', 'http://localhost:5174/termag/')).toBe('/?project=p1&ws=main&browser=open&browserUrl=http%3A%2F%2Flocalhost%3A5174%2Ftermag%2F');
+    expect(browserHandoff('?browser=open&browserUrl=http%3A%2F%2F127.0.0.1%3A3040%2F')).toEqual({ open: true, share: null, url: 'http://127.0.0.1:3040/' });
+    expect(loopbackUrl('http://localhost:80/x')).toBe('http://localhost/x');
+    expect(loopbackUrl('https://example.com/')).toBeNull();
+    expect(loopbackUrl('javascript:alert(1)')).toBeNull();
+    expect(loopbackUrl('http://u:p@localhost:1/')).toBeNull();
+    expect(handoffBrowserKey('/termag/chat/p/abc', '?ws=fix')).toBe('abc/fix');
+    expect(handoffBrowserKey('/termag/', '?project=abc')).toBe('abc/main');
+    expect(handoffBrowserKey('/termag/', '')).toBeNull();
   });
 });

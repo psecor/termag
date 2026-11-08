@@ -62,7 +62,7 @@ export function GithubField({ status, onChanged }: { status: CredentialsStatus['
         <Text slot="description">
           {unavailable
             ? <>This orchestrator has no credential store. Sign in to GitHub on each box with <code>gh auth login</code> instead.</>
-            : <>Run <code>gh auth token</code> on your laptop. Needs repo and read:org.</>}
+            : <>Run <code>gh auth token</code> on your laptop. Needs repo and read:org. Optional: workflow, so agents can push changes to <code>.github/workflows</code> (<code>gh auth refresh -h github.com -s workflow</code> adds it).</>}
         </Text>
         <FieldError />
       </TextField>

@@ -40,8 +40,8 @@ const peopleCols: Column<BoxCostPerson>[] = [
 
 const boxCols: Column<BoxCostBox>[] = [
   { id: 'name', label: 'box', value: x => x.name ?? x.ec2InstanceId, render: x => (
-    !x.name ? <span className="admin-bad" title="EC2 has it; termag has no row for it">{x.ec2InstanceId}</span>
-      : x.teardownUnfinished ? <span className="admin-bad" title="termag terminated it and EC2 still had it an hour or more later: a teardown that didn't finish">{x.name} <span className="usage-dim">· {x.ec2InstanceId}</span></span>
+    !x.name ? <span className="admin-bad" title="EC2 has it; termag has no row for it"><span className="admin-mono">{x.ec2InstanceId}</span></span>
+      : x.teardownUnfinished ? <span className="admin-bad" title="termag terminated it and EC2 still had it an hour or more later: a teardown that didn't finish">{x.name} <span className="usage-dim">· <span className="admin-mono">{x.ec2InstanceId}</span></span></span>
         : <span>{x.name}</span>) },
   { id: 'owner', label: 'owner', value: x => x.owner ?? '' },
   { id: 'status', label: 'status', value: x => x.status ?? '' },
@@ -56,7 +56,7 @@ type ReconcileRow = BoxReconcileLine & { kind: 'drift' | 'not metered' | 'not bi
 
 const reconcileCols: Column<ReconcileRow>[] = [
   { id: 'kind', label: 'why', value: x => x.kind, render: x => <span className={x.kind === 'not metered' ? 'usage-dim' : 'admin-bad'}>{x.kind}</span> },
-  { id: 'name', label: 'instance', value: x => x.name ?? x.ec2InstanceId, render: x => <span>{x.name ?? x.ec2InstanceId}{x.name ? <span className="usage-dim"> · {x.ec2InstanceId}</span> : null}</span> },
+  { id: 'name', label: 'instance', value: x => x.name ?? x.ec2InstanceId, render: x => <span>{x.name ?? <span className="admin-mono">{x.ec2InstanceId}</span>}{x.name ? <span className="usage-dim"> · <span className="admin-mono">{x.ec2InstanceId}</span></span> : null}</span> },
   { id: 'type', label: 'type', value: x => x.instanceType ?? '' },
   { id: 'mh', label: 'metered h', value: x => x.meteredHours, align: 'right', render: x => fmtHours(x.meteredHours) },
   { id: 'bh', label: 'billed h', value: x => x.billedHours, align: 'right', render: x => fmtHours(x.billedHours) },
@@ -125,11 +125,11 @@ export function AdminBoxCost({ from, to }: { from: string; to: string }) {
       <Reconcile rc={r?.reconcile} loading={report.loading} />
 
       <ChartCard title="Box cost by person" subtitle="owned boxes only; the warm pool and boxes with no termag row belong to nobody" stale={report.loading}>
-        <DataTable rows={r?.people ?? []} columns={peopleCols} rowKey={x => x.userId} defaultSort="total" dense empty={r ? 'no box hours in this window' : pendingText(report)} />
+        <DataTable rows={r?.people ?? []} columns={peopleCols} rowKey={x => x.userId} defaultSort="total" dense search="filter people" storageKey="boxcost-people" empty={r ? 'no box hours in this window' : pendingText(report)} />
       </ChartCard>
 
       <ChartCard title="Box cost by box" subtitle="type and GB as of the box's latest metered day; red: EC2 had it with no termag row, or kept it an hour past its teardown" stale={report.loading}>
-        <DataTable rows={r?.boxes ?? []} columns={boxCols} rowKey={x => x.ec2InstanceId} defaultSort="total" dense empty={r ? 'no box hours in this window' : pendingText(report)} />
+        <DataTable rows={r?.boxes ?? []} columns={boxCols} rowKey={x => x.ec2InstanceId} defaultSort="total" dense search="filter boxes" storageKey="boxcost-boxes" empty={r ? 'no box hours in this window' : pendingText(report)} />
       </ChartCard>
     </>
   );

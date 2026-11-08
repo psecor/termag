@@ -6,7 +6,7 @@ import { ChartCard } from '../dashboard/ChartCard';
 import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, HUE, HUE_ORDER, CURSOR, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
 import { shortDate } from '../dashboard/range';
 import { deltaPct } from '../dashboard/KpiRow';
-import { useAdminPolled, pendingText, DataTable, KeyValues, Counts, StatusPill, Dot, fmtAgo, fmtSeconds, type Column } from './shared';
+import { useAdminPolled, pendingText, DataTable, TableReset, KeyValues, Counts, StatusPill, statusPillText, Dot, fmtAgo, fmtSeconds, type Column } from './shared';
 import { cloudStateLabel, platformLabel } from '../../utils/cloudSessions';
 import { adminCloudName, daysForRange, fmtBytesShort, fmtPercentiles, pipelineShare, pipelineVerdict, pollStale, pressureCell, pressureClass, reportChartRows, slotHours, stackKeys, tmuxLabel } from '../../utils/adminCloud';
 import { fmtK } from '../../utils/format';
@@ -38,19 +38,29 @@ function healthItems(h: OrchestratorHealth, now: number): Array<[string, React.R
     ['control plane', <span className={connected ? 'admin-ok' : 'admin-warn'}>{connected ? 'connected' : 'NOT connected: the last poll of Anthropic failed'}</span>],
     ['spawn queue', counts ? <Counts counts={counts} /> : '—'],
     ['last poll', lastPoll ? <span className={stale ? 'admin-warn' : ''}>{fmtAgo(lastPoll, now)}{stale ? ' · stale: the unit polls every few seconds' : ''}</span> : '—'],
-    ['health port', `127.0.0.1:${h.port}${h.cached ? ' · cached' : ''} · read ${fmtAgo(h.fetchedAt, now)}`],
+    ['health port', <><span className="admin-mono">127.0.0.1:{h.port}</span>{h.cached ? ' · cached' : ''} · read {fmtAgo(h.fetchedAt, now)}</>],
   ];
 }
 
-/** The live status cell: the pill the project tables use, then what the agent waits on, a rate limit, the context size. */
-function LiveCell({ s }: { s: AdminCloudSession }) {
-  if (!s.live) return <span className="usage-dim">{s.state === 'running' ? 'no status yet' : '—'}</span>;
-  const l = s.live;
-  const extra = [
+/** What the live status cell says after its pill: what the agent waits on, a rate limit, the context size. */
+function liveExtra(l: NonNullable<AdminCloudSession['live']>): string {
+  return [
     l.waitingReason ? `on ${l.waitingReason}` : '',
     l.rateLimited ? `rate limited: ${l.rateLimited}` : '',
     l.contextTokens != null ? `${fmtK(l.contextTokens)} ctx` : '',
   ].filter(Boolean).join(' · ');
+}
+/** The live status cell's text, for the table's filter (Devin on #1298): the same words LiveCell shows. */
+export function liveCellText(s: AdminCloudSession): string {
+  if (!s.live) return s.state === 'running' ? 'no status yet' : '';
+  return [statusPillText(s.live.status), liveExtra(s.live)].filter(Boolean).join(' ');
+}
+
+/** The live status cell: the pill the project tables use, then liveExtra. */
+function LiveCell({ s }: { s: AdminCloudSession }) {
+  if (!s.live) return <span className="usage-dim">{s.state === 'running' ? 'no status yet' : '—'}</span>;
+  const l = s.live;
+  const extra = liveExtra(l);
   return <span><StatusPill status={l.status} />{extra ? <span className={`usage-dim ${l.rateLimited ? 'admin-bad' : ''}`}> {extra}</span> : null}</span>;
 }
 
@@ -62,6 +72,8 @@ function GroupPicker({ value, onChange }: { value: CloudReportGroup; onChange: (
   );
 }
 
+/** The usage cell's text, for the filter: the token total it shows. */
+const usageCellText = (run: AdminCloudSession['current']): string => (run?.usage ? fmtK(run.usage.total) : '');
 /** The run's posted token total, with the model on hover; a dash until the box posts usage (S4). */
 function UsageCell({ run }: { run: AdminCloudSession['current'] }) {
   const u = run?.usage;
@@ -94,12 +106,12 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
     { id: 'owner', label: 'owner', value: r => r.owner },
     { id: 'slot', label: 'slot', value: r => r.current?.slot ?? null, align: 'right' },
     { id: 'state', label: 'state', value: r => r.state, render: r => <span className={`cloud-state cloud-state--${r.state}`}>{cloudStateLabel(r)}</span> },
-    { id: 'status', label: 'status', value: r => r.live?.status ?? '', render: r => <LiveCell s={r} />, title: 'live working/waiting/ready from the session\'s status hooks' },
+    { id: 'status', label: 'status', value: r => r.live?.status ?? '', render: r => <LiveCell s={r} />, text: liveCellText, title: 'live working/waiting/ready from the session\'s status hooks' },
     { id: 'since', label: 'since', value: r => r.live?.updatedAt ? Date.parse(r.live.updatedAt) : null, render: r => fmtAgo(r.live?.updatedAt, now), title: 'last status write' },
     { id: 'from', label: 'from', value: r => platformLabel(r.clientPlatform) ?? '' },
-    { id: 'started', label: 'started', value: r => r.current?.startedAt ?? r.firstSeenAt, render: r => fmtAgo(r.current?.startedAt ?? r.firstSeenAt, now) },
+    { id: 'started', label: 'started', value: r => Date.parse(r.current?.startedAt ?? r.firstSeenAt), render: r => fmtAgo(r.current?.startedAt ?? r.firstSeenAt, now) },
     { id: 'alive', label: 'tmux', value: r => r.current?.alive == null ? null : r.current.alive ? 1 : 0, render: r => tmuxLabel(r.current?.alive ?? null, r.boxConnected) },
-    { id: 'tokens', label: 'tokens', value: r => r.current?.usage?.total ?? null, align: 'right', render: r => <UsageCell run={r.current} />, title: 'cumulative, posted by the session itself on each turn' },
+    { id: 'tokens', label: 'tokens', value: r => r.current?.usage?.total ?? null, align: 'right', render: r => <UsageCell run={r.current} />, text: r => usageCellText(r.current), title: 'cumulative, posted by the session itself on each turn' },
     { id: 'session', label: 'session', value: r => r.key, render: link },
   ];
   const queuedCols: Column<AdminCloudSession>[] = [
@@ -115,9 +127,9 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
     { id: 'box', label: 'box', value: r => r.current ? `${r.current.boxName} · ${r.current.slot}` : '' },
     { id: 'state', label: 'end', value: r => r.exitReason ?? r.state, render: r => <span className={`cloud-state cloud-state--${r.state}`}>{cloudStateLabel(r)}</span> },
     { id: 'from', label: 'from', value: r => platformLabel(r.clientPlatform) ?? '' },
-    { id: 'ended', label: 'ended', value: r => r.current?.endedAt ?? r.lastSeenAt, render: r => fmtAgo(r.current?.endedAt ?? r.lastSeenAt, now) },
+    { id: 'ended', label: 'ended', value: r => Date.parse(r.current?.endedAt ?? r.lastSeenAt), render: r => fmtAgo(r.current?.endedAt ?? r.lastSeenAt, now) },
     { id: 'duration', label: 'slot held', value: r => r.current?.durationSec ?? null, align: 'right', render: r => fmtSeconds(r.current?.durationSec ?? null) },
-    { id: 'tokens', label: 'tokens', value: r => r.current?.usage?.total ?? null, align: 'right', render: r => <UsageCell run={r.current} /> },
+    { id: 'tokens', label: 'tokens', value: r => r.current?.usage?.total ?? null, align: 'right', render: r => <UsageCell run={r.current} />, text: r => usageCellText(r.current) },
     { id: 'checkout', label: 'checkout', value: r => r.current?.checkoutBytes ?? null, align: 'right', title: 'the session directory when it ended; "kept" means unpushed work stayed on the box',
       render: r => <span className={r.current?.kept ? 'admin-warn' : ''}>{fmtBytesShort(r.current?.checkoutBytes)}{r.current?.kept ? ' · kept' : ''}</span> },
     { id: 'runs', label: 'runs', value: r => r.runs.length, align: 'right' },
@@ -126,7 +138,7 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
   const capCols: Column<BoxCapacity>[] = [
     { id: 'box', label: 'box', value: r => r.boxName },
     { id: 'owner', label: 'owner', value: r => r.owner ?? '', render: r => r.owner ?? <span className="usage-dim">warm pool</span> },
-    { id: 'status', label: 'status', value: r => r.status, render: r => <StatusPill status={r.status} /> },
+    { id: 'status', label: 'status', value: r => r.status, render: r => <StatusPill status={r.status} />, text: r => statusPillText(r.status) },
     { id: 'agent', label: 'agent', value: r => (r.connected ? 1 : 0), render: r => <span><Dot on={r.connected} /> {r.connected ? (r.capable ? 'ready for runners' : 'too old for runners') : 'offline'}</span> },
     { id: 'eligible', label: 'eligible', value: r => (r.eligible ? 1 : 0), render: r => r.eligible ? 'yes' : 'no', title: 'the spawn route would place a session here' },
     { id: 'slots', label: 'slots', value: r => r.slotsUsed, align: 'right', render: r => <span className={r.eligible && r.slotsUsed >= r.slotsMax ? 'admin-warn' : ''}>{r.slotsUsed} / {r.slotsMax}</span> },
@@ -163,7 +175,8 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
   const delta = (cur: number, prior: number) => { const p = deltaPct(cur, prior); return p == null ? '' : ` (${p > 0 ? '▲' : p < 0 ? '▼' : ''}${Math.abs(p).toFixed(0)}% ${vs})`; };
 
   return (
-    <>
+    // ?box= narrows the runs tables: back to page 1 (the range resets them from Admin.tsx).
+    <TableReset value={boxFilter}>
       {boxFilter && (
         <div className="dash-updated">
           showing box <b>{filteredBoxName}</b> only · <button type="button" className="admin-link" onClick={() => setParams({})}>show every box</button>
@@ -173,8 +186,8 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
         <ChartCard title="Orchestrator" subtitle={h ? (h.available ? 'claude-runner-orchestrator on this host' : 'not on this host, or down') : pendingText(health)} stale={health.loading}>
           {h && <KeyValues items={healthItems(h, now)} />}
           <div className="usage-dim dash-card-note">
-            The health body is the unit's own; `connected` is the alert, `queue_counts` the backlog by state. History and charts: the orchestrator journal and metrics in your observability tool{' '}
-            {h?.observabilityUrl ? <a href={h.observabilityUrl} target="_blank" rel="noreferrer">open →</a> : <span>(no OBSERVABILITY_UI_URL configured on this host)</span>}.
+            The health body is the unit's own; <code>connected</code> is the alert, <code>queue_counts</code> the backlog by state. History and charts: the orchestrator journal and metrics in your observability tool{' '}
+            {h?.observabilityUrl ? <a href={h.observabilityUrl} target="_blank" rel="noreferrer">open →</a> : <span>(no <code>OBSERVABILITY_UI_URL</code> configured on this host)</span>}.
           </div>
         </ChartCard>
         <ChartCard title="Sessions now" subtitle={d ? `generated ${fmtAgo(d.generatedAt, now)}` : pendingText(sessions)} stale={sessions.loading}>
@@ -268,21 +281,21 @@ export function AdminCloud({ range, now }: { range: AdminRange; now: number }) {
       </div>
 
       <ChartCard title="Live runs" subtitle="one row per run on a box; the title is the owner's and is not shown" stale={sessions.loading}>
-        <DataTable rows={live} columns={liveCols} rowKey={r => r.key} defaultSort="started" dense empty={boxFilter ? 'no cloud session is running on this box' : 'no cloud session is running on any box'} />
+        <DataTable rows={live} columns={liveCols} rowKey={r => r.key} defaultSort="started" dense search="filter runs" storageKey="cloud-live" empty={boxFilter ? 'no cloud session is running on this box' : 'no cloud session is running on any box'} />
       </ChartCard>
       <ChartCard title="Queued" subtitle="sessions the spawn hook refused, with the reason the Activity tab shows and the owner's boxes" stale={sessions.loading}>
         <DataTable rows={d?.queued ?? []} columns={queuedCols} rowKey={r => r.key} defaultSort="since" dense empty="nothing queued" />
       </ChartCard>
       <ChartCard title="Recent ends" subtitle={d ? `ended and lost sessions in the last ${d.days} day${d.days === 1 ? '' : 's'}, newest first, at most 500` : pendingText(sessions)} stale={sessions.loading}>
-        <DataTable rows={recent} columns={recentCols} rowKey={r => r.key} defaultSort="ended" dense empty="nothing ended in the window" />
+        <DataTable rows={recent} columns={recentCols} rowKey={r => r.key} defaultSort="ended" dense search="filter runs" storageKey="cloud-recent" empty="nothing ended in the window" />
       </ChartCard>
       <ChartCard title="Capacity" subtitle={cap ? `${cap.totals.slotsUsed} of ${cap.totals.slotsUsed + cap.totals.slotsFree} slots in use · cap ${cap.max} per box · every non-terminated box, judged by the spawn route's rule` : pendingText(capacity)} stale={capacity.loading}>
-        <DataTable rows={cap?.boxes ?? []} columns={capCols} rowKey={r => r.instanceId} defaultSort="slots" dense empty="no boxes" />
+        <DataTable rows={cap?.boxes ?? []} columns={capCols} rowKey={r => r.instanceId} defaultSort="slots" dense search="filter boxes" storageKey="cloud-capacity" empty="no boxes" />
         <div className="usage-dim dash-card-note">Slots used are open runs in Postgres; a vanished runner is closed by the lost sweep within ten minutes. Raising the cap is a configuration change.</div>
       </ChartCard>
       <ChartCard title="Pipeline health" subtitle={pipeline.data ? `per box, last ${pipeline.data.days} days: which box-side signals reach the backend` : pendingText(pipeline)} stale={pipeline.loading}>
-        <DataTable rows={pipeline.data?.boxes ?? []} columns={pipeCols} rowKey={r => r.instanceId} defaultSort="runs" dense empty="no cloud runs in the window" />
+        <DataTable rows={pipeline.data?.boxes ?? []} columns={pipeCols} rowKey={r => r.instanceId} defaultSort="runs" dense search="filter boxes" storageKey="cloud-pipeline" empty="no cloud runs in the window" />
       </ChartCard>
-    </>
+    </TableReset>
   );
 }

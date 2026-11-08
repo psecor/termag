@@ -1,0 +1,22 @@
+/* First train: green-signal accents in both UIs and both palettes. Contrast:
+   dark: #5fd38d on #0d1117 10.08:1, #161b22 9.22:1, #21262d 8.11:1, simple UI #181a1f 9.27:1,
+   #23252a 8.17:1; white on #1b7f4b 5.02:1; #1b7f4b as a border or outline on #21262d 3.03:1,
+   #23252a 3.06:1.
+   light: #14753f on #ffffff 5.76:1, #f6f8fa 5.41:1, #eaeef2 4.94:1, simple UI #f7f9fb 5.46:1;
+   white on #11663a 7.03:1. */
+
+html[data-daily-theme="2026-11-07"],
+html[data-daily-theme="2026-11-07"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-07"] .lp-theme {
+  --accent: #5fd38d;
+  --accent-dim: #1b7f4b;
+  --accent-rgb: 95, 211, 141;
+}
+
+html[data-daily-theme="2026-11-07"][data-palette="light"],
+html[data-daily-theme="2026-11-07"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-07"][data-palette="light"] .lp-theme {
+  --accent: #14753f;
+  --accent-dim: #11663a;
+  --accent-rgb: 20, 117, 63;
+}

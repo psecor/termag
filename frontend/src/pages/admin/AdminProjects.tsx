@@ -1,6 +1,7 @@
 import React, { useCallback, useState } from 'react';
+import { AdminPreviewLinkEnd } from './AdminPreviewLinkEnd';
 import { adminApi, type AdminCloudSessions, type AdminProject, type AdminSessionRow } from '../../services/adminApi';
-import { useAdminPolled, pendingText, DataTable, StatusPill, Dot, Counts, fmtAgo, type Column } from './shared';
+import { useAdminPolled, pendingText, DataTable, StatusPill, statusPillText, Dot, Counts, fmtAgo, type Column } from './shared';
 import { fmtK } from '../../utils/format';
 import { adminCloudName } from '../../utils/adminCloud';
 
@@ -51,15 +52,15 @@ export function AdminProjects({ now }: { now: number }) {
     { id: 'created', label: 'created', value: r => Date.parse(r.createdAt), render: r => fmtAgo(r.createdAt, now) },
   ];
   const scols: Column<AdminSessionRow>[] = [
-    { id: 'session', label: 'session', value: r => r.session },
+    { id: 'session', label: 'session', value: r => r.session, render: r => (r.role === 'cloud' ? r.session : <span className="admin-mono">{r.session}</span>) },
     { id: 'owner', label: 'owner', value: r => r.owner },
-    { id: 'status', label: 'status', value: r => r.status, render: r => <StatusPill status={r.status} /> },
+    { id: 'status', label: 'status', value: r => r.status, render: r => <StatusPill status={r.status} />, text: r => statusPillText(r.status) },
     { id: 'since', label: 'since', value: r => r.updatedAt ? Date.parse(r.updatedAt) : null, render: r => fmtAgo(r.updatedAt, now), title: 'last status write' },
     { id: 'why', label: 'waiting on', value: r => r.waitingReason },
     { id: 'rl', label: 'rate limit', value: r => r.rateLimited, render: r => r.rateLimited ? <span className="admin-bad">{r.rateLimited}</span> : '—' },
     { id: 'ctx', label: 'context', value: r => r.contextTokens, align: 'right', render: r => r.contextTokens != null ? fmtK(r.contextTokens) : '—' },
     { id: 'provider', label: 'provider', value: r => r.provider },
-    { id: 'host', label: 'host', value: r => r.instanceId ?? 'orchestrator', render: r => <span><Dot on={r.connected} /> {r.instanceId ? r.instanceId.slice(0, 8) : 'orchestrator'}{r.alive ? '' : ' · no tmux'}</span> },
+    { id: 'host', label: 'host', value: r => r.instanceId ?? 'orchestrator', render: r => <span><Dot on={r.connected} /> {r.instanceId ? <span className="admin-mono">{r.instanceId.slice(0, 8)}</span> : 'orchestrator'}{r.alive ? '' : ' · no tmux'}</span> },
     { id: 'role', label: 'role', value: r => r.role },
   ];
 
@@ -77,7 +78,8 @@ export function AdminProjects({ now }: { now: number }) {
           <label className="admin-toggle"><input type="checkbox" checked={agentOnly} onChange={e => setAgentOnly(e.target.checked)} /> agent panes only</label>
           <label className="admin-toggle"><input type="checkbox" checked={withCloud} onChange={e => setWithCloud(e.target.checked)} /> cloud sessions</label>
         </div>
-        <DataTable rows={sessionRows} columns={scols} rowKey={r => `${r.projectId}:${r.instanceId ?? 'orchestrator'}:${r.session}`} defaultSort="status" defaultDesc={false} empty={s ? 'no sessions' : pendingText(live)} dense />
+        <DataTable rows={sessionRows} columns={scols} rowKey={r => `${r.projectId}:${r.instanceId ?? 'orchestrator'}:${r.session}`} defaultSort="status" defaultDesc={false}
+          search="filter sessions" storageKey="live-sessions" resetKey={[agentOnly, withCloud]} empty={s ? 'no sessions' : pendingText(live)} dense />
       </section>
       <section className="dash-section">
         <div className="dash-section-title">
@@ -86,8 +88,10 @@ export function AdminProjects({ now }: { now: number }) {
           <label className="admin-toggle"><input type="checkbox" checked={stale} onChange={e => setStale(e.target.checked)} /> stale 30d+</label>
           <label className="admin-toggle"><input type="checkbox" checked={archived} onChange={e => setArchived(e.target.checked)} /> archived</label>
         </div>
-        <DataTable rows={projects.data ?? []} columns={pcols} rowKey={r => r.id} defaultSort="active" empty={projects.data ? 'no projects' : pendingText(projects)} dense />
+        <DataTable rows={projects.data ?? []} columns={pcols} rowKey={r => r.id} defaultSort="active"
+          search="filter projects" storageKey="projects" resetKey={[stale, archived]} empty={projects.data ? 'no projects' : pendingText(projects)} dense />
       </section>
+      <AdminPreviewLinkEnd />
     </>
   );
 }

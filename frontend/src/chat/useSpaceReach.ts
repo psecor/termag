@@ -44,8 +44,6 @@ export function useSpaceReach(spaces: SpacesLike, space: string): SpaceReach {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [space, needed]);
   if (listed) return 'yes';
-  // Spaces off: every space route answers 404.
-  if (spaces.enabled === false) return 'no';
   // Still loading the list: nothing is asked for yet, so a link opened before access
   // leaves no failed listing behind in the explorer's cache.
   if (!spaces.loaded) return 'checking';

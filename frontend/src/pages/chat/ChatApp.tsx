@@ -4,12 +4,11 @@
 // phone the list is the page, or a drawer over the conversation, so the
 // thread keeps the width (chat/chatLayout.ts). Mounted inside the same
 // providers as the workspace, without MainLayout: no starfield, and no
-// terminals beyond the side panel's ctrl shell (chat/sidePanel.ts, behind
-// simple-ui-side-panel-enabled; Open in full UI is the way to the agent
+// terminals beyond the side panel's ctrl shell (chat/sidePanel.ts;
+// Open in full UI is the way to the agent
 // pane). An automation has its own page, /chat/automations/:id
 // (pages/chat/automations/, behind simple-ui-automations-enabled), opened
 // from its row in its space's explorer, with that explorer beside it.
-// Behind simple-ui-enabled.
 import React, { startTransition, useCallback, useEffect, useMemo, useState } from 'react';
 import { Navigate, Route, Routes, useLocation, useMatch, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
@@ -19,7 +18,9 @@ import { ConnectionOverlay } from '../../components/ConnectionOverlay';
 import { boxFeed } from '../../services/boxFeed';
 import { useStartParkedBoxOnOpen } from '../../hooks/useStartParkedBoxOnOpen';
 import { useBrowserShareHandoff } from '../../hooks/useBrowserShareHandoff';
-import { CHAT_NARROW_QUERY, chatHistoryMode } from '../../chat/chatLayout';
+import { CHAT_NARROW_QUERY, chatHistoryMode, chatZoomable } from '../../chat/chatLayout';
+import { MOBILE_MEDIA_QUERY } from '../../mobile/redirect';
+import { useZoomableViewport } from '../../hooks/useZoomableViewport';
 import { recordUiMode } from '../../chat/uiMode';
 import { isSidePanelShortcut, readSidePanel, writeSidePanel, type SidePanelState, type SidePanelTab } from '../../chat/sidePanel';
 import { isNewSessionShortcut } from '../../chat/shortcuts';
@@ -32,6 +33,7 @@ import { ChatChromeProvider } from './chatChrome';
 import { ChatSidebar } from './ChatSidebar';
 import { NewChat } from './NewChat';
 import { ChatRoute } from './ChatRoute';
+import { EnvironmentsPage } from './EnvironmentsPage';
 import { FileExplorer } from './FileExplorer';
 import { AgentsTab } from './AgentsExplorer';
 import { SpaceFileView } from './SpaceFileView';
@@ -39,6 +41,7 @@ import { AutomationDetailRoute } from './automations/AutomationDetail';
 import { AutomationsProvider, useAutomationsEnabled } from '../../chat/useAutomations';
 import { ReviewsPage } from './ReviewsPage';
 import { PrPage } from './PrPage';
+import { ReviewCloneStart } from './ReviewCloneStart';
 import { ReviewsDataProvider } from './reviewsData';
 import type { PanelToolState } from './reviewLinks';
 import { MarkdownLinkContext } from '../../chat/Markdown';
@@ -55,19 +58,33 @@ import './chat.css';
 import '@launchpad-ui/tokens/fonts.css';
 import './chrome.css';
 import './reviews.css';
+import { DailyThemeLayer } from '../../theme/daily/DailyThemeLayer';
 
-function useNarrow(): boolean {
-  const [narrow, setNarrow] = useState(
-    () => typeof window !== 'undefined' && window.matchMedia(CHAT_NARROW_QUERY).matches,
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia(query).matches,
   );
   useEffect(() => {
-    const mq = window.matchMedia(CHAT_NARROW_QUERY);
-    const on = () => setNarrow(mq.matches);
+    const mq = window.matchMedia(query);
+    const on = () => setMatches(mq.matches);
     on();
     mq.addEventListener('change', on);
     return () => mq.removeEventListener('change', on);
+  }, [query]);
+  return matches;
+}
+
+/**
+ * Marks <html> while the simple UI is mounted, so chat.css can hold every
+ * field it shows at 16 px on a phone: menus, dialogs and popovers render in
+ * portals on <body>, outside .chat-root.
+ */
+function useSimpleUiDocumentMark() {
+  useEffect(() => {
+    const html = document.documentElement;
+    html.dataset.simpleUi = '';
+    return () => { delete html.dataset.simpleUi; };
   }, []);
-  return narrow;
 }
 
 function localStore(): Storage | null {
@@ -77,14 +94,13 @@ function localStore(): Storage | null {
 /**
  * A space file link in a reply opens the file in its tab, else a new one, and
  * a folder's link (ending in `/`) its space's new tab with that folder shown
- * in Files, only where those routes are mounted (`enabled`); elsewhere it
- * stays a plain link.
+ * in Files.
  */
-function SpaceFileLinks({ enabled, children }: { enabled: boolean; children: React.ReactNode }) {
+function SpaceFileLinks({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   const { items, activeTab } = useSimpleData();
   const { pick } = items;
-  const openLink = useMemo(() => (enabled ? (href: string) => {
+  const openLink = useMemo(() => (href: string) => {
     const target = spaceLinkTarget(href, window.location.origin, import.meta.env.BASE_URL);
     if (!target) return false;
     const { ref, dir } = target;
@@ -93,7 +109,7 @@ function SpaceFileLinks({ enabled, children }: { enabled: boolean; children: Rea
       navigate(dir == null ? itemHref(ref, tab) : folderHref(ref.space, dir, tab));
     });
     return true;
-  } : null), [enabled, navigate, pick, activeTab]);
+  }, [navigate, pick, activeTab]);
   return <MarkdownLinkContext.Provider value={openLink}>{children}</MarkdownLinkContext.Provider>;
 }
 
@@ -131,13 +147,13 @@ export default function ChatApp() {
     return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
   }, [navigate]);
 
-  const narrow = useNarrow();
+  const narrow = useMediaQuery(CHAT_NARROW_QUERY);
+  // A phone, not a narrow desktop window (mobile/redirect.ts): pinch-zoom and the 16 px fields.
+  const phone = useMediaQuery(MOBILE_MEDIA_QUERY);
+  useSimpleUiDocumentMark();
   const location = useLocation();
   const { pathname } = location;
 
-  // The side panel, and with spaces the tabs (simpleData.tsx): every open of
-  // a session, file or new tab is recorded as a tab.
-  const sidePanelOn = useFlag(FLAGS.chatSidePanel, false);
   // The chrome refresh: scoped to .chat-root
   // and handed down as useChatChrome().refresh; off, nothing here changes.
   const chromeRefresh = useFlag(FLAGS.chatChromeRefresh, false);
@@ -173,22 +189,21 @@ export default function ChatApp() {
   const { projects } = useProjects();
   const boxKey = useMemo(() => [...new Set(projects.map(p => p.instanceId ?? ''))].sort().join(','), [projects]);
   const loadedSpaces = useChatSpaces({ withBoxes: true, reloadKey: boxKey });
-  const { enabled: spacesOn, loaded: spacesLoaded, spaces, index, current: spacesCurrent, reload: reloadSpaces } = loadedSpaces;
+  const { loaded: spacesLoaded, spaces, index, current: spacesCurrent, reload: reloadSpaces } = loadedSpaces;
   const sharedSpaces = useMemo(
-    () => ({ enabled: spacesOn, loaded: spacesLoaded, spaces, index, current: spacesCurrent, reload: reloadSpaces, colorOf: spacePalette(spaces) }),
-    [spacesOn, spacesLoaded, spaces, index, spacesCurrent, reloadSpaces],
+    () => ({ loaded: spacesLoaded, spaces, index, current: spacesCurrent, reload: reloadSpaces, colorOf: spacePalette(spaces) }),
+    [spacesLoaded, spaces, index, spacesCurrent, reloadSpaces],
   );
 
   // The side panel: docked and remembered on desktop, an overlay that
   // starts shut on a phone. For a conversation the project list knows, a new
   // tab on the agents in no space and, where the user has spaces (its Files
   // tab), a space file and a new tab.
-  const filesInTools = sidePanelOn && spacesOn;
   const automationsOn = useAutomationsEnabled();
   const fileMatch = useMatch('/chat/f/:space/*');
   const newTabMatch = useMatch('/chat/files/:space');
   // A link to a folder (?dir=, chat/openItems.ts folderHref): its space's new tab, with the folder shown in Files.
-  const folderDir = filesInTools && newTabMatch ? folderForRoute(location.search) : null;
+  const folderDir = newTabMatch ? folderForRoute(location.search) : null;
   // A new tab on the agents in no space (AgentsExplorer.tsx): with the side panel, spaces or not.
   const agentsMatch = useMatch('/chat/agents');
   // An automation's page, with its space's explorer beside it in Files.
@@ -220,13 +235,12 @@ export default function ChatApp() {
     if (narrow) setOverlayOpen(false);
     else setPanel({ ...panel, open: false });
   }, [narrow, panel, setPanel, forgetToolAsk]);
-  const panelAvailable = sidePanelOn && (Boolean(shownProject) || Boolean(agentsMatch) || Boolean(automationShown) || (filesInTools && Boolean(fileMatch || newTabMatch)));
+  const panelAvailable = Boolean(shownProject) || Boolean(agentsMatch) || Boolean(automationShown) || Boolean(fileMatch || newTabMatch);
   // Files: the shown agent's space, or the agents in no space beside an agent with none; a file's or new tab's space.
-  const panelFiles: SidePanelFiles | null = !sidePanelOn ? null
-    : shownProject ? { agent: shownProject }
+  const panelFiles: SidePanelFiles | null = shownProject ? { agent: shownProject }
     : agentsMatch ? { space: NO_SPACE_EXPLORER }
     : automationShown ? { automation: automationShown }
-    : filesInTools ? { space: (fileMatch ?? newTabMatch)?.params.space ?? '', path: fileMatch?.params['*'], dir: folderDir ?? undefined } : null;
+    : { space: (fileMatch ?? newTabMatch)?.params.space ?? '', path: fileMatch?.params['*'], dir: folderDir ?? undefined };
   useEffect(() => { setOverlayOpen(false); }, [pathname]);
   // A share link its owner opened (chat/uiMode.ts simpleUiShareHandoff): the
   // panel opens on Browser, the overlay on a phone, and that conversation's
@@ -317,12 +331,18 @@ export default function ChatApp() {
       open: panelOpen,
       toggle: togglePanel,
       show: (tab: SidePanelTab) => { askTool(tab); if (narrow) setOverlayOpen(true); setPanel({ ...panel, tab, open: narrow ? panel.open : true }); },
-      revealDir: filesInTools && fileMatch ? revealDir : undefined,
+      revealDir: fileMatch ? revealDir : undefined,
       // Agent tabs are the refresh's tabs, which a phone's overlay doesn't have.
       showAgent: chromeRefresh && !narrow ? (agent: AgentTabRef) => { askAgent(agent); setPanel({ ...panel, open: true }); } : undefined,
     } : undefined,
     refresh: chromeRefresh,
   };
+
+  // On a phone the chat can be pinch-zoomed, as /m can. The side panel's
+  // overlay (Terminal, Browser) keeps the lock: a pinch there would fight xterm
+  // and the browser pane's own touch handling.
+  const overlayShown = narrow && panelAvailable && panelOpen;
+  useZoomableViewport(chatZoomable(phone, overlayShown));
 
   return (
     <ChatChromeProvider value={chrome}>
@@ -330,10 +350,11 @@ export default function ChatApp() {
       <SimpleDataProvider>
       <AutomationsProvider>
       <ReviewsDataProvider>
-      <SpaceFileLinks enabled={filesInTools}>
+      <SpaceFileLinks>
         <div className={chromeRefresh ? `chat-root ${LP_THEME}` : 'chat-root'} data-chrome={chromeRefresh ? 'refresh' : undefined} data-pane={mode} data-history={mode === 'page' || historyOpen ? 'open' : 'closed'}>
           <ConnectionOverlay />
-          <Tooltips titles={sidePanelOn} />
+          <Tooltips />
+          <DailyThemeLayer />
           {mode === 'drawer' && historyOpen && (
             <button type="button" className="chat-backdrop" aria-label="Close sessions" onClick={() => setHistoryOpen(false)} />
           )}
@@ -342,14 +363,19 @@ export default function ChatApp() {
             <Routes>
               <Route index element={<ChatHome />} />
               <Route path="new" element={<NewChat />} />
+              <Route path="environments" element={<EnvironmentsPage />} />
+              <Route path="environments/:id" element={<EnvironmentsPage />} />
+              <Route path="environments/:id/history" element={<EnvironmentsPage history />} />
               <Route path="p/:projectId" element={<ChatRoute />} />
-              {sidePanelOn && <Route path="agents" element={<AgentsTab />} />}
+              <Route path="agents" element={<AgentsTab />} />
               {reviewsOn && <Route path="reviews" element={<ReviewsPage />} />}
               {reviewsOn && <Route path="pr/:owner/:name/:number" element={<PrPage />} />}
+              {/* A review on a repository with no project waits here for its clone (simple-ui-review-clone-enabled). */}
+              {reviewsOn && <Route path="review-start/:owner/:name/:number" element={<ReviewCloneStart />} />}
               {/* GitHub's own path, with any tab after it (/files, /commits, /checks), so a URL with the host swapped opens here. */}
               {reviewsOn && <Route path="gh/:owner/:name/pull/:number/*" element={<PrPage />} />}
-              {filesInTools && <Route path="files/:space" element={<FileExplorer />} />}
-              {filesInTools && <Route path="f/:space/*" element={<SpaceFileView />} />}
+              <Route path="files/:space" element={<FileExplorer />} />
+              <Route path="f/:space/*" element={<SpaceFileView />} />
               {automationsOn && <Route path="automations/:id" element={<AutomationDetailRoute />} />}
               <Route path="*" element={<Navigate to="/chat" replace />} />
             </Routes>

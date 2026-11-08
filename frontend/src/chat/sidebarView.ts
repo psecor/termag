@@ -5,7 +5,7 @@
 import { useSyncExternalStore } from 'react';
 
 export type SidebarDensity = 'compact' | 'standard';
-export type SidebarGroupBy = 'space' | 'status';
+export type SidebarGroupBy = 'space' | 'project' | 'status';
 
 export interface SidebarView {
   density: SidebarDensity;
@@ -31,7 +31,7 @@ export function parseSidebarView(raw: string | null): SidebarView {
   const d = DEFAULT_SIDEBAR_VIEW;
   return {
     density: r.density === 'compact' || r.density === 'standard' ? r.density : d.density,
-    groupBy: r.groupBy === 'space' || r.groupBy === 'status' ? r.groupBy : d.groupBy,
+    groupBy: r.groupBy === 'space' || r.groupBy === 'project' || r.groupBy === 'status' ? r.groupBy : d.groupBy,
     showFiles: typeof r.showFiles === 'boolean' ? r.showFiles : d.showFiles,
     showIdle: typeof r.showIdle === 'boolean' ? r.showIdle : d.showIdle,
   };

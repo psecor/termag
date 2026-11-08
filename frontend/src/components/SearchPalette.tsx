@@ -7,6 +7,7 @@ import { recentSessions, searchRows, type InboxRow } from '../mobile/inbox';
 import { asPaneSearchResult, focusLine, paneHitKey, paneSearchError, paneSearchScope } from '../mobile/paneSearch';
 import { pushRecentSearch, readRecentSearches, removeRecentSearch, writeRecentSearches } from '../mobile/recentSearches';
 import { useHome } from '../mobile/useHome';
+import { useTheme } from '../theme/ThemeProvider';
 import { prsApi, sessionsApi, type PaneSearchResult, type PrPipelineResponse, type PrRow } from '../services/api';
 import { StatusDot } from './StatusDot';
 import { OPEN_PALETTE_EVENT, clampIndex, hitStatus, matchActions, paletteItems, paletteSelectEvent, type OpenPaletteDetail, type PaletteAction, type PaletteItem as Item } from '../utils/searchPalette';
@@ -57,7 +58,10 @@ export function SearchPalette({ actions = [] }: { actions?: PaletteAction[] }) {
   // Offline, the takeover blocks the workspace (ConnectionOverlay); the
   // palette would sit above it and land you in a terminal under it.
   const offline = useConnection().state === 'offline';
-  const { rows, now } = useHome();
+  // Same list the status strip shows: ask chats left out unless Settings →
+  // Appearance shows them (utils/askChatVisibility.ts).
+  const { theme } = useTheme();
+  const { rows, now } = useHome({ hideAskChats: !theme.sidebarAskChats });
   const openTarget = useOpenTarget();
   return <PaletteLauncher actions={actions} offline={offline} rows={rows} now={now} openTarget={openTarget} />;
 }

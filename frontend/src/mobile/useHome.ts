@@ -8,7 +8,7 @@ import { cloudSessionFeed } from '../services/cloudSessionFeed';
 import { FLAGS, useFlag } from '../flags';
 import { buildHome, Home } from './inbox';
 
-export function useHome(): Home & { now: number } {
+export function useHome(opts: { hideAskChats?: boolean } = {}): Home & { now: number } {
   const { user } = useAuth();
   const { projects, statusMap } = useProjects();
   const [now, setNow] = useState(() => Date.now());
@@ -20,9 +20,10 @@ export function useHome(): Home & { now: number } {
   const cloudOn = useFlag(FLAGS.cloudSessions, false);
   const cloudAll = useSyncExternalStore(cloudSessionFeed.subscribe, cloudSessionFeed.getSnapshot);
   const cloudSessions = cloudOn ? cloudAll : null;
+  const hideAskChats = opts.hideAskChats;
   const home = useMemo(
-    () => buildHome(projects, statusMap, user?.unixUsername ?? '', { cloudSessions }),
-    [projects, statusMap, user?.unixUsername, cloudSessions],
+    () => buildHome(projects, statusMap, user?.unixUsername ?? '', { cloudSessions, hideAskChats }),
+    [projects, statusMap, user?.unixUsername, cloudSessions, hideAskChats],
   );
   return { ...home, now };
 }

@@ -8,7 +8,7 @@ import { PrsOverlay } from './PrsOverlay';
 
 // The overlay with review groups.
 const mocks = vi.hoisted(() => ({
-  data: null as unknown, groupsOn: true, defer: vi.fn(async () => ({})), start: vi.fn(async () => ({ ok: true })),
+  data: null as unknown, defer: vi.fn(async () => ({})), start: vi.fn(async () => ({ ok: true })),
   createGroup: vi.fn(async () => ({ id: 'g9' })), setGroupMembers: vi.fn(async () => ({ ok: true })), dismissSuggestion: vi.fn(async () => undefined),
 }));
 
@@ -21,8 +21,8 @@ vi.mock('./PrWorkstreamPicker', () => ({ PrWorkstreamPicker: () => null }));
 vi.mock('./SharePrPreview', () => ({ SharePrPreview: () => null }));
 vi.mock('../services/api', () => ({ prsApi: { defer: mocks.defer, createGroup: mocks.createGroup, setGroupMembers: mocks.setGroupMembers, dismissSuggestion: mocks.dismissSuggestion }, reviewApi: { start: mocks.start } }));
 vi.mock('../flags', () => ({
-  FLAGS: { prReviewGroups: 'pr-review-groups-enabled' },
-  useFlag: (key: string, fallback: boolean) => (key === 'pr-review-groups-enabled' ? mocks.groupsOn : fallback),
+  FLAGS: {},
+  useFlag: (_key: string, fallback: boolean) => fallback,
 }));
 
 function row(over: Partial<PrRow>): PrRow {
@@ -74,7 +74,6 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   Element.prototype.scrollIntoView = vi.fn();
   mocks.data = RES;
-  mocks.groupsOn = true;
   mocks.defer.mockClear();
   mocks.start.mockClear();
   mocks.createGroup.mockClear();
@@ -185,13 +184,6 @@ describe('PrsOverlay review groups', () => {
     expect(button.disabled).toBe(true);
     expect(button.title).toBe('No checkout to review from: make a project for one of these repositories');
   });
-  it('shows nothing of groups with the flag off', () => {
-    mocks.groupsOn = false;
-    render('/?prs=needs_my_review');
-    expect(document.querySelectorAll('.prg-card')).toHaveLength(0);
-    expect(listTitles()).toEqual(['bridge', 'agent', 'unrelated review']);
-    expect([...document.querySelectorAll('.prso-detail-head button')].map(b => b.textContent)).not.toContain('Add to group…');
-  });
 });
 
 describe('suggested groups in the overlay (phase 3)', () => {
@@ -242,12 +234,9 @@ describe('suggested groups in the overlay (phase 3)', () => {
     render('/?prs=needs_you');
     expect(document.body.textContent).toContain('Nothing needs you right now.');
   });
-  it('shows no suggestion in other lanes, or with the flag off', () => {
+  it('shows no suggestion in other lanes', () => {
     mocks.data = { ...RES, suggestions: [SUGG] };
     render('/?prs=checks');
-    expect(document.querySelector('.prg-suggestion')).toBeNull();
-    mocks.groupsOn = false;
-    render('/?prs=needs_my_review');
     expect(document.querySelector('.prg-suggestion')).toBeNull();
   });
 });

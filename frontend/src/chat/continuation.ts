@@ -29,7 +29,7 @@ export function continuationPolls(c: ChatContinuation | null | undefined): boole
  * a send's pending bubble, or the chat's newest message, which is the held
  * one gone in before the next history read drops it from the list.
  */
-export function heldToShow(c: ChatContinuation | null | undefined, onScreen: readonly string[]): Array<{ id: string; text: string; error: string | null }> {
+export function heldToShow(c: ChatContinuation | null | undefined, onScreen: readonly string[]): NonNullable<ChatContinuation['held']> {
   const left = [...onScreen];
   return (c?.held ?? []).filter(m => {
     const i = left.indexOf(m.text);

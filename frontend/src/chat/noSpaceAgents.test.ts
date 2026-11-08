@@ -12,7 +12,7 @@ describe('noSpaceRows', () => {
     expect(noSpaceRows(rows, known, index).map(r => r.projectId)).toEqual(['b', 'c', 'd']);
     // While the index reloads for a new box, that box is not known to be in no space yet.
     expect(noSpaceRows(rows, known, index, box => box !== 'box-x').map(r => r.projectId)).toEqual(['c', 'd']);
-    // No spaces (or spaces off): every agent.
+    // No spaces: every agent.
     expect(noSpaceRows(rows, [], new Map()).map(r => r.projectId)).toEqual(['a', 'b', 'c', 'd']);
   });
 

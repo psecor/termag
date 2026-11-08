@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CHAT_NARROW_QUERY, chatHistoryMode, historyListHidden } from './chatLayout';
+import { CHAT_NARROW_QUERY, chatHistoryMode, chatZoomable, historyListHidden } from './chatLayout';
 
 describe('chatHistoryMode', () => {
   it('keeps the list docked beside the chat on a wide screen', () => {
@@ -32,5 +32,16 @@ describe('chatHistoryMode', () => {
     // pages/chat/chat.css `@media (max-width: 767px)` must stay this string,
     // including the New chat safe-area padding for the Chats control.
     expect(CHAT_NARROW_QUERY).toBe('(max-width: 767px)');
+  });
+});
+
+describe('chatZoomable', () => {
+  it('lifts the zoom lock on a phone with the side panel shut', () => {
+    expect(chatZoomable(true, false)).toBe(true);
+  });
+  it('keeps it while the terminal overlay is open, and on a desktop', () => {
+    expect(chatZoomable(true, true)).toBe(false);
+    expect(chatZoomable(false, false)).toBe(false);
+    expect(chatZoomable(false, true)).toBe(false);
   });
 });

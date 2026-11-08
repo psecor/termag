@@ -13,12 +13,14 @@ import postcss, { type AtRule, type ChildNode, type Container, type Rule } from 
 /**
  * The hashed prefix of every CSS module in the stylesheet: `DpiyKW` for
  * Slider's `.DpiyKW_slider`, `_1iK3oq` for Popover's `._1iK3oq_popover` (a
- * hash that would start with a digit gets a leading `_`). Throws when there is
+ * hash that would start with a digit gets a leading `_`). A hash may itself
+ * hold `_` or `-` (Group's `.gv_P7W_group`, Input's `.AEOY-G_base`), so it is
+ * any six of them, not up to the first `_`. Throws when there is
  * none, so a LaunchPad release that changes the class scheme fails the build
  * instead of shipping every component unstyled.
  */
 export function modulePrefixes(css: string): string[] {
-  const prefixes = [...new Set([...css.matchAll(/\.(_?[A-Za-z0-9-]{6})_[A-Za-z]/g)].map(m => m[1]))];
+  const prefixes = [...new Set([...css.matchAll(/\.(_?[A-Za-z0-9_-]{6})_[A-Za-z]/g)].map(m => m[1]))];
   if (prefixes.length === 0) throw new Error('launchpadCss: no .<hash>_<local> classes in LaunchPad\'s stylesheet');
   return prefixes;
 }

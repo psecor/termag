@@ -16,7 +16,6 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock('../flags', () => ({ FLAGS: { spaces: 'spaces-enabled' }, useFlag: () => true }));
 vi.mock('../services/api', () => ({
   spacesApi: {
     list: mocks.list,

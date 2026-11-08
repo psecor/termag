@@ -78,7 +78,8 @@ export function AdminBoxDisk({ boxId, now }: { boxId: string; now: number }) {
 
   return (
     <div>
-      <div>{boxDiskSummary(disk.volume)}</div>
+      {/* The volume id is code; the rest of the line is prose. */}
+      <div>{volume ? <><span className="admin-mono">{volume.volumeId}</span>{boxDiskSummary(volume).slice(volume.volumeId.length)}</> : boxDiskSummary(disk.volume)}</div>
       {grow && <div className={disk.grow?.state === 'failed' ? 'admin-bad' : 'usage-dim'}>last grow: {grow}</div>}
       {volume && (disk.refusal
         ? <div className="usage-dim">can't grow: {disk.refusal}</div>

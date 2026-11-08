@@ -36,18 +36,16 @@ describe('appStartTarget', () => {
   const app = { standalone: true };
 
   it('opens the phone client on a touch device, flag or not', () => {
-    expect(appStartTarget({ ...app, touch: true, simpleUi: true })).toBe('/m');
-    expect(appStartTarget({ ...app, touch: true, simpleUi: false })).toBe('/m');
+    expect(appStartTarget({ ...app, touch: true })).toBe('/m');
   });
 
-  it('opens the simple UI on a desktop, or the workspace without simple-ui-enabled', () => {
-    expect(appStartTarget({ ...app, touch: false, simpleUi: true })).toBe('/chat');
-    expect(appStartTarget({ ...app, touch: false, simpleUi: false })).toBe('/');
+  it('opens the simple UI on a desktop', () => {
+    expect(appStartTarget({ ...app, touch: false })).toBe('/chat');
   });
 
   it('is the workspace URL in a browser tab, so its own redirect and opt-out apply', () => {
-    expect(appStartTarget({ standalone: false, touch: true, simpleUi: true })).toBe('/');
-    expect(appStartTarget({ standalone: false, touch: false, simpleUi: true })).toBe('/');
+    expect(appStartTarget({ standalone: false, touch: true })).toBe('/');
+    expect(appStartTarget({ standalone: false, touch: false })).toBe('/');
   });
 });
 

@@ -13,7 +13,7 @@ vi.mock('../../contexts/AuthContext', () => ({ useAuth: () => ({ user: { unixUse
 vi.mock('../../hooks/useSetupContext', () => ({ useSetupContext: () => ({}) }));
 vi.mock('../../flags', async () => {
   const actual = await vi.importActual<typeof import('../../flags')>('../../flags');
-  return { ...actual, useFlag: (key: string, fallback: unknown) => (key === actual.FLAGS.browserPane ? true : fallback) };
+  return { ...actual, useFlag: (key: string, fallback: unknown) => fallback };
 });
 vi.mock('../../components/Terminal', () => ({ Terminal: () => <div data-testid="terminal" /> }));
 vi.mock('../../components/BrowserPane', () => ({ BrowserPane: () => <div data-testid="browser" /> }));
@@ -91,7 +91,7 @@ describe('the side panel under the chrome refresh', () => {
   it('keeps the fixed tabs with the refresh off', () => {
     render(false);
     expect(host.querySelector('.chat-side-add, .chat-side-tab-close')).toBeNull();
-    expect([...host.querySelectorAll('[role="tab"]')].map(t => t.textContent)).toEqual(['Files', 'Terminal', 'Browser']);
+    expect([...host.querySelectorAll('[role="tab"]')].map(t => t.textContent)).toEqual(['Files', 'Terminal', 'Browser', 'Share']);
   });
 
   it("opens on a new tab's launcher when nothing is kept, never on a tool it picks", () => {
@@ -112,7 +112,7 @@ describe('the side panel under the chrome refresh', () => {
     await press(host.querySelector('.chat-side-add'));
     expect(tabs()).toEqual(['Terminal', 'New tab*']);
     expect(shown()).toBe('launcher');
-    expect([...host.querySelectorAll('.chat-launcher-name')].map(n => n.textContent)).toEqual(['Files', 'Terminal', 'Browser', 'Pull request']);
+    expect([...host.querySelectorAll('.chat-launcher-name')].map(n => n.textContent)).toEqual(['Files', 'Terminal', 'Browser', 'Share', 'Pull request']);
     await press([...host.querySelectorAll('.chat-launcher-tile')][2]);
     expect(tabs()).toEqual(['Terminal', 'Browser*']);
     expect(shown()).toBe('browser');

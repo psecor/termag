@@ -56,12 +56,12 @@ async function flush() {
   await act(async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); });
 }
 
-async function render() {
+async function render(p: Project = project) {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
   await act(async () => {
-    root.render(<MemoryRouter><SdkChatView project={project} workstream="main" /></MemoryRouter>);
+    root.render(<MemoryRouter><SdkChatView project={p} workstream="main" /></MemoryRouter>);
   });
   await flush();
 }
@@ -151,3 +151,5 @@ describe('SdkChatView composer chrome while the history loads', () => {
     expect(attach()).toBeNull();
   });
 });
+
+

@@ -68,7 +68,6 @@ export function ChatPalette(props: PaletteViewProps) {
   const live = data?.live ?? NO_LIVE;
   const setupOf = data?.setupOf ?? NO_SETUP;
   const unseen = data?.unseen ?? NO_UNSEEN;
-  const titlesShown = data?.titlesShown ?? false;
   const narrow = useSyncExternalStore(onNarrowChange, narrowNow, () => false);
   const byKey = useMemo(() => new Map(m.items.map(it => [keyOf(it), it])), [m.items]);
   const of = <K extends Item['kind']>(kind: K) => m.items.filter((it): it is Extract<Item, { kind: K }> => it.kind === kind);
@@ -77,7 +76,7 @@ export function ChatPalette(props: PaletteViewProps) {
     const r = it.row;
     // Its mark and words as the sidebar's row has them, a stop you haven't seen included.
     const state = chatRowState(r, live.get(chatLiveKey(r.projectId, r.workstream)), setupOf.get(r.projectId), unseen.has(r.key));
-    const named = chatRowName(r, titlesShown);
+    const named = chatRowName(r);
     const name = named.title ?? agentLabel(r);
     const since = stateSince(r);
     const age = since ? fmtAge(Math.max(0, now - Date.parse(since))) : null;
@@ -302,6 +301,6 @@ export function ChatPalette(props: PaletteViewProps) {
  * names it (chatRowName): an ask thread's title always, and Claude's title for
  * any other session while titles are shown.
  */
-export function paletteNameOf(titlesShown: boolean): (row: InboxRow) => string | null {
-  return row => chatRowName(row, titlesShown).title;
+export function paletteNameOf(): (row: InboxRow) => string | null {
+  return row => chatRowName(row).title;
 }

@@ -190,6 +190,64 @@ describe('a spec fence while it streams, and when it cannot be drawn', () => {
   });
 });
 
+describe('an optional prop the agent left as "" or null', () => {
+  const options = [{ value: 'a', label: 'Alpha' }, { value: 'b', label: 'Beta' }];
+  const one = (type: string, props: object, state: object = {}) =>
+    surface(JSON.stringify({ root: 'main', state, elements: { main: { type, props, children: [] } } }));
+  const bad = () => [...host.querySelectorAll('.genui-bad')].map(e => e.textContent);
+  const radios = () => [...host.querySelectorAll<HTMLInputElement>('input[type=radio]')];
+
+  it('draws a RadioGroup seeded with "" with nothing picked, and the person can pick one', async () => {
+    one('RadioGroup', { label: 'Where', value: { $bindState: '/where' }, options }, { where: '' });
+    expect(bad()).toEqual([]);
+    expect(radios().map(r => r.checked)).toEqual([false, false]);
+    await act(async () => { radios()[1].click(); });
+    expect(radios().map(r => r.checked)).toEqual([false, true]);
+  });
+
+  it.each([
+    ['RadioGroup', { label: 'L', value: '', options }],
+    ['Select', { label: 'L', value: '', options }],
+    ['SegmentedControl', { label: 'L', value: '', options }],
+    ['SelectList', { label: 'L', value: '', options }],
+    ['CheckboxGroup', { label: 'L', value: null, options }],
+    ['Tabs', { tabs: [{ id: 'a', label: 'Alpha' }], value: '' }],
+    ['Tabs', { tabs: [{ id: 'a', label: 'Alpha' }], value: null }],
+    ['DatePicker', { label: 'L', value: '' }],
+    ['TimeField', { label: 'L', value: '' }],
+    ['DateRangePicker', { label: 'L', value: '' }],
+    ['NumberField', { label: 'L', value: '' }],
+    ['Slider', { label: 'L', value: null }],
+    ['TextField', { label: 'L', value: null }],
+    ['Checkbox', { label: 'L', checked: null }],
+    ['Switch', { label: 'L', checked: null }],
+  ])('draws a %s whose value is blank as if it were left out', (type, props) => {
+    one(type, props);
+    expect(bad()).toEqual([]);
+    // A Tabs shows its tab, a SelectList its options (its label is for screen readers); the rest their label.
+    expect(host.textContent).toContain(type === 'Tabs' || type === 'SelectList' ? 'Alpha' : 'L');
+  });
+
+  it('still fails a required prop left blank, and an option whose own value is ""', () => {
+    one('RadioGroup', { label: '', options });
+    expect(bad()).toEqual(['RadioGroup could not be drawn (label: Too small: expected string to have >=1 characters)']);
+    one('RadioGroup', { label: 'L', options: [{ value: '', label: 'Alpha' }] });
+    expect(bad()[0]).toMatch(/^RadioGroup could not be drawn \(options\.0\.value:/);
+  });
+
+  it('draws the children of a container whose own props fail, under its note', () => {
+    surface(JSON.stringify({
+      root: 'main',
+      elements: {
+        main: { type: 'Card', props: { title: 'Decisions', tone: 'loud' }, children: ['q'] },
+        q: { type: 'RadioGroup', props: { label: 'Where', value: '', options }, children: [] },
+      },
+    }));
+    expect(bad()[0]).toMatch(/^Card could not be drawn \(tone:/);
+    expect(radios()).toHaveLength(2);
+  });
+});
+
 describe('a repeat whose list grows past the limit after it was read', () => {
   it('draws a note instead of the list, so one press cannot draw thousands', async () => {
     const renders = { item: 0 };

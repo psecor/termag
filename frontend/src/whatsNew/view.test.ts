@@ -9,7 +9,7 @@ const entry = (id: string, over: Partial<WhatsNewEntry> = {}): WhatsNewEntry => 
 
 const TODAY = '2026-10-28'; // a Wednesday
 const FLAG = 'simple-ui-chrome-refresh-enabled' as FlagKey;
-const SPACES = 'spaces-enabled' as FlagKey;
+const SPACES = 'automations-enabled' as FlagKey;
 
 describe('days and weeks', () => {
   it('adds days across months and years', () => {

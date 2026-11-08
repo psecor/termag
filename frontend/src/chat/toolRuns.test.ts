@@ -83,10 +83,25 @@ describe('runSummary', () => {
 });
 
 describe('alwaysShown', () => {
-  it('keeps failures and the running call visible while the run is closed', () => {
+  it('keeps failures visible while the run is closed, and not the call running now (the step line says it)', () => {
     const failed = tool('2', 'Bash', { isError: true });
     const running = tool('4', 'Read', { done: false, result: null });
-    expect(alwaysShown([tool('1'), failed, tool('3'), running])).toEqual([failed, running]);
+    expect(alwaysShown([tool('1'), failed, tool('3'), running])).toEqual([failed]);
+    expect(alwaysShown([tool('1'), running])).toEqual([]);
+  });
+
+  it('only ever adds calls as a live run goes on, so the run never shrinks under the text above it', () => {
+    // Each step of a run: a call starts, ends, the next starts, one fails, the last ends.
+    const steps: ToolItem[][] = [
+      [tool('1', 'Bash', { done: false, result: null })],
+      [tool('1')],
+      [tool('1'), tool('2', 'Read', { done: false, result: null })],
+      [tool('1'), tool('2', 'Read', { isError: true })],
+      [tool('1'), tool('2', 'Read', { isError: true }), tool('3', 'Grep', { done: false, result: null })],
+      [tool('1'), tool('2', 'Read', { isError: true }), tool('3', 'Grep')],
+    ];
+    const shown = steps.map(s => alwaysShown(s).map(t => t.id));
+    expect(shown).toEqual([[], [], [], ['2'], ['2'], ['2']]);
   });
 
   it('keeps a call still running in the background visible, and lets it fold once it has finished', () => {
@@ -219,7 +234,16 @@ describe('runSummary: the step line', () => {
     expect(runSummary(running)).toMatchObject({ step: 'Measure the checkout size', running: 1, state: 'running' });
     expect(runSummary([bash('1', 'ls', 'List the root'), read('2', '/r/a.ts')]).step).toBe('Read a.ts');
     expect(runSummary([bash('1', 'ls'), bash('2', 'pwd')]).step).toBe('Bash');
-    // A call still streaming in has no words: the latest call that has some.
-    expect(runSummary([bash('1', 'ls', 'List the root'), tool('2', 'Bash', { input: {}, done: false, result: null })]).step).toBe('List the root');
+    // With nothing in flight, a last call without words gives way to the latest call that has some.
+    expect(runSummary([bash('1', 'ls', 'List the root'), bash('2', 'pwd')]).step).toBe('List the root');
+  });
+
+  it('names a call still streaming in by its tool, never by an earlier, finished call', () => {
+    const before = bash('1', 'ls', 'List the root');
+    // Its input is still on its way: no path yet.
+    expect(runSummary([before, read('2', '', { input: {}, done: false, result: null })]).step).toBe('Read');
+    expect(runSummary([before, tool('2', 'Bash', { input: {}, done: false, result: null })]).step).toBe('Bash');
+    // Then its words, once they have come in.
+    expect(runSummary([before, read('2', '/r/a.ts', { done: false, result: null })]).step).toBe('Read a.ts');
   });
 });

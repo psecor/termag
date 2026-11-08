@@ -183,7 +183,7 @@ describe('SdkChatView effort', () => {
     mocks.history.mockResolvedValue({ ...historyOn('opus'), effortInput: true });
     await render();
     await flush();
-    expect(mocks.send).toHaveBeenLastCalledWith('p1', 'main', 'first from New session', [], null, 'high');
+    expect(mocks.send).toHaveBeenLastCalledWith('p1', 'main', 'first from New session', [], null, 'high', expect.stringMatching(/^[A-Za-z0-9-]{8,64}$/));
     expect(document.querySelector('.chat-composer-bar')?.textContent).not.toContain('From your next message');
     await pickEffort('Max');
     await closeMenu();

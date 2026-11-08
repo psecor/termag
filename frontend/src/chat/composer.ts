@@ -172,6 +172,9 @@ export function repoTriggerLabel(pick: RepoPick): string {
 
 export const REPO_LOAD_ERROR = 'Could not load repositories. Paste a URL, or try again.';
 export const REPO_EMPTY = 'No repositories on this account. Paste a URL to use one that is not listed.';
+/** A started session's pill has no paste field, so its texts do not offer one. */
+export const REPO_LOAD_ERROR_NO_PASTE = 'Could not load repositories.';
+export const REPO_EMPTY_NO_PASTE = 'No repositories on this account.';
 
 export type RepoListView =
   | { kind: 'loading' }
@@ -179,11 +182,12 @@ export type RepoListView =
   | { kind: 'empty' }
   | { kind: 'ready' };
 
-export function repoListView(catalog: RepoCatalog | null): RepoListView {
+export function repoListView(catalog: RepoCatalog | null, pasteable = true): RepoListView {
   if (!catalog) return { kind: 'loading' };
   if (!catalog.ok) {
     const notice = catalog.notice ?? '';
-    const text = notice.startsWith('Could not load') || notice === '' ? REPO_LOAD_ERROR : notice;
+    const loadError = pasteable ? REPO_LOAD_ERROR : REPO_LOAD_ERROR_NO_PASTE;
+    const text = notice.startsWith('Could not load') || notice === '' ? loadError : notice;
     return { kind: 'error', text };
   }
   const any = catalog.groups.some(g => g.repos.length > 0 || g.status !== 'ok');

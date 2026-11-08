@@ -11,15 +11,14 @@ export const APP_START_PATH = '/app';
 
 /**
  * Where a launch from the app icon opens: a phone or tablet gets the phone
- * client, a desktop install the simple UI, or the workspace without
- * simple-ui-enabled. One manifest serves both, so start_url cannot say.
+ * client, a desktop install the simple UI. One manifest serves both, so start_url cannot say.
  * Outside an installed window (`standalone`) it is the workspace URL, so a tab
- * keeps mobile-redirect-enabled and its "Lab" opt-out.
+ * keeps the phone redirect and its "Lab" opt-out.
  */
-export function appStartTarget(i: { touch: boolean; standalone: boolean; simpleUi: boolean }): string {
+export function appStartTarget(i: { touch: boolean; standalone: boolean }): string {
   if (!i.standalone) return '/';
   if (i.touch) return '/m';
-  return i.simpleUi ? '/chat' : '/';
+  return '/chat';
 }
 
 interface LaunchParams { targetURL?: string | null }

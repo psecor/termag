@@ -10,7 +10,7 @@ const cell = (state: SoftwareState) => ({ version: '1', raw: null, path: null, s
 const host = (hostKey: string, kind: SoftwareHost['kind'], connected: boolean, state: SoftwareState): SoftwareHost =>
   ({ hostKey, kind, name: hostKey, owner: null, boxKind: null, status: null, connected, lastInventoryAt: null, cells: { claude: cell(state) } });
 const summary = (current: number): SoftwareSummary[] =>
-  [{ component: 'claude', reference: '1', referenceNote: '', counts: { current, behind: 0, outdated: 0, ahead: 0, missing: 0, unknown: 0 }, spread: [] }];
+  [{ component: 'claude', reference: '1', referenceNote: '', counts: { current, behind: 0, outdated: 0, ahead: 0, pending: 0, missing: 0, unknown: 0 }, spread: [] }];
 const matrix = (online?: SoftwareMatrix['online']): SoftwareMatrix => ({
   components: ['claude'], summary: summary(9), online,
   hosts: [

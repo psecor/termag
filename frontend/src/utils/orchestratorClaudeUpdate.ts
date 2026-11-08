@@ -3,7 +3,7 @@
  * "Update Claude Code" says. The orchestrator host's /usr/bin/claude runs the runner orchestrator, which
  * runs no turns, so a run always try-restarts it and offers no restart choice; host users' sessions on
  * the old binary are counted in the run, never stopped. The routes are the boxes' (hostKey `orchestrator`),
- * and answer 404 claude_update_off while orchestrator-claude-update-enabled is off, which hides this.
+ * and answer 404 claude_update_off while orchestrator-claude-update-policy's mode is off, which hides this.
  */
 import type { ToolUpdatePreview } from '../services/adminApi';
 

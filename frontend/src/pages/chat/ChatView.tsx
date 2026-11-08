@@ -1,7 +1,7 @@
 // One conversation in the simple UI: the workstream's agent pane captured and
 // parsed into turns (chat/paneChat.ts, as the phone does), one status line,
-// answer keys only while the agent waits, and a composer that types into the
-// pane. No terminal is shown here: Open in Lab is the way to one. While
+// answer keys only while the agent waits, the asks it sent and its Claude's
+// subagents in a drawer on the composer, and a composer that types into the pane. No terminal is shown here: Open in Lab is the way to one. While
 // the chat comes up (box, clone, Claude) it narrates the steps, and a message
 // typed before Claude is there waits and is sent once it is.
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -17,6 +17,9 @@ import { sessionName } from '../../utils/sessionName';
 import { statusKey } from '../../utils/statusKey';
 import { parsePane } from '../../chat/paneChat';
 import { BlockView, DraftView } from '../../chat/Blocks';
+import { chatNoticePlacement } from '../../chat/chatNotices';
+import { useChatNotices } from '../../chat/useChatNotices';
+import { RestartNotice } from '../../chat/RestartNotice';
 import { draftAfterSend, flattenForSend, MAX_KEYS, sendErrorText } from '../../chat/compose';
 import { useFollowBottom } from '../../chat/useFollowBottom';
 import { useAutoGrow } from '../../chat/useAutoGrow';
@@ -35,6 +38,7 @@ import { REPLAY_BLOCK_CLASS } from '../../observability';
 import { providerFor, STATUS_GLYPH } from '../../mobile/inbox';
 import { FLAGS, useFlag } from '../../flags';
 import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
+import { SessionRepoPill } from './SessionRepoPill';
 import { AgentIcon } from './OpenItems';
 import { ChatSpaceChip } from './SpaceSwatch';
 import { useDictation } from '../../chat/useDictation';
@@ -43,18 +47,32 @@ import { SendIcon } from '../../chat/ComposerIcons';
 import { ChatBoxTag } from './ChatBoxTag';
 import { useSimpleDataIfAny } from './simpleData';
 import { recordTypedChatCommand } from '../../usageEvents';
+import { AsksDrawer } from './Asks';
+import { usePaneAsksUi } from '../../chat/useChatAsks';
+import { askStore, askTabId, askThreadOf } from '../../chat/askStore';
+import { useShownSubagent } from '../../chat/subagentStore';
+import { askAgentName, type AskView } from '../../chat/asks';
+import { AgentsDrawer, type SubagentsUi } from './Subagents';
+import { subagentStore } from '../../chat/subagentStore';
+import { usePaneKeptSubagents, usePaneSubagents } from '../../chat/usePaneSubagents';
+import type { SubagentView } from '../../chat/subagents';
 
 // Remembered across conversations in this tab so visits carry a previous id.
 let lastVisitedProjectId: string | null = null;
+
+/** The drawers on the composer: one alone, or several in one frame with a line between them (chrome.css), as in the SDK chat. */
+function PaneDrawers({ drawers }: { drawers: React.ReactNode[] }) {
+  const shown = drawers.filter(Boolean);
+  if (shown.length === 0) return null;
+  return shown.length === 1 ? <>{shown[0]}</> : <div className="agent-drawer-stack">{shown}</div>;
+}
 
 export function ChatView() {
   const { projectId = '' } = useParams();
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
-  const { mode: chromeMode, sidePanel } = useChatChrome();
-  // The one-row phone header ships with simple-ui-side-panel-enabled; off, it is main's.
-  const phoneHeader = useFlag(FLAGS.chatSidePanel, false);
-  const phone = chromeMode === 'drawer' && phoneHeader;
+  const { mode: chromeMode, sidePanel, refresh } = useChatChrome();
+  const phone = chromeMode === 'drawer';
   const { user } = useAuth();
   const { projects, statusMap, settleProjectClone } = useProjects();
 
@@ -87,6 +105,10 @@ export function ChatView() {
     [capture.content, provider],
   );
   const blocks = useMemo(() => (parsed ? conversationBlocks(parsed.blocks) : null), [parsed]);
+  // Why the session restarted, when a tool update restarted it: above the pane's
+  // blocks, which are that session's; another pane's restart after them (chat/chatNotices.ts).
+  const notices = useChatNotices(project && hasAgent ? project.id : null, ws, status?.status);
+  const restart = useMemo(() => chatNoticePlacement(notices), [notices]);
   const offline = capture.error === 'offline';
 
   // The setup narration: the box from the box feed, the clone from the
@@ -107,6 +129,45 @@ export function ChatView() {
   }, [project?.id, ws]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { scroller, onScroll, unseen, jumpToBottom } = useFollowBottom(blocks, `${projectId}|${ws}`);
+
+  // Asks: the ones this pane's agent sent with `termag ask`, which the
+  // orchestrator records by the pane's session, in the drawer on the composer; a row opens its ask tab in the
+  // panel, which reads the views from here (chat/askStore.ts). As in the SDK chat: only with the panel's tabs.
+  const chatId = `${projectId}|${ws}`;
+  const subagentsOn = useFlag(FLAGS.chatSubagents, false);
+  const showAgent = refresh && !phone ? sidePanel?.showAgent : undefined;
+  const shownAgent = useShownSubagent(chatId);
+  const openAsk = useCallback((v: AskView) => { showAgent?.({ chat: chatId, id: askTabId(v.thread), title: v.title }); }, [showAgent, chatId]);
+  const asks = usePaneAsksUi({
+    on: subagentsOn && showAgent != null && hasAgent, owner: project?.role !== 'collaborator', projectId: project?.id ?? '', workstream: ws,
+    working: status?.status === 'working', open: openAsk, shownThread: sidePanel?.open ? askThreadOf(shownAgent) : null,
+    agent: askAgentName(provider),
+  });
+  // None until the first answer (the ask tab says it is loading); then the views, none at all included.
+  useEffect(() => { askStore.publish(chatId, asks.published); }, [chatId, asks.published]);
+  useEffect(() => () => askStore.publish(chatId, null), [chatId]);
+  // Subagents: the Agent-tool subagents of the pane's
+  // Claude, read from beside its session by the box, in the drawer too; a row opens its agent tab, which reads
+  // them from here (chat/subagentStore.ts). Behind chat-pane-subagents-enabled as well; for the session's sharees
+  // too, who can open its pane anyway.
+  const paneSubagentsOn = useFlag(FLAGS.chatPaneSubagents, false) && subagentsOn && showAgent != null && hasAgent && Boolean(project);
+  const subagents = usePaneSubagents(project?.id ?? '', ws, status?.status === 'working', paneSubagentsOn);
+  // Its subagents and the sessions running alongside it, for their tabs.
+  const published = useMemo(() => (subagents.views ? [...subagents.views, ...subagents.alongside] : null), [subagents.views, subagents.alongside]);
+  useEffect(() => {
+    if (!paneSubagentsOn) return undefined;
+    // None until the box's first answer: the agent tab says it is loading, not that its subagent is gone.
+    subagentStore.publish(chatId, published);
+    return undefined;
+  }, [paneSubagentsOn, chatId, published]);
+  useEffect(() => () => subagentStore.publish(chatId, null), [chatId]);
+  const keptAgents = usePaneKeptSubagents(paneSubagentsOn ? subagents.views : null);
+  const agentsUi = useMemo<SubagentsUi | null>(() => (paneSubagentsOn && showAgent ? {
+    byId: new Map((published ?? []).map(v => [v.id, v])),
+    open: (v: SubagentView) => showAgent({ chat: chatId, id: v.id, title: v.description }),
+    shownId: sidePanel?.open ? shownAgent : null,
+  } : null), [paneSubagentsOn, showAgent, published, chatId, shownAgent, sidePanel?.open]);
+  const alongside = paneSubagentsOn ? subagents.alongside : [];
 
   // Starts with a first message New chat handed over, if any (chat/useHandedDraft.ts).
   const [text, setText] = useComposerText(`${projectId}|${ws}`);
@@ -284,11 +345,13 @@ export function ChatView() {
             {!held && hasAgent && parsed == null && !capture.error && !echo && queued == null && <div className="chat-empty">Loading…</div>}
             {capture.error === 'denied' && <div className="chat-notice">This session is not reachable.</div>}
             {capture.error === 'failed' && <div className="chat-notice">Capture failed · retrying</div>}
+            {blocks && restart.session && <RestartNotice notice={restart.session} />}
             {blocks?.map((b, i) => (
               <BlockView key={i} block={b} agentLabel={agentLabel}
                 dialogHint={b.options ? 'question · answer with the keys below' : `${agentLabel} is asking · use the keys below`} />
             ))}
             {blocks && blocks.length === 0 && !capture.error && !queued && <div className="chat-empty">Nothing yet. Say hello.</div>}
+            {blocks && restart.side && <RestartNotice notice={restart.side} side />}
             {parsed?.draft ? <DraftView draft={parsed.draft} /> : null}
             {echo && !queued && !blocks?.some(b => b.kind === 'you') && (
               <div className="m-block m-block-you">
@@ -311,7 +374,8 @@ export function ChatView() {
             <ClaudeLoginCard projectId={project.id} owner={project.role !== 'collaborator'} enabled box={box?.status}
               hostShowsBox={line.tone === 'offline' || line.tone === 'setup'} />
           )}
-          <div className="chat-status" data-tone={line.tone} role="status" aria-live="polite">{line.text}</div>
+          {project && <SessionRepoPill project={project} />}
+          <div className="chat-status" data-tone={line.tone} role="status" aria-live="polite" title={line.text}>{line.text}</div>
           {answerKeys.length > 0 && (
             <div className="chat-keys" role="toolbar" aria-label="Answer keys">
               {answerKeys.map(k => (
@@ -319,6 +383,11 @@ export function ChatView() {
               ))}
             </div>
           )}
+          <PaneDrawers drawers={[
+            agentsUi && keptAgents.length > 0 ? <AgentsDrawer key="agents" list={keptAgents} ui={agentsUi} /> : null,
+            agentsUi && alongside.length > 0 ? <AgentsDrawer key="alongside" list={alongside} ui={agentsUi} alongside /> : null,
+            asks.ui && asks.kept.length > 0 ? <AsksDrawer key="asks" list={asks.kept} ui={asks.ui} /> : null,
+          ]} />
           <form className="chat-composer" onSubmit={e => { e.preventDefault(); onSend(); }}>
             <textarea
               ref={composer}

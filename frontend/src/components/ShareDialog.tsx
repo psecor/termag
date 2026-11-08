@@ -6,6 +6,11 @@ import { browserStorage, rememberPerson } from '../utils/recentPeople';
 import { checkoutLabel } from '../utils/checkoutLabel';
 import { previewShareLink, previewSharesApi, type PreviewShareView, type PreviewStackCheck } from '../services/api';
 import { FLAGS, useFlag } from '../flags';
+import { useProjects } from '../contexts/ProjectContext';
+import { useEnvironmentSelection } from '../hooks/useEnvironments';
+import { Label, Radio, RadioGroup } from '@launchpad-ui/components';
+import { LP_THEME } from '../launchpad/theme';
+import { PreviewLinksPanel } from '../previewLinks/PreviewLinksPanel';
 
 interface ShareProps {
   projectId: string;
@@ -69,6 +74,48 @@ export function ShareDialog({ onClose, ...share }: Props) {
   );
 }
 
+type Delivery = 'termag' | 'browser';
+
+/**
+ * How the people it's shared with open the preview: in termag, in a browser
+ * of their own on this box (the preview share below); or, with
+ * preview-links-enabled, in their own browser at the app's own address (a
+ * preview link, previewLinks/). The flag only hides the choice: the server
+ * refuses a publish while it's off.
+ */
+export function SharePreview(props: SharePreviewProps) {
+  const linksOn = useFlag(FLAGS.previewLinks, false);
+  const [delivery, setDelivery] = useState<Delivery>('termag');
+  const browser = linksOn && delivery === 'browser';
+  // Once opened, each delivery stays mounted and is only hidden: a link's
+  // one-time share URL and a share in flight survive a switch (Bugbot, #1485).
+  const [linksOpened, setLinksOpened] = useState(false);
+  useEffect(() => { if (browser) setLinksOpened(true); }, [browser]);
+  // Either delivery mid-request keeps the dialog open: a link's one-time URL comes back only in its publish's answer (Devin, #1485).
+  const [termagBusy, setTermagBusy] = useState(false);
+  const [linkBusy, setLinkBusy] = useState(false);
+  const { onBusyChange } = props;
+  useEffect(() => { onBusyChange?.(termagBusy || linkBusy); }, [termagBusy, linkBusy, onBusyChange]);
+  return (
+    <>
+      {linksOn && (
+        <RadioGroup className={`${LP_THEME} share-delivery`} value={delivery} onChange={v => setDelivery(v as Delivery)}>
+          <Label>Where they open it</Label>
+          <div className="share-delivery-choices">
+            <Radio value="termag">In termag</Radio>
+            <Radio value="browser">In your browser</Radio>
+          </div>
+        </RadioGroup>
+      )}
+      {(browser || linksOpened) && linksOn && (
+        // Keyed: another project or workstream ("Share X instead") starts a fresh form, never showing the last one's key (Bugbot, #1485).
+        <div hidden={!browser}><PreviewLinksPanel key={`${props.projectId}:${props.workstream}`} projectId={props.projectId} workstream={props.workstream} onBusyChange={setLinkBusy} /></div>
+      )}
+      <div hidden={browser}><ShareInTermag {...props} autoFocus={props.autoFocus && !browser} onBusyChange={setTermagBusy} /></div>
+    </>
+  );
+}
+
 /**
  * Share this workstream's preview with a named termag user,
  * or, with nobody named and open links on, by a
@@ -79,13 +126,21 @@ export function ShareDialog({ onClose, ...share }: Props) {
  * refused, and their links. The full UI shows it in ShareDialog; the simple
  * UI in its side panel's Share tab.
  */
-export function SharePreview({ projectId, workstream, defaultTtlHours, atPath = null, autoFocus = false, onBusyChange, byHand, reloadKey, onEnded, onSwitchWorkstream, children }: SharePreviewProps) {
-  const openLinks = useFlag(FLAGS.openLinkShares, false);
+function ShareInTermag({ projectId, workstream, defaultTtlHours, atPath = null, autoFocus = false, onBusyChange, byHand, reloadKey, onEnded, onSwitchWorkstream, children }: SharePreviewProps) {
   const [email, setEmail] = useState('');
   // The name of the person picked from the suggestions, kept with them in this browser's recent list.
   const [pickedName, setPickedName] = useState<string | undefined>();
   const [ttl, setTtl] = useState(defaultTtlHours);
-  const [manual, setManual] = useState(false);
+  // What they reach: the workstream's webapp dev stack, the app its environment file runs (its first port), or addresses typed here.
+  const [reach, setReach] = useState<'stack' | 'repo' | 'manual'>('stack');
+  const manual = reach === 'manual';
+  // The port "This environment's app" opens: the first of the environment file's (the box's last report).
+  const { projects } = useProjects();
+  // Project.environmentStatus is the main checkout's app (the claim's chain): only the main workstream shares it.
+  // Another workstream's share would bind main's listeners and be refused at attach (Bugbot, #998).
+  // Off (environment-selection-enabled), no environment choice is offered, this one included.
+  const environmentsOn = useEnvironmentSelection();
+  const firstPort = environmentsOn && workstream === 'main' ? projects.find(p => p.id === projectId)?.environmentStatus?.ports?.[0] ?? null : null;
   const [origins, setOrigins] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -103,6 +158,8 @@ export function SharePreview({ projectId, workstream, defaultTtlHours, atPath = 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { reload(); }, [reload, reloadKey]);
   useEffect(() => { onBusyChange?.(busy); }, [busy, onBusyChange]);
+  // Unmounted mid-share (the flag went off, the dialog's project changed): don't leave the dialog locked.
+  useEffect(() => () => onBusyChange?.(false), [onBusyChange]);
 
   // A share is tied to this workstream: the box says now whether a reviewer
   // of its dev stack would get in, or whose stack would refuse them.
@@ -131,7 +188,7 @@ export function SharePreview({ projectId, workstream, defaultTtlHours, atPath = 
     try {
       const recipe = manual
         ? { kind: 'manual' as const, origins: origins.split(/[\s,]+/).map(o => o.trim()).filter(Boolean) }
-        : undefined;
+        : reach === 'repo' ? { kind: 'repo' as const } : undefined;
       const made = await previewSharesApi.create(projectId, { ...(named ? { email: email.trim() } : { audience: 'link' as const }), workstream, ttlHours: ttl, ...(recipe ? { recipe } : {}) });
       if (named) rememberPerson(browserStorage(), { email: email.trim(), displayName: pickedName });
       setEmail('');
@@ -164,8 +221,8 @@ export function SharePreview({ projectId, workstream, defaultTtlHours, atPath = 
       <form className="share-dialog-form" onSubmit={create}>
         <label>
           <span>Their termag email</span>
-          <PersonPicker required={!openLinks} autoFocus={autoFocus} value={email} onChange={(next, name) => { setEmail(next); setPickedName(name); }} placeholder="name or name@example.com" />
-          {openLinks && <span className="usage-dim">Leave it empty for a link anyone signed in to termag can open.</span>}
+          <PersonPicker autoFocus={autoFocus} value={email} onChange={(next, name) => { setEmail(next); setPickedName(name); }} placeholder="name or name@example.com" />
+          <span className="usage-dim">Leave it empty for a link anyone signed in to termag can open.</span>
         </label>
         <label>
           <span>For</span>
@@ -175,8 +232,15 @@ export function SharePreview({ projectId, workstream, defaultTtlHours, atPath = 
         </label>
         <fieldset className="share-dialog-recipe">
           <legend>What they can reach</legend>
-          <label><input type="radio" checked={!manual} onChange={() => setManual(false)} /> This workstream's webapp dev stack</label>
-          <label><input type="radio" checked={manual} onChange={() => setManual(true)} /> These addresses on this box</label>
+          <label><input type="radio" checked={reach === 'stack'} onChange={() => setReach('stack')} /> This workstream's webapp dev stack</label>
+          {/* Only with a port to open: a project with no environment (or an older agent) would land the guest on an error (#998). */}
+          {firstPort && (
+            <label>
+              <input type="radio" checked={reach === 'repo'} onChange={() => setReach('repo')} /> This environment's app
+              <span className="usage-dim"> · {firstPort.name} · {firstPort.port}</span>
+            </label>
+          )}
+          <label><input type="radio" checked={manual} onChange={() => setReach('manual')} /> These addresses on this box</label>
           {manual && (
             <textarea
               aria-label="Addresses"
@@ -186,7 +250,8 @@ export function SharePreview({ projectId, workstream, defaultTtlHours, atPath = 
               placeholder="127.0.0.1:3000 127.0.0.1:3001"
             />
           )}
-          {!manual && stack?.checked && !stack.ok && (
+          {/* The webapp stack's check: nothing to say for the environment's app or typed addresses. */}
+          {reach === 'stack' && stack?.checked && !stack.ok && (
             <div className="share-dialog-stack" role="status">
               {stack.message}
               {stack.holder?.workstream && onSwitchWorkstream && (
@@ -197,8 +262,8 @@ export function SharePreview({ projectId, workstream, defaultTtlHours, atPath = 
         </fieldset>
         <div className="share-dialog-actions">
           {atPath && <span className="usage-dim share-dialog-at" title={atPath}>Links open at {atPath}</span>}
-          <button type="submit" className="btn-primary" disabled={busy || (!named && !openLinks)}>
-            {busy ? 'Sharing…' : named || !openLinks ? 'Share and copy link' : 'Share with anyone and copy link'}
+          <button type="submit" className="btn-primary" disabled={busy}>
+            {busy ? 'Sharing…' : named ? 'Share and copy link' : 'Share with anyone and copy link'}
           </button>
         </div>
       </form>

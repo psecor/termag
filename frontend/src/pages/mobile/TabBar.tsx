@@ -1,7 +1,8 @@
 // The bottom tab bar (Slack-style, user decision 2026-10-11): Sessions and
-// Search, in thumb reach. Sessions carries the awaiting-you count.
+// Search, in thumb reach, and Chat, the way to the simple UI. Sessions carries the awaiting-you count.
 import React from 'react';
-import { NavLink } from 'react-router-dom';
+import { Link, NavLink } from 'react-router-dom';
+import { CHAT_HOME_HREF } from '../../mobile/chatLinks';
 
 export function TabBar({ attention }: { attention: number }) {
   return (
@@ -15,6 +16,11 @@ export function TabBar({ attention }: { attention: number }) {
         <span className="m-tabbar-icon" aria-hidden>⌕</span>
         <span className="m-tabbar-label">Search</span>
       </NavLink>
+      {/* Leaves /m, so it is never the active tab: a plain Link. */}
+      <Link to={CHAT_HOME_HREF} className="m-tabbar-item" data-analytics="mobile-open-chat">
+        <span className="m-tabbar-icon" aria-hidden>❝</span>
+        <span className="m-tabbar-label">Chat</span>
+      </Link>
     </nav>
   );
 }

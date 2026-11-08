@@ -3,7 +3,7 @@ import type { BoxStatusBus } from './boxStatusBus';
 import { canStartBox } from './boxPower';
 
 // Opening a project or workstream whose box is stopped or hibernated starts
-// the box (behind box-open-start-enabled), in the workspace, the simple UI and
+// the box, in the workspace, the simple UI and
 // the phone client alike. It is the box menu's Start, fired by the open:
 // the same POST /api/instances/:id/start, so the route's owner check and its
 // power rules stand. A box the caller does not own is not in their box list

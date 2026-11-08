@@ -125,6 +125,36 @@ describe('Appearance: Thanksgiving turkeys', () => {
   });
 });
 
+describe('Appearance: Theme of the day', () => {
+  const toggle = () => [...el.querySelectorAll('label')].find(l => l.textContent?.includes('Theme of the day'))
+    ?.querySelector('input[type="checkbox"]') as HTMLInputElement | undefined;
+  afterEach(() => setFlagValues(undefined));
+
+  it('is hidden while the flag is off', () => {
+    render();
+    expect(toggle()).toBeUndefined();
+  });
+
+  it('turns on and off with the flag on, and says what today is', async () => {
+    setFlagValues({ 'daily-theme-enabled': true });
+    render();
+    expect(toggle()!.checked).toBe(false);
+    expect(el.querySelector('[data-testid="daily-theme-today"]')).toBeNull();
+    await act(async () => { toggle()!.click(); });
+    expect(auth.updatePreferences).toHaveBeenLastCalledWith({ theme: { ...DEFAULT_THEME, dailyTheme: true } });
+    auth.user = { theme: { ...DEFAULT_THEME, dailyTheme: true } };
+    render();
+    expect(toggle()!.checked).toBe(true);
+    // Once today's day has loaded (or turned out to have none), never before.
+    // A day with a theme loads its files lazily, so that can take more than one tick.
+    const hint = () => el.querySelector('[data-testid="daily-theme-today"]');
+    for (let i = 0; i < 100 && !hint(); i++) await act(async () => { await new Promise(r => setTimeout(r, 10)); });
+    expect(hint()).not.toBeNull();
+    await act(async () => { toggle()!.click(); });
+    expect(auth.updatePreferences).toHaveBeenLastCalledWith({ theme: { ...DEFAULT_THEME, dailyTheme: false } });
+  });
+});
+
 describe('Appearance: Terminal font', () => {
   const fontRadio = (name: string) => [...el.querySelectorAll('[aria-label="Terminal font"] label')]
     .find(l => l.querySelector('.settings-row-name')?.textContent === name)
@@ -160,7 +190,7 @@ describe('Appearance: Terminal font', () => {
     render();
     await act(async () => { reset()!.click(); });
     expect(auth.updatePreferences).toHaveBeenLastCalledWith({
-      theme: { ...DEFAULT_THEME, palette: 'dark', starfieldTurkeys: false, terminalFont: 'maple' },
+      theme: { ...DEFAULT_THEME, palette: 'dark', starfieldTurkeys: false, dailyTheme: false, terminalFont: 'maple' },
     });
   });
 });

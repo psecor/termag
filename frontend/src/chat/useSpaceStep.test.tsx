@@ -9,17 +9,12 @@ import { useSpaceStep } from './useSpaceStep';
 const mocks = vi.hoisted(() => {
   let resolve: (v: { spaces: SpaceView[] }) => void = () => {};
   return {
-    enabled: true,
     list: vi.fn(() => new Promise<{ spaces: SpaceView[] }>(r => { resolve = r; })),
     addBox: vi.fn(async () => ({})),
     resolveList: (spaces: SpaceView[]) => resolve({ spaces }),
   };
 });
 
-vi.mock('../flags', () => ({
-  FLAGS: { spaces: 'spaces-enabled' },
-  useFlag: () => mocks.enabled,
-}));
 vi.mock('../services/api', () => ({
   spacesApi: { list: mocks.list, create: vi.fn(), addBox: mocks.addBox, boxes: vi.fn() },
 }));
@@ -41,7 +36,6 @@ let host: HTMLDivElement;
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-  mocks.enabled = true;
   mocks.list.mockClear();
   mocks.addBox.mockClear();
   renders = [];
@@ -76,13 +70,5 @@ describe('useSpaceStep', () => {
     await act(async () => mocks.resolveList([notes]));
     act(() => latest.pickerProps.onChange({ kind: 'none' }));
     await expect(latest.prepare()).resolves.toBeNull();
-  });
-
-  it('is ready at once and grants nothing while spaces are off', async () => {
-    mocks.enabled = false;
-    act(() => root.render(<Harness requested="notes" />));
-    expect(latest.ready).toBe(true);
-    await expect(latest.prepare()).resolves.toBeNull();
-    expect(mocks.list).not.toHaveBeenCalled();
   });
 });

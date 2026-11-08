@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { SshKeysSection, SshKeysSectionHandle } from './settings/SshKeysSection';
 import { GithubCredential } from './settings/GithubCredential';
@@ -8,28 +8,37 @@ import { DotfilesSection } from './settings/DotfilesSection';
 import { NewProjectForm } from '../components/NewProjectForm';
 import { boxFeed } from '../services/boxFeed';
 import { blocksManagedBox, gateArmed } from '../boxGate';
-import { credentialsApi, CredentialsStatus } from '../services/api';
+import { credentialsApi, CredentialsStatus, mcpConnectorsApi, McpConnectorList } from '../services/api';
 import { recordProductEvent } from '../observability';
 import { FLAGS, useFlag } from '../flags';
 import WelcomeRefresh from './welcome/WelcomeRefresh';
+import { McpStep } from './welcome/McpStep';
 
 /**
  * First-run setup: /welcome. Offered when /auth/me says
  * needsOnboarding (never finished, no projects); reachable any time from
- * Settings. Steps 1–3 reuse the Settings sections verbatim so there is one
- * implementation of each behaviour; step 4 is the same NewProjectForm the
+ * Settings. The SSH, GitHub and Dotfiles steps reuse the Settings sections
+ * verbatim so there is one implementation of each behaviour, and the MCP
+ * servers step reuses Settings → MCP's catalog list (shown only when the
+ * catalog offers a server). The last step is the same NewProjectForm the
  * sidebar's New project dialog uses: pick or create a box, wait for it, and
  * create the first project on it, optionally as a clone of a starter repo.
  */
 
-type StepId = 'ssh' | 'github' | 'dotfiles' | 'project';
+type StepId = 'ssh' | 'github' | 'dotfiles' | 'mcp' | 'project';
 const STEPS: Array<{ id: StepId; title: string; blurb: string }> = [
   { id: 'ssh', title: 'Your laptop SSH key', blurb: 'Lets you ssh, scp and port-forward into your boxes. Added to every box you own.' },
   { id: 'github', title: 'GitHub', blurb: 'Paste the output of `gh auth token` from your laptop. The token stays on the orchestrator; your boxes\' git and gh reach GitHub through it, so you never log in to GitHub on a box.' },
   { id: 'dotfiles', title: 'Dotfiles', blurb: 'A repo applied to each new box: shell config, editor settings, the usual.' },
+  { id: 'mcp', title: 'MCP servers', blurb: 'Connect a server and the agent on your boxes can use its tools, signed in as you.' },
   { id: 'project', title: 'Your first box and project', blurb: 'A box is a machine of your own that runs your agents; a project is a directory on it with an agent in it. Create a box (a few minutes the first time unless a warm one is waiting) or use one you have, then start from a known repo or your own.' },
 ];
-const OPTIONAL: StepId[] = ['ssh', 'github', 'dotfiles'];
+const OPTIONAL: StepId[] = ['ssh', 'github', 'dotfiles', 'mcp'];
+
+/** The step named by ?step= (the MCP step's sign-ins return to /welcome?step=mcp), else the first. */
+export function initialStep(search: string): StepId {
+  return new URLSearchParams(search).get('step') === 'mcp' ? 'mcp' : 'ssh';
+}
 
 function apiError(err: unknown, fallback: string): string {
   const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
@@ -44,7 +53,8 @@ export default function Welcome() {
 function WelcomeClassic() {
   const { user, setOnboarded } = useAuth();
   const navigate = useNavigate();
-  const [step, setStep] = useState(0);
+  const { search } = useLocation();
+  const [stepId, setStepId] = useState<StepId>(() => initialStep(search));
   const sshSection = useRef<SshKeysSectionHandle>(null);
   const mounted = useRef(false);
   useEffect(() => {
@@ -55,8 +65,39 @@ function WelcomeClassic() {
   }, []);
   const [sshBusy, setSshBusy] = useState(false);
   const [pendingNavigation, setPendingNavigation] = useState<(() => void) | null>(null);
-  const cur = STEPS[step];
-  const githubStep = STEPS.findIndex(s => s.id === 'github');
+
+  // The MCP step shows while onboarding-mcp-step-enabled is on and the catalog
+  // (mcp-default-connectors, minus the servers the user has) offers an MCP
+  // server; API providers (`kind: 'api'`) alone don't count. Once the catalog
+  // has offered one it stays for this visit, so connecting the last one doesn't
+  // take the step away; a sign-in's return to ?step=mcp shows it too. With the
+  // flag off the wizard neither loads the list nor has the step. A failed load
+  // leaves the step out, except on that return, where the step shows the error
+  // with Retry.
+  const mcpStepOn = useFlag(FLAGS.onboardingMcpStep, false);
+  const [mcpList, setMcpList] = useState<McpConnectorList | null>(null);
+  const [mcpError, setMcpError] = useState('');
+  const [catalogOffered, setCatalogOffered] = useState(stepId === 'mcp');
+  // Whether the MCP step has been open: its tab shows done only then, since it
+  // can join the list after the person has already moved on to Project.
+  const [mcpSeen, setMcpSeen] = useState(stepId === 'mcp');
+  const loadMcp = () => {
+    setMcpError('');
+    return mcpConnectorsApi.list().then(l => {
+      if (!mounted.current) return;
+      setMcpList(l);
+      if (l.catalog?.some(s => s.kind !== 'api')) setCatalogOffered(true);
+    }).catch(err => { if (mounted.current) setMcpError(apiError(err, 'Could not load MCP servers')); });
+  };
+  useEffect(() => { if (mcpStepOn) void loadMcp(); }, [mcpStepOn]);
+  useEffect(() => { if (stepId === 'mcp') setMcpSeen(true); }, [stepId]);
+
+  const offerMcp = mcpStepOn && catalogOffered;
+  const steps = offerMcp ? STEPS : STEPS.filter(s => s.id !== 'mcp');
+  const step = Math.max(0, steps.findIndex(s => s.id === stepId));
+  const cur = steps[step];
+  const setStep = (i: number) => setStepId(steps[i].id);
+  const isDone = (id: StepId, i: number) => i < step && (id !== 'mcp' || mcpSeen);
 
   // Adding a managed box needs a stored GitHub token (boxGate): with the gate
   // armed the GitHub step is not optional, and while blocked it has no Next.
@@ -109,8 +150,8 @@ function WelcomeClassic() {
     else sshSection.current?.focusDraft();
   }
 
-  const next = () => leaveStep(() => setStep(s => Math.min(STEPS.length - 1, s + 1)));
-  const back = () => leaveStep(() => setStep(s => Math.max(0, s - 1)));
+  const next = () => leaveStep(() => setStep(Math.min(steps.length - 1, step + 1)));
+  const back = () => leaveStep(() => setStep(Math.max(0, step - 1)));
 
   return (
     <div className="dash-root">
@@ -122,10 +163,10 @@ function WelcomeClassic() {
         </header>
 
         <ol className="wiz-steps" aria-label="setup steps">
-          {STEPS.map((s, i) => (
-            <li key={s.id} className={`wiz-step${i === step ? ' is-current' : ''}${i < step ? ' is-done' : ''}`}>
+          {steps.map((s, i) => (
+            <li key={s.id} className={`wiz-step${i === step ? ' is-current' : ''}${isDone(s.id, i) ? ' is-done' : ''}`}>
               <button type="button" disabled={sshBusy} onClick={() => { if (i !== step) leaveStep(() => setStep(i)); }}>
-                <span className="wiz-step-n">{i < step ? '✓' : i + 1}</span>
+                <span className="wiz-step-n">{isDone(s.id, i) ? '✓' : i + 1}</span>
                 <span className="wiz-step-t">{s.title}</span>
               </button>
             </li>
@@ -133,7 +174,7 @@ function WelcomeClassic() {
         </ol>
 
         <section className="dash-section wiz-body" aria-labelledby="wiz-h">
-          <div className="dash-section-title" id="wiz-h"><span>Step {step + 1} of {STEPS.length}: {cur.title}</span></div>
+          <div className="dash-section-title" id="wiz-h"><span>Step {step + 1} of {steps.length}: {cur.title}</span></div>
           <p className="wiz-blurb">{cur.blurb}</p>
 
           {cur.id === 'ssh' && <SshKeysSection ref={sshSection} onBusyChange={setSshBusy} />}
@@ -146,11 +187,12 @@ function WelcomeClassic() {
             </div>
           )}
           {cur.id === 'dotfiles' && <DotfilesSection />}
+          {cur.id === 'mcp' && <McpStep list={mcpList} loadError={mcpError} search={search} onReload={() => void loadMcp()} />}
 
           {cur.id === 'project' && (
             <div className="dash-card wiz-card">
               <NewProjectForm
-                onGithubRequired={() => { void loadCredentials(); setStep(githubStep); }}
+                onGithubRequired={() => { void loadCredentials(); setStepId('github'); }}
                 submitLabel="Create project and open it"
                 actions={<button type="button" className="btn-ghost" onClick={() => void finishWithoutProject()}>Finish without a project</button>}
                 onBranchOff={projectId => {

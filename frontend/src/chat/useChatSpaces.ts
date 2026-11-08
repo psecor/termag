@@ -1,16 +1,13 @@
 // The user's spaces and which boxes reach each, for the simple UI's New chat
-// and sidebar (chat/chatSpaces.ts). Nothing is fetched while spaces-enabled
-// is off, and a failed load reads as no spaces, so the simple UI behaves as
+// and sidebar (chat/chatSpaces.ts). A failed load reads as no spaces, so the simple UI behaves as
 // it does without spaces. ChatApp loads them once and shares them
 // (ChatSpacesProvider), so the sidebar and the chat header agree.
 import { createContext, createElement, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
-import { FLAGS, useFlag } from '../flags';
 import { spacesApi, type SpaceView } from '../services/api';
 import { boxSpaceIndex } from './chatSpaces';
 import { spaceColor, type SpaceColorOf } from './spaceColors';
 
 export interface ChatSpaces {
-  enabled: boolean;
   loaded: boolean;
   spaces: SpaceView[];
   /** Box id → the spaces it reaches (chatSpaces.boxSpaceIndex). */
@@ -31,13 +28,11 @@ const EMPTY: Loaded = { loaded: false, spaces: [], index: new Map(), forKey: nul
 
 /** `reloadKey` changing (for example the set of the user's boxes) loads again. */
 export function useChatSpaces(opts: { withBoxes: boolean; reloadKey?: string }): ChatSpaces {
-  const enabled = useFlag(FLAGS.spaces, false);
   const [state, setState] = useState(EMPTY);
   const [generation, setGeneration] = useState(0);
   const reload = useCallback(() => setGeneration(g => g + 1), []);
   const key = opts.reloadKey ?? '';
   useEffect(() => {
-    if (!enabled) { setState(EMPTY); return; }
     let cancelled = false;
     (async () => {
       const { spaces } = await spacesApi.list();
@@ -49,15 +44,15 @@ export function useChatSpaces(opts: { withBoxes: boolean; reloadKey?: string }):
     // reload (say after a change in the Share dialog) keeps what was loaded.
     })().catch(() => { if (!cancelled) setState(s => (s.loaded && s.forKey !== null ? s : { ...EMPTY, loaded: true, forKey: key })); });
     return () => { cancelled = true; };
-  }, [enabled, opts.withBoxes, key, generation]);
+  }, [opts.withBoxes, key, generation]);
   const { loaded, spaces, index, forKey } = state;
-  return { enabled, loaded, spaces, index, current: loaded && forKey === key, reload };
+  return { loaded, spaces, index, current: loaded && forKey === key, reload };
 }
 
 /** What ChatApp shares: the spaces, and each one's colour among them (spaceColors.spacePalette). */
 export interface SharedChatSpaces extends ChatSpaces { colorOf: SpaceColorOf }
 
-const Shared = createContext<SharedChatSpaces>({ enabled: false, loaded: false, spaces: [], index: new Map(), current: false, colorOf: spaceColor });
+const Shared = createContext<SharedChatSpaces>({ loaded: false, spaces: [], index: new Map(), current: false, colorOf: spaceColor });
 
 export function ChatSpacesProvider({ value, children }: { value: SharedChatSpaces; children: ReactNode }) {
   return createElement(Shared.Provider, { value }, children);

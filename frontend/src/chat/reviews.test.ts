@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { PrPipelineResponse, PrRow } from '../services/api';
-import { approvedSince, githubListUrl, postedAt, leftToReview, parsePrRef, prPath, reviewQueue, sidebarItems, type AgentReview, type PostedRound, type SessionState } from './reviews';
+import {
+  approvedSince, filterOptions, filterQueue, filtersFromSearch, filtersToSearch, githubListUrl, hasFilters, isBotAuthor, matchesFilters, NO_FILTERS,
+  filtersOnOpen, postedAt, leftToReview, parsePrRef, prPath, queueNote, readRememberedFilters, reviewQueue, reviewStateOf, sectionCounts, sidebarItems, writeRememberedFilters,
+  type AgentReview, type PostedRound, type QueueFilters, type SessionState,
+} from './reviews';
 
 const NOW = Date.parse('2026-10-28T12:00:00Z');
 
@@ -238,5 +242,169 @@ describe('PR references', () => {
     expect(prPath('example-org/termag', 804)).toBe('/chat/pr/example-org/termag/804');
     expect(decodeURIComponent(githubListUrl('to-review')!)).toContain('user-review-requested:@me');
     expect(githubListUrl('your-call')).toBeNull();
+  });
+});
+
+describe('review filters', () => {
+  const people = (approved: string[] = [], changes: string[] = []) => ({ approved, changes, commented: [], botsApproved: [], botsChanges: [] });
+  const f = (over: Partial<QueueFilters>): QueueFilters => ({ ...NO_FILTERS, ...over });
+  const queue = () => reviewQueue({
+    prs: prs([
+      row(1, { title: 'Port forward a box', reviewDecision: 'REVIEW_REQUIRED', reviewers: people() }),
+      row(2, { repo: 'example-org/webapp', url: 'https://github.com/example-org/webapp/pull/2', reviewDecision: 'APPROVED', reviewers: people(['alice']) }),
+      row(3, { lane: 'team_review', askedYou: false, author: 'dependabot', badges: ['draft'], reviewDecision: 'CHANGES_REQUESTED', reviewers: people([], ['bob']) }),
+      row(4, { lane: 'team_review', askedYou: false, author: 'devin-ai-integration', checksFailed: true, reviewDecision: null, reviewers: people() }),
+    ]),
+    now: NOW,
+  });
+
+  it('reads the review state from GitHub, and from people when the repo requires no review', () => {
+    const subject = (extra: Partial<PrRow>) => ({ repo: 'a/b', number: 1, title: '', author: null, row: row(1, extra) });
+    expect(reviewStateOf(subject({ reviewDecision: 'APPROVED', reviewers: null }))).toBe('approved');
+    expect(reviewStateOf(subject({ reviewDecision: 'CHANGES_REQUESTED', reviewers: null }))).toBe('changes');
+    // GitHub still wants a review (a second approver, a code owner): not approved yet, whoever approved.
+    expect(reviewStateOf(subject({ reviewDecision: 'REVIEW_REQUIRED', reviewers: people(['alice']) }))).toBe('none');
+    expect(reviewStateOf(subject({ reviewDecision: null, reviewers: people(['alice']) }))).toBe('approved');
+    expect(reviewStateOf(subject({ reviewDecision: null, reviewers: people(['alice'], ['bob']) }))).toBe('changes');
+    // A bot's approval is not a person's.
+    expect(reviewStateOf(subject({ reviewDecision: null, reviewers: { ...people(), botsApproved: ['cursor'] } }))).toBe('none');
+    // An older backend says nothing: unknown, which no review-state filter matches.
+    expect(reviewStateOf(subject({}))).toBe('unknown');
+    expect(reviewStateOf({ repo: 'a/b', number: 1, title: '', author: null, row: null })).toBe('unknown');
+  });
+
+  it('tells bots from people by login', () => {
+    expect(['dependabot', 'dependabot[bot]', 'Devin-AI-Integration', 'renovate[bot]', 'some-app[bot]', 'github-actions'].every(isBotAuthor)).toBe(true);
+    expect(['alice', 'e2e-fabian', null].some(isBotAuthor)).toBe(false);
+  });
+
+  it('filters every section by repository, review state, author, bots, draft, CI and text', () => {
+    const q = queue();
+    const nums = (x: QueueFilters) => filterQueue(q, x).items.map(i => i.number);
+    expect(nums(NO_FILTERS)).toEqual([1, 2, 3, 4]);
+    expect(nums(f({ repos: ['example-org/termag'] }))).toEqual([1, 3, 4]);
+    expect(nums(f({ repos: ['Example-Org/Webapp', 'example-org/termag'] }))).toEqual([1, 2, 3, 4]);
+    expect(nums(f({ review: 'not-approved' }))).toEqual([1, 3, 4]);
+    expect(nums(f({ review: 'approved' }))).toEqual([2]);
+    expect(nums(f({ review: 'changes' }))).toEqual([3]);
+    expect(nums(f({ hideBots: true }))).toEqual([1, 2]);
+    expect(nums(f({ author: 'DEPENDABOT' }))).toEqual([3]);
+    expect(nums(f({ draft: 'draft' }))).toEqual([3]);
+    expect(nums(f({ draft: 'ready' }))).toEqual([1, 2, 4]);
+    expect(nums(f({ ciFailing: true }))).toEqual([4]);
+    expect(nums(f({ q: 'port FORWARD' }))).toEqual([1]);
+    expect(nums(f({ q: '#2' }))).toEqual([2]);
+    expect(nums(f({ q: 'webapp#2' }))).toEqual([2]);
+    expect(nums(f({ repos: ['example-org/termag'], review: 'not-approved', hideBots: true }))).toEqual([1]);
+  });
+
+  it('counts each section after filtering, a group card counted while any member matches', () => {
+    const member = (number: number, extra: Record<string, unknown> = {}) => ({ repo: 'example-org/termag', number, note: null, title: `PR ${number}`, url: '', author: 'alice', state: 'open' as const, yourReview: null, askedYou: true, checked: false, row: null, inLane: true, reviewers: people(), ...extra });
+    const q = reviewQueue({
+      prs: prs([row(1, { reviewDecision: null, reviewers: people() }), row(2, { lane: 'team_review', askedYou: false, reviewDecision: 'APPROVED', reviewers: people() })], {
+        groups: [{ id: 'g', name: 'Port forward', closedAt: null, createdAt: '', done: false, members: [member(5, { reviewers: people(['bob']) }), member(6, { reviewers: people(['bob']) })] }],
+      }),
+      now: NOW,
+    });
+    expect(sectionCounts(filterQueue(q, NO_FILTERS))).toMatchObject({ 'to-review': 2, team: 1 });
+    const open = filterQueue(q, f({ review: 'not-approved' }));
+    expect(open.groups).toEqual([]);
+    expect(sectionCounts(open)).toMatchObject({ 'to-review': 1, team: 0 });
+    expect(filterQueue(q, f({ review: 'approved' })).groups.map(g => g.group.id)).toEqual(['g']);
+  });
+
+  it('matches a number exactly, never a longer one that starts with it', () => {
+    const q = reviewQueue({ prs: prs([row(2), row(20), row(21), row(123), row(12, { title: 'bump vite 7.1.2' })]), now: NOW });
+    const nums = (text: string) => filterQueue(q, f({ q: text })).items.map(i => i.number).sort((a, b) => a - b);
+    expect(nums('#2')).toEqual([2]);
+    expect(nums('2')).toEqual([2]);
+    expect(nums('12')).toEqual([12]);
+    expect(nums('termag#12')).toEqual([12]);
+    expect(nums('example-org/termag#2')).toEqual([2]);
+    expect(nums('webapp#2')).toEqual([]);
+    // Text that isn't a reference still searches the titles.
+    expect(nums('vite 7.1')).toEqual([12]);
+  });
+
+  it('shows one note: nothing to review, or nothing matching the filters', () => {
+    const empty = reviewQueue({ prs: prs([]), now: NOW });
+    const some = queue();
+    const state = { loading: false, failed: false, disconnected: false };
+    expect(queueNote(empty, empty, NO_FILTERS, state)).toBe('nothing');
+    // Filters set over a queue with nothing to review: only "nothing asks for your review".
+    expect(queueNote(empty, filterQueue(empty, f({ review: 'approved' })), f({ review: 'approved' }), state)).toBe('nothing');
+    const deferredOnly = { ...empty, deferred: some.items.slice(0, 1) };
+    expect(queueNote(deferredOnly, filterQueue(deferredOnly, f({ q: 'zzz' })), f({ q: 'zzz' }), state)).toBe('nothing');
+    expect(queueNote(some, filterQueue(some, f({ q: 'zzz' })), f({ q: 'zzz' }), state)).toBe('no-match');
+    expect(queueNote(some, filterQueue(some, f({ q: 'port' })), f({ q: 'port' }), state)).toBe(null);
+    expect(queueNote(some, some, NO_FILTERS, state)).toBe(null);
+    for (const s of [{ ...state, loading: true }, { ...state, failed: true }, { ...state, disconnected: true }]) {
+      expect(queueNote(empty, empty, f({ q: 'zzz' }), s)).toBe(null);
+    }
+  });
+
+  it("reads a group member's own GitHub decision, whatever lane its row is from", () => {
+    const authored = row(7, { lane: 'needs_approval', askedYou: undefined, reviewDecision: 'REVIEW_REQUIRED', reviewers: undefined });
+    expect(reviewStateOf({ repo: 'example-org/termag', number: 7, title: '', author: 'e2e-octocat', row: authored, reviewers: people(['bob']) })).toBe('none');
+  });
+
+  it("shows only a group card's matching members, and how many the filters hide", () => {
+    const member = (repo: string, number: number) => ({ repo, number, note: null, title: `PR ${number}`, url: '', author: 'alice', state: 'open' as const, yourReview: null, askedYou: true, checked: false, row: null, inLane: true, reviewers: people() });
+    const group = { id: 'g', name: 'Port forward', closedAt: null, createdAt: '', done: false, members: [member('example-org/termag', 5), member('example-org/webapp', 6), member('example-org/termag', 7)] };
+    const q = reviewQueue({ prs: prs([], { groups: [group] }), now: NOW });
+    const g = filterQueue(q, f({ repos: ['example-org/termag'] })).groups[0];
+    expect(g.shown!.map(m => m.number)).toEqual([5, 7]);
+    expect(g.group.members).toHaveLength(3);
+    expect(g.left).toBe(2);
+    expect(filterQueue(q, NO_FILTERS).groups[0].shown).toBeUndefined();
+  });
+
+  it('a link that names filters becomes the remembered choice; a bare one brings the remembered choice back', () => {
+    const last = f({ review: 'approved' });
+    expect(filtersOnOpen(new URLSearchParams('review=not-approved'), last)).toEqual({ remember: f({ review: 'not-approved' }) });
+    expect(filtersOnOpen(new URLSearchParams(''), last)).toEqual({ apply: last });
+    expect(filtersOnOpen(new URLSearchParams(''), NO_FILTERS)).toEqual({});
+    // A link that clears every filter (?review= with nothing) is a choice too.
+    expect(filtersOnOpen(new URLSearchParams('review='), last)).toEqual({ remember: NO_FILTERS });
+  });
+
+  it('offers the repositories and authors the queue holds, once each', () => {
+    const o = filterOptions(queue());
+    expect(o.repos).toEqual(['example-org/termag', 'example-org/webapp']);
+    expect(o.authors).toEqual(['dependabot', 'devin-ai-integration', 'e2e-fabian']);
+  });
+
+  it('says when any filter is set', () => {
+    expect(hasFilters(NO_FILTERS)).toBe(false);
+    expect(hasFilters(f({ q: '  ' }))).toBe(false);
+    expect(hasFilters(f({ hideBots: true }))).toBe(true);
+  });
+
+  it('round-trips through the URL, keeping its other parameters, and drops values it does not know', () => {
+    const all = f({ repos: ['example-org/termag', 'example-org/webapp'], review: 'not-approved', author: 'alice', hideBots: true, draft: 'ready', ciFailing: true, q: 'port #12' });
+    const params = filtersToSearch(all, new URLSearchParams('tab=x&review=approved'));
+    expect(params.get('tab')).toBe('x');
+    expect(filtersFromSearch(params)).toEqual(all);
+    expect(params.toString()).toBe('tab=x&review=not-approved&repo=example-org%2Ftermag&repo=example-org%2Fwebapp&author=alice&bots=hide&draft=ready&ci=failing&q=port+%2312');
+    expect(filtersToSearch(NO_FILTERS, params).toString()).toBe('tab=x');
+    expect(filtersFromSearch(new URLSearchParams('review=maybe&draft=x&ci=1&bots=show&repo=not a repo'))).toEqual(NO_FILTERS);
+  });
+
+  it("remembers the last choice per user, and a user's own only", () => {
+    const store = new Map<string, string>();
+    const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => { store.set(k, v); } };
+    writeRememberedFilters(storage, 'zane', f({ review: 'not-approved', repos: ['example-org/termag'] }));
+    expect(readRememberedFilters(storage, 'zane')).toEqual(f({ review: 'not-approved', repos: ['example-org/termag'] }));
+    expect(readRememberedFilters(storage, 'alice')).toEqual(NO_FILTERS);
+    expect(readRememberedFilters(storage, null)).toEqual(NO_FILTERS);
+    store.set('termag.chat.reviewFilters.zane', '%%garbage');
+    expect(readRememberedFilters(storage, 'zane')).toEqual(NO_FILTERS);
+  });
+
+  it('matches a row with no lane data only on what it has', () => {
+    const it0 = { repo: 'example-org/termag', number: 9, title: 'x', author: 'alice', row: null };
+    expect(matchesFilters(it0, f({ repos: ['example-org/termag'] }))).toBe(true);
+    expect(matchesFilters(it0, f({ review: 'not-approved' }))).toBe(false);
+    expect(matchesFilters(it0, f({ draft: 'ready' }))).toBe(false);
   });
 });

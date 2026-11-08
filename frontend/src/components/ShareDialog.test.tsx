@@ -3,16 +3,27 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const api = vi.hoisted(() => ({ list: vi.fn(), create: vi.fn(), extend: vi.fn(), revoke: vi.fn(), revokeViewer: vi.fn(), stackCheck: vi.fn() }));
+const api = vi.hoisted(() => ({ list: vi.fn(), create: vi.fn(), extend: vi.fn(), revoke: vi.fn(), revokeViewer: vi.fn(), stackCheck: vi.fn(), settings: vi.fn() }));
 const usersApi = vi.hoisted(() => ({ search: vi.fn(async () => []) }));
 const flags = vi.hoisted(() => ({ on: {} as Record<string, boolean> }));
 vi.mock('../flags', async () => {
   const actual = await vi.importActual<typeof import('../flags')>('../flags');
   return { ...actual, useFlag: (key: string, fallback: unknown) => (key in flags.on ? flags.on[key] : fallback) };
 });
+const env = vi.hoisted(() => ({ projects: [] as unknown[] }));
+vi.mock('../contexts/ProjectContext', () => ({ useProjects: () => ({ projects: env.projects }) }));
 vi.mock('../services/api', () => ({ previewSharesApi: api, usersApi, previewShareLink: (id: string, at?: string | null, linkPath?: string | null) => `https://termag.test/termag${linkPath ?? `/p/${id}`}${at ? `?at=${encodeURIComponent(at)}` : ''}` }));
 
+const linksApi = vi.hoisted(() => ({ list: vi.fn(), listeners: vi.fn(), publish: vi.fn() }));
+vi.mock('../services/previewLinksApi', () => ({ previewLinksApi: linksApi, previewLinkError: () => 'refused' }));
+vi.mock('../launchpad/sprite', () => ({ ensureLaunchPadSprite: () => Promise.resolve() }));
+
 import { ShareDialog } from './ShareDialog';
+
+/** The share choice whose label starts with `text`: by name, so a choice that isn't shown doesn't shift the rest. */
+const radio = (root: HTMLElement, text: string) =>
+  [...root.querySelectorAll('input[type=radio]')].find(r => r.parentElement?.textContent?.trim().startsWith(text)) as HTMLInputElement;
+
 
 const share = (over: Record<string, unknown> = {}) => ({
   id: 's1', workstream: 'feature-x', grantee: { id: 'u2', email: 'gus@x.test', name: 'Gus' }, recipe: { kind: 'webapp-dev-stack' },
@@ -24,11 +35,11 @@ let el: HTMLDivElement;
 const flush = () => act(async () => { await new Promise(r => setTimeout(r, 0)); });
 const writeText = vi.fn(async () => {});
 
-function mount(atPath: string | null = null, defaultTtlHours = 24, onSwitchWorkstream?: (ws: string) => void) {
+function mount(atPath: string | null = null, defaultTtlHours = 24, onSwitchWorkstream?: (ws: string) => void, workstream = 'feature-x') {
   el = document.createElement('div');
   document.body.appendChild(el);
   root = createRoot(el);
-  act(() => root.render(<ShareDialog projectId="p1" workstream="feature-x" defaultTtlHours={defaultTtlHours} atPath={atPath} onClose={() => {}} onSwitchWorkstream={onSwitchWorkstream} />));
+  act(() => root.render(<ShareDialog projectId="p1" workstream={workstream} defaultTtlHours={defaultTtlHours} atPath={atPath} onClose={() => {}} onSwitchWorkstream={onSwitchWorkstream} />));
 }
 const button = (text: string) => [...el.querySelectorAll('button')].find(b => b.textContent === text)!;
 function type(input: HTMLInputElement, value: string) {
@@ -38,6 +49,7 @@ function type(input: HTMLInputElement, value: string) {
 
 beforeEach(() => {
   for (const f of Object.values(api)) f.mockReset();
+  api.settings.mockResolvedValue({ prLinksEnabled: false, pathFilter: [], reviewerAccountHint: null });
   api.stackCheck.mockResolvedValue({ checked: false });
   flags.on = {};
   localStorage.clear();
@@ -77,16 +89,7 @@ describe('the share dialog', () => {
     expect(JSON.parse(localStorage.getItem('termag-recent-people')!)).toEqual([expect.objectContaining({ email: 'gus@x.test' })]);
   });
 
-  it('needs an email while open links are off', async () => {
-    api.list.mockResolvedValue([]);
-    mount();
-    await flush();
-    expect(button('Share and copy link').disabled).toBe(true);
-    expect(el.textContent).not.toContain('Leave it empty');
-  });
-
-  it('with open links on, shares by a link anyone signed in can open when nobody is named, and copies its token link', async () => {
-    flags.on = { 'browser-pane-open-link-shares-enabled': true };
+  it('shares by a link anyone signed in can open when nobody is named, and copies its token link', async () => {
     const token = 'f'.repeat(32);
     api.list.mockResolvedValue([]);
     api.create.mockResolvedValue({ id: 'copen1', expiresAt: '', link: `/p/${token}`, linkPath: `/p/${token}`, ttlHours: 24 });
@@ -105,7 +108,6 @@ describe('the share dialog', () => {
   });
 
   it('says so when the workstream\'s open link was renewed', async () => {
-    flags.on = { 'browser-pane-open-link-shares-enabled': true };
     api.list.mockResolvedValue([]);
     api.create.mockResolvedValue({ id: 'copen1', expiresAt: '', link: `/p/${'f'.repeat(32)}`, linkPath: `/p/${'f'.repeat(32)}`, ttlHours: 24, renewed: true });
     mount();
@@ -131,7 +133,7 @@ describe('the share dialog', () => {
     mount();
     await flush();
     type(el.querySelector('input[type=email]') as HTMLInputElement, 'gus@x.test');
-    const manual = [...el.querySelectorAll('input[type=radio]')][1] as HTMLInputElement;
+    const manual = radio(el, "These addresses on this box");
     act(() => { manual.click(); });
     const area = el.querySelector('textarea[aria-label="Addresses"]') as HTMLTextAreaElement;
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
@@ -141,6 +143,57 @@ describe('the share dialog', () => {
       email: 'gus@x.test', workstream: 'feature-x', ttlHours: 24,
       recipe: { kind: 'manual', origins: ['127.0.0.2:3000', '127.0.0.2:3001', 'https://127.0.0.2:4443/'] },
     });
+  });
+
+  it("shares the app the workstream's environment file runs, the box resolving its ports", async () => {
+    api.list.mockResolvedValue([]);
+    api.create.mockResolvedValue({ id: 'snew', expiresAt: '', link: '/p/snew', ttlHours: 24 });
+    mount();
+    await flush();
+    type(el.querySelector('input[type=email]') as HTMLInputElement, 'gus@x.test');
+    env.projects = [{ id: 'p1', environmentStatus: { ports: [{ name: 'frontend', port: 5174, path: '/termag/', healthy: true }] } }];
+    // The project's status is its main checkout's app (the claim's chain), so the main workstream's to share.
+    mount(null, 24, undefined, 'main');
+    await flush();
+    type(el.querySelector('input[type=email]') as HTMLInputElement, 'gus@x.test');
+    const repo = radio(el, "This environment's app");
+    expect(repo.parentElement?.textContent?.trim()).toBe("This environment's app · frontend · 5174");
+    act(() => { repo.click(); });
+    await act(async () => { (el.querySelector('form') as HTMLFormElement).requestSubmit(); await new Promise(r => setTimeout(r, 0)); });
+    expect(api.create).toHaveBeenCalledWith('p1', { email: 'gus@x.test', workstream: 'main', ttlHours: 24, recipe: { kind: 'repo' } });
+  });
+
+  // Review on #998: a project with no environment port (none, or a box whose agent is older) has nothing for
+  // "This environment's app" to open, so it isn't offered.
+  it("doesn't offer this environment's app when the project's environment names no port", async () => {
+    api.list.mockResolvedValue([]);
+    env.projects = [{ id: 'p1', environmentStatus: null }];
+    mount();
+    await flush();
+    const labels = [...el.querySelectorAll('input[type=radio]')].map(r => r.parentElement?.textContent?.trim());
+    expect(labels).not.toContain("This environment's app");
+    expect(labels.length).toBe(2);
+  });
+
+  // Bugbot on #998 (e1fbcadb): Project.environmentStatus is the main checkout's app; another workstream's share would
+  // bind main's listeners and be refused at attach, so it isn't offered there.
+  // Decision #71 on #998: environment-selection-enabled off hides the choice, as it hides every environment choice.
+  it("doesn't offer this environment's app while environment selection is off", async () => {
+    api.list.mockResolvedValue([]);
+    env.projects = [{ id: 'p1', environmentStatus: { ports: [{ name: 'frontend', port: 5174, path: '/termag/', healthy: true }] } }];
+    flags.on['environment-selection-enabled'] = false;
+    mount(null, 24, undefined, 'main');
+    await flush();
+    expect(radio(el, "This environment's app")).toBeUndefined();
+    delete flags.on['environment-selection-enabled'];
+  });
+
+  it("offers this environment's app on the main workstream only", async () => {
+    api.list.mockResolvedValue([]);
+    env.projects = [{ id: 'p1', environmentStatus: { ports: [{ name: 'frontend', port: 5174, path: '/termag/', healthy: true }] } }];
+    mount();
+    await flush();
+    expect(radio(el, "This environment's app")).toBeUndefined();
   });
 
   it('names a lifetime the flag sets in hours properly', async () => {
@@ -265,8 +318,10 @@ describe('the share dialog', () => {
     expect(el.querySelector('.share-dialog-stack')?.textContent).toContain('started from the main workstream, not feature-x');
     act(() => button('Share main instead').click());
     expect(switchTo).toHaveBeenCalledWith('main');
-    // Addresses on the box have no dev stack to check.
-    act(() => (el.querySelectorAll('.share-dialog-recipe input[type=radio]')[1] as HTMLInputElement).click());
+    // Addresses on the box have no webapp dev stack to check. (The environment's app isn't offered here: this
+    // project's environment names no port.)
+    expect(radio(el, "This environment's app")).toBeUndefined();
+    act(() => radio(el, 'These addresses on this box').click());
     await flush();
     expect(el.querySelector('.share-dialog-stack')).toBeNull();
   });
@@ -297,3 +352,86 @@ describe('the share dialog', () => {
     expect(el.textContent).toContain('The stack running was started from ~/src/webapp.');
   });
 });
+
+describe('the delivery choice (preview links)', () => {
+  beforeEach(() => {
+    for (const f of Object.values(linksApi)) f.mockReset();
+    api.list.mockResolvedValue([]);
+    linksApi.list.mockResolvedValue({ links: [], requests: [], ttlHoursDefault: 24, previewDomain: 'preview.test' });
+    linksApi.listeners.mockResolvedValue([]);
+  });
+  const choice = (label: string) => [...el.querySelectorAll('.share-delivery input[type=radio]')].find(r => r.closest('label')?.textContent?.trim() === label) as HTMLInputElement;
+
+  it('is not offered while preview-links-enabled is off: the dialog is the preview share alone', async () => {
+    mount();
+    await flush();
+    expect(el.querySelector('.share-delivery')).toBeNull();
+    expect(el.querySelector('.preview-links')).toBeNull();
+    expect(linksApi.list).not.toHaveBeenCalled();
+  });
+
+  const shown = (sel: string) => { const e = el.querySelector(sel); return !!e && !e.closest('[hidden]'); };
+
+  it('with the flag on, starts in termag and switches to "In your browser", the publish form for this workstream', async () => {
+    flags.on = { 'preview-links-enabled': true };
+    mount();
+    await flush();
+    expect(el.querySelector('.share-delivery')?.classList.contains('lp-theme')).toBe(true);
+    expect(choice('In termag').checked).toBe(true);
+    expect(shown('.share-dialog-form')).toBe(true);
+    expect(el.querySelector('.preview-links')).toBeNull();
+    act(() => { choice('In your browser').click(); });
+    await flush();
+    expect(shown('.share-dialog-form')).toBe(false);
+    expect(shown('.preview-links-publish')).toBe(true);
+    expect(linksApi.list).toHaveBeenCalledWith('p1');
+    expect(linksApi.listeners).toHaveBeenCalledWith('p1', 'feature-x');
+    act(() => { choice('In termag').click(); });
+    expect(shown('.share-dialog-form')).toBe(true);
+    expect(shown('.preview-links-publish')).toBe(false);
+  });
+
+  it('keeps a published link\'s one-time URL across a switch away and back (Bugbot, #1485)', async () => {
+    flags.on = { 'preview-links-enabled': true };
+    env.projects = [{ id: 'p1', name: 'shop' }];
+    linksApi.listeners.mockResolvedValue([{ port: 5173, pid: 1, command: 'vite', verdict: { ok: true }, inCheckout: true }]);
+    linksApi.publish.mockResolvedValue({
+      link: { id: 'l1', name: 'feature-x', audience: 'link', url: 'https://t/termag/previews/feature-x', host: 'feature-x--k3.preview.test', expiresAt: new Date().toISOString() },
+      renewed: false, shareUrl: 'https://t/termag/previews/feature-x/KEY',
+    });
+    mount();
+    await flush();
+    act(() => { choice('In your browser').click(); });
+    await flush();
+    await act(async () => { button('Publish').click(); });
+    expect(el.querySelector('.preview-links-result .preview-links-url')?.textContent).toBe('https://t/termag/previews/feature-x/KEY');
+    const reads = linksApi.list.mock.calls.length;
+    act(() => { choice('In termag').click(); });
+    act(() => { choice('In your browser').click(); });
+    expect(shown('.preview-links-result')).toBe(true);
+    expect(el.querySelector('.preview-links-result .preview-links-url')?.textContent).toBe('https://t/termag/previews/feature-x/KEY');
+    // Not remounted: the list wasn't read again.
+    expect(linksApi.list.mock.calls.length).toBe(reads);
+  });
+
+  it('starts a fresh publish form for another workstream, without the last one\'s link (Bugbot, #1485)', async () => {
+    flags.on = { 'preview-links-enabled': true };
+    env.projects = [{ id: 'p1', name: 'shop' }];
+    linksApi.listeners.mockResolvedValue([{ port: 5173, pid: 1, command: 'vite', verdict: { ok: true }, inCheckout: true }]);
+    linksApi.publish.mockResolvedValue({
+      link: { id: 'l1', name: 'shop-feature-x', audience: 'link', url: 'https://t/termag/previews/shop-feature-x', host: null, expiresAt: new Date().toISOString() },
+      renewed: false, shareUrl: 'https://t/termag/previews/shop-feature-x/KEY',
+    });
+    mount();
+    await flush();
+    act(() => { choice('In your browser').click(); });
+    await flush();
+    await act(async () => { button('Publish').click(); });
+    expect(el.querySelector('.preview-links-result')).not.toBeNull();
+    act(() => root.render(<ShareDialog projectId="p1" workstream="other" defaultTtlHours={24} onClose={() => {}} />));
+    await flush();
+    expect(el.querySelector('.preview-links-result')).toBeNull();
+    expect((el.querySelector('.preview-links-name input') as HTMLInputElement).value).toBe('shop-other');
+  });
+});
+

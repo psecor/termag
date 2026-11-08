@@ -122,9 +122,20 @@ describe('SdkChatView composer', () => {
     await render();
     expect(document.querySelector('form.chat-composer textarea.chat-input')).not.toBeNull();
     expect(document.querySelector('form.chat-composer .chat-composer-bar .chat-compose-model-btn')).not.toBeNull();
-    expect(actions()).toEqual(['Attach images']);
+    expect(actions()).toEqual(['Attach files']);
     await type('look at this');
-    expect(actions()).toEqual(['Attach images', 'Send']);
+    expect(actions()).toEqual(['Attach files', 'Send']);
+  });
+
+  it('shows the messages queued behind the turn again after switching away and back', async () => {
+    mocks.history.mockResolvedValue({ ...historyOn('sonnet'), running: true, queued: 2, waiting: [{ text: 'and the tests?' }, { text: 'then push' }] });
+    await render();
+    const queued = () => [...document.querySelectorAll('.sdk-user-bubble')].map(b => b.textContent);
+    expect(queued()).toEqual(['and the tests?', 'then push']);
+    expect([...document.querySelectorAll('.sdk-user-note')].map(n => n.textContent)).toEqual(['queued', 'queued']);
+    unmount();
+    await render();
+    expect(queued()).toEqual(['and the tests?', 'then push']);
   });
 
   it('shows Stop while Claude works, and Send after it once there is a message', async () => {

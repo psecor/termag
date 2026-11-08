@@ -77,9 +77,8 @@ describe('links', () => {
     expect(chatHref('p1', 'feature x')).toBe('/chat/p/p1?ws=feature%20x');
   });
 
-  it('sends a run\'s conversation to the simple UI only when the user has it', () => {
-    expect(runConversationHref('p1', 'run-20261020-0900', true)).toBe('/chat/p/p1?ws=run-20261020-0900');
-    expect(runConversationHref('p1', 'run-20261020-0900', false)).toBe('/?project=p1&ws=run-20261020-0900');
+  it('sends a run\'s conversation to the simple UI', () => {
+    expect(runConversationHref('p1', 'run-20261020-0900')).toBe('/chat/p/p1?ws=run-20261020-0900');
   });
 
   it('builds the full-UI deep link', () => {
@@ -183,26 +182,23 @@ describe('repoStartsTrusted', () => {
 describe('chatRowName', () => {
   const row = { projectName: 'termag', workstream: 'fix-auth', sessionTitle: 'Login rate limiting' };
 
-  it('leads with the title when titles are on, the project and workstream secondary', () => {
-    expect(chatRowName(row, true)).toEqual({ title: 'Login rate limiting', where: 'termag · fix-auth', ask: false });
-    expect(chatRowName({ ...row, workstream: 'main' }, true)).toEqual({ title: 'Login rate limiting', where: 'termag', ask: false });
+  it('leads with the title, the project and workstream secondary', () => {
+    expect(chatRowName(row)).toEqual({ title: 'Login rate limiting', where: 'termag · fix-auth', ask: false });
+    expect(chatRowName({ ...row, workstream: 'main' })).toEqual({ title: 'Login rate limiting', where: 'termag', ask: false });
   });
 
-  it('names the row after the project with titles off, or before Claude has titled the session', () => {
-    expect(chatRowName(row, false)).toEqual({ title: null, where: 'termag · fix-auth', ask: false });
-    expect(chatRowName({ ...row, sessionTitle: null }, true)).toEqual({ title: null, where: 'termag · fix-auth', ask: false });
-    expect(chatRowName({ ...row, sessionTitle: '   ' }, true).title).toBeNull();
-    expect(chatRowName({ projectName: 'termag', workstream: 'main' }, true).title).toBeNull();
+  it('names the row after the project before Claude has titled the session', () => {
+    expect(chatRowName({ ...row, sessionTitle: null })).toEqual({ title: null, where: 'termag · fix-auth', ask: false });
+    expect(chatRowName({ ...row, sessionTitle: '   ' }).title).toBeNull();
+    expect(chatRowName({ projectName: 'termag', workstream: 'main' }).title).toBeNull();
   });
 
   it("leads an ask with its title, flag or not, and puts Claude's session title second", () => {
     const ask = { projectName: 'termag-3', workstream: 'ask-t1', askThreadId: 't1', askTitle: 'Readable names', sessionTitle: 'Rename ask rows' };
-    expect(chatRowName(ask, true)).toEqual({ title: 'Readable names', where: 'Rename ask rows', ask: true });
-    expect(chatRowName(ask, false)).toEqual({ title: 'Readable names', where: null, ask: true });
-    expect(chatRowName({ ...ask, sessionTitle: 'Readable names' }, true).where).toBeNull();
+    expect(chatRowName(ask)).toEqual({ title: 'Readable names', where: 'Rename ask rows', ask: true });
+    expect(chatRowName({ ...ask, sessionTitle: 'Readable names' }).where).toBeNull();
     // An untitled thread is called by its id, never by Claude's title or anything from its prompt; that title comes second.
-    expect(chatRowName({ ...ask, askTitle: null }, true)).toEqual({ title: 'ask-t1', where: 'Rename ask rows', ask: true });
-    expect(chatRowName({ ...ask, askTitle: null }, false)).toEqual({ title: 'ask-t1', where: null, ask: true });
+    expect(chatRowName({ ...ask, askTitle: null })).toEqual({ title: 'ask-t1', where: 'Rename ask rows', ask: true });
   });
 });
 

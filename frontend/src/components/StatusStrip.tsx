@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Link, useLocation } from 'react-router-dom';
 import { HOME_FILTERS, HomeFilter, InboxRow, matchesFilter } from '../mobile/inbox';
 import { useHome } from '../mobile/useHome';
+import { useTheme } from '../theme/ThemeProvider';
 import { prsApi } from '../services/api';
 import { usePolled } from '../pages/dashboard/useDashboardData';
 import { PRS_CHANGED_EVENT, myReviewCount, prsSearch, prsTileView } from '../utils/prPipeline';
@@ -18,7 +19,12 @@ import { SessionList, useOpenTarget } from './SessionList';
  * overlay over the workspace (components/PrsOverlay.tsx).
  */
 export function StatusStrip() {
-  const { rows, counts, now } = useHome();
+  // Ask chats have no pane to open here, so the strip leaves them out unless
+  // Settings → Appearance shows them (utils/askChatVisibility.ts). The counts
+  // build from the same filtered rows, so a tile never shows more than its
+  // popover lists.
+  const { theme } = useTheme();
+  const { rows, counts, now } = useHome({ hideAskChats: !theme.sidebarAskChats });
   const openTarget = useOpenTarget();
   // Reviews asked of you by name, as on the phone; the backend memoizes per user,
   // so this shares one GitHub read with the overlay, the dashboard and /m/prs.

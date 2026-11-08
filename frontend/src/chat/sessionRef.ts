@@ -38,8 +38,8 @@ function askTarget(box: string, project: string, workstream: string, repo: strin
  * person's boxes): `@"<name>" (termag ask <target>[ --thread <id>])`, where the
  * name is what the sidebar calls the session. Else why it can't be messaged.
  */
-export function sessionRef(row: RefRow, box: string | null, titlesShown: boolean): SessionRef {
-  const name = (chatRowName(row, titlesShown).title ?? agentLabel(row)).replace(/"/g, "'");
+export function sessionRef(row: RefRow, box: string | null): SessionRef {
+  const name = (chatRowName(row).title ?? agentLabel(row)).replace(/"/g, "'");
   if (row.shared) return { refusal: `${name} is ${row.owner}'s session. Only your own sessions can be messaged.` };
   if (!row.instanceId || !box) return { refusal: `${name} isn't on a box of yours, so it can't be messaged.` };
   // A follow-up names the thread's own target; an older orchestrator doesn't say it, and most threads ask main.
@@ -50,8 +50,8 @@ export function sessionRef(row: RefRow, box: string | null, titlesShown: boolean
 }
 
 /** Puts the reference to `row` on a drag that starts on its row or tab. */
-export function putSessionRef(e: React.DragEvent, row: RefRow, box: string | null, titlesShown: boolean): void {
-  e.dataTransfer.setData(SESSION_REF_TYPE, JSON.stringify(sessionRef(row, box, titlesShown)));
+export function putSessionRef(e: React.DragEvent, row: RefRow, box: string | null): void {
+  e.dataTransfer.setData(SESSION_REF_TYPE, JSON.stringify(sessionRef(row, box)));
 }
 
 /** The reference a drop carries, or null for anything else, a text not of sessionRef's form included. */

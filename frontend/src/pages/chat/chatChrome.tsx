@@ -15,7 +15,7 @@ export interface ChatChrome {
   historyOpen: boolean;
   openHistory: () => void;
   closeHistory: () => void;
-  /** The side panel, where simple-ui-side-panel-enabled is on; else absent. `show` opens it on a tool (the refresh's context card). */
+  /** The side panel, where it is mounted; else absent. `show` opens it on a tool (the refresh's context card). */
   /** `revealDir`, where Files can show a space: opens the panel on Files with that folder (a tree prefix, '' for the space) open and focused. */
   /** `showAgent`, under the chrome refresh on a desktop width: opens the panel on a subagent's agent tab. */
   sidePanel?: { open: boolean; toggle: () => void; show?: (tab: SidePanelTab) => void; revealDir?: (dir: string) => void; showAgent?: (agent: AgentTabRef) => void };

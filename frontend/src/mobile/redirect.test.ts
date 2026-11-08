@@ -1,18 +1,17 @@
-import { afterEach, describe, it, expect } from 'vitest';
-import { installedAppMode, installedOnTouch, isAppleMobile, isStandalone, setInstalledAppEnabled, mobileHrefFromWorkspaceSearch, readOptOut, shouldRedirectToMobile, writeOptOut, MOBILE_OPT_OUT_KEY } from './redirect';
+import { describe, it, expect } from 'vitest';
+import { installedAppMode, installedOnTouch, isAppleMobile, isStandalone, mobileHrefFromWorkspaceSearch, readOptOut, shouldRedirectToMobile, writeOptOut, MOBILE_OPT_OUT_KEY } from './redirect';
 
 describe('shouldRedirectToMobile', () => {
-  it('needs the flag, a phone-like viewport and no opt-out', () => {
-    expect(shouldRedirectToMobile({ flagOn: true, phoneLike: true, optedOut: false })).toBe(true);
-    expect(shouldRedirectToMobile({ flagOn: false, phoneLike: true, optedOut: false })).toBe(false);
-    expect(shouldRedirectToMobile({ flagOn: true, phoneLike: false, optedOut: false })).toBe(false);
-    expect(shouldRedirectToMobile({ flagOn: true, phoneLike: true, optedOut: true })).toBe(false);
+  it('needs a phone-like viewport and no opt-out', () => {
+    expect(shouldRedirectToMobile({ phoneLike: true, optedOut: false })).toBe(true);
+    expect(shouldRedirectToMobile({ phoneLike: false, optedOut: false })).toBe(false);
+    expect(shouldRedirectToMobile({ phoneLike: true, optedOut: true })).toBe(false);
   });
 
   it('always redirects an app installed on a touch device, unless this window opted out', () => {
-    expect(shouldRedirectToMobile({ flagOn: false, phoneLike: false, optedOut: false, installed: true })).toBe(true);
-    expect(shouldRedirectToMobile({ flagOn: false, phoneLike: true, optedOut: true, installed: true })).toBe(false);
-    expect(shouldRedirectToMobile({ flagOn: false, phoneLike: true, optedOut: false, installed: false })).toBe(false);
+    expect(shouldRedirectToMobile({ phoneLike: false, optedOut: false, installed: true })).toBe(true);
+    expect(shouldRedirectToMobile({ phoneLike: true, optedOut: true, installed: true })).toBe(false);
+    expect(shouldRedirectToMobile({ phoneLike: false, optedOut: false, installed: false })).toBe(false);
   });
 });
 
@@ -87,13 +86,7 @@ describe('installedAppMode', () => {
   const installedPhone = {
     matchMedia: (q: string) => ({ matches: q === '(display-mode: standalone)' || q === '(pointer: coarse)' }),
   };
-  afterEach(() => setInstalledAppEnabled(false));
-
-  it('applies the installed-app rules only with mobile-installed-app-enabled on', () => {
-    setInstalledAppEnabled(false);
-    expect(installedOnTouch(installedPhone)).toBe(true);
-    expect(installedAppMode(installedPhone)).toBe(false);
-    setInstalledAppEnabled(true);
+  it('applies the installed-app rules to an app installed on a touch device', () => {
     expect(installedAppMode(installedPhone)).toBe(true);
     expect(installedAppMode({ matchMedia: () => ({ matches: false }) })).toBe(false);
   });

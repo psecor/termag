@@ -107,11 +107,50 @@ export function safeAtPath(at: string | null | undefined): string | null {
  * asks the workspace to open its browser dock on that share's app, at that
  * page. Null when the URL asks for nothing.
  */
-export function browserHandoff(search: string): { open: true; share: BrowserShareHandoff | null } | null {
+export function browserHandoff(search: string): { open: true; share: BrowserShareHandoff | null; url: string | null } | null {
   const sp = new URLSearchParams(search);
   if (sp.get('browser') !== 'open') return null;
   const shareId = sp.get('browserShare');
-  return { open: true, share: shareId && /^[a-z0-9]{10,64}$/.test(shareId) ? { shareId, at: safeAtPath(sp.get('browserAt')) } : null };
+  return {
+    open: true,
+    share: shareId && /^[a-z0-9]{10,64}$/.test(shareId) ? { shareId, at: safeAtPath(sp.get('browserAt')) } : null,
+    url: loopbackUrl(sp.get('browserUrl')),
+  };
+}
+
+/** An http(s) URL on the box's loopback (localhost, 127.x, [::1]), as the pane opens it; null for anything else. */
+export function loopbackUrl(value: string | null | undefined): string | null {
+  if (typeof value !== 'string' || !value || value.length > 2048) return null;
+  let u: URL;
+  try { u = new URL(value); } catch { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (u.username || u.password) return null;
+  if (!/^(localhost|127(\.\d{1,3}){3}|\[::1\])$/i.test(u.hostname)) return null;
+  return u.toString();
+}
+
+/**
+ * A link that opens `url` (one of the box's loopback ports) in the owner's own
+ * browser pane for this project and workstream, in whichever UI they use:
+ * the workspace's dock, or the simple UI's side panel on Browser
+ * (chat/uiMode.ts simpleUiShareHandoff). The environment's port links
+ * (components/EnvironmentSection.tsx) open it in a new tab.
+ */
+export function browserPortHref(projectId: string, workstream: string, url: string): string {
+  const q = new URLSearchParams({ project: projectId, ws: workstream, browser: 'open', browserUrl: url });
+  return `${import.meta.env.BASE_URL.replace(/\/$/, '')}/?${q}`;
+}
+
+/**
+ * The browser key (`<project>/<workstream>`) the page was loaded for: the
+ * simple UI's `/chat/p/<id>?ws=`, else the workspace's `?project=&ws=`.
+ */
+export function handoffBrowserKey(pathname: string, search: string): string | null {
+  const sp = new URLSearchParams(search);
+  const ws = sp.get('ws') || 'main';
+  const chat = /\/chat\/p\/([^/?#]+)/.exec(pathname);
+  const project = chat ? decodeURIComponent(chat[1]) : sp.get('project');
+  return project ? `${project}/${ws}` : null;
 }
 
 /**

@@ -1,5 +1,4 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import { FLAGS, useFlag } from '../flags';
 import { instancesApi } from '../services/api';
 import { boxFeed } from '../services/boxFeed';
 import { boxStatusBus } from '../utils/boxStatusBus';
@@ -27,15 +26,13 @@ const selectBoxStarter = new SelectBoxStarter(
  * `showsStored`: the open view shows a chat's stored transcript (the simple
  * UI's SDK chat, chat/storedOpen.ts). The decision then waits for its history:
  * a stored transcript is shown and the box is left parked, and only a chat
- * with nothing stored (chat-transcripts-enabled off for the owner included)
- * starts it, as before.
+ * with nothing stored starts it.
  */
 export function useStartParkedBoxOnOpen(
   project: Pick<Project, 'id' | 'instanceId'> | undefined,
   workstream: string,
   showsStored = false,
 ): void {
-  const enabled = useFlag(FLAGS.boxOpenStart, false);
   const storedKey = showsStored && project ? storedOpenKey(project.id, workstream) : null;
   const stored = useSyncExternalStore(subscribeStoredOpen, () => (storedKey ? readStoredOpen(storedKey) : null));
   const boxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
@@ -46,7 +43,7 @@ export function useStartParkedBoxOnOpen(
 
   useEffect(() => {
     if (!openKey) { decided.current = null; return; }
-    if (!enabled || !fresh || decided.current === openKey) return;
+    if (!fresh || decided.current === openKey) return;
     const box = boxes.find(b => b.id === instanceId);
     if (!box) return;
     const gate = storedKey ? openStartGate(stored) : 'start';
@@ -54,5 +51,5 @@ export function useStartParkedBoxOnOpen(
     decided.current = openKey;
     if (gate === 'skip') return;
     void selectBoxStarter.open(box);
-  }, [enabled, fresh, openKey, boxes, instanceId, storedKey, stored]);
+  }, [fresh, openKey, boxes, instanceId, storedKey, stored]);
 }

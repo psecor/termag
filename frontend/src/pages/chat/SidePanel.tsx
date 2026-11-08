@@ -10,10 +10,14 @@
 // new tab's on a new tab. Picking in it shows the pick in the main pane.
 // Beside an agent with no space, and on a new tab on the agents in no space,
 // the tab is Agents instead: the explorer of agents only (AgentsExplorer.tsx).
+// As a phone's overlay, the panel follows the visual viewport (the keyboard,
+// hooks/useVisualViewport.ts) and its Terminal has a key bar (TerminalKeyBar.tsx).
 import React, { useLayoutEffect, useRef, useState } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useSetupContext } from '../../hooks/useSetupContext';
 import { Terminal } from '../../components/Terminal';
+import { useVisualViewport } from '../../hooks/useVisualViewport';
+import { PhoneTerminal } from './TerminalKeyBar';
 import { BrowserPane } from '../../components/BrowserPane';
 import { useRememberedBrowserUrl } from '../../components/BrowserDock';
 import type { BrowserShareHandoff } from '../../utils/browserPaneConnection';
@@ -124,9 +128,6 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
   // The chrome refresh: the collapse button is an icon at the panel's corner, where the header's
   // toggle was before the panel opened (chatChrome.tsx SidePanelButton).
   const { refresh } = useChatChrome();
-  const browserOn = useFlag(FLAGS.browserPane, false);
-  const keptProfilesOn = useFlag(FLAGS.persistentProfiles, false);
-  const previewShareOn = useFlag(FLAGS.previewShare, false);
   const subagentsOn = useFlag(FLAGS.chatSubagents, false);
   const target = useFilesTarget(files, workstream);
   const agentsOnly = target?.space === NO_SPACE_EXPLORER;
@@ -137,18 +138,22 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
   // The Review tab: a session's review panes, with reviews on, on a phone's overlay
   // too, where a review's link opens it.
   const reviewsOn = useReviewsData().on;
-  const offer = { files: target != null, session: project != null, share: previewShareOn && project?.role !== 'collaborator', pr: refresh === true && !overlay, review: reviewsOn };
-  const tab = shownSidePanelTab(state.tab, browserOn, offer);
+  const offer = { files: target != null, session: project != null, share: project?.role !== 'collaborator', pr: refresh === true && !overlay, review: reviewsOn };
+  const tab = shownSidePanelTab(state.tab, offer);
   // The chrome refresh's tabs (PanelTabs.tsx): added with +, closed, each a tool or a launcher.
   const tabsOn = refresh === true && !overlay;
   // A subagent's agent tab shows beside its own chat only.
   const agentChat = subagentsOn && project ? `${project.id}|${workstream}` : null;
-  const tabsUi = usePanelTabs(tabsOn, sidePanelTabs(browserOn, offer), state.tab, t => onChange({ ...state, tab: t }), ask, onAskUsed, agentChat, agentAsk, onAgentAskUsed);
+  const tabsUi = usePanelTabs(tabsOn, sidePanelTabs(offer), state.tab, t => onChange({ ...state, tab: t }), ask, onAskUsed, agentChat, agentAsk, onAgentAskUsed);
   const launcherShown = tabsOn && tabsUi.active.kind === 'launcher';
   const agentShown = tabsOn && tabsUi.active.kind === 'agent' ? tabsUi.active.agent ?? null : null;
   const shownTool: SidePanelTab = tabsOn && tabsUi.active.kind !== 'launcher' && tabsUi.active.kind !== 'agent' ? tabsUi.active.kind : tab;
 
   const panelRef = useRef<HTMLElement>(null);
+  // An overlay is a phone's full screen: its top and height come from the visual
+  // viewport (--chat-vvtop / --chat-vvh, chat.css), so with the keyboard up on iOS
+  // the tabs stay on screen and the Terminal re-fits above the keyboard.
+  useVisualViewport(panelRef, 'chat', overlay);
   // The main column's width, so a remembered width that no longer fits
   // (a smaller window, a resize) still leaves the chat its minimum.
   const [mainWidth, setMainWidth] = useState<number | null>(null);
@@ -202,7 +207,7 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
       <div className="chat-side-head">
         {tabsOn && <PanelTabStrip ui={tabsUi} />}
         {!tabsOn && <div className="chat-side-tabs" role="tablist">
-          {sidePanelTabs(browserOn, offer).map(t => (
+          {sidePanelTabs(offer).map(t => (
             <button
               key={t}
               type="button"
@@ -229,9 +234,9 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
         {/* An ask's tab is an agent tab whose id names its thread (chat/askStore.ts askTabId). */}
         {agentShown && project && (askThreadOf(agentShown.id)
           ? <AskTab key={agentShown.id} project={project} workstream={workstream} agent={agentShown} />
-          : <AgentTab key={agentShown.id} project={project} workstream={workstream} agent={agentShown} />)}
+          : <AgentTab key={agentShown.id} project={project} workstream={workstream} agent={agentShown} openAgent={tabsUi.openAgent} />)}
         {launcherShown && (
-          <ToolLauncher tools={sidePanelTabs(browserOn, offer)} onPick={tabsUi.pick}
+          <ToolLauncher tools={sidePanelTabs(offer)} onPick={tabsUi.pick}
             context={project ? `For ${project.name}${target ? ` in ${where}` : ''}` : target ? `In ${where}` : ''} />
         )}
         {!launcherShown && !agentShown && shownTool === 'files' && target && agentsOnly && (
@@ -243,7 +248,7 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
         {!launcherShown && !agentShown && shownTool === 'pr' && project && <PrTab project={project} workstream={workstream} />}
         {!launcherShown && !agentShown && shownTool === 'review' && project && <ReviewPaneTab key={`${project.id}|${workstream}`} project={project} workstream={workstream} />}
         {!launcherShown && !agentShown && shownTool !== 'files' && shownTool !== 'pr' && shownTool !== 'review' && project && (
-          <SessionTools project={project} workstream={workstream} tab={shownTool} showReset={keptProfilesOn} openShare={openShare} onOpenShareUsed={onOpenShareUsed} />
+          <SessionTools project={project} workstream={workstream} tab={shownTool} showReset openShare={openShare} onOpenShareUsed={onOpenShareUsed} overlay={overlay} />
         )}
       </div>
     </aside>
@@ -251,9 +256,11 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
 }
 
 /** Terminal, Browser or Share for `project`'s session. */
-function SessionTools({ project, workstream, tab, showReset, openShare, onOpenShareUsed }: {
+function SessionTools({ project, workstream, tab, showReset, openShare, onOpenShareUsed, overlay }: {
   project: Project; workstream: string; tab: Exclude<SidePanelTab, 'files' | 'pr' | 'review'>; showReset: boolean;
   openShare?: BrowserShareHandoff | null; onOpenShareUsed?: () => void;
+  /** A phone's overlay: the Terminal has the key bar. */
+  overlay: boolean;
 }) {
   const { user } = useAuth();
   const setupCtx = useSetupContext(project);
@@ -272,6 +279,17 @@ function SessionTools({ project, workstream, tab, showReset, openShare, onOpenSh
     );
   }
   if (tab === 'share') return <ShareTab projectId={project.id} workstream={workstream} key={`${project.id}-${workstream}`} />;
+  if (tab === 'terminal' && overlay) {
+    return (
+      <PhoneTerminal
+        sessionName={ctrlSession}
+        projectId={project.id}
+        workstream={workstream}
+        instanceId={project.instanceId}
+        key={`${project.id}-${workstream}-ctrl`}
+      />
+    );
+  }
   return tab === 'terminal' ? (
     <Terminal
       sessionName={ctrlSession}

@@ -1,16 +1,20 @@
 // The sidebar's head and foot under the chrome refresh,
-// all LaunchPad: the brand, New session as
-// a full-width row with its shortcut, Search, and the account at the foot with
-// its menu (Open Lab, Settings) and a Settings button beside it.
+// all LaunchPad: the brand, How it works
+// (the docs site), New session as a full-width row with its shortcut, Search,
+// and the account at the foot with its menu (Phone view on a phone, Open Lab,
+// Settings, How it works) and a Settings button beside it.
 import React from 'react';
 import { Link, useHref, useNavigate } from 'react-router-dom';
+import { optBackIntoMobile } from '../../mobile/redirect';
+import { useEnvironmentSelection } from '../../hooks/useEnvironments';
 import {
-  Button, IconButton, InitialsAvatar, LinkButton, LinkIconButton, Menu, MenuItem, MenuTrigger, Popover, RouterProvider, Text, Tooltip, TooltipTrigger,
+  Button, IconButton, InitialsAvatar, Link as LpLink, LinkButton, LinkIconButton, Menu, MenuItem, MenuTrigger, Popover, RouterProvider, Text, Tooltip, TooltipTrigger,
 } from '@launchpad-ui/components';
 import { Icon } from '@launchpad-ui/icons';
 import { useAuth } from '../../contexts/AuthContext';
 import { useConnection } from '../../contexts/ConnectionContext';
 import { LP_THEME } from '../../launchpad/theme';
+import { DOCS_SITE_URL } from '../settings/settingsDocs';
 import { OPEN_PALETTE_EVENT } from '../../utils/searchPalette';
 import { currentSearchShortcut } from '../../utils/workspaceTarget';
 import { ViewOptions } from './ViewOptions';
@@ -18,11 +22,25 @@ import { useWhatsNewDialog, whatsNewLabel } from '../../whatsNew/useWhatsNew';
 
 const SEARCH_KEYS = currentSearchShortcut();
 const SETTINGS_HREF = '/settings?from=chat';
+const ENVIRONMENTS_HREF = '/chat/environments';
 
 /** LaunchPad's links navigate in the app (React Aria's router), with the app's basename on their hrefs. */
-function AppRouter({ children }: { children: React.ReactNode }) {
+export function AppRouter({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   return <RouterProvider navigate={navigate} useHref={useHref}>{children}</RouterProvider>;
+}
+
+/**
+ * The docs site (settingsDocs.ts), when the build names one. A LaunchPad
+ * link so it takes the UI font and opens in a new tab.
+ */
+export function DocsSiteLink({ className }: { className: string }) {
+  if (!DOCS_SITE_URL) return null;
+  return (
+    <LpLink className={className} href={DOCS_SITE_URL} target="_blank" rel="noopener noreferrer">
+      How it works
+    </LpLink>
+  );
 }
 
 /** Up to two initials for the account's avatar: of the name, else of the email's local part. */
@@ -37,7 +55,7 @@ export function accountInitials(name: string): string {
  * ChatSearch, kept mounted for ⌘K and its palette; SearchButton stands in for
  * its trigger, which the refresh hides.
  */
-export function SidebarTop({ newSessionKeys, search, viewOptions }: { newSessionKeys: string; search: React.ReactNode; viewOptions: boolean }) {
+export function SidebarTop({ newSessionKeys, search }: { newSessionKeys: string; search: React.ReactNode }) {
   return (
     <>
       <div className="chat-sidebar-head">
@@ -45,6 +63,7 @@ export function SidebarTop({ newSessionKeys, search, viewOptions }: { newSession
           <Icon name="terminal" size="medium" className="chat-brand-mark" aria-hidden="true" />
           termag
         </Link>
+        <DocsSiteLink className="chat-docs-link" />
       </div>
       <div className="chat-sidebar-actions">
         <NewSessionRow keys={newSessionKeys} />
@@ -54,7 +73,7 @@ export function SidebarTop({ newSessionKeys, search, viewOptions }: { newSession
             <SearchButton />
           </div>
           {/* The view options are the tabs sidebar's (OpenItems.tsx). */}
-          {viewOptions && <ViewOptions />}
+          <ViewOptions />
         </div>
       </div>
     </>
@@ -92,12 +111,14 @@ function SearchButton() {
   );
 }
 
-/** The account at the sidebar's foot: a menu with Open Lab and Settings (and What's new), and Settings beside it. */
-export function AccountFoot({ openFullUi }: { openFullUi: () => void }) {
+/** The account at the sidebar's foot: a menu with Open Lab, Environments, Settings and How it works (and What's new), and Settings beside it. */
+/** `phoneView`: where the menu's Phone view goes (mobile/chatLinks.ts); absent off a phone, and the item with it. */
+export function AccountFoot({ openFullUi, phoneView }: { openFullUi: () => void; phoneView?: string | null }) {
   const { user } = useAuth();
   const navigate = useNavigate();
   const name = user?.displayName || user?.email || '';
   const whatsNew = useWhatsNewDialog('termag');
+  const environmentsOn = useEnvironmentSelection();
   return (
     <AppRouter>
       <MenuTrigger>
@@ -110,16 +131,45 @@ export function AccountFoot({ openFullUi }: { openFullUi: () => void }) {
           <Icon name="chevron-up" size="medium" className="chat-account-caret" aria-hidden="true" />
         </Button>
         <Popover placement="top start" className={`${LP_THEME} chat-menu-popover`}>
-          <Menu onAction={key => { if (key === 'full') openFullUi(); else if (key === 'settings') navigate(SETTINGS_HREF); else if (key === 'whats-new') whatsNew.open(); }}>
+          <Menu onAction={key => {
+            if (key === 'phone' && phoneView) { optBackIntoMobile(); navigate(phoneView); }
+            else if (key === 'full') openFullUi();
+            else if (key === 'settings') navigate(SETTINGS_HREF);
+            else if (key === 'environments') navigate(ENVIRONMENTS_HREF);
+            // An href here would go through the in-app router, which rewrites an absolute URL.
+            else if (key === 'docs') globalThis.open(DOCS_SITE_URL, '_blank', 'noopener,noreferrer');
+            else if (key === 'whats-new') whatsNew.open();
+          }}>
+            {phoneView && (
+              <MenuItem id="phone" textValue="Phone view">
+                <Icon name="device-mobile" size="medium" aria-hidden="true" />
+                <Text slot="label">Phone view</Text>
+                <Text slot="description">termag's app for phones</Text>
+              </MenuItem>
+            )}
             <MenuItem id="full" textValue="Open Lab">
               <Icon name="arrow-up-right" size="medium" aria-hidden="true" />
               <Text slot="label">Open Lab</Text>
               <Text slot="description">termag opens in the UI you used last</Text>
             </MenuItem>
+            {environmentsOn && (
+              <MenuItem id="environments" textValue="Environments">
+                <Icon name="package" size="medium" aria-hidden="true" />
+                <Text slot="label">Environments</Text>
+                <Text slot="description">Repositories and the box they need, shared</Text>
+              </MenuItem>
+            )}
             <MenuItem id="settings" textValue="Settings">
               <Icon name="gear-outline" size="medium" aria-hidden="true" />
               <Text slot="label">Settings</Text>
             </MenuItem>
+            {DOCS_SITE_URL && (
+              <MenuItem id="docs" textValue="How it works">
+                <Icon name="book-external-link" size="medium" aria-hidden="true" />
+                <Text slot="label">How it works</Text>
+                <Text slot="description">The docs site</Text>
+              </MenuItem>
+            )}
             {whatsNew.enabled && (
               <MenuItem id="whats-new" textValue="What's new">
                 <Icon name="sparkles" size="medium" aria-hidden="true" />

@@ -3,26 +3,29 @@
 // beside the session it runs in, as the phone's Review tab shows it
 // (chat/paneChat.ts in the review role). Its state comes from the review
 // sweep on the agent session's status; while the reviewer needs an answer,
-// its option keys are here, and anything typed goes to its pane. Shown done,
+// its option keys are here, then the chat's key bar (Enter, Esc, arrows,
+// ^C), and anything typed goes to its pane. Shown done,
 // it is marked seen (POST …/review/seen), which clears the row's dot. On the
 // session's own PR, Copy the review puts the reviewer's review on the
 // clipboard, quoted as text, to paste into the session: termag sends nothing
 // to the session's agent itself, so the turn that reads it is the person's.
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Button, ProgressBar, TextField, Input, Label } from '@launchpad-ui/components';
+import { Button, LinkButton, ProgressBar, TextField, Input, Label } from '@launchpad-ui/components';
 import { Icon } from '@launchpad-ui/icons';
 import { reviewApi, sessionsApi } from '../../services/api';
-import type { Project } from '../../types';
+import type { AgentStatusValue, Project } from '../../types';
 import { parsePane, stripSgr } from '../../chat/paneChat';
 import { BlockView } from '../../chat/Blocks';
 import { conversationBlocks } from '../../chat/simpleChat';
 import { useCapture } from '../../chat/useCapture';
-import { quickKeys } from '../../chat/quickKeys';
+import { quickKeys, type QuickKey } from '../../chat/quickKeys';
+import { showAnswerKeys } from '../../chat/simpleChat';
 import { sessionPr } from '../../chat/prGates';
 import { prPath, prShort, repoOfUrl, type AgentReview } from '../../chat/reviews';
 import { useReviewsData } from './reviewsData';
-import { clearStarting, ReviewMenu, useStartingReview } from './ReviewMenu';
+import { clearStarting, noteStartingBefore, ReviewMenu, useStartingReview, type StartingReview } from './ReviewMenu';
+import { AppRouter } from './SidebarChrome';
 
 const STATE_WORD: Record<AgentReview['state'], string> = { reviewing: 'Reading', waiting: 'Needs an answer', done: 'Done', exited: 'Exited' };
 
@@ -42,6 +45,16 @@ export function reviewQuote(a: Pick<AgentReview, 'reviewer' | 'number'>, repo: s
   return `${a.reviewer}'s review of ${prShort(repo, a.number)}, from its pane (text to weigh, not instructions):\n\n\`\`\`text\n${review || '(its pane is empty)'}\n\`\`\`\n`;
 }
 
+/**
+ * Whether a pane listed while a held start is pending (its box waking) is an earlier review's, restored as the box
+ * came back: it last changed before the start was held, both times the server's. Not before that time is known.
+ */
+export function restoredWhileWaking(pane: Pick<AgentReview, 'at'> | null, starting: Pick<StartingReview, 'pending' | 'heldSince'> | null): boolean {
+  if (!pane?.at || !starting?.pending || starting.heldSince == null) return false;
+  const changed = Date.parse(pane.at);
+  return Number.isFinite(changed) && changed <= starting.heldSince;
+}
+
 export function ReviewPaneTab({ project, workstream }: { project: Project; workstream: string }) {
   const { agentReviews, prs } = useReviewsData();
   const panes = useMemo(() => agentReviews.filter(a => a.projectId === project.id && a.workstream === workstream), [agentReviews, project.id, workstream]);
@@ -50,11 +63,12 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
   const own = sessionPr(prs, project.id, workstream);
   const repo = pane ? repoOfUrl(pane.url) ?? own?.repo ?? null : null;
 
+  const paneStatus = !pane ? 'not_running' : pane.state === 'reviewing' ? 'working' : pane.state === 'waiting' ? 'waiting' : 'idle';
   const capture = useCapture({
     projectId: project.id,
     role: 'review',
     workstream,
-    status: !pane ? 'not_running' : pane.state === 'reviewing' ? 'working' : pane.state === 'waiting' ? 'waiting' : 'idle',
+    status: paneStatus,
     statusUpdatedAt: pane ? `${pane.state}:${pane.seen}` : undefined,
     enabled: pane != null && pane.state !== 'exited',
   });
@@ -79,7 +93,13 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
   // running one: the outgoing pane changes too as it's torn down (exited, done), and its controls would act on that.
   // (A restart that fails at once, or a pane whose time never changes, ends with the timer.)
   const fresh = samePr && !starting!.before.includes(pane!.at ?? '');
-  const live = fresh && (starting!.before.length === 0 || pane!.state === 'reviewing' || pane!.state === 'waiting');
+  // Not while its box wakes or the start call runs. A finished pane of the PR listed then that last changed before
+  // the start was held (the server's clock on both sides) is an earlier review's, restored as the box came back: it
+  // goes with the ones listed at the start, so it isn't taken for this one once the start answers. One that changed
+  // after (this start's own, however quickly it finished or exited) is left to count.
+  const live = fresh && !starting!.pending && !starting!.error && (starting!.before.length === 0 || pane!.state === 'reviewing' || pane!.state === 'waiting');
+  const restored = fresh && restoredWhileWaking(pane, starting) ? pane!.at ?? '' : null;
+  useEffect(() => { if (restored != null) noteStartingBefore(project.id, workstream, restored); }, [restored, project.id, workstream]);
   useEffect(() => { if (live) clearStarting(project.id, workstream); }, [live, project.id, workstream]);
   // Until then the start covers whatever pane is listed: an empty tab, the PR's last finished review, or another PR's.
   const covered = !!starting && !live;
@@ -97,9 +117,10 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
   useEffect(() => {
     if (!covered && pane && pane.state === 'done' && !pane.seen) reviewApi.seen(project.id, workstream, pane.session ?? undefined).catch(() => {});
   }, [covered, pane, project.id, workstream]);
-  // Two minutes with no pane listed: back to the empty state, on a timer (a render alone may never come).
+  // Two minutes with no pane listed: back to the empty state, on a timer (a render alone may never come). Counted from
+  // the start call's answer (its box may take minutes to wake first); a failed start stays until it's dismissed.
   useEffect(() => {
-    if (!starting) return;
+    if (!starting || starting.pending || starting.error) return;
     const t = setTimeout(() => clearStarting(project.id, workstream), Math.max(0, 120_000 - (Date.now() - starting.at)));
     return () => clearTimeout(t);
   }, [starting, project.id, workstream]);
@@ -109,27 +130,50 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
   const [copyFailed, setCopyFailed] = useState(false);
   useEffect(() => { if (pane?.state !== 'done') { setCopiedFor(null); setCopyFailed(false); } }, [pane?.state]);
   const copied = copiedFor === paneKey && pane?.state === 'done';
-  const send = (keys: string, enter = true, literal = true) => sessionsApi.sendKeys(project.id, 'review', { workstream, keys, enter, literal }).then(() => setTimeout(capture.refresh, 500));
+  // One send at a time, spaced: ↓ then Enter pressed quickly both reach the pane.
+  const sender = useMemo(() => spacedSender(SEND_GAP_MS, (b: SendBody) => sessionsApi.sendKeys(project.id, 'review', { workstream, ...b })), [project.id, workstream]);
+  const [sendFailed, setSendFailed] = useState(false);
+  // Another review, or this one's state moved on: a failed send's note is the last one's.
+  useEffect(() => { setSendFailed(false); }, [paneKey, pane?.at]);
+  const send = (keys: string, enter = true, literal = true) => sender({ keys, enter, literal }).then(ok => {
+    setSendFailed(!ok);
+    if (ok) setTimeout(capture.refresh, 500);
+    return ok;
+  });
   const lastDialog = parsed?.blocks.at(-1);
   const options = lastDialog?.kind === 'dialog' ? lastDialog.options ?? 0 : 0;
-  // The reviewer's own options, read off its list ("❯ 1. Yes (approve once)"), else its digits.
-  const listed = pane?.state === 'waiting' ? paneOptions(content) : [];
-  const keys = pane?.state !== 'waiting' ? []
-    : listed.length ? listed.map(o => ({ keys: o.n, label: `${o.n} · ${o.text}`, enter: false, literal: true }))
-    : answerDigits(reviewerId(pane.reviewer), options);
+  const { choices, keys } = pane ? reviewKeys(pane.state, paneStatus, content, options, reviewerId(pane.reviewer)) : { choices: [], keys: [] };
   // GitHub's owner/name case differs between a typed path and the pipeline's row.
   const ownPr = pane && own && own.repo && own.number === pane.number && (!repo || repo.toLowerCase() === own.repo.toLowerCase());
 
-  // Started, and its pane not listed yet (or the one listed is the PR's last, finished review, or another PR's).
-  if (starting && covered) {
+  // A start that failed (its box couldn't be woken, the start was refused): why, and what to do, until dismissed.
+  if (starting?.error) {
     return (
       <div className="rv-pane">
         <div className="rv-pane-head">
-          <span className="rv-pane-mark" data-state="reviewing" aria-hidden="true"><ProgressBar variant="spinner" size="small" isIndeterminate aria-label="Starting" /></span>
           <span className="rv-pane-title">{starting.reviewer}{starting.repo && <> on {prShort(starting.repo, starting.number)}</>}</span>
-          <span className="rv-pane-state">Starting</span>
+          <span className="rv-pane-state">Couldn't start</span>
         </div>
-        <div className="rv-pane-body chat-transcript-inner"><p className="rv-note">{starting.reviewer} is starting…</p></div>
+        <div className="rv-pane-body chat-transcript-inner">
+          <p className="rv-note rv-pane-error" role="alert">{starting.error}</p>
+          <Button size="small" variant="default" onPress={() => clearStarting(project.id, workstream)}>Dismiss</Button>
+        </div>
+      </div>
+    );
+  }
+
+  // Started, and its pane not listed yet (or the one listed is the PR's last, finished review, or another PR's):
+  // what's happening first (its box waking, the start), else the reviewer starting.
+  if (starting && covered) {
+    const waking = starting.step?.startsWith('Waking') ?? false;
+    return (
+      <div className="rv-pane">
+        <div className="rv-pane-head">
+          <span className="rv-pane-mark" data-state="reviewing" aria-hidden="true"><ProgressBar variant="spinner" size="small" isIndeterminate aria-label={waking ? 'Waking' : 'Starting'} /></span>
+          <span className="rv-pane-title">{starting.reviewer}{starting.repo && <> on {prShort(starting.repo, starting.number)}</>}</span>
+          <span className="rv-pane-state">{waking ? 'Waking' : 'Starting'}</span>
+        </div>
+        <div className="rv-pane-body chat-transcript-inner"><p className="rv-note" role="status">{starting.step ?? `${starting.reviewer} is starting…`}</p></div>
       </div>
     );
   }
@@ -140,10 +184,12 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
         <span className="chat-launcher-icon" data-kind="review" aria-hidden="true"><Icon name="preview" size="medium" /></span>
         <span className="chat-launcher-title">No review here yet</span>
         <span className="chat-launcher-sub">
-          {own?.repo && own.number != null ? <>Have a reviewer read this session's PR, {prShort(own.repo, own.number)}:</> : 'Start one from a PR\'s page, or on this session\'s PR once it has one.'}
+          {own?.repo && own.number != null ? <>Have a reviewer read this session's PR, {prShort(own.repo, own.number)}:</> : 'Have a reviewer read one of the PRs waiting on you, or this session\'s once it opens one.'}
         </span>
-        {own?.repo && own.number != null && (
+        {own?.repo && own.number != null ? (
           <ReviewMenu repo={own.repo} number={own.number} row={own} here={{ projectId: project.id, workstream }} agentOnly />
+        ) : (
+          <AppRouter><LinkButton href="/chat/reviews" variant="primary" className="rv-pick">Pick a PR to review</LinkButton></AppRouter>
         )}
       </div>
     );
@@ -175,9 +221,11 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
           <p className="rv-note">{pane.state === 'exited' ? `${pane.reviewer} exited.` : content == null ? `Reading ${pane.reviewer}'s pane…` : `${pane.reviewer} is starting…`}</p>
         )}
       </div>
-      {keys.length > 0 && (
+      {(choices.length > 0 || keys.length > 0) && (
         <div className="rv-pane-keys" role="toolbar" aria-label={`Answer ${pane.reviewer}`}>
-          {keys.map(k => <Button key={k.keys} size="small" variant={k.keys === '1' ? 'primary' : 'default'} onPress={() => { void send(k.keys, k.enter, k.literal); }}>{k.label}</Button>)}
+          {choices.map(k => <Button key={k.keys} size="small" variant={k.keys === '1' || k.keys === 'Enter' ? 'primary' : 'default'} onPress={() => { void send(k.keys, k.enter, k.literal); }}>{k.label}</Button>)}
+          {choices.length > 0 && keys.length > 0 && <span className="rv-pane-keys-sep" aria-hidden="true" />}
+          {keys.map(k => <Button key={`key-${k.keys}`} size="small" variant="default" aria-label={k.title} onPress={() => { void send(k.keys, k.enter, k.literal); }}>{k.label}</Button>)}
         </div>
       )}
       {pane.state === 'exited' && repo && (
@@ -203,7 +251,8 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
           )}
         </div>
       )}
-      <form className="rv-pane-input" onSubmit={e => { e.preventDefault(); const t = text.trim(); if (!t) return; void send(t).then(() => setText('')); }}>
+      {sendFailed && <p className="rv-note rv-send-failed" role="alert">That didn't reach {pane.reviewer}. Try it again.</p>}
+      <form className="rv-pane-input" onSubmit={e => { e.preventDefault(); const t = text.trim(); if (!t) return; void send(t).then(ok => { if (ok) setText(''); }); }}>
         <TextField aria-label={`Message ${pane.reviewer}`} value={text} onChange={setText} className="rv-pane-field">
           <Label className="chat-sr">Message {pane.reviewer}</Label>
           <Input placeholder={`Message ${pane.reviewer}…`} />
@@ -241,6 +290,136 @@ export function paneOptions(content: string | null): Array<{ n: string; text: st
   const out: Array<{ n: string; text: string }> = [];
   for (const m of run) if (!out.some(o => o.n === m[2])) out.push({ n: m[2], text: m[3].replace(/`/g, '').slice(0, 48) });
   return out;
+}
+
+// Devin's approval footer as a whole line: "↑↓ select · ↵ confirm", with
+// hints between and after in newer builds ("· ↔ scope · e edit"). One star
+// before each fixed token, so a line that fails fails in linear time.
+const ARROW_FOOTER = /^\s*↑↓\s+select\b[^↵]*·\s*↵\s+confirm\b[^↵]*$/;
+const CURSOR_ROW = /^\s*[❭❯›>]\s+(.+)$/;
+// A wrapped footer, joined: nothing but short hints ("↔ scope", "e edit",
+// "esc cancel") between dots, so a line of review text under the footer is not
+// taken for its tail. A hint starts and ends on a non-space, so the dots and
+// spaces split one way only.
+const HINT = String.raw`[^·\s](?:[^·]{0,18}[^·\s])?`;
+const WRAPPED_FOOTER = new RegExp(String.raw`^↑↓\s+select(?:\s*·\s*${HINT})*\s*·\s*↵\s+confirm(?:\s*·\s*${HINT})*$`);
+
+/**
+ * Devin's un-numbered approval list (3000.11.234: "❭ Allow ← ■□□□ → Once
+ * Exec(gh auth)" over "  Deny", then the footer), whose rows take arrows and
+ * Enter, not digits. The footer is the pane's last line, or its last two or
+ * three when a narrow pane wraps it. Offered, each one send: the cursor row
+ * (Enter), the row under it (Down, Enter), and the Allow row just above a
+ * cursor on Deny (Up, Enter). Any other row above the cursor may be the tool
+ * call it asks about, and Up from the top row could wrap. Esc cancels.
+ */
+export function arrowOptions(content: string | null): Array<{ keys: string; label: string; enter: boolean; literal: boolean }> {
+  if (!content) return [];
+  const rows = content.split('\n').map(l => stripSgr(l).trimEnd());
+  let last = rows.length - 1;
+  while (last >= 0 && !rows[last]) last--;
+  if (last < 1) return [];
+  // Where the footer starts: the last line, or up to two more when it wraps.
+  let foot = -1;
+  for (let k = last; k >= Math.max(0, last - 2) && foot < 0; k--) {
+    if (!/^\s*↑↓\s+select\b/.test(rows[k])) continue;
+    const joined = rows.slice(k, last + 1).map(r => r.trim()).join(' ');
+    if (k === last ? ARROW_FOOTER.test(joined) : WRAPPED_FOOTER.test(joined)) foot = k;
+  }
+  if (foot < 1) return [];
+  // The rows end at a blank or two over the footer, and start at the next blank up.
+  let i = foot - 1;
+  while (i >= 0 && !rows[i] && foot - i <= 2) i--;
+  const above: string[] = [];
+  for (; i >= 0 && rows[i] && above.length < 6; i--) above.unshift(rows[i]);
+  // Nearest the footer: a quoted `> …` or `❯ …` row higher up is transcript, not the list.
+  const at = above.findLastIndex(r => CURSOR_ROW.test(r));
+  if (at < 0) return [];
+  const label = (r: string) => (CURSOR_ROW.exec(r)?.[1] ?? r).replace(/←\s*[■□]+\s*→/g, ' ').replace(/`/g, '').replace(/\s+/g, ' ').trim().slice(0, 48);
+  const out = [{ keys: 'Enter', label: label(above[at]), enter: false, literal: false }];
+  if (above[at + 1]) out.push({ keys: 'Down', label: label(above[at + 1]), enter: true, literal: false });
+  if (at > 0 && /^\s*Deny\b/.test(label(above[at])) && /^\s+Allow\b/.test(above[at - 1])) {
+    out.splice(1, 0, { keys: 'Up', label: label(above[at - 1]), enter: true, literal: false });
+  }
+  out.push({ keys: 'Escape', label: 'Esc · cancel', enter: false, literal: false });
+  return out;
+}
+
+type AnswerKey = { keys: string; label: string; enter: boolean; literal: boolean };
+type SendBody = { keys: string; enter: boolean; literal: boolean };
+
+/**
+ * The send-keys route takes one send per 500 ms per caller and session
+ * (routes/sessions.ts) and refuses the rest, so the tab's sends go one at a
+ * time, this far apart: the next starts once the last is answered and the gap
+ * has passed since it started.
+ */
+export const SEND_GAP_MS = 600;
+
+/**
+ * Keys pressed twice on purpose: ↑↓ to move two rows, Esc twice to interrupt
+ * Devin, ^C twice to quit. Any other send repeated while the first is still
+ * pending is a double click, and goes once: a second "1" or Enter would answer
+ * whatever the reviewer asks next.
+ */
+const REPEATABLE = new Set(['Up', 'Down', 'Escape', 'C-c']);
+
+/**
+ * `sendOne` one at a time, `gapMs` apart; each resolves true once sent, false
+ * if it failed. A send the same as one still pending joins it, unless it's a
+ * REPEATABLE key.
+ */
+export function spacedSender(gapMs: number, sendOne: (body: SendBody) => Promise<unknown>): (body: SendBody) => Promise<boolean> {
+  let chain: Promise<unknown> = Promise.resolve();
+  let last = -Infinity;
+  const pending = new Map<string, Promise<boolean>>();
+  return body => {
+    const repeatable = !body.literal && !body.enter && REPEATABLE.has(body.keys);
+    const id = JSON.stringify([body.keys, body.enter, body.literal]);
+    const same = repeatable ? undefined : pending.get(id);
+    if (same) return same;
+    const run = chain.then(async () => {
+      const wait = last + gapMs - Date.now();
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+      last = Date.now();
+      await sendOne(body);
+      return true;
+    }).catch(() => false);
+    chain = run;
+    if (!repeatable) {
+      pending.set(id, run);
+      void run.then(() => { if (pending.get(id) === run) pending.delete(id); });
+    }
+    return run;
+  };
+}
+
+/**
+ * What the tab offers a reviewer to answer with. Its own choices while it
+ * waits, read off its list ("❯ 1. Yes (approve once)", Devin's "❭ Allow …"),
+ * else its digits. Then the chat's own key bar (quickKeys: Enter, Esc, ↑, ↓,
+ * ^C), shown when the chat's would be: while it waits, or a question is on
+ * screen the sweep hasn't read as waiting. So a prompt the choices misread
+ * can still be answered key by key, as in the session's chat and on the phone.
+ */
+export function reviewKeys(
+  state: AgentReview['state'],
+  status: AgentStatusValue,
+  content: string | null,
+  dialogOptions: number,
+  provider: string,
+): { choices: AnswerKey[]; keys: QuickKey[] } {
+  const waiting = state === 'waiting';
+  const listed = waiting ? paneOptions(content) : [];
+  const arrowed = waiting && !listed.length ? arrowOptions(content) : [];
+  const choices = !waiting ? []
+    : listed.length ? listed.map(o => ({ keys: o.n, label: `${o.n} · ${o.text}`, enter: false, literal: true }))
+    : arrowed.length ? arrowed
+    : answerDigits(provider, dialogOptions);
+  // The bar without its digits: the choices above are the reviewer's own.
+  const keys = state !== 'exited' && showAnswerKeys(status, dialogOptions) ? quickKeys(null, undefined, null) : [];
+  // Its Esc cancels as the list's own "Esc · cancel" would, so that one goes.
+  return { choices: keys.length ? choices.filter(c => c.keys !== 'Escape') : choices, keys };
 }
 
 /**

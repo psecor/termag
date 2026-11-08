@@ -7,13 +7,12 @@ import type { Project } from '../../types';
 import { ChatChromeProvider, SidePanelButton, type ChatChrome } from './chatChrome';
 import { SessionHeader, type SessionHeaderProps } from './SessionHeader';
 
-const mocks = vi.hoisted(() => ({ titles: true }));
 vi.mock('../../flags', async () => {
   const actual = await vi.importActual<typeof import('../../flags')>('../../flags');
-  return { ...actual, useFlag: <T,>(key: string, fallback: T) => (key === 'simple-ui-session-titles-enabled' ? mocks.titles as T : fallback) };
+  return { ...actual, useFlag: <T,>(_key: string, fallback: T) => fallback };
 });
 vi.mock('../../chat/useChatSpaces', () => ({
-  useSharedChatSpaces: () => ({ enabled: true, loaded: true, current: true, spaces: [{ id: 's-notes', name: 'notes' }], index: new Map([['box-1', ['notes']]]), colorOf: () => '#888888' }),
+  useSharedChatSpaces: () => ({ loaded: true, current: true, spaces: [{ id: 's-notes', name: 'notes' }], index: new Map([['box-1', ['notes']]]), colorOf: () => '#888888' }),
 }));
 vi.mock('../../components/BoxPill', () => ({ BoxPill: ({ label }: { label: string }) => <span className="box-pill">{label}</span> }));
 
@@ -32,7 +31,6 @@ beforeEach(() => {
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
-  mocks.titles = true;
 });
 
 afterEach(() => {
@@ -63,13 +61,6 @@ describe('SessionHeader', () => {
     expect(host.querySelector('.chat-title-project')?.textContent).toBe('webapp');
     expect(host.querySelector('.chat-header-actions .box-pill')?.textContent).toBe('box-2');
     expect(host.textContent).not.toMatch(/\$|total/);
-  });
-
-  it('names the project when session titles are off, with no chip', () => {
-    mocks.titles = false;
-    show();
-    expect(host.querySelector('.chat-title-name')?.textContent).toBe('webapp');
-    expect(host.querySelector('.chat-title-project')).toBeNull();
   });
 
   it('shows a Working pill only during a turn', () => {

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Link, NavLink, Navigate, Route, Routes } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import type { AdminRange } from '../services/adminApi';
+import { TableReset } from './admin/DataTable';
 import { RangePicker } from './dashboard/RangePicker';
 import { AdminOverview } from './admin/AdminOverview';
 import { AdminFleet } from './admin/AdminFleet';
@@ -66,6 +67,8 @@ export default function Admin() {
             {TABS.map(t => <NavLink key={t.to} to={t.to} end={t.end}>{t.label}{t.to === '/admin/bugs' && <BugsBadge />}</NavLink>)}
           </nav>
         </header>
+        {/* The range picker changes the rows of most tabs' tables: every DataTable goes back to page 1. */}
+        <TableReset value={range}>
         <Routes>
           <Route index element={<><RangePicker value={range} onChange={setRange} /><AdminOverview range={range} now={now} /></>} />
           <Route path="fleet" element={<><RangePicker value={range} onChange={setRange} /><AdminFleet range={range} now={now} /></>} />
@@ -84,6 +87,7 @@ export default function Admin() {
           {/* Absolute, like TABS: with v7 path resolution "." inside this splat is the unknown URL itself. */}
           <Route path="*" element={<Navigate to="/admin" replace />} />
         </Routes>
+        </TableReset>
         <footer className="dash-footer usage-dim">
           Aggregates and metadata only; no terminal contents. Token days are UTC, working-time days are server-local. Every view here is audited.
         </footer>

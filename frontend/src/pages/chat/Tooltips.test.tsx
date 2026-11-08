@@ -21,12 +21,12 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-async function render(titles: boolean) {
+async function render() {
   await act(async () => root.render(
     <div className="chat-root">
       <span className="state" title="Asked you a question">Asked you a question</span>
       <button type="button" className="tipped" data-tip="Refresh">↻</button>
-      <Tooltips titles={titles} />
+      <Tooltips />
     </div>,
   ));
 }
@@ -37,17 +37,8 @@ const hover = (sel: string) => act(() => {
 const bubble = () => document.querySelector('.chat-tip')?.textContent ?? null;
 
 describe('Tooltips', () => {
-  it('leaves every title to the browser without titles, as on main, and still shows data-tip', async () => {
-    await render(false);
-    hover('.state');
-    expect(bubble()).toBeNull();
-    expect(host.querySelector('.state')!.getAttribute('title')).toBe('Asked you a question');
-    hover('.tipped');
-    expect(bubble()).toBe('Refresh');
-  });
-
-  it('moves a title to its bubble with titles', async () => {
-    await render(true);
+  it('moves a title to its bubble', async () => {
+    await render();
     hover('.state');
     expect(bubble()).toBe('Asked you a question');
     expect(host.querySelector('.state')!.hasAttribute('title')).toBe(false);
@@ -58,7 +49,7 @@ describe('Tooltips', () => {
       <div className="chat-root">
         <ul className="sidebar"><li><button type="button" className="tipped" data-tip="Options for notes">⋮</button></li></ul>
         <div className="chat-transcript"><p>step 1</p></div>
-        <Tooltips titles />
+        <Tooltips />
       </div>,
     ));
     hover('.tipped');

@@ -33,7 +33,7 @@ export function AdminSystem({ now }: { now: number }) {
     { id: 'overrides', label: 'from the flag', value: r => r.overrides.length, render: r => r.overrides.length ? r.overrides.join(', ') : <span className="usage-dim">defaults</span> },
   ];
   const cols: Column<SystemHealth['db']['tables'][number]>[] = [
-    { id: 'table', label: 'table', value: r => r.table },
+    { id: 'table', label: 'table', value: r => r.table, render: r => <span className="admin-mono">{r.table}</span> },
     { id: 'rows', label: 'rows (est.)', value: r => r.rows, align: 'right', render: r => r.rows.toLocaleString() },
     { id: 'bytes', label: 'size', value: r => r.bytes, align: 'right', render: r => fmtBytes(r.bytes) },
   ];
@@ -45,13 +45,13 @@ export function AdminSystem({ now }: { now: number }) {
             ['uptime', `${fmtDurationShort(s.process.uptimeS * 1000)} · started ${fmtAgo(s.process.startedAt, now)}`],
             ['memory', `${s.process.rssMb} MB rss · ${s.process.heapUsedMb} MB heap`],
             ['auth mode', `${s.process.authMode}${s.process.localSessions ? '' : ' · local sessions disabled'}`],
-            ['commit', s.process.commit ?? 'not recorded'],
+            ['commit', s.process.commit ? <span className="admin-mono">{s.process.commit}</span> : 'not recorded'],
             ['agents', `${s.agents.connected} connected (${s.agents.boxes} boxes, ${s.agents.legacy} orchestrator)`],
             ...(s.agents.tokenForms ? [['agent token in URL', agentTokenFormsText(s.agents.tokenForms)] as [string, string]] : []),
             ['status map', <><Counts counts={s.statusMap.byStatus} /> <span className="usage-dim">· {s.statusMap.sessions} sessions, {s.statusMap.note}</span></>],
             ['box updates', <>
               target {s.boxUpdates.targetCommit ? <span className="admin-mono">{s.boxUpdates.targetCommit.slice(0, 12)}</span> : 'unknown'}{s.boxUpdates.targetImageCreatedAt ? ` (baked ${fmtAgo(s.boxUpdates.targetImageCreatedAt, now)})` : ''} · {s.boxUpdates.pushedThisProcess} pushed since start · last sweep {fmtAgo(s.boxUpdates.lastSweepAt, now)}
-              <br /><span className="usage-dim">boxes by their latest report, last day: {Object.keys(s.boxUpdates.boxesByLastOutcome24h ?? {}).length ? <Counts counts={s.boxUpdates.boxesByLastOutcome24h} /> : 'none'} · flag {s.boxUpdates.flag}</span>
+              <br /><span className="usage-dim">boxes by their latest report, last day: {Object.keys(s.boxUpdates.boxesByLastOutcome24h ?? {}).length ? <Counts counts={s.boxUpdates.boxesByLastOutcome24h} /> : 'none'} · flag <span className="admin-mono">{s.boxUpdates.flag}</span></span>
             </>],
             ['usage scans', `${s.usageScans.hosts} hosts · ${s.usageScans.failing} failing · ${s.usageScans.schema1Hosts} old agents · last ${fmtAgo(s.usageScans.lastScanAt, now)}`],
           ]} />}
@@ -71,7 +71,7 @@ export function AdminSystem({ now }: { now: number }) {
         <div className="usage-dim dash-card-note">Set them with the <span className="admin-mono">{sl?.flag.key ?? 'agent-spawn-limits'}</span> flag in <span className="admin-mono">TERMAG_FLAGS</span>. Hot-box thresholds and the park and retire timings come from the same flag.</div>
       </ChartCard>
       <div className="usage-dim dash-card-note">
-        Working time in flight is lost when the process restarts; the status map and usage-scan health are rebuilt from scratch. Phase 1 persists both.
+        Working time in flight is lost when the process restarts; the status map and usage-scan health are rebuilt from scratch. A later phase persists both.
       </div>
     </>
   );

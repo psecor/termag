@@ -1,4 +1,4 @@
-// What a new tab lists in its main pane (simple-ui-side-panel-enabled, beside the
+// What a new tab lists in its main pane (beside the
 // panel's Files): the space's files and agents the person had open, most
 // recently opened first, then the space's other agents, most recently active
 // first. Picking one shows it in that tab. An agent is the space's when it

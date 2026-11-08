@@ -1,15 +1,27 @@
 // Asks in an SDK chat: another agent,
-// like a subagent, but Claude sends it from Bash with `termag ask`, so a call
-// is a Bash tool item whose command runs it. What the call printed names the
-// ask's thread and message; how the ask is doing comes from
-// GET …/chat/asks (ChatAskThread). Pure, for the tests.
+// like a subagent, but the chat's agent sends it from Bash with `termag ask`,
+// so a call is a Bash tool item whose command runs it. What the call printed
+// names the ask's thread and message; how the ask is doing comes from
+// GET …/chat/asks (ChatAskThread). The words name the chat's agent
+// (askAgentName). Pure, for the tests.
 import type { ChatItem } from './sdkChat';
+import { PROVIDERS } from '../providers/registry';
 
 type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
 
 /** A message's reply, as the orchestrator says what became of it (backend services/chatAsks.ts). */
 // `stored`: nobody has read it yet, and `termag ask --reply` can for 14 days.
 export type ChatAskReply = 'pending' | 'delivered' | 'stored' | 'dropped' | 'none' | 'follow-up';
+
+/**
+ * Whether the session that sent a message is told when it finishes, by a
+ * "[termag] Your ask … finished" notice in its chat or agent pane (backend
+ * services/chatAsks.ts noticeState). `due`: it will be. `sent`: it was.
+ * `none`: nothing tells it (`--no-notify`, no checked sender,
+ * ask-completion-notify-enabled off, or a poll got the finish). `unsent`: one
+ * was due and did not go.
+ */
+export type ChatAskNotice = 'due' | 'sent' | 'none' | 'unsent';
 
 export interface ChatAskMessage {
   id: string;
@@ -18,6 +30,7 @@ export interface ChatAskMessage {
   queued: boolean;
   error: string | null;
   reply: ChatAskReply;
+  notice: ChatAskNotice;
   supersededBy: string | null;
   publish: { status: string; detail: string | null } | null;
   createdAt: string;
@@ -180,6 +193,9 @@ export function askCallsOf(items: readonly ChatItem[]): Map<string, AskCall> {
   return out;
 }
 
+/** At most this many thread ids in one read of GET …/chat/asks (the orchestrator's MAX_CHAT_ASK_THREADS; more is a 400). */
+export const MAX_ASK_THREAD_IDS = 50;
+
 /** The threads the calls name: what they sent, and what they followed up on. */
 export function askThreadIds(calls: Iterable<AskCall>): string[] {
   const ids = new Set<string>();
@@ -230,12 +246,14 @@ export type AskState = 'queued' | 'starting' | 'working' | 'done' | 'failed' | '
 export const isAskActive = (s: AskState) => s === 'queued' || s === 'starting' || s === 'working';
 
 /**
- * Who is waiting for an ask's reply. `claude`: a call in the session still
+ * Who is waiting for an ask's reply. `agent`: a call in the session still
  * waits for it (a plain `termag ask`, in the foreground or the background, or a
- * `--reply`). `nobody`: it was sent with `--no-wait` and nothing waits again,
- * so its reply goes to nobody; the answer is in its own session.
+ * `--reply`), so the chat's agent reads it when it returns. `nobody`: no call
+ * does, as for one sent with `--no-wait`. The reply is kept either way
+ * (`termag ask --reply` reads it for 14 days), and the view's `notice` says
+ * whether termag tells the chat when it finishes, so its agent reads it then.
  */
-export type AskWaiting = 'claude' | 'nobody';
+export type AskWaiting = 'agent' | 'nobody';
 
 export interface AskView {
   thread: string;
@@ -249,13 +267,17 @@ export interface AskView {
   startedAt: string | null;
   completedAt: string | null;
   waiting: AskWaiting;
-  /** Its newest turn was sent with `--no-wait`: nobody was ever going to get the reply. */
+  /** Its newest turn was sent with `--no-wait`: no call in the chat waits for the reply. */
   noWait: boolean;
   /** What became of its newest turn's reply. */
   reply: ChatAskReply;
+  /** Whether termag tells the chat when its newest turn finishes. */
+  notice: ChatAskNotice;
   prs: ChatAskThread['prs'];
   /** The orchestrator has answered for it: until then it is only what the call printed. */
   known: boolean;
+  /** The chat draws no row for it in its transcript (a pane chat, paneAskViews), so its tab has no "Show in chat". */
+  noRow?: boolean;
 }
 
 /** The turn a thread's state is: its newest message that a follow-up didn't join. */
@@ -301,32 +323,78 @@ export function askViews(calls: ReadonlyMap<string, AskCall>, byCall: ReadonlyMa
       if (out.has(th)) continue;
       out.set(th, {
         thread: th, title: '', target: null, chat: null, state: c.rejected ? 'failed' : 'starting', turns: 1, error: c.rejected,
-        startedAt: null, completedAt: null, waiting: 'nobody', noWait: false, reply: 'pending', prs: [], known: false,
+        startedAt: null, completedAt: null, waiting: 'nobody', noWait: false, reply: 'pending', notice: 'none', prs: [], known: false,
       });
     }
   }
   for (const [th, v] of out) {
-    const t = threads.get(th);
-    const m = t ? newest(t) : null;
-    v.title = t?.title?.trim() || titles.get(th) || `ask-${th}`;
-    v.target = t?.target ?? targets.get(th) ?? null;
-    v.chat = t?.chat ?? null;
-    v.prs = t?.prs ?? [];
-    v.known = Boolean(t);
-    if (t && m) {
-      v.state = stateOf(m);
-      v.turns = Math.max(1, t.messages.length);
-      v.error = m.error;
-      v.startedAt = m.startedAt ?? m.createdAt;
-      v.completedAt = m.completedAt;
-      v.reply = m.reply;
-    }
+    fromThread(v, threads.get(th), titles.get(th), targets.get(th));
     // A call still running waits for the reply, even once the ask has ended: until it returns, the reply
     // may only be on its way (the route says `dropped` until a poll reads it), so nothing says it went to nobody.
-    v.waiting = waits.has(th) ? 'claude' : 'nobody';
+    v.waiting = waits.has(th) ? 'agent' : 'nobody';
     v.noWait = noWaits.get(th) ?? false;
   }
   return out;
+}
+
+/** A view's fields as its thread has them, once the orchestrator has answered for it; else what the calls said. */
+function fromThread(v: AskView, t: ChatAskThread | undefined, title: string | undefined, target: string | undefined): void {
+  const m = t ? newest(t) : null;
+  v.title = t?.title?.trim() || title || `ask-${v.thread}`;
+  v.target = t?.target ?? target ?? null;
+  v.chat = t?.chat ?? null;
+  v.prs = t?.prs ?? [];
+  v.known = Boolean(t);
+  if (t && m) {
+    v.state = stateOf(m);
+    v.turns = Math.max(1, t.messages.length);
+    v.error = m.error;
+    v.startedAt = m.startedAt ?? m.createdAt;
+    v.completedAt = m.completedAt;
+    v.reply = m.reply;
+    v.notice = m.notice ?? 'none';
+  }
+}
+
+/**
+ * One view per thread a pane chat sent (ChatView.tsx), oldest first: there,
+ * the chat is a captured tmux pane with no Bash calls to read, so the asks are
+ * the threads the orchestrator recorded the pane as sending (GET …/chat/asks
+ * by parent alone) and nothing else. Nothing says whether a command in the
+ * pane still waits for a reply, so `waiting` is `nobody`, and the words go by
+ * the finish notice and what became of the reply (askWaitingText): a pane is
+ * told when its ask finishes, and a waiting `termag ask` that read the reply
+ * leaves it `delivered`.
+ */
+export function paneAskViews(threads: ReadonlyMap<string, ChatAskThread>): Map<string, AskView> {
+  const out = new Map<string, AskView>();
+  const byAge = [...threads.values()].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  for (const t of byAge) {
+    const v: AskView = {
+      thread: t.id, title: '', target: null, chat: null, state: 'starting', turns: 1, error: null,
+      startedAt: null, completedAt: null, waiting: 'nobody', noWait: false, reply: 'pending', notice: 'none', prs: [], known: true, noRow: true,
+    };
+    fromThread(v, t, undefined, undefined);
+    out.set(t.id, v);
+  }
+  return out;
+}
+
+/** How long a pane chat keeps an ask in view after it ends (paneKeptAsks); the orchestrator's ASK_KEPT_AFTER_END_MS answers one past its newest 50 as long. */
+export const PANE_ASK_KEEP_MS = 60 * 60 * 1000;
+
+/**
+ * The asks a pane chat keeps in view (the drawer on its composer): any still
+ * going, and those that ended in the last PANE_ASK_KEEP_MS. A pane's
+ * transcript has no row for an ask, so the drawer is the only way to one, and
+ * an hour keeps a fan-out's answers there while someone reads them.
+ */
+export function paneKeptAsks(views: ReadonlyMap<string, AskView>, now: number): AskView[] {
+  return [...views.values()].filter(v => {
+    if (isAskActive(v.state)) return true;
+    const end = Date.parse(v.completedAt ?? v.startedAt ?? '');
+    return Number.isFinite(end) && now - end <= PANE_ASK_KEEP_MS;
+  });
 }
 
 /** "<1s", "12s", "3m 5s", "1h 2m". */
@@ -356,17 +424,82 @@ export function askLine(v: Pick<AskView, 'state' | 'startedAt' | 'completedAt' |
   }
 }
 
+/** A finished message whose notice is due is read at the chat's poll this long after it finished (the sweep's grace and its first ticks). */
+export const NOTICE_POLL_FAST_FOR_MS = 2 * 60 * 1000;
+/** After that, once a minute: a pane is told only once its agent is idle. */
+export const NOTICE_POLL_SLOW_MS = 60 * 1000;
+/** And not past a day after it finished, when the sweep gives up (backend askNotice.ts NOTICE_GIVE_UP_MS). */
+export const NOTICE_POLL_GIVE_UP_MS = 24 * 60 * 60 * 1000;
+
 /**
- * Whether Claude is waiting for the reply, said plainly: an ask sent with
- * `--no-wait` must read as one nobody is waiting on, so it is never mistaken
- * for a subagent whose report comes back to the chat.
+ * How long until the asks are read again for a finished message whose notice
+ * is still due, so the words change once the notice is sent: `fastMs` (the
+ * chat's poll) at first, then NOTICE_POLL_SLOW_MS, until the sweep's day is
+ * up; null when no finished message waits on its notice. A message still
+ * going is read by the chat's own poll.
  */
-export function askWaitingText(v: Pick<AskView, 'state' | 'waiting' | 'reply'>): string | null {
-  if (isAskActive(v.state)) return v.waiting === 'claude' ? 'Claude is waiting' : 'Claude isn’t waiting for a reply';
-  if (v.reply === 'delivered') return 'Returned to Claude';
-  if (v.waiting === 'claude') return null;
-  if (v.reply === 'dropped' || v.state === 'done') return 'Not sent back to Claude';
+export function askNoticePollMs(threads: Iterable<ChatAskThread>, now: number, fastMs: number): number | null {
+  let wait: number | null = null;
+  for (const t of threads) {
+    for (const m of t.messages) {
+      if (m.notice !== 'due' || m.status === 'submitted' || m.status === 'working' || !m.completedAt) continue;
+      const age = now - Date.parse(m.completedAt);
+      if (!(age <= NOTICE_POLL_GIVE_UP_MS)) continue;
+      const ms = age <= NOTICE_POLL_FAST_FOR_MS ? fastMs : NOTICE_POLL_SLOW_MS;
+      wait = wait == null ? ms : Math.min(wait, ms);
+    }
+  }
+  return wait;
+}
+
+/** What the words call the chat's agent when its provider is unknown. */
+export const UNKNOWN_AGENT = 'the agent';
+
+/**
+ * What the ask words call the agent of the chat that sent them: its
+ * provider's display name in the registry (providers/registry.ts), without
+ * the " (chat)" that tells a chat-runner provider from its pane one ("Claude"
+ * for both `claude` and `claude-chat`), or "the agent" for no provider or one
+ * the registry doesn't have.
+ */
+export function askAgentName(provider: string | null | undefined): string {
+  const name = provider ? PROVIDERS[provider]?.displayName : undefined;
+  return name ? name.replace(/\s*\(chat\)$/, '') : UNKNOWN_AGENT;
+}
+
+/** `agent` to start a sentence: "the agent" takes a capital, a name keeps its own. */
+export const capitalized = (agent: string) => agent.charAt(0).toUpperCase() + agent.slice(1);
+
+/** termag tells the chat when the ask finishes, or has: its agent reads the reply then. */
+export const askTold = (v: Pick<AskView, 'notice'>) => v.notice === 'due' || v.notice === 'sent';
+
+/**
+ * Whether the chat's agent (`agent`, askAgentName) gets the reply, said
+ * plainly: a call waiting for it, a
+ * finish notice that tells the chat (so the agent reads it then), or neither,
+ * when an ask sent with `--no-wait` must read as one nobody is waiting on, so
+ * it is never mistaken for a subagent whose report comes back to the chat.
+ */
+export function askWaitingText(v: Pick<AskView, 'state' | 'waiting' | 'reply'> & Partial<Pick<AskView, 'notice' | 'noRow'>>, agent: string): string | null {
+  const notice = v.notice ?? 'none';
+  const Agent = capitalized(agent);
+  if (isAskActive(v.state)) {
+    if (v.waiting === 'agent') return `${Agent} is waiting`;
+    if (notice === 'due') return `${Agent} is told when it finishes`;
+    // A pane chat's ask (paneAskViews): no call to read, so nothing says whether a command there waits.
+    return v.noRow ? null : `${Agent} isn’t waiting for a reply`;
+  }
+  if (v.reply === 'delivered') return `Returned to ${agent}`;
+  if (v.waiting === 'agent') return null;
+  if (notice === 'sent') return `${Agent} was told it ${v.state === 'done' ? 'finished' : 'ended'}`;
+  if (notice === 'due') return `Telling ${agent} it ${v.state === 'done' ? 'finished' : 'ended'}`;
+  if (v.reply === 'dropped' || v.state === 'done') return `Not sent back to ${agent}`;
   return null;
+}
+
+/** A lead mid-line: lower-cased, except where it starts with the agent's own name ("Codex is waiting"). */
+export function midLine(text: string, agent: string): string {
+  return agent !== UNKNOWN_AGENT && text.startsWith(agent) ? text : text.charAt(0).toLowerCase() + text.slice(1);
 }
 
 /** How a list of asks stands: "2 working · 1 done", "3 done", "2 done · 1 failed". */
@@ -390,7 +523,7 @@ export function targetBox(target: string | null): string | null {
  * The asks to keep in view (the context card's Asks, the drawer above the
  * composer): any still going, and those the chat's calls named since the
  * last message sent. An ask outlives the turn that sent it, so a --no-wait
- * fan-out stays in view after Claude's turn ends, until it finishes.
+ * fan-out stays in view after the agent's turn ends, until it finishes.
  */
 export function recentAsks(items: readonly ChatItem[], byCall: ReadonlyMap<string, string[]>, views: ReadonlyMap<string, AskView>): AskView[] {
   let last = -1;
@@ -399,8 +532,8 @@ export function recentAsks(items: readonly ChatItem[], byCall: ReadonlyMap<strin
   return [...views.values()].filter(v => isAskActive(v.state) || since.has(v.thread));
 }
 
-/** What a kept-in-view row says under its name: where the ask is, and whether Claude is waiting ("Working · Claude isn't waiting"). */
-export function askRowSub(v: Pick<AskView, 'state' | 'waiting' | 'reply' | 'turns' | 'error' | 'target'>): string {
+/** What a kept-in-view row says under its name: where the ask is, and whether the chat's agent is waiting ("Working · Codex isn't waiting for a reply"). */
+export function askRowSub(v: Pick<AskView, 'state' | 'waiting' | 'reply' | 'turns' | 'error' | 'target'> & Partial<Pick<AskView, 'notice' | 'noRow'>>, agent: string): string {
   const box = targetBox(v.target);
   const where = v.state === 'queued' ? 'Queued'
     : v.state === 'starting' ? (box ? `Starting on ${box}` : 'Starting')
@@ -408,9 +541,8 @@ export function askRowSub(v: Pick<AskView, 'state' | 'waiting' | 'reply' | 'turn
     : v.state === 'done' ? 'Finished'
     : v.state === 'canceled' ? 'Canceled'
     : v.error ? `Failed: ${v.error}` : 'Failed';
-  // Mid-line, "Not sent back to Claude" reads as "not sent back to Claude"; Claude keeps its capital.
-  const waiting = askWaitingText(v);
-  const said = waiting && !waiting.startsWith('Claude') ? waiting.charAt(0).toLowerCase() + waiting.slice(1) : waiting;
+  const waiting = askWaitingText(v, agent);
+  const said = waiting && midLine(waiting, agent);
   return [where, v.turns > 1 ? `${v.turns} turns` : null, said].filter(Boolean).join(' · ');
 }
 

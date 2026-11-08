@@ -9,15 +9,24 @@ const mocks = vi.hoisted(() => ({
   list: vi.fn(), add: vi.fn(), remove: vi.fn(), credentials: vi.fn(),
   navigate: vi.fn(), setOnboarded: vi.fn(),
   user: { email: 'owner@example.com' },
+  mcpList: vi.fn(), connectCatalog: vi.fn(), startOAuth: vi.fn(),
+  search: '',
+  // onboarding-mcp-step-enabled.
+  mcpStep: false,
+}));
+vi.mock('../flags', async importOriginal => ({
+  ...(await importOriginal<typeof import('../flags')>()),
+  useFlag: (key: string, fallback: unknown) => (key === 'onboarding-mcp-step-enabled' ? mocks.mcpStep : fallback),
 }));
 vi.mock('../services/api', () => ({
   sshKeysApi: { list: mocks.list, add: mocks.add, remove: mocks.remove },
   credentialsApi: { get: mocks.credentials },
+  mcpConnectorsApi: { list: mocks.mcpList, connectCatalog: mocks.connectCatalog, startOAuth: mocks.startOAuth },
 }));
 vi.mock('../contexts/AuthContext', () => ({
   useAuth: () => ({ user: mocks.user, setOnboarded: mocks.setOnboarded }),
 }));
-vi.mock('react-router-dom', () => ({ useNavigate: () => mocks.navigate }));
+vi.mock('react-router-dom', () => ({ useNavigate: () => mocks.navigate, useLocation: () => ({ search: mocks.search }) }));
 vi.mock('../services/boxFeed', () => ({ boxFeed: { start: vi.fn(), stop: vi.fn() } }));
 vi.mock('./settings/GithubCredential', () => ({ GithubCredential: () => <div>GitHub settings</div> }));
 vi.mock('./settings/DotfilesSection', () => ({ DotfilesSection: () => <div>Dotfiles settings</div> }));
@@ -33,6 +42,12 @@ const savedKey = {
 };
 let root: Root;
 let container: HTMLDivElement;
+const ACME = { name: 'acme', upstream: 'https://mcp.acme.example/mcp' };
+const mcpPage = (over: object) => ({ available: true, storeAvailable: true, connectors: [], catalog: [], ...over });
+const acmeConnector = {
+  id: 'c1', name: 'acme', upstream: ACME.upstream, authType: 'oauth', headers: {}, secretNames: [], missingSecrets: [],
+  brokerUrl: null, updatedAt: '2026-11-04T00:00:00Z', linkStatus: 'linked', linkError: null, oauth: null,
+};
 
 function button(label: string): HTMLButtonElement {
   const found = [...document.querySelectorAll('button')].find(b => b.textContent?.trim() === label);
@@ -66,6 +81,9 @@ beforeEach(async () => {
   mocks.add.mockResolvedValue(savedKey);
   mocks.credentials.mockResolvedValue({ github: { boxGate: 'clear' } });
   mocks.setOnboarded.mockResolvedValue(undefined);
+  mocks.mcpList.mockResolvedValue(mcpPage({}));
+  mocks.search = '';
+  mocks.mcpStep = false;
   container = document.createElement('div');
   document.body.append(container);
   root = createRoot(container);
@@ -316,5 +334,141 @@ describe('shared SSH key form', () => {
       await act(async () => { input().form!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); });
       expect(mocks.add).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe('wizard MCP servers step', () => {
+  // Renders the wizard again with the MCP list, the URL's query and the flag set first.
+  async function rerender(list: object, search = '', flag = true) {
+    await act(async () => { root.unmount(); });
+    mocks.mcpList.mockResolvedValue(list);
+    mocks.search = search;
+    mocks.mcpStep = flag;
+    root = createRoot(container);
+    await act(async () => { root.render(<Welcome />); });
+  }
+  const stepTitles = () => [...document.querySelectorAll('.wiz-step-t')].map(e => e.textContent);
+  const available = () => document.querySelector('[aria-label="Available to connect"]');
+
+  it('has no MCP step with onboarding-mcp-step-enabled off, even when the catalog offers a server', async () => {
+    await rerender(mcpPage({ catalog: [ACME] }), '', false);
+    expect(stepTitles()).toEqual(['Your laptop SSH key', 'GitHub', 'Dotfiles', 'Your first box and project']);
+    expect(mocks.mcpList).not.toHaveBeenCalled();
+    // A sign-in's return to ?step=mcp opens on the first step, as without the step.
+    await rerender(mcpPage({ catalog: [ACME] }), '?step=mcp&server=c1&linked=1', false);
+    expect(stepTitles()).not.toContain('MCP servers');
+    expect(stepTitle()).toContain('Your laptop SSH key');
+  });
+
+  it('has no MCP step when the catalog is empty (mcp-default-connectors off or [])', async () => {
+    await rerender(mcpPage({}));
+    expect(stepTitles()).toEqual(['Your laptop SSH key', 'GitHub', 'Dotfiles', 'Your first box and project']);
+    await rerender(mcpPage({ catalog: undefined }));
+    expect(stepTitles()).not.toContain('MCP servers');
+  });
+
+  it('has no MCP step when the catalog offers only API providers, which are not MCP servers', async () => {
+    await rerender(mcpPage({ catalog: [{ name: 'google', upstream: 'https://www.googleapis.com', kind: 'api' }] }));
+    expect(stepTitles()).not.toContain('MCP servers');
+  });
+
+  it('does not mark the MCP step done when it arrives after the person has moved past it', async () => {
+    await act(async () => { root.unmount(); });
+    const list = deferred<object>();
+    mocks.mcpList.mockReturnValue(list.promise);
+    mocks.mcpStep = true;
+    root = createRoot(container);
+    await act(async () => { root.render(<Welcome />); });
+    // The Project tab, before GET /api/mcp-connectors answers.
+    await click([...document.querySelectorAll<HTMLButtonElement>('.wiz-steps button')][3]);
+    expect(stepTitle()).toContain('Your first box and project');
+    await act(async () => { list.resolve(mcpPage({ catalog: [ACME] })); });
+    const mcpTab = [...document.querySelectorAll('.wiz-step')].find(li => li.textContent?.includes('MCP servers'))!;
+    expect(mcpTab.classList.contains('is-done')).toBe(false);
+    expect(mcpTab.querySelector('.wiz-step-n')?.textContent).toBe('4');
+    expect(stepTitle()).toBe('Step 5 of 5: Your first box and project');
+  });
+
+  it('says so with a Retry when the list fails on the return from a sign-in, rather than loading forever', async () => {
+    await act(async () => { root.unmount(); });
+    mocks.mcpList.mockRejectedValueOnce({ response: { data: { error: 'network down' } } });
+    mocks.mcpList.mockResolvedValue(mcpPage({ connectors: [acmeConnector] }));
+    mocks.search = '?step=mcp&server=c1&linked=1';
+    mocks.mcpStep = true;
+    Element.prototype.scrollIntoView = vi.fn();
+    root = createRoot(container);
+    await act(async () => { root.render(<Welcome />); });
+    expect(stepTitle()).toContain('MCP servers');
+    expect(document.body.textContent).not.toContain('Loading…');
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('network down');
+    await click(button('Retry'));
+    expect(mocks.mcpList).toHaveBeenCalledTimes(2);
+    expect(document.querySelector('[aria-label="Your servers"]')?.textContent).toContain('acme');
+  });
+
+  it('warns that boxes don\'t get the servers when the orchestrator has no MCP broker, and doesn\'t promise agents can use one', async () => {
+    await rerender(mcpPage({ available: false, connectors: [acmeConnector], catalog: [ACME] }), '?step=mcp&server=c1&linked=1');
+    expect(document.body.textContent).toContain("No MCP broker is set up on this orchestrator yet, so boxes don't get these servers.");
+    expect(document.body.textContent).not.toContain('Your agents can use it now');
+  });
+
+  it('has no MCP step when the list cannot be loaded', async () => {
+    await act(async () => { root.unmount(); });
+    mocks.mcpList.mockRejectedValue(new Error('down'));
+    mocks.mcpStep = true;
+    root = createRoot(container);
+    await act(async () => { root.render(<Welcome />); });
+    expect(stepTitles()).not.toContain('MCP servers');
+    expect(stepTitle()).toContain('Your laptop SSH key');
+  });
+
+  it('shows the step between Dotfiles and Project with the flag on and a server in the catalog, with its Connect', async () => {
+    await rerender(mcpPage({ catalog: [ACME] }));
+    expect(stepTitles()).toEqual(['Your laptop SSH key', 'GitHub', 'Dotfiles', 'MCP servers', 'Your first box and project']);
+    await click([...document.querySelectorAll<HTMLButtonElement>('.wiz-steps button')][3]);
+    expect(stepTitle()).toBe('Step 4 of 5: MCP servers');
+    expect(available()?.textContent).toContain('acme');
+    expect(document.body.textContent).toContain('Optional. You can finish it later in Settings.');
+    await click(button('Next'));
+    expect(stepTitle()).toContain('Your first box and project');
+  });
+
+  it('starts the sign-in with returnTo welcome, so the callback comes back here', async () => {
+    const assign = vi.fn();
+    vi.stubGlobal('location', { ...window.location, assign });
+    try {
+      await rerender(mcpPage({ catalog: [ACME] }), '?step=mcp');
+      mocks.connectCatalog.mockResolvedValue({ id: 'c1', authorizeUrl: 'https://auth.acme.example/authorize', connector: { ...acmeConnector, linkStatus: 'needs_link' } });
+      await click([...available()!.querySelectorAll('button')].find(b => b.textContent === 'Connect')!);
+      expect(mocks.connectCatalog).toHaveBeenCalledWith('acme', { chooseScopes: true, returnTo: 'welcome' });
+      expect(assign).toHaveBeenCalledWith('https://auth.acme.example/authorize');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('reopens on the MCP step after a sign-in, with that server connected, even once the catalog is empty', async () => {
+    // The returned server's row scrolls into view; jsdom has no layout.
+    Element.prototype.scrollIntoView = vi.fn();
+    await rerender(mcpPage({ connectors: [acmeConnector] }), '?step=mcp&server=c1&linked=1');
+    expect(stepTitle()).toBe('Step 4 of 5: MCP servers');
+    expect(document.querySelector('[role="status"]')?.textContent).toContain('acme is connected.');
+    const yours = document.querySelector('[aria-label="Your servers"]');
+    expect(yours?.textContent).toContain('acme');
+    expect(yours?.textContent).toContain('Re-link');
+    expect(available()).toBeNull();
+  });
+
+  it('shows a sign-in error on the step', async () => {
+    await rerender(mcpPage({ catalog: [ACME] }), '?step=mcp&server=c1&error=The+server+did+not+grant+access');
+    expect(stepTitle()).toContain('MCP servers');
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('The server did not grant access');
+  });
+
+  it('keeps Skip setup working from the MCP step', async () => {
+    await rerender(mcpPage({ catalog: [ACME] }), '?step=mcp');
+    await click(button('Skip setup'));
+    expect(mocks.setOnboarded).toHaveBeenCalledWith(true);
+    expect(mocks.navigate).toHaveBeenCalledWith('/', { replace: true });
   });
 });

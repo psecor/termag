@@ -35,6 +35,12 @@
 .chat-root[data-chrome='refresh'] .rv-title-icon[data-icon] { fill: var(--text-secondary); margin-right: 8px; }
 .chat-root[data-chrome='refresh'] .rv-queue { max-width: 880px; margin: 0 auto; padding: 4px 24px 48px; }
 .chat-root[data-chrome='refresh'] .rv-note { color: var(--text-secondary); font-size: 13.5px; padding: 18px 12px 0; margin: 0; }
+/* The page a review on a repository with no project waits on (ReviewCloneStart): one step at a time, centred. */
+.chat-root[data-chrome='refresh'] .rv-clone-start { max-width: 560px; margin: 48px auto 0; text-align: center; }
+.chat-root[data-chrome='refresh'] .rv-clone-step { display: inline-flex; align-items: center; gap: 10px; }
+/* A review that couldn't start, in the session's Review tab: why and what to do, then Dismiss under it. */
+.chat-root[data-chrome='refresh'] .rv-pane-error { color: var(--danger); padding-bottom: 12px; }
+.chat-root[data-chrome='refresh'] .rv-pane-error + button { margin: 0 12px; }
 .chat-root[data-chrome='refresh'] .rv-section { margin-top: 18px; }
 .chat-root[data-chrome='refresh'] .rv-section-head {
   display: flex; align-items: center; gap: 8px; margin: 0 0 6px; padding: 0 12px;
@@ -206,12 +212,15 @@
 .chat-root[data-chrome='refresh'] .rv-pane-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px; }
 .chat-root[data-chrome='refresh'] .rv-pane-body .m-block-plain { font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
 .chat-root[data-chrome='refresh'] .rv-pane-keys { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+.chat-root[data-chrome='refresh'] .rv-send-failed { padding: 8px 12px 0; color: var(--danger); }
+.chat-root[data-chrome='refresh'] .rv-pane-keys-sep { align-self: stretch; width: 1px; margin: 2px 4px; background: var(--border); }
 .chat-root[data-chrome='refresh'] .rv-handoff { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--border); font-size: 13px; background: color-mix(in srgb, var(--accent) 7%, transparent); }
 .chat-root[data-chrome='refresh'] .rv-handoff > span { flex: 1; }
 .chat-root[data-chrome='refresh'] .rv-pane-input { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); }
 .chat-root[data-chrome='refresh'] .rv-pane-field { flex: 1; display: flex; }
 .chat-root[data-chrome='refresh'] .rv-pane-field input { flex: 1; width: 100%; }
 .chat-root[data-chrome='refresh'] .rv-pane-empty .rv-menu { align-items: center; margin-top: 6px; }
+.chat-root[data-chrome='refresh'] .rv-pane-empty .rv-pick { margin-top: 6px; }
 
 /* The dialogs render at the end of the body, outside .chat-root. */
 .rv-confirm { font-family: var(--font-ui); color: var(--text-primary); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 12px; }
@@ -383,13 +392,44 @@
 .chat-root[data-chrome='refresh'] li[data-tone='warn'] .rv-gate-detail { color: var(--warning); }
 .chat-root[data-chrome='refresh'] li[data-tone='fail'] .rv-gate-detail { color: var(--danger); }
 
-/* A row's Review shows when the row is pointed at or focused, so the list stays quiet; always on touch. */
+/* A row's Review is always shown, so it's found without pointing at the row. Its ⋯, and the note under a Review
+   that can't run here, show when the row is pointed at or focused, so the list stays quiet; always on touch.
+   A start's progress and errors always show. */
 @media (hover: hover) {
-  .chat-root[data-chrome='refresh'] .rv-row-li .rv-row-end .rv-menu,
+  .chat-root[data-chrome='refresh'] .rv-row-li .rv-row-end .rv-menu-note:not([role='status']),
   .chat-root[data-chrome='refresh'] .rv-row-li .rv-row-end .rv-row-more { opacity: 0; transition: opacity 120ms ease; }
-  .chat-root[data-chrome='refresh'] .rv-row-li:hover .rv-row-end .rv-menu, .chat-root[data-chrome='refresh'] .rv-row-li:focus-within .rv-row-end .rv-menu,
+  .chat-root[data-chrome='refresh'] .rv-row-li:hover .rv-row-end .rv-menu-note, .chat-root[data-chrome='refresh'] .rv-row-li:focus-within .rv-row-end .rv-menu-note,
   .chat-root[data-chrome='refresh'] .rv-row-li:hover .rv-row-end .rv-row-more, .chat-root[data-chrome='refresh'] .rv-row-li:focus-within .rv-row-end .rv-row-more { opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .chat-root[data-chrome='refresh'] .rv-row-li .rv-row-end .rv-menu, .chat-root[data-chrome='refresh'] .rv-row-li .rv-row-end .rv-row-more { transition: none; }
+  .chat-root[data-chrome='refresh'] .rv-row-li .rv-row-end .rv-menu-note, .chat-root[data-chrome='refresh'] .rv-row-li .rv-row-end .rv-row-more { transition: none; }
 }
+
+/* ── the Reviews page's filter bar (ReviewFilters.tsx) ─────────────────── */
+.chat-root[data-chrome='refresh'] .rv-filters {
+  display: flex; flex-direction: column; gap: 8px; padding: 12px 12px 10px; margin: 6px 0 4px;
+  border-bottom: 1px solid var(--border); font-family: var(--font-ui);
+}
+.chat-root[data-chrome='refresh'] .rv-filter-search { width: 100%; }
+.chat-root[data-chrome='refresh'] .rv-filter-search-group {
+  display: flex; align-items: center; gap: 6px; padding: 0 4px 0 10px; height: 32px;
+  /* LaunchPad's Group is overflow: hidden, which lets a flex item shrink below its height; keep it 32 px. */
+  flex-shrink: 0;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-surface);
+}
+.chat-root[data-chrome='refresh'] .rv-filter-search-group:focus-within { border-color: var(--accent); }
+.chat-root[data-chrome='refresh'] .rv-filter-search-group input {
+  flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text-primary); font: inherit; font-size: 13.5px;
+  /* LaunchPad's Group zeroes its input's padding; this is the field's own. */
+  padding: 5px 8px;
+}
+.chat-root[data-chrome='refresh'] .rv-filter-search-icon[data-icon] { fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .rv-filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.chat-root[data-chrome='refresh'] .rv-filter-button { gap: 4px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .rv-filter-button [data-icon] { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .rv-filter-button[data-active] { color: var(--text-primary); background: var(--bg-elevated); }
+.chat-root[data-chrome='refresh'] .rv-filter-clear { margin-left: auto; color: var(--accent); }
+.chat-root[data-chrome='refresh'] .rv-filter-none { display: flex; align-items: center; gap: 8px; padding: 18px 0 0; }
+.chat-root[data-chrome='refresh'] .rv-filter-none .rv-note { padding-top: 0; }
+.rv-filter-empty { padding: 6px 10px; color: var(--text-secondary); font-size: 13px; }
+.rv-filter-list { max-height: 320px; overflow: auto; }

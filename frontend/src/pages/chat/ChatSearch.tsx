@@ -16,7 +16,6 @@ import type { PaletteAction } from '../../utils/searchPalette';
 import type { WorkspaceTarget } from '../../utils/workspaceTarget';
 import { useChatChrome } from './chatChrome';
 import { ChatPalette, paletteNameOf } from './ChatPalette';
-import { useSimpleDataIfAny } from './simpleData';
 import { useReviewsData } from './reviewsData';
 import { prPath } from '../../chat/reviews';
 
@@ -29,8 +28,7 @@ export function ChatSearch({ rows, now, boxNameOf, actions }: {
   const offline = useConnection().state === 'offline';
   const navigate = useNavigate();
   const { refresh } = useChatChrome();
-  const titlesShown = useSimpleDataIfAny()?.titlesShown ?? false;
-  const nameOf = useMemo(() => (refresh ? paletteNameOf(titlesShown) : undefined), [refresh, titlesShown]);
+  const nameOf = useMemo(() => (refresh ? paletteNameOf() : undefined), [refresh]);
   const openTarget = useCallback((t: WorkspaceTarget) => {
     if (t.kind === 'external') window.open(t.url, '_blank', 'noopener');
     else if (t.kind === 'pane') navigate(chatHref(t.projectId, t.workstream));

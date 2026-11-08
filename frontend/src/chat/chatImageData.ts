@@ -12,7 +12,6 @@ export const CHAT_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/
 export const CHAT_IMAGE_ACCEPT = CHAT_IMAGE_TYPES.join(',');
 /** A PDF goes as it is, to Claude as a document (agent/chat-images.js, chat-pdfs-v1). */
 export const CHAT_PDF_TYPE = 'application/pdf';
-export const CHAT_ATTACHMENT_ACCEPT = `${CHAT_IMAGE_ACCEPT},${CHAT_PDF_TYPE}`;
 
 /** One image ready to send: `data` is what the backend takes, `src` what the composer and bubble show. */
 export interface PreparedImage { id: string; mediaType: string; data: string; src: string; name: string }
@@ -52,7 +51,7 @@ export function admitImages(held: number, files: readonly File[], pdfs = false):
   const take = supported.slice(0, room);
   const notes: string[] = [];
   if (supported.length < files.length) notes.push(pdfs ? 'Only PNG, JPEG, GIF and WebP images and PDFs can be sent' : 'Only PNG, JPEG, GIF and WebP images can be sent');
-  if (supported.length > room) notes.push(`At most ${MAX_CHAT_IMAGES} ${pdfs ? 'attachments' : 'images'} per message`);
+  if (supported.length > room) notes.push(`At most ${MAX_CHAT_IMAGES} ${pdfs ? 'images and PDFs' : 'images'} per message`);
   return { take, note: notes.length ? notes.join('. ') : null };
 }
 

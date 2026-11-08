@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { connectorStatus, formatHeaderLines, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
+import { connectorStatus, formatHeaderLines, initialScopes, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
 import { PROVIDERS } from '../../providers/registry';
 
 describe('parseHeaderLines', () => {
@@ -79,5 +79,25 @@ describe('mcpAgentNames', () => {
 
   it('is Claude Code alone when no other agent has connectors', () => {
     expect(mcpAgentNames({ claude: { id: 'claude', displayName: 'Claude', mcpConnectors: true }, deepseek: { id: 'deepseek', displayName: 'DeepSeek' } })).toBe('Claude Code');
+  });
+});
+
+describe('initialScopes', () => {
+  const opt = (name: string) => ({ name, label: name });
+  const choice = { options: [opt('search:read.public'), opt('channels:history'), opt('chat:write')] };
+  const named = (...names: string[]) => names.map(name => ({ name, label: name }));
+
+  it('starts a link with nothing ticked, whatever an earlier sign-in asked for', () => {
+    expect(initialScopes({ scopeChoice: choice, requestedScopes: null, grantedScopes: null }, false)).toEqual([]);
+    expect(initialScopes({ scopeChoice: choice, requestedScopes: named('chat:write'), grantedScopes: named('chat:write') }, false)).toEqual([]);
+  });
+
+  it('starts Change permissions with the current grant, in the server order, keeping only scopes it still offers', () => {
+    expect(initialScopes({ scopeChoice: choice, requestedScopes: named('chat:write', 'channels:history'), grantedScopes: named('chat:write', 'gone:read', 'search:read.public') }, true))
+      .toEqual(['search:read.public', 'chat:write']);
+  });
+
+  it('uses what was asked for when the server did not say what it granted', () => {
+    expect(initialScopes({ scopeChoice: choice, requestedScopes: named('channels:history'), grantedScopes: null }, true)).toEqual(['channels:history']);
   });
 });

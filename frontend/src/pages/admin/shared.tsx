@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { fmtAge, fmtDurationShort, fmtK } from '../../utils/format';
 import type { Signal, SignalSeverity } from '../../services/adminApi';
@@ -82,63 +82,13 @@ export const fmtMs = (ms: number): string => ms > 0 ? fmtDurationShort(ms) : '0'
 export const fmtTok = (n: number): string => n > 0 ? fmtK(n) : '0';
 export const fmtSeconds = (s: number | null): string => s == null ? '—' : s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${Math.round(s)}s`;
 
-/** Sortable table. Columns declare how to pull a sortable value and how to render. */
-export interface Column<T> {
-  id: string; label: string;
-  value: (row: T) => string | number | null | undefined;
-  render?: (row: T) => React.ReactNode;
-  align?: 'left' | 'right';
-  title?: string;
-}
-export function DataTable<T>({ rows, columns, rowKey, defaultSort, defaultDesc = true, empty = 'nothing to show', dense, onRowClick, selectedKey }: {
-  rows: T[]; columns: Column<T>[]; rowKey: (row: T) => string; defaultSort: string; defaultDesc?: boolean; empty?: string; dense?: boolean;
-  /** Rows become selectable (click, Enter or Space); the one whose key is `selectedKey` is marked. */
-  onRowClick?: (row: T) => void; selectedKey?: string | null;
-}) {
-  const [sort, setSort] = useState(defaultSort);
-  const [desc, setDesc] = useState(defaultDesc);
-  const sorted = useMemo(() => {
-    const col = columns.find(c => c.id === sort) ?? columns[0];
-    return [...rows].sort((a, b) => {
-      const va = col.value(a), vb = col.value(b);
-      if (va == null && vb == null) return 0;
-      if (va == null) return 1;
-      if (vb == null) return -1;
-      const c = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb));
-      return desc ? -c : c;
-    });
-  }, [rows, columns, sort, desc]);
-  const click = (id: string) => { if (id === sort) setDesc(d => !d); else { setSort(id); setDesc(true); } };
-  return (
-    <div className="admin-table-wrap">
-      <table className={`admin-table ${dense ? 'admin-table--dense' : ''}`}>
-        <thead>
-          <tr>{columns.map(c => (
-            <th key={c.id} className={c.align ?? 'left'} title={c.title} onClick={() => click(c.id)} aria-sort={sort === c.id ? (desc ? 'descending' : 'ascending') : 'none'}>
-              {c.label}{sort === c.id ? (desc ? ' ▾' : ' ▴') : ''}
-            </th>
-          ))}</tr>
-        </thead>
-        <tbody>
-          {sorted.length === 0 && <tr><td colSpan={columns.length} className="usage-dim">{empty}</td></tr>}
-          {sorted.map(r => {
-            const key = rowKey(r);
-            const select = onRowClick ? {
-              className: `admin-row--selectable${key === selectedKey ? ' admin-row--selected' : ''}`,
-              tabIndex: 0, 'aria-selected': key === selectedKey,
-              onClick: () => onRowClick(r),
-              onKeyDown: (e: React.KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onRowClick(r); } },
-            } : {};
-            return <tr key={key} {...select}>{columns.map(c => <td key={c.id} className={c.align ?? 'left'}>{c.render ? c.render(r) : (c.value(r) ?? '—')}</td>)}</tr>;
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
+/** The admin pages' sortable, filterable, paged table (DataTable.tsx). */
+export { DataTable, TablePager, TableReset, type Column, type DataTableProps } from './DataTable';
 
+/** What a StatusPill reads ("awaiting agent"), for a table's filter. */
+export const statusPillText = (status: string): string => status.replace('_', ' ');
 export function StatusPill({ status }: { status: string }) {
-  return <span className={`admin-pill admin-pill--${status.replace(/[^a-z_-]/gi, '')}`}>{status.replace('_', ' ')}</span>;
+  return <span className={`admin-pill admin-pill--${status.replace(/[^a-z_-]/gi, '')}`}>{statusPillText(status)}</span>;
 }
 
 export function Dot({ on, title }: { on: boolean; title?: string }) {

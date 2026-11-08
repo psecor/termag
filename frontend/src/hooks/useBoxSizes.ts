@@ -23,19 +23,21 @@ const reposOf = (repos: BoxRepos): string[] =>
  * the size flag says, null until it answers or from an orchestrator before it:
  * no field, and the box gets the server's disk.
  */
-export function useBoxSizes(active: boolean, repoUrls?: BoxRepos): { sizes: BoxSizeOptions | null; disk: BoxDiskOptions | null } {
+export function useBoxSizes(active: boolean, repoUrls?: BoxRepos, environment?: string | null): { sizes: BoxSizeOptions | null; disk: BoxDiskOptions | null } {
   const [options, setOptions] = useState<BoxSizeOptions | null>(null);
   // A string key, so the effect runs again only when the repositories do.
-  const key = reposOf(repoUrls).join('\n');
+  // An environment is sized by its one file instead.
+  const key = environment ? '' : reposOf(repoUrls).join('\n');
+  const env = environment || null;
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
     const repos = key ? key.split('\n') : [];
     const timer = setTimeout(() => {
-      instancesApi.sizes(repos.length > 1 ? repos : repos[0] ?? null).then(o => { if (!cancelled) setOptions(o); }).catch(() => {});
+      (env ? instancesApi.sizes(null, env) : instancesApi.sizes(repos.length > 1 ? repos : repos[0] ?? null)).then(o => { if (!cancelled) setOptions(o); }).catch(() => {});
     }, repos.length ? REPO_SETTLE_MS : 0);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [active, key]);
+  }, [active, key, env]);
   return { sizes: options?.enabled ? options : null, disk: options?.disk ?? null };
 }
 
@@ -45,8 +47,8 @@ export function useBoxSizes(active: boolean, repoUrls?: BoxRepos): { sizes: BoxS
  * `.termag/environment.json` (or the owner's default) preselects, and the
  * form sends no stale preset that would override it.
  */
-export function useBoxSizePick(repoUrls?: BoxRepos): [SizePick | null, (size: SizePick) => void] {
-  return usePickFor<SizePick>(repoUrls);
+export function useBoxSizePick(repoUrls?: BoxRepos, environment?: string | null): [SizePick | null, (size: SizePick) => void] {
+  return usePickFor<SizePick>(repoUrls, environment);
 }
 
 /**
@@ -54,12 +56,13 @@ export function useBoxSizePick(repoUrls?: BoxRepos): [SizePick | null, (size: Si
  * typed with, dropped as a size pick is, so the field goes back to the new
  * repository's diskGiB (or 120) and sends nothing stale. Null until they type.
  */
-export function useBoxDiskPick(repoUrls?: BoxRepos): [string | null, (typed: string) => void] {
-  return usePickFor<string>(repoUrls);
+export function useBoxDiskPick(repoUrls?: BoxRepos, environment?: string | null): [string | null, (typed: string) => void] {
+  return usePickFor<string>(repoUrls, environment);
 }
 
-function usePickFor<T>(repoUrls?: BoxRepos): [T | null, (value: T) => void] {
-  const repo = reposOf(repoUrls).join('\n') || null;
+/** `environment`: a pick made for an environment is its own, whatever its repositories. */
+function usePickFor<T>(repoUrls?: BoxRepos, environment?: string | null): [T | null, (value: T) => void] {
+  const repo = environment ? `environment:${environment}` : reposOf(repoUrls).join('\n') || null;
   const [pick, setPick] = useState<T | null>(null);
   // Derived state, reset while rendering (React's documented pattern): no stale pick is ever shown or sent.
   const [pickedFor, setPickedFor] = useState(repo);

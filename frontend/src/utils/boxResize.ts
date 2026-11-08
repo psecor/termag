@@ -3,8 +3,10 @@
 // what blocks it, which type); this is how its answers read.
 import type { Instance } from '../types';
 import { sizeName, sizeOptionLabel, type BoxSize, type BoxSizeChoice } from './boxSize';
+import type { BoxDiskOptions } from './boxDisk';
 
-export type ResizePhase = 'resuming' | 'stopping' | 'resizing' | 'starting' | 'ready' | 'stopped' | 'failed';
+/** `disk`: the resize waits for the box's disk to grow before it stops the box (the dialog asked for both). */
+export type ResizePhase = 'disk' | 'resuming' | 'stopping' | 'resizing' | 'starting' | 'ready' | 'stopped' | 'failed';
 
 /** The box's current or last resize (backend boxResizePolicy.resizeView). */
 export interface ResizeView {
@@ -35,6 +37,31 @@ export interface BoxResizeInfo {
   resize: ResizeView | null;
   refusal: { status: number; code: string; error: string } | null;
   blockers: ResizeBlocker[];
+  /** The owner's routes only (backend services/boxDisk.ts diskView); absent from the Fleet tab's and older orchestrators. */
+  disk?: DiskView | null;
+}
+
+/** A disk grow (backend boxDisk.ts growView). */
+export interface GrowView {
+  fromGb: number;
+  toGb: number;
+  /** modifying: EBS is growing the volume · filesystem: the box's agent grows the file system · done · failed */
+  state: 'modifying' | 'filesystem' | 'done' | 'failed';
+  running: boolean;
+  detail: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+/** The box's disk in the owner's Resize box dialogs. */
+export interface DiskView {
+  sizeGb: number | null;
+  maxGb: number;
+  /** Why it can't grow now (stopped, EBS's six hours, already at the cap); null when it can. */
+  refusal: string | null;
+  grow: GrowView | null;
+  /** The last grow reached the volume's size but not its file system: the same size again finishes it (absent from older orchestrators). */
+  retry?: { sizeGb: number; error: string | null } | null;
 }
 
 export const RESIZE_DOWNTIME = "The box stops for two to three minutes while it's resized. "
@@ -71,6 +98,7 @@ export function currentSizeLabel(box: Pick<Instance, 'size' | 'instanceType'>, s
 }
 
 const PHASE_LABEL: Record<ResizePhase, string> = {
+  disk: 'Waiting for the disk to grow',
   resuming: 'Resuming it from hibernation',
   stopping: 'Stopping',
   resizing: 'Changing its instance type',
@@ -91,14 +119,16 @@ export interface ResizeStep {
 }
 
 /**
- * The progress list: stopping, resizing, starting, ready for a box that was
+ * The progress list: waiting for the disk first when it grows in the same go (`withDisk`), then stopping, resizing, starting, ready for a box that was
  * running (resuming first for a hibernated one; a box that was down ends at
  * stopped). `fromStatus` is the box's status when the resize was asked for.
  */
-export function resizeSteps(view: ResizeView, fromStatus: string): ResizeStep[] {
-  const order: ResizePhase[] = fromStatus === 'stopped'
+export function resizeSteps(view: ResizeView, fromStatus: string, withDisk = false): ResizeStep[] {
+  const base: ResizePhase[] = fromStatus === 'stopped'
     ? ['resizing', 'stopped']
     : fromStatus === 'hibernated' ? ['resuming', 'stopping', 'resizing', 'stopped'] : ['stopping', 'resizing', 'starting', 'ready'];
+  // A resize asked for with a disk grow waits for it first (backend boxResize.ts).
+  const order: ResizePhase[] = withDisk || view.phase === 'disk' ? ['disk', ...base] : base;
   const at = view.phase === 'failed' ? -1 : order.indexOf(view.phase ?? order[0]);
   const finished = !view.running && view.phase !== 'failed';
   return order.map((phase, i) => ({
@@ -184,4 +214,61 @@ export function resizeError(err: unknown, fallback = 'Could not resize the box')
 export function offersResize(box: Pick<Instance, 'kind' | 'status' | 'ec2InstanceId' | 'resize'>): boolean {
   if (box.kind !== 'ec2' || !box.ec2InstanceId) return false;
   return rowResizing(box) || ['ready', 'stopped', 'hibernated'].includes(box.status);
+}
+
+// ── The disk, beside the size (backend services/boxDisk.ts) ────────────────
+
+export const DISK_GROW_NOTE = "Growing the disk doesn't stop the box. A disk never shrinks, and EBS allows one change to it every six hours.";
+
+/** "120 GB disk", beside the current size; null when the disk isn't known. */
+export function currentDiskLabel(disk: DiskView | null | undefined): string | null {
+  return disk?.sizeGb ? `${disk.sizeGb} GB disk` : null;
+}
+
+/** The disk field's range (utils/boxDisk.ts): from the current disk (grow only) to the server's cap; null when the disk isn't known. */
+export function growFieldOptions(disk: DiskView | null | undefined): BoxDiskOptions | null {
+  if (!disk?.sizeGb) return null;
+  return { minGiB: disk.sizeGb, maxGiB: Math.max(disk.maxGb, disk.sizeGb), defaultGiB: disk.sizeGb, diskGiB: disk.sizeGb };
+}
+
+/**
+ * The dialogs' one warning for what is about to change: the downtime notice
+ * only when the instance type changes (a disk grows with the box up), the
+ * disk's own note when only it does, nothing when nothing does.
+ */
+export function changeWarning(status: string, changes: { size: boolean; disk: boolean }, losesHibernation = false): string | null {
+  if (changes.size) {
+    const sized = resizeWarning(status, losesHibernation);
+    return changes.disk ? `${sized} The disk grows first, with the box up; a disk never shrinks, and EBS allows one change to it every six hours.` : sized;
+  }
+  return changes.disk ? DISK_GROW_NOTE : null;
+}
+
+export interface GrowStep {
+  state: 'done' | 'current' | 'todo';
+  label: string;
+  key: 'modifying' | 'filesystem';
+}
+
+/** The grow's progress list, drawn like the resize's: EBS grows the volume, then the agent the file system. */
+export function growSteps(grow: GrowView): GrowStep[] {
+  const order = ['modifying', 'filesystem'] as const;
+  const at = grow.state === 'done' ? order.length : grow.state === 'failed' ? -1 : order.indexOf(grow.state);
+  return order.map((key, i) => ({
+    key,
+    label: key === 'modifying' ? `Growing the disk to ${grow.toGb} GB` : 'Growing its file system',
+    state: i < at ? 'done' : i === at ? 'current' : 'todo',
+  }));
+}
+
+/** How a finished grow reads, or null while it runs. */
+export function growOutcome(grow: GrowView): string | null {
+  if (grow.running) return null;
+  if (grow.state === 'failed') return `The disk grow failed: ${grow.detail ?? 'no reason given'}`;
+  return `The disk is now ${grow.toGb} GB.`;
+}
+
+/** What the dialogs say beside "Finish growing the disk" (DiskView.retry). */
+export function retryNote(retry: { sizeGb: number; error: string | null }): string {
+  return `The disk is ${retry.sizeGb} GB, but its file system was not grown into it${retry.error ? `: ${retry.error}` : ''}.`;
 }

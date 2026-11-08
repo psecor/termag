@@ -14,13 +14,12 @@ const fmt = (d: Date) => d.toISOString().slice(0, 10);
 const box = (status: Instance['status'], lifecycle?: BoxLifecycle) => ({ status, lifecycle });
 
 describe('offersAutoHibernate', () => {
-  it('needs the flag and a live box, whether or not it can hibernate', () => {
-    expect(offersAutoHibernate(box('ready', lc()), true)).toBe(true);
-    expect(offersAutoHibernate(box('hibernated', lc()), true)).toBe(true);
-    expect(offersAutoHibernate(box('ready', lc({ canAutoHibernate: false })), true)).toBe(true);
-    expect(offersAutoHibernate(box('ready', lc()), false)).toBe(false);
-    expect(offersAutoHibernate(box('terminated', lc()), true)).toBe(false);
-    expect(offersAutoHibernate(box('ready'), true)).toBe(false);
+  it('needs a live box, whether or not it can hibernate', () => {
+    expect(offersAutoHibernate(box('ready', lc()))).toBe(true);
+    expect(offersAutoHibernate(box('hibernated', lc()))).toBe(true);
+    expect(offersAutoHibernate(box('ready', lc({ canAutoHibernate: false })))).toBe(true);
+    expect(offersAutoHibernate(box('terminated', lc()))).toBe(false);
+    expect(offersAutoHibernate(box('ready'))).toBe(false);
   });
 });
 

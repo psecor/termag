@@ -157,10 +157,8 @@ function DayListCard({ overview }: { overview: SegmentsOverview | null }) {
           list today's per-user segments
         </button>
       </div>
-      <div style={{ maxHeight: 230, overflowY: 'auto' }}>
-        <DataTable rows={state.rows} columns={columns} rowKey={r => (r.username ?? '') + String(0)}
-          defaultSort="user" empty="no day loaded" dense />
-      </div>
+      <DataTable rows={state.rows} columns={columns} rowKey={r => (r.username ?? '') + String(0)}
+        defaultSort="user" empty="no day loaded" dense search="filter users" storageKey="segments-users" resetKey={state.day} />
       <div className="usage-dim">{overview?.tracker
         ? `tracker ${overview.tracker.state}${overview.tracker.lastRunAt ? ` · ran ${overview.tracker.lastRunAt.slice(11, 16)}Z` : ''}` : '…'}</div>
     </ChartCard>

@@ -11,10 +11,10 @@ interface Props {
   openShare?: BrowserShareHandoff | null;
   /** The pane's dial carrying `openShare` is ready: the handoff is spent. */
   onOpenShareUsed?: () => void;
-  /** browser-pane-persistent-profiles-enabled: the pane offers "Reset browser". */
+  /** The pane offers "Reset browser". */
   showReset?: boolean;
   /**
-   * browser-pane-preview-share-enabled, owner only: "Share…" on the bar,
+   * Owner only: "Share…" on the bar,
    * given the page the pane shows, for a link that
    * opens there.
    */
@@ -22,6 +22,11 @@ interface Props {
 }
 
 const storageKey = (projectId: string, workstream: string) => `termag.browserPane.url.${projectId}/${workstream}`;
+
+/** Sets the page a browser pane for `<project>/<workstream>` opens next (an environment's port link). */
+export function rememberBrowserUrl(browserKey: string, url: string): void {
+  writeUrl(`termag.browserPane.url.${browserKey}`, url);
+}
 
 function readUrl(key: string): string {
   try { return window.localStorage.getItem(key) ?? ''; } catch { return ''; }

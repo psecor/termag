@@ -25,26 +25,34 @@ const mocks = vi.hoisted(() => ({
   tabs: [] as unknown[],
   rows: [] as unknown[],
   projects: [] as unknown[],
-  titles: false,
   spaces: [] as Array<{ name: string; role?: string }>,
   interrupt: vi.fn(async () => ({ interrupted: true })),
   context: vi.fn(async (_p: string, _w: string, action: string) => (action === 'clear' ? { reset: true, at: '2026-10-27T12:00:00Z' } : { compacting: true })),
   noBoxes: [] as unknown[],
+  start: vi.fn(async () => ({ ok: true, status: 'starting' })),
   fileText: '# PR outbox\n\n- #755',
 }));
 vi.mock('./simpleData', () => {
   const data = () => ({
-    items: { pick: vi.fn(), noteSent: mocks.noteSent, state: { items: mocks.tabs } }, rows: mocks.rows, live: new Map(), setupOf: new Map(), links: [], activeTab: 'f1', itemsShown: true, titlesShown: mocks.titles,
-    spaces: { enabled: true, loaded: true, current: true, spaces: mocks.spaces, index: new Map([['box-1', [SPACE]]]) },
+    items: { pick: vi.fn(), noteSent: mocks.noteSent, state: { items: mocks.tabs } }, rows: mocks.rows, live: new Map(), setupOf: new Map(), links: [], activeTab: 'f1', itemsShown: true,
+    spaces: { loaded: true, current: true, spaces: mocks.spaces, index: new Map([['box-1', [SPACE]]]) },
   });
   return { WithSimpleData: ({ children }: { children: React.ReactNode }) => children, useSimpleData: data, useSimpleDataIfAny: data };
 });
-vi.mock('../../contexts/ProjectContext', () => ({ useProjects: () => ({ projects: mocks.projects }) }));
+vi.mock('../../contexts/ProjectContext', () => ({ useProjects: () => ({ projects: mocks.projects, reloadProjects: async () => {} }) }));
 vi.mock('../../chat/useChatModelOptions', () => ({ useChatModelOptions: () => chatModelOptions([]) }));
 vi.mock('../../services/api', () => ({
   spacesApi: { view: mocks.view },
   chatApi: { history: mocks.history, send: mocks.send, interrupt: mocks.interrupt, reclaim: vi.fn(), openInTerminal: vi.fn(), trust: vi.fn(), context: mocks.context },
   activityApi: { heartbeat: vi.fn(async () => ({})) },
+  instancesApi: { start: mocks.start },
+}));
+// jsdom draws no images: a picked file comes back prepared as it would in a browser.
+vi.mock('../../chat/chatImageData', async importOriginal => ({
+  ...(await importOriginal<typeof import('../../chat/chatImageData')>()),
+  prepareImage: async (f: File) => ({ id: `img-${f.name}`, mediaType: f.type, data: 'aGVsbG8=', src: 'data:image/png;base64,aGVsbG8=', name: f.name }),
+  // The composer prepares attachments (images, and PDFs since #1110) through this one.
+  prepareAttachment: async (f: File) => ({ id: `img-${f.name}`, mediaType: f.type, data: 'aGVsbG8=', src: 'data:image/png;base64,aGVsbG8=', name: f.name }),
 }));
 // The conversation's composer, as SdkChatView's tests mount it: no box feed, no sign-in card.
 vi.mock('../../services/boxFeed', () => ({
@@ -97,7 +105,6 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   host.remove();
-  mocks.titles = false;
   mocks.fileText = '# PR outbox\n\n- #755';
   vi.unstubAllGlobals();
   mocks.view.mockReset(); mocks.history.mockReset(); mocks.send.mockReset(); mocks.noteSent.mockReset(); mocks.interrupt.mockClear();
@@ -157,7 +164,6 @@ describe('FileChat under a space file', () => {
   });
 
   it('names the target as the sidebar does: Claude\'s title, then the project', async () => {
-    mocks.titles = true;
     mocks.rows = mocks.rows.map(r => ((r as { projectId: string }).projectId === 'termag-5' ? { ...(r as object), sessionTitle: 'Track the PR outbox' } : r));
     sessionStorage.setItem(LAST_CHAT_KEY, JSON.stringify({ projectId: 'termag-5', workstream: 'main' }));
     await open();
@@ -316,6 +322,32 @@ describe('the conversation\'s composer under the file', () => {
     expect(bar.querySelector('.chat-ring, .chat-ring-btn, [class*="chat-ring"]')).not.toBeNull();
     const attach = bar.querySelector<HTMLButtonElement>('.chat-attach');
     expect(attach?.disabled).toBe(false);
+  });
+
+  it('takes an image while the target\'s box is stopped, and sends it with the text to the orchestrator, which holds both (#971)', async () => {
+    mocks.noBoxes = [{ id: 'box-1', name: 'box-1', kind: 'ec2', ec2InstanceId: 'i-1', status: 'stopped' }];
+    // A stored chat whose send the orchestrator holds while its box is down (routes/chat.ts holdIfContinuing).
+    mocks.history.mockResolvedValue(history({ imageInput: true, stored: true, continuation: { takesSends: true }, entries: [{ type: 'user', message: { role: 'user', content: 'earlier' } }] }));
+    mocks.send.mockResolvedValue({ queued: true, held: true, position: 1, phase: 'starting' });
+    try {
+      await open();
+      const picker = host.querySelector<HTMLInputElement>('.fv-chat input[type="file"]')!;
+      Object.defineProperty(picker, 'files', { value: [new File(['x'], 'shot.png', { type: 'image/png' })], configurable: true });
+      await act(async () => { picker.dispatchEvent(new Event('change', { bubbles: true })); });
+      await settle();
+      expect(host.querySelector('.fv-chat .chat-composer img')).not.toBeNull();
+      await type('what changed here?');
+      await enter();
+      expect(mocks.send).toHaveBeenCalledTimes(1);
+      expect(mocks.send.mock.calls[0][3]).toEqual([{ mediaType: 'image/png', data: 'aGVsbG8=' }]);
+      expect(String(mocks.send.mock.calls[0][2])).toContain('what changed here?');
+      // The orchestrator starts the box for a send it holds; this tab doesn't.
+      expect(mocks.start).not.toHaveBeenCalled();
+      expect(host.querySelector('.fv-chat .chat-composer img')).toBeNull();
+    } finally {
+      mocks.noBoxes = [];
+      mocks.start.mockClear();
+    }
   });
 
   it('sends at the effort chosen for the session, as the conversation does', async () => {
@@ -743,7 +775,6 @@ describe('above the box: one line, never more', () => {
 
   it('never prints the agent\'s name in the composer: a generic placeholder, the name only in the button\'s label and tooltip', async () => {
     const long = 'A very long haiku agent name that would never fit in a composer';
-    mocks.titles = true;
     mocks.rows = mocks.rows.map(r => ((r as { projectId: string }).projectId === 'termag-5' ? { ...(r as object), sessionTitle: long } : r));
     sessionStorage.setItem(LAST_CHAT_KEY, JSON.stringify({ projectId: 'termag-5', workstream: 'main' }));
     await open();

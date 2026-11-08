@@ -7,8 +7,6 @@ export const MOBILE_MEDIA_QUERY = '(max-width: 767px) and (pointer: coarse)';
 export const TOUCH_MEDIA_QUERY = '(pointer: coarse)';
 
 export interface RedirectInputs {
-  /** Flag `mobile-redirect-enabled`; default off. */
-  flagOn: boolean;
   /** `matchMedia(MOBILE_MEDIA_QUERY).matches` */
   phoneLike: boolean;
   /** The user pressed "Lab" on this browser (or, installed, in this window). */
@@ -19,13 +17,12 @@ export interface RedirectInputs {
 
 /**
  * Installed on a phone or tablet, the app is the phone client whatever the
- * flag says: installing it is the opt-in the flag stands in for, and sign-in
- * returns to `/termag/` with no way back otherwise.
+ * viewport: sign-in returns to `/termag/` with no way back otherwise.
  */
 export function shouldRedirectToMobile(i: RedirectInputs): boolean {
   if (i.optedOut) return false;
   if (i.installed) return true;
-  return i.flagOn && i.phoneLike;
+  return i.phoneLike;
 }
 
 type MatchMediaFn = (query: string) => { matches: boolean };
@@ -57,17 +54,9 @@ export function installedOnTouch(env: DisplayEnv | undefined): boolean {
   try { return !!env?.matchMedia?.(TOUCH_MEDIA_QUERY).matches; } catch { return false; }
 }
 
-// mobile-installed-app-enabled (flags.ts). Kept here, set by the components that
-// read flags (MobileRedirectGate, MobileApp), because the opt-out helpers below
-// run from click handlers all over /m that don't.
-let installedAppEnabled = false;
-export function setInstalledAppEnabled(on: boolean): void {
-  installedAppEnabled = on;
-}
-
-/** An installed app that gets the installed-app rules (§5.1): the flag is on and `installedOnTouch`. */
+/** An installed app that gets the installed-app rules (§5.1): `installedOnTouch`. */
 export function installedAppMode(env: DisplayEnv | undefined): boolean {
-  return installedAppEnabled && installedOnTouch(env);
+  return installedOnTouch(env);
 }
 
 /** Carries a workspace deep link (`?project=…&ws=…`) over to its /m route. */

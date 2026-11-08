@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   activeTab, arrangeItems, dismissItem, duplicateItem, EMPTY_OPEN_ITEMS, groupOpenItems, folderForRoute, folderHref, itemForRoute, spaceLinkTarget, itemHref, itemKey, openItem,
-  noteSent, parseOpenItems, pickItem, placeUnplacedItems, RECONCILE_GRACE_MS, reconcileItems, reorderItem, seedItems, serializeOpenItems, tabForRoute,
+  noteActive, noteSent, parseOpenItems, pickItem, placeUnplacedItems, RECENT_TABS_MAX, RECONCILE_GRACE_MS, reconcileItems, reorderItem, seedItems, serializeOpenItems, tabAfterClose, tabForRoute,
   type ChatListing, type OpenItemRef, type OpenItemsState } from './openItems';
 
 const chat = (projectId: string, workstream = 'main') => ({ kind: 'chat' as const, projectId, workstream });
@@ -446,5 +446,123 @@ describe('a chat in no space of its own goes under the space its tab was opened 
       s = openItem(s, chat('ask2'), null, 2, counter('b'), 'design').state;
       expect(placeUnplacedItems(s, listingOf)).toBe(s);
     });
+  });
+});
+
+describe('the tabs most recently shown, for a close that goes back', () => {
+  const two = (): OpenItemsState => ({ seeded: true, items: [
+    { ...chat('a'), id: 'ta', openedAt: 1 }, { ...chat('b'), id: 'tb', openedAt: 1 }, { ...file('notes', 'x.png'), id: 'tf', openedAt: 1 },
+  ] });
+
+  it('puts the shown tab first, once, and ignores an id no tab has', () => {
+    let s = two();
+    s = noteActive(s, 'tb');
+    s = noteActive(s, 'ta');
+    s = noteActive(s, 'tf');
+    expect(s.recent).toEqual(['tf', 'ta', 'tb']);
+    s = noteActive(s, 'ta');
+    expect(s.recent).toEqual(['ta', 'tf', 'tb']);
+    expect(noteActive(s, 'ta')).toBe(s);
+    expect(noteActive(s, 'nope')).toBe(s);
+  });
+
+  it('keeps the newest RECENT_TABS_MAX', () => {
+    let s: OpenItemsState = { seeded: true, items: Array.from({ length: RECENT_TABS_MAX + 5 }, (_, i) => ({ ...chat(`p${i}`), id: `t${i}`, openedAt: 1 })) };
+    for (const i of s.items) s = noteActive(s, i.id);
+    expect(s.recent).toHaveLength(RECENT_TABS_MAX);
+    expect(s.recent![0]).toBe(`t${RECENT_TABS_MAX + 4}`);
+  });
+
+  it('a route open records its tab as shown only when asked', () => {
+    const make = counter();
+    let s: OpenItemsState = { seeded: true, items: [] };
+    s = openItem(s, chat('a'), null, 1, make, undefined, true).state;
+    s = openItem(s, file('notes', 'x.png'), null, 2, make).state;
+    expect(s.recent).toEqual(['t1']);
+    s = openItem(s, file('notes', 'x.png'), null, 3, make, undefined, true).state;
+    expect(s.recent).toEqual(['t2', 't1']);
+  });
+
+  it('a closed tab leaves the list', () => {
+    let s = noteActive(noteActive(noteActive(two(), 'ta'), 'tb'), 'tf');
+    s = dismissItem(s, 'tb');
+    expect(s.recent).toEqual(['tf', 'ta']);
+    s = dismissItem(s, ['tf', 'ta']);
+    expect(s.recent).toEqual([]);
+  });
+
+  it('is stored, without ids no tab has', () => {
+    const s = noteActive(noteActive(two(), 'ta'), 'tf');
+    expect(parseOpenItems(serializeOpenItems(s)).recent).toEqual(['tf', 'ta']);
+    const raw = JSON.stringify({ v: 2, seeded: true, items: two().items, recent: ['tf', 'gone', 7, 'tf', 'tb'] });
+    expect(parseOpenItems(raw).recent).toEqual(['tf', 'tb']);
+    expect(parseOpenItems(JSON.stringify({ v: 2, seeded: true, items: two().items })).recent).toBeUndefined();
+  });
+
+  describe('where closing tabs leaves the person', () => {
+    const groups = (s: OpenItemsState) => groupOpenItems(s.items, ['notes'], () => 'notes');
+    const four = (): OpenItemsState => ({ seeded: true, items: [
+      { ...file('notes', 'x.png'), id: 'tf', openedAt: 1 }, { ...chat('a'), id: 'ta', openedAt: 1 },
+      { ...chat('b'), id: 'tb', openedAt: 1 }, { ...file('notes', 'y.md'), id: 'ty', openedAt: 1 },
+    ] });
+
+    it('nowhere new when the open tab stays', () => {
+      expect(tabAfterClose(groups(four()), ['tb'], 'tf')).toBeNull();
+      expect(tabAfterClose(groups(four()), ['tb'], null)).toBeNull();
+    });
+
+    it('goes to the tab acted on, else the first left in the open tab\'s space, else the first anywhere, else none', () => {
+      const s = four();
+      expect(tabAfterClose(groups(s), ['tf'], 'tf')?.id).toBe('ta');
+      expect(tabAfterClose(groups(s), ['tf', 'ta'], 'tf', { stay: s.items[3] })?.id).toBe('ty');
+      expect(tabAfterClose(groups(s), ['tf', 'ta', 'tb', 'ty'], 'tf')).toBeUndefined();
+    });
+
+    it('with `recent`, goes to the tab shown before it that is still open', () => {
+      let s = four();
+      for (const id of ['ty', 'tb', 'tf']) s = noteActive(s, id);
+      expect(tabAfterClose(groups(s), ['tf'], 'tf', { recent: s.recent })?.id).toBe('tb');
+      expect(tabAfterClose(groups(s), ['tf', 'tb'], 'tf', { recent: s.recent })?.id).toBe('ty');
+      // None shown before it is still open: as without.
+      expect(tabAfterClose(groups(s), ['tf', 'tb', 'ty'], 'tf', { recent: s.recent })?.id).toBe('ta');
+      // A tab the groups leave out (a space the person left) is passed over.
+      const hidden = groupOpenItems(s.items.filter(i => i.id !== 'tb'), ['notes'], () => 'notes');
+      expect(tabAfterClose(hidden, ['tf'], 'tf', { recent: s.recent })?.id).toBe('ty');
+      // Unless it is one of `also`, tabs listed outside the groups (a review session, in Reviews).
+      expect(tabAfterClose(hidden, ['tf'], 'tf', { recent: s.recent, also: [s.items[2]] })?.id).toBe('tb');
+      // `also` is for going back only: with nothing shown before, the first left in the group, as without it.
+      expect(tabAfterClose(hidden, ['tf'], 'tf', { also: [s.items[2]] })?.id).toBe('ta');
+    });
+  });
+});
+
+describe('the tabs shown most recently, through seeding and reconciling', () => {
+  it('a first-load seed keeps the tabs a route recorded before it', () => {
+    let s: OpenItemsState = { seeded: false, items: [] };
+    s = openItem(s, chat('a'), null, 1, counter('r'), undefined, true).state;
+    expect(s.recent).toEqual(['r1']);
+    s = seedItems(s, [{ projectId: 'b', workstream: 'main', lastActiveAt: 5 }], 10, counter('s'));
+    expect(s.seeded).toBe(true);
+    expect(s.recent).toEqual(['r1']);
+  });
+
+  it('a reconcile that closes gone sessions drops their tabs from recent, as a close does', () => {
+    let s: OpenItemsState = { seeded: true, items: [
+      { ...chat('live'), id: 'tl', openedAt: 0 }, { ...chat('gone'), id: 'tg', openedAt: 0 }, { ...file('notes', 'x.md'), id: 'tf', openedAt: 0 },
+    ] };
+    for (const id of ['tf', 'tg', 'tl']) s = noteActive(s, id);
+    s = reconcileItems(s, new Set([itemKey(chat('live'))]), RECONCILE_GRACE_MS + 1);
+    expect(ids(s)).toEqual(['tl', 'tf']);
+    expect(s.recent).toEqual(['tl', 'tf']);
+  });
+
+  it('gone sessions never push a tab that is still open out of recent', () => {
+    let s: OpenItemsState = { seeded: true, items: [{ ...file('notes', 'a.md'), id: 'ta', openedAt: 0 }] };
+    s = noteActive(s, 'ta');
+    for (let i = 0; i < RECENT_TABS_MAX + 5; i++) {
+      s = openItem(s, chat(`p${i}`), `c${i}`, 0, counter(), undefined, true).state;
+      s = reconcileItems(s, new Set(), RECONCILE_GRACE_MS + 1);
+    }
+    expect(s.recent).toEqual(['ta']);
   });
 });

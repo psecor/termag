@@ -47,12 +47,11 @@ import {
  * Needs you count and the tile, and waits under "Deferred" at the foot of the
  * list until then.
  *
- * Review groups (pr-review-groups-enabled):
- *  the user's own ordered lists of PRs reviewed together, one card
- * each at the top of Needs you and Needs my review. A grouped row shows only
- * in its card there, and with a "Desktop bridge 2/5" pill in other lanes; the
- * counts are unchanged. Add to group… in the detail header puts the shown PR
- * in one.
+ * Review groups: the user's own ordered
+ * lists of PRs reviewed together, one card each at the top of Needs you and
+ * Needs my review. A grouped row shows only in its card there, and with a
+ * "Desktop bridge 2/5" pill in other lanes; the counts are unchanged. Add to
+ * group… in the detail header puts the shown PR in one.
  */
 export function PrsOverlay() {
   const location = useLocation();
@@ -78,7 +77,6 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
   const [bakeState, setBakeState] = useState<{ busy: boolean; startedAt: number | null }>({ busy: false, startedAt: null });
   const [showDeferred, setShowDeferred] = useState(false);
   const [deferBusy, setDeferBusy] = useState(false);
-  const groupsOn = useFlag(FLAGS.prReviewGroups, false);
   const parallelReviewsOn = useFlag(FLAGS.parallelReviews, false);
 
   const go = useCallback((next: PrsView | null, pr?: string | null) => {
@@ -92,8 +90,8 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
 
   const res = prs.data;
   // Review groups: their cards head Needs you and Needs my review, whose lists then leave grouped rows to the cards.
-  const places = useMemo(() => (groupsOn ? groupPlaces(res) : new Map<string, never>()), [groupsOn, res]);
-  const cardView = groupsOn && isCardView(view);
+  const places = useMemo(() => groupPlaces(res), [res]);
+  const cardView = isCardView(view);
   const cards = useMemo(() => (cardView
     ? openGroups(res).filter(g => !repo || g.members.some(m => m.repo.toLowerCase() === repo.toLowerCase()))
     : []), [cardView, res, repo]);
@@ -109,7 +107,7 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
   // What j/k walks: the cards' members, the shown rows, then the deferred ones while their list is open.
   const entries = useMemo(() => [...cardEntries, ...(showDeferred ? [...split.shown, ...split.deferred] : split.shown)], [cardEntries, split, showDeferred]);
   // A member no lane lists has a row built for its card: it can be picked too.
-  const all = useMemo(() => [...lanesOf(res).flatMap(l => l.rows), ...(groupsOn ? memberRows(res) : [])], [res, groupsOn]);
+  const all = useMemo(() => [...lanesOf(res).flatMap(l => l.rows), ...memberRows(res)], [res]);
   // The selected row: the one the URL names (wherever it is now: a review moves
   // it out of Needs you), else the view's first. One acted on and gone from
   // every lane stays shown until another is picked.
@@ -300,7 +298,7 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
           {at && <span className="usage-dim">{fmtAge(Math.max(0, now - Date.parse(at)))}</span>}
         </span>
         <span className="prso-row-title">{row.kind === 'pr' ? row.title : 'no pull request yet'}</span>
-        {groupsOn && !cardView && groupPill(places.get(groupKey(row) ?? '')) && (
+        {!cardView && groupPill(places.get(groupKey(row) ?? '')) && (
           <span className="prg-pill" title="In one of your review groups">{groupPill(places.get(groupKey(row) ?? ''))}</span>
         )}
         <span className={`prso-row-why${boxesBehindText(row) ? ' is-boxes-behind' : ''}`}>{until !== undefined ? `${why} · ${deferredText(until, now)}` : why}</span>
@@ -355,7 +353,7 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
           </nav>
           {prs.error != null && <div className="error-text">{apiErrorText(prs.error, 'Could not read your pull requests from GitHub.')}{res ? ' Showing the last answer.' : ''}</div>}
           {actionError && <div className="error-text" role="alert">{actionError}</div>}
-          {groupsOn && res?.connected && res.groupsError && <div className="error-text">{res.groupsError}</div>}
+          {res?.connected && res.groupsError && <div className="error-text">{res.groupsError}</div>}
 
           <div className="prso-body">
             <div className="prso-list" ref={listRef} role="listbox" aria-label="Pull requests in this view">
@@ -396,7 +394,7 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
                   {showDeferred && split.deferred.map(e => renderRow(e, e.until))}
                 </>
               )}
-              {groupsOn && view === 'needs_you' && (
+              {view === 'needs_you' && (
                 <ClosedGroups groups={closedGroups(res)} now={now} onChanged={changed} onError={setActionError} />
               )}
               {res?.connected && res.notes.map(n => <div key={n} className="usage-dim prso-note">{n}</div>)}
@@ -417,7 +415,7 @@ function Panel({ view, selectedKey, repo }: { view: PrsView; selectedKey: string
                     )}
                     <PrWorkstreamPicker key={selectedParam ?? ''} row={selected} checkouts={res?.connected ? res.checkouts : undefined} onChanged={changed} onError={setActionError} />
                     <SharePrPreview key={`share:${selectedParam ?? ''}`} row={selected} />
-                    {groupsOn && selected.kind === 'pr' && (
+                    {selected.kind === 'pr' && (
                       <AddToGroup key={`group:${selectedParam ?? ''}`} row={selected} groups={openGroups(res)} onChanged={changed} onError={setActionError} />
                     )}
                     {isReviewLane(selected.lane) && selected.reviewTarget && (

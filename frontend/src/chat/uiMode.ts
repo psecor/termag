@@ -84,9 +84,9 @@ export function notePageLocation(key: string): void {
 
 /** Whether the workspace at `here` (router path + query) opens the simple UI instead. */
 export function shouldOpenSimpleUi(i: {
-  flagOn: boolean; mode: UiMode; entry: string | null; here: string; locationKey: string;
+  mode: UiMode; entry: string | null; here: string; locationKey: string;
 }): boolean {
-  if (!i.flagOn || i.mode !== 'simple') return false;
+  if (i.mode !== 'simple') return false;
   if (i.locationKey !== INITIAL_LOCATION_KEY) return false;
   if (i.entry == null || i.here !== i.entry) return false;
   return i.here === '/';
@@ -98,15 +98,15 @@ export function shouldOpenSimpleUi(i: {
  * (`/?project=&ws=&browser=open&browserShare=&browserAt=`, routes/previewShares.ts);
  * this is the same in the chat, `/chat/p/<project>?ws=&browser=open&…`, whose
  * side panel then opens on Browser at the share (useBrowserShareHandoff).
- * Null for anything else, and without the side panel, which opens the workspace.
+ * Null for anything else.
  */
-export function simpleUiShareHandoff(i: { flagOn: boolean; sidePanelOn: boolean; mode: UiMode; search: string }): string | null {
-  if (!i.flagOn || !i.sidePanelOn || i.mode !== 'simple') return null;
+export function simpleUiShareHandoff(i: { mode: UiMode; search: string }): string | null {
+  if (i.mode !== 'simple') return null;
   const sp = new URLSearchParams(i.search);
   const project = sp.get('project');
   if (!project || sp.get('browser') !== 'open') return null;
   const q = new URLSearchParams({ ws: sp.get('ws') || 'main' });
-  for (const key of ['browser', 'browserShare', 'browserAt']) {
+  for (const key of ['browser', 'browserShare', 'browserAt', 'browserUrl']) {
     const value = sp.get(key);
     if (value != null) q.set(key, value);
   }

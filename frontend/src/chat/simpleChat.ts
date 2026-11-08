@@ -8,6 +8,7 @@ import { repoKey } from '../utils/repoPick';
 import type { Block } from './paneChat';
 import type { ChatLiveStatus } from './chatLiveStatus';
 import { agentLabel } from './explorerAgents';
+import { isAskChatWorkstream } from '../utils/askChatVisibility';
 
 /**
  * GitHub owners whose new simple-UI sessions start trusted. Empty: every
@@ -31,14 +32,10 @@ export function chatRows(rows: readonly InboxRow[]): InboxRow[] {
 
 /**
  * An ask thread's own chat: the workstream the orchestrator makes for it,
- * named `ask-<thread id>` (backend services/agentMessages.ts
- * askChatWorkstreamName).
+ * named `ask-<thread id>` — defined in utils/askChatVisibility.ts beside the
+ * row/workstream filters built on it, re-exported so the chat keeps one name.
  */
-const ASK_CHAT_WORKSTREAM = /^ask-[a-z0-9]{8,40}$/;
-
-export function isAskChatWorkstream(name: string): boolean {
-  return ASK_CHAT_WORKSTREAM.test(name);
-}
+export { isAskChatWorkstream };
 
 const isAskChat = (w: Project['workstreams'][number]) => Boolean(w.askThread) || isAskChatWorkstream(w.name);
 
@@ -124,13 +121,12 @@ export interface ChatRowName {
 
 /**
  * What a sidebar row is called. An ask thread leads with its title, or with
- * its thread id (ask-<id>) when its caller gave none, whatever
- * simple-ui-session-titles-enabled says; Claude's session title comes second. Otherwise, with that flag and a title Claude gave the
- * session, the title leads and the project (and workstream) is secondary;
+ * its thread id (ask-<id>) when its caller gave none; Claude's session title
+ * comes second. Otherwise, with a title Claude gave the session, the title leads and the project (and workstream) is secondary;
  * else the row is named after the project.
  */
-export function chatRowName(row: Pick<InboxRow, 'projectName' | 'workstream' | 'sessionTitle' | 'askTitle' | 'askThreadId'>, titlesShown: boolean): ChatRowName {
-  const session = titlesShown ? row.sessionTitle?.trim() || null : null;
+export function chatRowName(row: Pick<InboxRow, 'projectName' | 'workstream' | 'sessionTitle' | 'askTitle' | 'askThreadId'>): ChatRowName {
+  const session = row.sessionTitle?.trim() || null;
   // Callers name their threads (the person on #743): an ask is called by its title, else by its
   // thread id in the workstream's form (ask-<thread id>), never by anything derived.
   const askName = row.askThreadId ? row.askTitle?.trim() || row.workstream : null;
@@ -256,13 +252,9 @@ export function fullUiHref(projectId: string | null | undefined, workstream = 'm
   return `/?${q.toString()}`;
 }
 
-/**
- * Where an automation run's conversation opens: the simple UI when this user
- * has it (simple-ui-enabled), else the run's workstream in the workspace.
- * /chat redirects to / without the flag, so a link there would lose the run.
- */
-export function runConversationHref(projectId: string, workstream: string, simpleUi: boolean): string {
-  return simpleUi ? chatHref(projectId, workstream) : fullUiHref(projectId, workstream);
+/** Where an automation run's conversation opens: the simple UI. */
+export function runConversationHref(projectId: string, workstream: string): string {
+  return chatHref(projectId, workstream);
 }
 
 /**

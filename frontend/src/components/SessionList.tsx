@@ -26,7 +26,9 @@ export function useOpenTarget(): (t: WorkspaceTarget) => void {
     setActiveProject(t.projectId);
     // A review pane named by session is that workstream's; one resolved to main instead opens main's first.
     const session = t.pane === 'review' && workstream === t.workstream ? t.session : undefined;
-    const detail: FocusPaneDetail = { projectId: t.projectId, workstream, pane: t.pane, ...(session ? { session } : {}) };
+    // A terminal tab the hit is about, same rule.
+    const slot = t.pane === 'ctrl' && workstream === t.workstream ? t.slot : undefined;
+    const detail: FocusPaneDetail = { projectId: t.projectId, workstream, pane: t.pane, ...(session ? { session } : {}), ...(slot !== undefined ? { slot } : {}) };
     setTimeout(() => window.dispatchEvent(new CustomEvent(FOCUS_PANE_EVENT, { detail })), 0);
   }, [projects, setActiveProject, setActiveWorkstream]);
 }

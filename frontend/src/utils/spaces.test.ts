@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { actionLabel, breadcrumbs, collectDropped, formatBytes, nameError, parentPrefix, partRanges, prettyText, parseSpaceFileLink, parseSpaceFolderLink, previewKind, relPathError, roleAtLeast, spaceFileLink, SPACE_NAME_RE, type DropEntry } from './spaces';
+import { actionLabel, breadcrumbs, eventWho, collectDropped, formatBytes, nameError, parentPrefix, partRanges, prettyText, parseSpaceFileLink, parseSpaceFolderLink, previewKind, relPathError, roleAtLeast, spaceFileLink, SPACE_NAME_RE, type DropEntry } from './spaces';
 
 describe('spaces helpers', () => {
   it('ranks roles', () => {
@@ -60,6 +60,35 @@ describe('spaces helpers', () => {
     expect(actionLabel('something.new')).toBe('something.new');
     expect(SPACE_NAME_RE.test('team-docs')).toBe(true);
     expect(SPACE_NAME_RE.test('Team')).toBe(false);
+  });
+});
+
+describe('Slack audit labels and attribution', () => {
+  it('labels every slack.* action the space store writes', () => {
+    const actions = ['slack.enable', 'slack.disable', 'slack.channel_link', 'slack.channel_unlink', 'slack.channel_create', 'slack.channel_pause',
+      'slack.pause', 'slack.resume', 'slack.suspend', 'slack.ask', 'slack.approve', 'slack.deny'];
+    for (const a of actions) expect(actionLabel(a), a).not.toBe(a);
+    expect(actionLabel('slack.channel_link')).toBe('linked a Slack channel');
+    expect(actionLabel('slack.channel_unlink')).toBe('unlinked a Slack channel');
+  });
+
+  const names: Record<string, string> = { u1: 'alice@example.com', u2: 'bob@example.com' };
+  const nameOf = (id: string) => names[id] ?? null;
+  const boxName = (id: string) => (id === 'b1' ? 'alicebox' : null);
+
+  it('says via Slack, and for whom', () => {
+    expect(eventWho({ actorUserId: 'u1', actorInstanceId: null, surface: 'slack', onBehalfOfUserId: 'u2' }, nameOf, boxName))
+      .toBe('alice@example.com via Slack, for bob@example.com');
+    expect(eventWho({ actorUserId: 'u1', actorInstanceId: null, surface: 'slack', onBehalfOfUserId: 'u1' }, nameOf, boxName))
+      .toBe('alice@example.com via Slack');
+    expect(eventWho({ actorUserId: 'u1', actorInstanceId: null, surface: 'slack', onBehalfOfUserId: 'gone' }, nameOf, boxName))
+      .toBe('alice@example.com via Slack, for a former member');
+  });
+
+  it('reads an older event, with no surface, as before', () => {
+    expect(eventWho({ actorUserId: 'u1', actorInstanceId: null, surface: null, onBehalfOfUserId: null }, nameOf, boxName)).toBe('alice@example.com');
+    expect(eventWho({ actorUserId: 'u1', actorInstanceId: 'b1' }, nameOf, boxName)).toBe('alicebox (alice@example.com)');
+    expect(eventWho({ actorUserId: 'x', actorInstanceId: 'b9' }, nameOf, boxName)).toBe('a box (someone)');
   });
 });
 

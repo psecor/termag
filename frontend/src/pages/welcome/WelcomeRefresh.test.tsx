@@ -77,8 +77,6 @@ async function remount() {
 beforeEach(async () => {
   vi.resetAllMocks();
   localStorage.clear();
-  // termag is the chat UI; with it off there is nothing to choose (below).
-  setFlagValues({ 'simple-ui-enabled': true });
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   mocks.list.mockResolvedValue([]);
   mocks.add.mockResolvedValue(savedKey);
@@ -155,25 +153,6 @@ describe('the redrawn first run', () => {
     await press(button('Retry'));
     expect(button('Continue').disabled).toBe(false);
     expect(document.body.textContent).not.toContain("Couldn't check your GitHub connection.");
-  });
-
-  it('goes straight to a Lab project where the chat UI is off', async () => {
-    setFlagValues({});
-    await remount();
-    expect([...document.querySelectorAll('.wel-progress-label')].map(e => e.textContent)).toEqual(['GitHub', 'Start']);
-    await press(button('Continue'));
-    expect(heading()).toBe('Start your first project');
-    await act(async () => { await mocks.created!({ id: 'p1' }); });
-    expect(localStorage.getItem('termag-ui-mode')).toBe('full');
-    expect(mocks.navigate).toHaveBeenCalledWith('/?project=p1', { replace: true });
-  });
-
-  it('skips into Lab where the chat UI is off', async () => {
-    setFlagValues({});
-    await remount();
-    await press(button('Skip for now'));
-    expect(localStorage.getItem('termag-ui-mode')).toBe('full');
-    expect(mocks.navigate).toHaveBeenCalledWith('/', { replace: true });
   });
 
   it('keeps the SSH key and dotfiles folded away until asked for', async () => {

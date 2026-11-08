@@ -9,7 +9,7 @@ import { spacesApi, type SpaceEvent, type SpaceMember, type SpaceTreeDir, type S
 import { downloadFile, errorMessage, UploadAborted, UploadConflict, uploadConditionFor, uploadFile } from '../services/spaceTransfer';
 import type { Instance } from '../types';
 import {
-  actionLabel, breadcrumbs, collectDropped, formatBytes, nameError, parentPrefix, relPathError, prettyText, previewKind, roleAtLeast,
+  actionLabel, breadcrumbs, eventWho, collectDropped, formatBytes, nameError, parentPrefix, relPathError, prettyText, previewKind, roleAtLeast,
   SPACE_NAME_HINT, SPACE_NAME_RE, SPACE_ROLES, spaceFileLink, TEXT_PREVIEW_MAX_BYTES, usageLabel,
 } from '../utils/spaces';
 import type { DropEntry, DroppedFile } from '../utils/spaces';
@@ -438,7 +438,7 @@ function MembersTab({ space, myBoxes, userId, setConfirm, onRenamed, onGone }: {
   onRenamed: (s: SpaceView) => void;
   onGone: () => void;
 }) {
-  const { members, invites, boxes, sharing, error, note, setError, setNote, act } = useSpaceMembers(space.name);
+  const { members, invites, boxes, error, note, setError, setNote, act } = useSpaceMembers(space.name);
   const [email, setEmail] = useState('');
   const [pickedName, setPickedName] = useState<string | undefined>();
   const [role, setRole] = useState<string>('editor');
@@ -496,10 +496,7 @@ function MembersTab({ space, myBoxes, userId, setConfirm, onRenamed, onGone }: {
           </li>
         ))}
       </ul>
-      {isOwner && sharing === false && (
-        <div className="usage-dim space-hint">Sharing spaces with other people is not turned on for you yet.</div>
-      )}
-      {isOwner && sharing === true && (
+      {isOwner && (
         <form
           className="inline-form space-inline-form"
           onSubmit={e => {
@@ -611,12 +608,10 @@ function ActivityTab({ space, myBoxes }: { space: SpaceView; myBoxes: Instance[]
     return () => { live = false; };
   }, [space.name]);
 
-  const who = (e: SpaceEvent) => {
-    const person = members.find(m => m.userId === e.actorUserId)?.email ?? 'someone';
-    if (!e.actorInstanceId) return person;
-    const box = myBoxes.find(b => b.id === e.actorInstanceId)?.name ?? 'a box';
-    return `${box} (${person})`;
-  };
+  // "alice@… via Slack, for bob@…" for an event the space's Slack runner did for a member.
+  const who = (e: SpaceEvent) => eventWho(e,
+    id => members.find(m => m.userId === id)?.email ?? null,
+    id => myBoxes.find(b => b.id === id)?.name ?? null);
 
   if (error) return <div className="error-banner">{error}</div>;
   if (!events) return <div className="usage-dim">Loading…</div>;

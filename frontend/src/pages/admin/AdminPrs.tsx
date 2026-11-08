@@ -5,7 +5,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { ChartCard } from '../dashboard/ChartCard';
 import { TICK, GRID_STROKE, SURFACE, BAR_MAX, CHART_HEIGHT, HUE, CURSOR, DashTooltip, SeriesLegend } from '../dashboard/chartTheme';
 import { shortDate } from '../dashboard/range';
-import { DataTable, KeyValues, fmtAgo, fmtPct, pendingText, useAdminPolled, errorText, type Column } from './shared';
+import { DataTable, TableReset, KeyValues, fmtAgo, fmtPct, pendingText, useAdminPolled, errorText, type Column } from './shared';
 import { groupSummary, groupToText, textToGroup } from './prGroupText';
 import { importedTeamsNote, parseTeamsExportFile, teamToText, textToMembers } from './prTeamText';
 
@@ -206,7 +206,8 @@ export function AdminPrs({ now }: { now: number }) {
   const backfilling = st && st.repos > 0 && st.backfilled < st.repos;
 
   return (
-    <>
+    // Every table here goes back to page 1 when a picker changes its rows (Bugbot on #1298).
+    <TableReset value={[dimension, team, group, view, basis, win, rwin]}>
       {err && <div className="admin-error">{err}</div>}
       <ChartCard title="Ingestion"
         subtitle={st ? `${STATE_TEXT[st.ingester.state] ?? st.ingester.state}${st.tokenOwner ? ` · token of ${st.tokenOwner.unixUsername}` : ''}` : pendingText(status)}
@@ -243,7 +244,7 @@ export function AdminPrs({ now }: { now: number }) {
 
       <ChartCard title={inTeam ? 'Members' : 'Top contributors'} subtitle={c ? (inTeam ? `${c.contributors} on the team, ${c.total} PRs ${basisWord} in ${c.days} day${c.days === 1 ? '' : 's'} (zeros included)` : `${c.contributors} contributors, ${c.total} PRs ${basisWord} in ${c.days} day${c.days === 1 ? '' : 's'}`) : pendingText(contrib)} stale={contrib.loading}>
         <Choice label="window" value={win} options={[1, 7, 30] as const} onChange={setWin} render={d => `${d}d`} />
-        <DataTable rows={(c?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={contribCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense empty={c ? 'no PRs in this window' : pendingText(contrib)} />
+        <DataTable rows={(c?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={contribCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense search="filter people" storageKey="prs-contributors" empty={c ? 'no PRs in this window' : pendingText(contrib)} />
       </ChartCard>
 
       <ChartCard title="Weekly trend" subtitle={t ? `PRs ${basisWord} per week (Monday, UTC) by author class, and contributors in this view` : pendingText(trend)} stale={trend.loading}
@@ -270,10 +271,10 @@ export function AdminPrs({ now }: { now: number }) {
       {inTeam && <ChartCard title="PRs by repo" subtitle={teamRepos.data ? `${teamRepos.data.repos.length} repos · PRs ${basisWord} by the team in ${teamRepos.data.days} day${teamRepos.data.days === 1 ? '' : 's'}` : pendingText(teamRepos)} stale={teamRepos.loading}>
         <DataTable rows={(teamRepos.data?.repos ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={[
           { id: 'rank', label: '#', value: r => r.rank, align: 'right' },
-          { id: 'repo', label: 'repo', value: r => r.repo },
+          { id: 'repo', label: 'repo', value: r => r.repo, render: r => <span className="admin-mono">{r.repo}</span> },
           { id: 'prs', label: `PRs ${basisWord}`, value: r => r.prs, align: 'right' },
           { id: 'contributors', label: 'contributors', value: r => r.contributors, align: 'right' },
-        ]} rowKey={r => r.repo} defaultSort="rank" defaultDesc={false} dense empty={teamRepos.data ? 'no PRs in this window' : pendingText(teamRepos)} />
+        ]} rowKey={r => r.repo} defaultSort="rank" defaultDesc={false} dense search="filter repos" empty={teamRepos.data ? 'no PRs in this window' : pendingText(teamRepos)} />
       </ChartCard>}
 
       {inTeam && <>
@@ -283,7 +284,7 @@ export function AdminPrs({ now }: { now: number }) {
 
         <ChartCard title="Members as reviewers" subtitle={rgs ? `${rgs.reviewers} on the team, ${rgs.reviews} reviews in ${days(rgs.days)} (zeros included)` : pendingText(reviewersGiven)} stale={reviewersGiven.loading}>
           <Choice label="review window" value={rwin} options={[1, 7, 30] as const} onChange={setRwin} render={d => `${d}d`} />
-          <DataTable rows={(rgs?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={reviewerCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense empty={rgs ? 'no reviewers on the team' : pendingText(reviewersGiven)} />
+          <DataTable rows={(rgs?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={reviewerCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense search="filter people" empty={rgs ? 'no reviewers on the team' : pendingText(reviewersGiven)} />
         </ChartCard>
 
         <ChartCard title="Reviews received" subtitle={rr ? `${scopeRepos(rr.repos)} · reviews on the team's PRs, all reviewers · rolling windows ending now` : pendingText(reviewsReceived)} stale={reviewsReceived.loading}>
@@ -292,7 +293,7 @@ export function AdminPrs({ now }: { now: number }) {
 
         <ChartCard title="Who reviewed the team" subtitle={rrs ? `${rrs.reviewers} reviewers, ${rrs.reviews} reviews in ${days(rrs.days)}` : pendingText(reviewersReceived)} stale={reviewersReceived.loading}>
           <Choice label="review window" value={rwin} options={[1, 7, 30] as const} onChange={setRwin} render={d => `${d}d`} />
-          <DataTable rows={(rrs?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={teamReviewerCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense empty={rrs ? 'no reviews in this window' : pendingText(reviewersReceived)} />
+          <DataTable rows={(rrs?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={teamReviewerCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense search="filter people" empty={rrs ? 'no reviews in this window' : pendingText(reviewersReceived)} />
         </ChartCard>
 
         <ChartCard title="Weekly reviews (given / received)" subtitle={rtt ? 'reviews the team gave (by its members) and received (on its PRs) per week (Monday, UTC), and the reviewers on each side' : pendingText(teamRtrend)} stale={teamRtrend.loading}
@@ -321,7 +322,7 @@ export function AdminPrs({ now }: { now: number }) {
 
       <ChartCard title="Top reviewers" subtitle={rs ? `${rs.reviewers} reviewers, ${rs.reviews} reviews in ${days(rs.days)}` : pendingText(reviewers)} stale={reviewers.loading}>
         <Choice label="review window" value={rwin} options={[1, 7, 30] as const} onChange={setRwin} render={d => `${d}d`} />
-        <DataTable rows={(rs?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={reviewerCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense empty={rs ? 'no reviews in this window' : pendingText(reviewers)} />
+        <DataTable rows={(rs?.top ?? []).map((r, i) => ({ ...r, rank: i + 1 }))} columns={reviewerCols} rowKey={r => r.login} defaultSort="rank" defaultDesc={false} dense search="filter people" empty={rs ? 'no reviews in this window' : pendingText(reviewers)} />
       </ChartCard>
 
       <ChartCard title="Approval agent" subtitle={rv ? `merged PRs by how they were approved, in the ${repos(rv.windows[0]?.agent.repos ?? 0)} where ${rv.approvalAgentLogins.join(', ')} has approved` : pendingText(reviews)} stale={reviews.loading}>
@@ -438,6 +439,6 @@ export function AdminPrs({ now }: { now: number }) {
           </div>
         )}
       </ChartCard>
-    </>
+    </TableReset>
   );
 }

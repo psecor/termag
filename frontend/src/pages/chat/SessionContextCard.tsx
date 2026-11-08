@@ -9,6 +9,7 @@
 // changed and not committed or not pushed yet, from the box (useSessionChanges.ts).
 import React, { useSyncExternalStore } from 'react';
 import { Button } from '@launchpad-ui/components';
+import { EnvironmentSection } from '../../components/EnvironmentSection';
 import { Icon } from '@launchpad-ui/icons';
 import type { ChangedFile, PrFile } from '../../services/api';
 import type { InstanceStatus, Project } from '../../types';
@@ -124,6 +125,7 @@ export function SessionContextCard({ project, workstream, onOpenPr, agents }: { 
           {branch && <div className="ctx-row"><Icon name="arrow-merge" size="medium" aria-hidden="true" /><code>{branch}</code></div>}
         </div>
       </section>
+      <EnvironmentSection project={project} workstream={workstream} />
       <section className="ctx-section">
         <h4 className="ctx-heading">
           Changes

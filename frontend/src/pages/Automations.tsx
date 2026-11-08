@@ -5,7 +5,6 @@ import { automationsApi, type AutomationRunView, type AutomationView } from '../
 import { AutomationFields } from '../components/AutomationFields';
 import { draftBody, draftCron, draftFrom, type AutomationDraft } from '../utils/automationDraft';
 import { runConversationHref } from '../chat/simpleChat';
-import { FLAGS, useFlag } from '../flags';
 import { RUN_STATE_LABEL, agoLabel, automationSubtitle, boxStartFailuresLabel, describeSchedule, occurrenceShort, untilLabel } from '../utils/automationSchedule';
 import { runNowRefusal } from '../utils/automationRunNow';
 import { fmtDurationShort } from '../utils/format';
@@ -18,10 +17,8 @@ import { chatModelLabel } from '../chat/composer';
  * shared ones; `/automations/:id` (an automation's or its project's id) is
  * one automation with its schedule and prompt editable in place, Enabled,
  * Run now, the run table and the notes file the runs share. A run's
- * conversation opens in the simple UI (in the workspace without
- * simple-ui-enabled). Mounted like the dashboard, no status WebSocket and
- * no human heartbeat, so reading it is not working time; inside
- * FeatureFlagsProvider (App.tsx) so that flag is read, not its fallback.
+ * conversation opens in the simple UI. Mounted like the dashboard, no status
+ * WebSocket and no human heartbeat, so reading it is not working time.
  */
 const POLL_MS = 10_000;
 
@@ -85,7 +82,6 @@ function AutomationDetail({ id }: { id: string }) {
   const navigate = useNavigate();
   const { user } = useAuth();
   // A run's conversation is the simple UI's when this user has it; /chat redirects to / otherwise.
-  const simpleUi = useFlag(FLAGS.simpleUi, false);
   const [view, setView] = useState<(AutomationView & { runs: AutomationRunView[] }) | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -188,7 +184,7 @@ function AutomationDetail({ id }: { id: string }) {
           )}
           <button type="button" className="btn-ghost" onClick={() => navigate(`/?project=${encodeURIComponent(view.projectId)}`)}>Open in workspace</button>
           {view.lastRun?.workstream && (
-            <Link className="btn-ghost" to={runConversationHref(view.projectId, view.lastRun.workstream, simpleUi)}>Latest run's conversation</Link>
+            <Link className="btn-ghost" to={runConversationHref(view.projectId, view.lastRun.workstream)}>Latest run's conversation</Link>
           )}
           {owner && (
             <button type="button" className="btn-ghost menu-danger" onClick={() => { if (window.confirm(`Archive ${view.projectName}? Its runs stop; the project and its branches stay archived.`)) void act(() => automationsApi.remove(view.id).then(() => navigate('/automations')), 'Archived'); }}>Archive</button>
@@ -236,7 +232,7 @@ function AutomationDetail({ id }: { id: string }) {
                   <td className="auto-summary" title={r.summary ?? undefined}>{r.summary ?? ''}</td>
                   <td>{r.prUrl ? <a href={r.prUrl} target="_blank" rel="noreferrer">PR</a> : r.branch ? <code>{r.branch.split('/').pop()}</code> : ''}</td>
                   <td className="auto-actions">
-                    {r.workstream && <Link to={runConversationHref(view.projectId, r.workstream, simpleUi)} title={simpleUi ? "The run's conversation in termag" : "The run's conversation in the workspace"}>💬</Link>}
+                    {r.workstream && <Link to={runConversationHref(view.projectId, r.workstream)} title="The run's conversation in termag">💬</Link>}
                     {owner && (r.state === 'running' || r.state === 'pending') && (
                       <button type="button" className="btn-tiny" onClick={() => act(() => automationsApi.stopRun(view.id, r.id), 'Run stopped')}>Stop</button>
                     )}

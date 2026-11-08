@@ -1,9 +1,7 @@
 // A space's people and boxes, for the full UI's Members &
 // boxes tab and the simple UI's Share dialog: one load of both lists, and
 // every change through `act`, which reloads them after it and turns a
-// failure into `error`. `sharing` is the server's word on
-// spaces-sharing-enabled for the caller (GET /members), the same value
-// POST /members checks, so the add form and the 403 can't disagree.
+// failure into `error`.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { spacesApi, type SpaceBoxGrant, type SpaceInvite, type SpaceMember } from '../services/api';
 import { errorMessage } from '../services/spaceTransfer';
@@ -14,8 +12,6 @@ export interface SpaceMembers {
   /** Pending invites; the server sends them to owners only. */
   invites: SpaceInvite[];
   boxes: SpaceBoxGrant[];
-  /** Whether the caller may add people; null until loaded. */
-  sharing: boolean | null;
   error: string;
   note: string;
   setError: (message: string) => void;
@@ -32,7 +28,6 @@ export function useSpaceMembers(space: string): SpaceMembers {
   const [members, setMembers] = useState<SpaceMember[]>([]);
   const [invites, setInvites] = useState<SpaceInvite[]>([]);
   const [boxes, setBoxes] = useState<SpaceBoxGrant[]>([]);
-  const [sharing, setSharing] = useState<boolean | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState('');
   const [note, setNote] = useState('');
@@ -46,7 +41,6 @@ export function useSpaceMembers(space: string): SpaceMembers {
       if (current.current !== space) return;
       setMembers(m.members);
       setInvites(m.invites);
-      setSharing(m.sharing);
       setBoxes(b.boxes);
       setLoaded(true);
     } catch (err) {
@@ -70,5 +64,5 @@ export function useSpaceMembers(space: string): SpaceMembers {
     return true;
   }, [reload]);
 
-  return { loaded, members, invites, boxes, sharing, error, note, setError, setNote, reload, act };
+  return { loaded, members, invites, boxes, error, note, setError, setNote, reload, act };
 }

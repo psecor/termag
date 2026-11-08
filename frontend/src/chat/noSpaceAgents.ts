@@ -1,9 +1,8 @@
-// The explorer of agents in no space (simple-ui-side-panel-enabled,
-// pages/chat/AgentsExplorer.tsx): a space's explorer has its agents beside
+// The explorer of agents in no space (pages/chat/AgentsExplorer.tsx): a space's explorer has its agents beside
 // its files, and agents in no space (chatSpaces.ts chatHomeSpace) have no
 // file store, so theirs lists only agents, nested as a space's are
-// (explorerAgents.ts). For a person with no spaces, or with spaces off, that
-// is every agent.
+// (explorerAgents.ts). For a person with no spaces, that is every
+// agent.
 import { chatHomeSpace, type ChatPlace } from './chatSpaces';
 import { agentForest, type AgentNode, type AgentRowLike, type SpawnLink } from './explorerAgents';
 import { itemKey, type OpenItem } from './openItems';

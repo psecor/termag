@@ -176,7 +176,7 @@
 }
 .space-swatch[data-space="none"] { background: none; border: 1.5px dashed var(--text-secondary); }
 
-/* Open items (simple-ui-side-panel-enabled): one dense line per item, in main's space groups
+/* Open items: one dense line per item, in main's space groups
    (above), which fold the same way. A group's head is also where a dragged tab lands. */
 .chat-items .chat-group-head { padding: 2px 4px 0 0; }
 .chat-items .chat-group-name { flex: 1; }
@@ -347,6 +347,17 @@
 .fx-hit-text .fx-name { flex-shrink: 0; max-width: 70%; }
 .fx-hit mark { background: none; color: var(--accent); font-weight: 600; }
 .fx-where { color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+/* A subagent under its agent (chat-nested-agents-enabled): a button that opens the agent's chat, drawn as a row. */
+/* LaunchPad's Button, so its centring, radius and tertiary fill give way to the row's. */
+.fx-row.fx-subagent { justify-content: flex-start; border-radius: 6px; background: none; color: var(--text-primary); }
+.fx-row.fx-subagent[data-hovered] { background: var(--bg-elevated); }
+.fx-subagent .fx-name { color: var(--text-secondary); }
+/* Files' Archived fold (chat-nested-agents-enabled): a quiet head like an automation's runs, and Unarchive under each row. */
+.fx-row.fx-archived-head { justify-content: flex-start; border-radius: 6px; background: none; color: var(--text-muted); }
+.fx-row.fx-archived-head[data-hovered] { background: var(--bg-elevated); }
+.fx-unarchive-li { padding-left: 22px; }
+.fx-unarchive-li .fx-unarchive { height: auto; min-height: 0; padding: 0 0 2px; border-radius: 0; background: none; font-size: 11px; color: var(--accent); }
+.fx-unarchive-li .fx-unarchive[data-hovered] { background: none; text-decoration: underline; }
 .fx-note { color: var(--text-muted); font-size: 12px; padding: 4px 8px 4px 22px; }
 .fx-error { color: var(--danger); }
 /* Agents in the explorer are rows like files; one that started others has a caret to show them. */
@@ -395,7 +406,9 @@
    who can see the file by its icon and label alone (a lock and Share, or
    people and Shared), with the same weight as the header's other buttons
    either way; the link part copies the same link either way. */
-.fv-icon-btn { display: inline-flex; align-items: center; justify-content: center; }
+/* A header's icon button (Reload, Download, a tab page's back arrow): the refresh's 32px header buttons'
+   height, whatever else is in its row (pageBackCss.test.ts); a touch screen's 44px below wins. */
+.fv-icon-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; }
 .fv-icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
 .fv-share { display: inline-flex; align-items: stretch; }
 .fv-share .btn-ghost { display: inline-flex; align-items: center; gap: 6px; }
@@ -545,10 +558,17 @@
   .cv-num { padding: 0 8px 0 4px; }
 }
 
-.chat-sidebar-foot { display: flex; gap: 12px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--border); }
-.chat-foot-link { color: var(--text-secondary); text-decoration: none; font-size: 12px; }
+.chat-sidebar-foot { display: flex; flex-wrap: wrap; gap: 12px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--border); }
+.chat-foot-link { color: var(--text-secondary); text-decoration: none; font-size: 12px; white-space: nowrap; }
 button.chat-foot-link { background: none; border: none; padding: 0; font: inherit; cursor: pointer; }
 .chat-foot-link:hover { color: var(--text-primary); }
+/* How it works (DocsSiteLink): LaunchPad's link, drawn as the foot's other links. The UI font, never mono. */
+.chat-sidebar-foot a.chat-docs-link {
+  font-family: inherit;
+  font-weight: 400;
+  text-decoration: none;
+}
+.chat-sidebar-foot a.chat-docs-link:is(:hover, [data-hovered]) { color: var(--text-primary); background: none; text-decoration: none; }
 
 .chat-notify-hint { display: flex; align-items: center; gap: 8px; margin: 6px 12px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
 .chat-notify-hint a { flex: 1; color: var(--accent); text-decoration: none; }
@@ -679,6 +699,9 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
   background: linear-gradient(to bottom, transparent, var(--bg-base));
 }
 .chat-bottom > * { max-width: 820px; margin-left: auto; margin-right: auto; }
+/* One line at every width, a phone's too: the line changes at each step of a turn
+   ("Thinking…", "Running Bash · <command>"), and one that wrapped moved the composer
+   and the transcript above it each time. A cut line keeps its full text in its title. */
 .chat-status { font-size: 12px; color: var(--text-secondary); padding: 2px 0 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* The status line and the notes under the composer start where the text does, past the
    composer's rounded corner, in line with the transcript. Cards stay full width. */
@@ -900,6 +923,8 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
 /* Desktop: the Chats button is absent, so the composer stays the page's flex item. */
 .chat-new-stack { display: contents; }
 .chat-new-card { width: 100%; max-width: 640px; display: flex; flex-direction: column; gap: 14px; }
+/* Holds New session's drop overlay (.chat-drop-overlay) over the card. */
+.chat-new-card { position: relative; }
 .chat-new-card h2 { margin: 0; font-size: 20px; font-weight: 600; }
 .chat-new-lede, .chat-new-card > p { margin: 0; color: var(--text-secondary); }
 .chat-new-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-secondary); }
@@ -923,6 +948,8 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
 }
 .chat-new-space .chat-new-error { overflow-wrap: anywhere; }
 .chat-new-error { color: var(--danger); font-size: 12px; }
+/* A pooled environment's new box: "ready in about 20 s". */
+.chat-new-hint { color: var(--text-secondary); font-size: 12px; font-family: var(--font-ui); }
 .chat-new-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
 .chat-new-why { margin-right: auto; font-size: 12px; color: var(--text-muted); }
 .chat-new-card .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -1192,6 +1219,7 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
    only the keyboard's: out of sight until it has focus. */
 .chat-earlier { align-self: center; }
 .chat-earlier[data-fallback]:not(:focus-visible) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; padding: 0; border: 0; }
+.chat-earlier-error { align-self: center; margin: 0; font-size: 12px; color: var(--text-muted); }
 .sdk-user-note { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 .sdk-images { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-bottom: 4px; }
 .sdk-image {
@@ -1261,7 +1289,12 @@ a.sdk-image { cursor: zoom-in; }
 .chat-attachment { position: relative; width: 64px; height: 64px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); background: var(--bg-surface); }
 .chat-attachment img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .chat-attachment[data-file] { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 4px; }
+/* A text file's chip is as wide as its name, up to a point, so "Pasted text #1 +39 lines" reads whole. */
+.chat-attachment[data-text-file] { width: auto; min-width: 64px; max-width: 200px; }
 .chat-attachment-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--text-muted); }
+/* A file on its way to the box (chat/ChatImages.tsx ComposerImages): where it is, under its name. */
+.chat-attachment-status { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; color: var(--accent); }
+.chat-attachment[data-box-file='uploading'], .chat-attachment[data-box-file='waking'] { border-style: dashed; }
 .chat-attachment-remove {
   position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; padding: 0;
   border: none; border-radius: 50%; background: rgba(0, 0, 0, 0.65); color: #fff;
@@ -1585,7 +1618,7 @@ a.sdk-image { cursor: zoom-in; }
   }
 
   /* 16px stops iOS Safari from zooming the page when the composer focuses.
-     Scoped to the conversation composer; New chat owns its own field. */
+     (Every other field on a phone: the html[data-simple-ui] rule below.) */
   .chat-bottom .chat-input { font-size: 16px; }
   /* The ring's popover spans the composer: anchored to the ring it would run off the left edge. */
   .chat-composer { position: relative; }
@@ -1597,7 +1630,6 @@ a.sdk-image { cursor: zoom-in; }
   .chat-stop-split .chat-stop-main { width: 38px; }
   .chat-keys { flex-wrap: nowrap; overflow-x: auto; }
   .chat-keys .btn-tiny { flex-shrink: 0; min-height: 34px; }
-  .chat-status { white-space: normal; }
 
   .chat-transcript .m-block-you,
   .sdk-user { max-width: 92%; }
@@ -1738,15 +1770,22 @@ a.sdk-image { cursor: zoom-in; }
 .chat-side-share-pr-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 767px) {
+  /* Top and height follow the visual viewport (hooks/useVisualViewport.ts, set by
+     SidePanel.tsx): iOS overlays the keyboard and keeps 100dvh, which left the
+     prompt under it. With the keyboard up the home indicator is under the keyboard. */
   .chat-side-panel[data-overlay] {
     position: fixed;
     z-index: 30;
-    inset: 0;
-    height: 100dvh;
+    left: 0;
+    right: 0;
+    top: var(--chat-vvtop, 0px);
+    height: var(--chat-vvh, 100dvh);
+    box-sizing: border-box;
     border-left: none;
     padding-top: env(safe-area-inset-top, 0px);
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
+  .chat-side-panel[data-overlay][data-keyboard] { padding-bottom: 0; }
   .chat-side-close { min-height: 44px; min-width: 44px; }
   /* Tabs are 44px buttons on a phone, drawn like the header's (btn-ghost), the shown one marked as Tools is. */
   .chat-side-tabs { gap: 6px; }
@@ -1756,6 +1795,40 @@ a.sdk-image { cursor: zoom-in; }
   }
   .chat-side-tab:hover { border-color: var(--text-secondary); }
   .chat-side-tab.active { color: var(--text-primary); background: var(--bg-active); border-color: var(--accent); }
+}
+
+/* The overlay's Terminal (TerminalKeyBar.tsx): the pane over a row of keys a phone
+   keyboard lacks. LaunchPad buttons, 44 px targets; the keys scroll sideways
+   on a narrow phone, the keyboard button stays at the start. */
+.chat-term-phone { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.chat-term-phone-pane { position: relative; flex: 1 1 0; min-height: 0; }
+.chat-term-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 4px 6px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-surface);
+  font-family: var(--font-ui);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.chat-term-keys-scroll {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+}
+.chat-term-keys-scroll::-webkit-scrollbar { display: none; }
+.chat-term-key {
+  flex-shrink: 0;
+  min-width: 40px;
+  min-height: 40px;
+  font-family: var(--font-ui);
+  touch-action: manipulation;
 }
 
 /* The New session shortcut's hint is for keyboards: not on touch screens. */
@@ -1802,6 +1875,9 @@ a.sdk-image { cursor: zoom-in; }
 .chat-permission-btn { padding: 5px 8px; }
 .chat-permission-btn[data-choice="full"] { color: var(--warning); }
 .chat-permission-menu { width: min(310px, 86vw); max-width: none; }
+/* What an environment's choice is for: its checkouts, each at its branch (repository and branch names are code). */
+.chat-permission-for { padding: 0 10px 6px; font-family: var(--font-ui); font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.chat-permission-for code { font-family: var(--font-mono); font-size: 11px; }
 /* The orchestrator switch: its name and an on/off track; dimmed, with the reason on hover, while it needs Full access. */
 .chat-orchestrator-btn { padding: 5px 8px; }
 .chat-orchestrator-btn[aria-checked="true"] { color: var(--text-primary); }
@@ -1872,6 +1948,10 @@ a.sdk-image { cursor: zoom-in; }
 }
 .chat-launch-trigger:disabled { opacity: 0.6; cursor: default; }
 .chat-launch-trigger-label { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* New box's mark (pages/chat/LaunchDrawer.tsx): LaunchPad's sparkle, in the text's own colour beside the name. */
+.chat-launch-new-mark { flex-shrink: 0; --lp-color-fill-ui-primary: currentColor; }
+/* New box's tooltips and the box trigger's: a line each, the first in bold. */
+.chat-launch-tip { display: flex; flex-direction: column; gap: 2px; font-family: var(--font-ui); text-align: start; }
 .chat-launch-strip .chat-new-space { display: flex; flex-direction: row; align-items: center; gap: 6px; min-width: 0; }
 .chat-space-trigger[aria-invalid="true"] .chat-launch-trigger-label { color: var(--danger); }
 
@@ -1931,7 +2011,7 @@ a.sdk-image { cursor: zoom-in; }
 .chat-launch-new-disk { margin-top: 8px; }
 .box-disk-input { display: flex; flex-direction: row; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; }
 .box-disk-input .box-disk-input-label { color: var(--text-secondary); font: inherit; margin: 0; }
-.chat-launch-dialog .box-disk-input-field {
+.chat-launch-dialog .box-disk-input-field, .chat-resize-dialog .box-disk-input-field {
   width: 7em; height: auto; padding: 5px 9px; font: inherit; font-size: 13px;
   background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border); border-radius: 8px;
 }
@@ -1975,7 +2055,7 @@ a.sdk-image { cursor: zoom-in; }
 .chat-launch-dialog-note { margin: 0; font-size: 12.5px; color: var(--text-secondary); }
 .chat-space-choice .chat-launch-box-name { display: inline-flex; align-items: center; gap: 8px; }
 /* Under the name, past the swatch (10px + the 8px gap). */
-.chat-space-choice small { padding-left: 18px; }
+.chat-launch-choice-marked small { padding-left: 18px; }
 .chat-space-plus { width: 10px; flex-shrink: 0; text-align: center; font-size: 14px; line-height: 10px; color: var(--text-secondary); }
 
 /* A space's Share dialog (pages/chat/SpaceShareDialog.tsx), from its ⋮ in the sidebar. */
@@ -2055,6 +2135,7 @@ a.sdk-image { cursor: zoom-in; }
 .chat-resize-now, .chat-resize-note { color: var(--text-secondary); }
 .chat-resize-warning { padding: 8px 10px; border: 1px solid var(--warning); border-radius: 8px; color: var(--warning); line-height: 1.45; }
 .chat-resize-select .box-size-select-button { flex: 1; }
+.chat-resize-retry { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
 .chat-resize-progress { display: flex; flex-direction: column; gap: 10px; }
 .chat-resize-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .chat-resize-steps li { display: flex; align-items: center; gap: 8px; color: var(--text-muted); }
@@ -2062,3 +2143,90 @@ a.sdk-image { cursor: zoom-in; }
 .chat-resize-steps li[data-state="done"] { color: var(--text-secondary); }
 .chat-resize-steps li[data-state="done"] svg { color: var(--success); }
 .chat-resize-buttons { justify-content: flex-end; }
+
+/* ── Environments (EnvironmentsPage.tsx) ─────────── */
+/* The page is the automation page's (automations/automations.css); only the form's own layout is here. */
+.chat-env-form { display: flex; flex-direction: column; gap: 14px; }
+.chat-env-pointer { display: grid; grid-template-columns: 2fr 1fr 2fr; gap: 12px; }
+.chat-env-json textarea, .chat-env-definition { font-family: var(--font-mono); }
+.chat-env-json textarea { width: 100%; box-sizing: border-box; font-size: 12px; }
+.chat-env-error { color: var(--danger); font-size: 12px; }
+.chat-env-actions { display: flex; justify-content: flex-end; gap: 8px; }
+/* The pool card's last prepare failure: setup's log, terminal output. */
+.chat-env-pool-log { font-family: var(--font-mono); max-height: 240px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+.chat-env-lines { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.chat-env-change { white-space: normal; }
+@media (max-width: 600px) { .chat-env-pointer { grid-template-columns: 1fr; } }
+/* The environment dialog (pages/chat/EnvironmentSelect.tsx): the space dialog's rows, with no mark. */
+.chat-env-dialog-actions { justify-content: space-between; align-items: center; }
+/* Its search, over the rows. */
+.lp-theme.chat-env-search .chat-env-search-group {
+  display: flex; align-items: center; gap: 6px; height: 36px; padding: 0 4px 0 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg-primary); box-shadow: none; outline: none;
+}
+.lp-theme.chat-env-search .chat-env-search-group:focus-within { border-color: var(--accent); }
+.chat-env-search-icon { flex-shrink: 0; fill: var(--text-secondary); }
+/* SearchField hands its Group the field's box (above), so the input inside draws none, and no focus ring of its own. */
+.lp-theme.chat-env-search .chat-env-search-group input {
+  flex: 1; min-width: 0; height: auto; padding: 0; border: none; background: none; box-shadow: none; outline: none;
+  color: var(--text-primary); font: inherit; font-size: 13.5px;
+}
+.lp-theme.chat-env-search .chat-env-search-group input::placeholder { color: var(--text-muted); }
+.chat-env-search input::-webkit-search-cancel-button { display: none; }
+.chat-env-search[data-empty] .chat-env-search-clear { visibility: hidden; }
+.chat-env-search-clear [data-icon] { fill: var(--text-secondary); }
+.chat-env-choices { display: flex; flex-direction: column; gap: 2px; min-height: 0; }
+.chat-env-choices > .chat-menu-heading { padding: 8px 10px 2px; }
+.chat-env-pinned { display: flex; flex-direction: column; gap: 2px; }
+/* Every environment, in the shared .scroll-list (App.css): its own scroll, so No environment above it,
+   New environment below it and the dialog's buttons stay in view. */
+.chat-env-list { display: flex; flex-direction: column; gap: 2px; padding: 4px; margin: 2px 0 4px; }
+/* With no marks, names line up in one column: the box's 1px border and 4px padding come off its rows' 10px. */
+.chat-env-list .chat-launch-box { padding-left: 5px; padding-right: 5px; }
+.chat-env-empty { margin: 6px 10px; font-size: 12.5px; color: var(--text-secondary); }
+.chat-launch-environment { font-weight: 600; color: var(--text-primary); }
+/* What a session from an environment clones, under the heading: names are code, the sentence is UI text. */
+.chat-launch-checkouts { margin: -4px 0 8px; font-family: var(--font-ui); font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.chat-launch-checkouts code { font-family: var(--font-mono); font-size: 11px; }
+
+/* The repo pill over a started session's composer (SessionRepoPill.tsx): New
+   session's RepoPicker as a small outlined pill, its menu opening upward,
+   each Selected row's clone status under its name. */
+.chat-session-repos { display: flex; padding: 0 2px 6px; font-size: 13px; }
+.chat-session-repos .chat-compose-repo-btn {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+}
+.chat-session-repos .chat-compose-repo-btn:hover,
+.chat-session-repos .chat-compose-repo-btn[aria-expanded="true"] { color: var(--text-primary); background: var(--bg-active); }
+.chat-compose-repo-state { color: var(--text-muted); }
+.chat-compose-repo-state[data-state="failed"] { color: var(--danger); }
+.chat-compose-menu[data-above] { top: auto; bottom: calc(100% + 6px); right: auto; width: min(400px, 90vw); max-height: min(60vh, 420px); }
+.chat-repo-option-note { display: block; color: var(--text-secondary); font-size: 12px; }
+.chat-session-repos-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 8px 2px; }
+.chat-session-repos-error { color: var(--danger); }
+/* A tool update's restart notice in a pane chat (chat/RestartNotice.tsx): one muted line across
+   the transcript, like a context divider, in the UI font: it is a sentence, not code. */
+.chat-restart-notice { display: flex; align-items: center; gap: 10px; align-self: stretch; margin: 6px 0; font-family: var(--font-ui); font-size: 12px; color: var(--text-muted); }
+.chat-restart-notice::before, .chat-restart-notice::after { content: ''; flex: 1; min-width: 16px; border-top: 1px solid var(--border); }
+.chat-restart-notice-text { flex: 0 1 auto; max-width: 80%; text-align: center; overflow-wrap: anywhere; }
+/* Another pane's restart (the side terminal's, Review's): a note after the pane's blocks, no rules, so it never reads as the agent's session restarting. */
+.chat-restart-notice[data-side]::before, .chat-restart-notice[data-side]::after { content: none; }
+.chat-restart-notice[data-side] { justify-content: center; }
+
+/* On a phone every field the simple UI shows is at least 16px, or iOS Safari
+   zooms the page into it on focus; the simple UI lifts the zoom lock there
+   (hooks/useZoomableViewport.ts). html[data-simple-ui] is
+   set while /chat is mounted (ChatApp.tsx), so this reaches the menus, dialogs
+   and popovers that render in portals outside .chat-root. !important because it
+   is a floor over many component rules of higher specificity. xterm's hidden
+   helper textarea is the terminal's, not a field, and is left alone. */
+@media (max-width: 767px) and (pointer: coarse) {
+  html[data-simple-ui] :is(
+    input:not([type='checkbox'], [type='radio'], [type='range'], [type='button'], [type='submit'], [type='reset'], [type='file'], [type='color'], [type='image'], [type='hidden']),
+    textarea:not(.xterm-helper-textarea),
+    select
+  ) { font-size: 16px !important; }
+}

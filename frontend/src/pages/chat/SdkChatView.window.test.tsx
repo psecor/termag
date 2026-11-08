@@ -7,13 +7,14 @@ import type { Project } from '../../types';
 
 const mocks = vi.hoisted(() => ({
   history: vi.fn(),
+  earlier: vi.fn(),
   send: vi.fn(),
   noBoxes: [] as unknown[],
 }));
 
 vi.mock('../../services/api', async importOriginal => ({
   ...(await importOriginal<typeof import('../../services/api')>()),
-  chatApi: { history: mocks.history, send: mocks.send, reclaim: vi.fn(), interrupt: vi.fn(), openInTerminal: vi.fn(), trust: vi.fn() },
+  chatApi: { history: mocks.history, earlier: mocks.earlier, send: mocks.send, reclaim: vi.fn(), interrupt: vi.fn(), openInTerminal: vi.fn(), trust: vi.fn() },
   activityApi: { heartbeat: () => Promise.resolve() },
   visitsApi: { record: () => Promise.resolve() },
 }));
@@ -97,6 +98,7 @@ beforeEach(() => {
   localStorage.clear();
   sessionStorage.clear();
   mocks.history.mockReset();
+  mocks.earlier.mockReset();
   fakeLayout();
 });
 
@@ -221,5 +223,101 @@ describe('SdkChatView long transcripts', () => {
     for (let i = 0; i < 3; i++) await act(async () => { button()!.click(); });
     expect(questions()).toHaveLength(100);
     expect(button()).toBeNull();
+  });
+
+  it('pages older history in from the box once the window reaches the top, anchored, until the first question', async () => {
+    // The box sends the newest 40 questions and says there are more; each page is 30 more, the last one done.
+    const all = longHistory(100).entries;
+    const from = (i: number) => all.findIndex(e => (e as { uuid?: string }).uuid === `u${i}`);
+    mocks.history.mockImplementation(async () => ({ ...longHistory(0), entries: all.slice(from(60)), more: true }));
+    mocks.earlier.mockImplementation(async (_p: string, _w: string, before: string) => {
+      const end = all.findIndex(e => (e as { uuid?: string }).uuid === before);
+      const begin = Math.max(0, end - 60);
+      return { entries: all.slice(begin, end), done: begin === 0 };
+    });
+    await render();
+    for (let i = 0; i < 20 && questions()[0] !== 'question 0'; i++) {
+      await scrollTo(1000);
+      await scrollTo(100);
+      await flush();
+    }
+    expect(questions()[0]).toBe('question 0');
+    expect(questions()).toHaveLength(100);
+    expect(new Set(questions()).size).toBe(100);
+    expect(mocks.earlier.mock.calls.map(c => c[2])).toEqual(['u60', 'u30']);
+    expect(document.querySelector('.chat-earlier')).toBeNull();
+  });
+
+  it('keeps what is on screen where it was when a page comes in', async () => {
+    const all = longHistory(40).entries;
+    mocks.history.mockImplementation(async () => ({ ...longHistory(0), entries: all.slice(40), more: true }));
+    mocks.earlier.mockResolvedValue({ entries: all.slice(0, 40), done: true });
+    await render();
+    expect(questions()).toHaveLength(20);
+    await scrollTo(500);
+    await scrollTo(100);
+    await flush();
+    expect(mocks.earlier).toHaveBeenCalledWith('p1', 'main', 'u20', undefined);
+    expect(questions()[0]).toBe('question 0');
+    // 40 groups came in above what was 100px from the top.
+    expect(transcript().scrollTop).toBe(100 + 40 * ROW_PX);
+  });
+
+  it('offers older history as a button when the transcript is too short to scroll', async () => {
+    const all = longHistory(3).entries;
+    mocks.history.mockImplementation(async () => ({ ...longHistory(0), entries: all.slice(2), more: true }));
+    mocks.earlier.mockResolvedValue({ entries: all.slice(0, 2), done: true });
+    await render();
+    const button = document.querySelector('.chat-earlier') as HTMLButtonElement;
+    expect(button.textContent).toBe('Show earlier messages');
+    await act(async () => { button.click(); });
+    await flush();
+    expect(questions()).toEqual(['question 0', 'question 1', 'question 2']);
+    expect(document.querySelector('.chat-earlier')).toBeNull();
+  });
+
+  it('says why older history did not come, offers it again only when asking again can help', async () => {
+    const all = longHistory(3).entries;
+    mocks.history.mockImplementation(async () => ({ ...longHistory(0), entries: all.slice(2), more: true }));
+    const refusal = (status: number, code: string, error: string) => Object.assign(new Error(error), { response: { status, data: { code, error } } });
+    mocks.earlier.mockRejectedValueOnce(refusal(503, 'box-away', "The session's box isn't connected"));
+    await render();
+    await act(async () => { (document.querySelector('.chat-earlier') as HTMLButtonElement).click(); });
+    await flush();
+    expect(document.querySelector('.chat-earlier-error')?.textContent).toBe("The session's box isn't connected");
+    expect(document.querySelector('.chat-earlier')?.textContent).toBe('Try again');
+    mocks.earlier.mockRejectedValueOnce(refusal(409, 'runner-update', "This box's agent needs an update before it can show older history"));
+    await act(async () => { (document.querySelector('.chat-earlier') as HTMLButtonElement).click(); });
+    await flush();
+    expect(document.querySelector('.chat-earlier-error')?.textContent).toBe("This box's agent needs an update before it can show older history");
+    expect(document.querySelector('.chat-earlier')).toBeNull();
+    expect(questions()).toEqual(['question 1', 'question 2']);
+  });
+
+  it('keeps paging open on an empty page that is not done', async () => {
+    const all = longHistory(3).entries;
+    mocks.history.mockImplementation(async () => ({ ...longHistory(0), entries: all.slice(2), more: true }));
+    mocks.earlier.mockResolvedValueOnce({ entries: [], done: false });
+    await render();
+    await act(async () => { (document.querySelector('.chat-earlier') as HTMLButtonElement).click(); });
+    await flush();
+    expect(document.querySelector('.chat-earlier-error')?.textContent).toBe('Could not load earlier messages');
+    expect(document.querySelector('.chat-earlier')?.textContent).toBe('Try again');
+  });
+
+  it('starts another chat with paging open, whatever the last one ended on', async () => {
+    const all = longHistory(3).entries;
+    mocks.history.mockImplementation(async () => ({ ...longHistory(0), entries: all.slice(2), more: true }));
+    mocks.earlier.mockRejectedValueOnce(Object.assign(new Error('old'), { response: { status: 409, data: { code: 'runner-update', error: 'needs an update' } } }));
+    await render();
+    await act(async () => { (document.querySelector('.chat-earlier') as HTMLButtonElement).click(); });
+    await flush();
+    expect(document.querySelector('.chat-earlier')).toBeNull();
+    await act(async () => {
+      root.render(<MemoryRouter><SdkChatView project={project} workstream="other" /></MemoryRouter>);
+    });
+    await flush();
+    expect(document.querySelector('.chat-earlier-error')).toBeNull();
+    expect(document.querySelector('.chat-earlier')?.textContent).toBe('Show earlier messages');
   });
 });

@@ -1,8 +1,8 @@
 // A simple-UI chat whose box is parked, and whose transcript the orchestrator
-// stores (chat-transcripts-enabled), opens on that
+// stores, opens on that
 // copy and leaves the box alone: starting it is the person's call, by sending
 // (the only way this view wakes it). Only a chat with nothing stored is started on open
-// (box-open-start-enabled, hooks/useStartParkedBoxOnOpen.ts), so there is
+// (hooks/useStartParkedBoxOnOpen.ts), so there is
 // something to see. The conversation's history load (pages/chat/useSdkChat.ts)
 // reports what it got here, and the open waits for that answer.
 import type { Instance } from '../types';

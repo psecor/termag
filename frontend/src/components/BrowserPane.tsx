@@ -33,7 +33,7 @@ interface Props {
   openShare?: BrowserShareHandoff | null;
   /** A dial that carried `openShare` is ready: its owner drops the handoff, so a remount doesn't carry it again. */
   onOpenShareUsed?: () => void;
-  /** "Reset browser": sign out of everything this pane's kept profile holds (browser-pane-persistent-profiles-enabled). */
+  /** "Reset browser": sign out of everything this pane's kept profile holds. */
   showReset?: boolean;
   onCheckout?: (checkout: PaneCheckout) => void;
   /** A final close, for a page that shows its own state (the guest page: a box asleep). */
@@ -50,6 +50,7 @@ interface Nav { url: string; title: string; canGoBack: boolean; canGoForward: bo
 
 interface ServerMessage {
   type?: string;
+  resettable?: boolean;
   data?: string;
   width?: number;
   height?: number;
@@ -107,6 +108,8 @@ export function BrowserPane({ projectId = '', workstream = 'main', share, url, o
   const onUrlChangeRef = useRef(onUrlChange);
   onUrlChangeRef.current = onUrlChange;
   const [status, setStatus] = useState<Status>({ kind: 'connecting' });
+  // Known once the pane is ready: an agent that keeps no profiles can't reset one.
+  const [resettable, setResettable] = useState<boolean | null>(null);
   const [nav, setNav] = useState<Nav>({ url: urlRef.current, title: '', canGoBack: false, canGoForward: false });
   const [urlInput, setUrlInput] = useState('');
   const [editing, setEditing] = useState(false);
@@ -253,6 +256,7 @@ export function BrowserPane({ projectId = '', workstream = 'main', share, url, o
         switch (msg.type) {
           case 'ready':
             attempt = 0;
+            setResettable(msg.resettable === true);
             setStatus({ kind: 'live' });
             setTakenOver(false);
             openShareRef.current = null;
@@ -534,7 +538,7 @@ export function BrowserPane({ projectId = '', workstream = 'main', share, url, o
             ⌕
           </button>
         )}
-        {showReset && (
+        {showReset && resettable !== false && (
           <button
             type="button"
             className="browser-pane-btn"

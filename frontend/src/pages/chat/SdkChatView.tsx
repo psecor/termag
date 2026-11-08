@@ -11,11 +11,12 @@ import { HeadingStoreContext } from '../../chat/toolGroupHeadings';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { Link } from 'react-router-dom';
+import { Button } from '@launchpad-ui/components';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { Dialog } from '../../components/Dialog';
 import { announceChatsChanged, archiveBoxNotice, clearRunningBox, dismissRunningBoxNotice, dropLastActiveProject, parkedPowerError, runningBoxFromNotice, saveRunningBox, stillRunningWorkspaceHref } from '../../chat/archive';
 import { LAST_ACTIVE_PROJECT_KEY, useProjects } from '../../contexts/ProjectContext';
-import { chatsApi, instancesApi, visitsApi } from '../../services/api';
+import { chatsApi, heldImageUrl, instancesApi, visitsApi } from '../../services/api';
 import { boxFeed } from '../../services/boxFeed';
 import { REPLAY_BLOCK_CLASS } from '../../observability';
 import { Markdown } from '../../chat/Markdown';
@@ -25,19 +26,20 @@ import { ActionBubble } from '../../chat/genui/ActionBubble';
 import { parseActionMessage, sentSurfaces } from '../../chat/genui/action';
 import { preLaunchTail } from '../../chat/newChat';
 import { parsePane } from '../../chat/paneChat';
-import { commandLine, formatCost, groupTurns, loadsEarlier, chatGroupKey, earlierStart, TRANSCRIPT_WINDOW, transcriptWindow, windowStart, type ChatGroup, type ChatItem, type ChatState, tasksLine } from '../../chat/sdkChat';
+import { commandLine, formatCost, groupTurns, loadsEarlier, chatGroupKey, earlierStart, TRANSCRIPT_WINDOW, transcriptWindow, windowStart, windowStartAfterPage, type ChatGroup, type ChatItem, type ChatState, tasksLine } from '../../chat/sdkChat';
 import { SetupSteps } from '../../chat/SetupSteps';
 import { groupToolRuns } from '../../chat/toolRuns';
 import { SkillCard, ToolCard, ToolRun } from './ToolCards';
 import { ReplyMeta } from './ChatTimes';
 import { ChatError, UnsentMessages } from './TranscriptNotices';
 import { ReadOnlyTurnNotice } from './ReadOnlyTurnNotice';
-import { chatHref, fullUiHref, repoSlug } from '../../chat/simpleChat';
+import { chatHref, chatProvider, fullUiHref, repoSlug } from '../../chat/simpleChat';
 import { desktopSessionHref, openDesktopLink } from '../../chat/desktopLinks';
 import { useCapture } from '../../chat/useCapture';
 import { useFollowBottom } from '../../chat/useFollowBottom';
 import { useTranscriptFocus } from '../../chat/transcriptFocus';
-import { MessageImages } from '../../chat/ChatImages';
+import { MessageImages, MessageTextFiles } from '../../chat/ChatImages';
+import { splitTextFiles } from '../../chat/chatTextFiles';
 import type { Project } from '../../types';
 import { FLAGS, useFlag } from '../../flags';
 import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
@@ -61,6 +63,7 @@ import { workstreamLabel, workstreamTip } from '../../chat/explorerAgents';
 import { ChatSpaceChip } from './SpaceSwatch';
 import { ChatBoxTag } from './ChatBoxTag';
 import { SdkComposer } from './SdkComposer';
+import { SessionRepoPill } from './SessionRepoPill';
 import { errorOf, useSdkChat } from './useSdkChat';
 import { UserMessageText } from '../../chat/UserMessageText';
 import { formatTokens } from '../../chat/contextUsage';
@@ -70,7 +73,7 @@ import { AgentsCardSection, AgentsDrawer, SubagentsContext, type SubagentsUi } f
 import { AsksCardSection, AsksContext, AsksDrawer } from './Asks';
 import { useAsksUi } from '../../chat/useChatAsks';
 import { askStore, askTabId, askThreadOf } from '../../chat/askStore';
-import { recentAsks, type AskView } from '../../chat/asks';
+import { askAgentName, recentAsks, type AskView } from '../../chat/asks';
 
 let lastVisitedProjectId: string | null = null;
 
@@ -106,17 +109,20 @@ export function ItemView({ item, onRetry, onResume, projectId, workstream }: { i
   // A generative-UI answer (chat/genui/action.ts) reads as what was done, not as its payload.
   const action = React.useContext(GenUiChatContext) && item.kind === 'user' ? parseActionMessage(item.text) : null;
   switch (item.kind) {
-    case 'user':
+    case 'user': {
       // termag's own note into a review session (Check the fixes) reads as an event, not as the user's words.
       if (item.text?.startsWith(TERMAG_NOTE)) return <div className="rv-event" role="note">{item.text.slice(TERMAG_NOTE.length).split(REVIEW_FORMAT_MARK)[0]}</div>;
+      // Text files the message carries (chat/chatTextFiles.ts) show as chips, live and from the history alike.
+      const { text, files, boxFiles } = splitTextFiles(item.text ?? '');
       return (
         <div className="sdk-user" data-pending={item.pending || undefined}>
-          {item.images?.length ? <MessageImages images={item.images} projectId={projectId} workstream={workstream} /> : null}
-          {action ? <ActionBubble payload={action} /> : item.text && <div className="sdk-user-bubble"><UserMessageText text={item.text.split(REVIEW_FORMAT_MARK)[0]} /></div>}
-          <ReviewFormatChip text={item.text} />
+          {item.images?.length || files.length || boxFiles ? <MessageImages images={item.images ?? []} files={files} boxFiles={boxFiles} projectId={projectId} workstream={workstream} /> : null}
+          {action ? <ActionBubble payload={action} /> : text && <div className="sdk-user-bubble"><UserMessageText text={text.split(REVIEW_FORMAT_MARK)[0]} /></div>}
+          <ReviewFormatChip text={text} />
           {item.pending && <div className="sdk-user-note">queued</div>}
         </div>
       );
+    }
     case 'text':
       return (
         <div className="sdk-text" data-streaming={item.streaming || undefined}>
@@ -245,6 +251,9 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
     dropHandlers,
     deliver,
   } = s;
+  // The echo's and the queued message's text files show as chips, as a sent one's do (chat/chatTextFiles.ts).
+  const echoed = splitTextFiles(echo ?? '');
+  const queuedParts = splitTextFiles(s.queuedText ?? '');
 
   useEffect(() => {
     visitsApi.record({ projectId: project.id, previousProjectId: lastVisitedProjectId, workstream });
@@ -252,8 +261,6 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   }, [project.id, workstream]);
 
   const { mode: chromeMode, sidePanel, refresh } = useChatChrome();
-  // The one-row phone header ships with simple-ui-side-panel-enabled; off, it is main's.
-  const phoneHeader = useFlag(FLAGS.chatSidePanel, false);
   // A reply's ```spec fence drawn as UI; off, it is a code block.
   const generativeUi = useFlag(FLAGS.chatGenerativeUi, false);
   const generativeUiOn = generativeUi;
@@ -274,7 +281,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
     followUp: fence => <FollowUpCard fence={fence} projectId={project.id} workstream={workstream} repo={review.repo} number={review.number} viewer={reviews.queue.viewer}
       approvedOnServer={approvedSince((reviews.prs && reviews.prs.connected ? (reviews.prs as { reviewRounds?: PostedRound[] }).reviewRounds ?? [] : []), review.repo, review.number, fence.head)} />,
   } : null), [review, project.id, workstream, reviews.queue.viewer, reviews.prs, sidePanel]);
-  const phone = chromeMode === 'drawer' && phoneHeader;
+  const phone = chromeMode === 'drawer';
   // Subagents: an Agent call is a row that opens its transcript in the
   // panel's agent tab, which reads them from here (chat/subagentStore.ts). Only with the panel's tabs.
   const subagentsOn = useFlag(FLAGS.chatSubagents, false);
@@ -306,6 +313,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   const asksUi = useAsksUi({
     on: agentsUi != null, owner: project.role !== 'collaborator', projectId: project.id, workstream, items: chat.items, open: openAsk,
     shownThread: sidePanel?.open ? askThreadOf(shownAgent) : null,
+    agent: askAgentName(chatProvider(project, workstream)),
   });
   // None while the history loads (the tab says it is loading); once it is in, the chat's asks, none at all
   // included, so a tab whose ask is gone says so rather than waiting.
@@ -338,7 +346,14 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   const groupKeys = useMemo(() => groups.map(chatGroupKey), [groups]);
   const [windowFrom, setWindowFrom] = useState<string | null>(null);
   useEffect(() => { setWindowFrom(null); }, [chatId]);
-  const start = windowStart(groupKeys, windowFrom);
+  // A page of older history the box was asked for (useSdkChat loadEarlier):
+  // how many groups were from the window's start on, and the distance from
+  // the bottom to keep. Once it lands, the window takes in the groups it brought;
+  // an ask that ends without a page (`settled`) lets it go. Neither is a history
+  // load: one that runs while the page is on its way leaves it waiting.
+  const fetching = useRef<{ tail: number; loaded: number; settled: number; fromBottom: number | null } | null>(null);
+  const landed = fetching.current != null && s.earlier.loaded !== fetching.current.loaded ? fetching.current : null;
+  const start = landed ? earlierStart(windowStartAfterPage(groupKeys, windowFrom, landed.tail)) : windowStart(groupKeys, windowFrom);
   const windowed = transcriptWindow(groups, start);
   // Fix the start once there are groups, and again if its group went away.
   useEffect(() => {
@@ -361,18 +376,36 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
     // and the correction, which then took that step back (one frame stood still).
     flushSync(() => setWindowFrom(groupKeys[earlierStart(start)] ?? null));
   };
+  const fetchEarlier = () => {
+    if (fetching.current || s.earlier.loading || !s.earlier.more) return;
+    const el = scroller.current;
+    fetching.current = { tail: groups.length - start, loaded: s.earlier.loaded, settled: s.earlier.settled, fromBottom: el ? el.scrollHeight - el.scrollTop : null };
+    if (!s.loadEarlier()) fetching.current = null;
+  };
   const onTranscriptScroll = () => {
     onScroll();
     const el = scroller.current;
     if (!el) return;
     const prev = lastScrollTop.current;
     lastScrollTop.current = el.scrollTop;
+    if (fetching.current) fetching.current.fromBottom = el.scrollHeight - el.scrollTop;
     if (loadsEarlier({ scrollTop: el.scrollTop, prevScrollTop: prev, hidden: windowed.hidden, pending: fromBottom.current != null })) showEarlier();
+    else if (windowed.hidden === 0 && loadsEarlier({ scrollTop: el.scrollTop, prevScrollTop: prev, hidden: s.earlier.more ? 1 : 0, pending: fetching.current != null })) fetchEarlier();
   };
   const [canScroll, setCanScroll] = useState(true);
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el) return;
+    const f = fetching.current;
+    if (f && (s.earlier.loaded !== f.loaded || s.earlier.settled !== f.settled)) {
+      fetching.current = null;
+      if (s.earlier.loaded !== f.loaded) {
+        if (f.fromBottom != null) el.scrollTop = el.scrollHeight - f.fromBottom;
+        setWindowFrom(groupKeys[start] ?? null);
+      }
+    } else if (f) {
+      f.fromBottom = el.scrollHeight - el.scrollTop;
+    }
     if (fromBottom.current != null) {
       el.scrollTop = el.scrollHeight - fromBottom.current;
       fromBottom.current = null;
@@ -386,7 +419,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
     // The anchoring jump is not the reader scrolling: judge the next event from here.
     lastScrollTop.current = el.scrollTop;
     setCanScroll(el.scrollHeight > el.clientHeight + 1);
-  }, [start, groups, scroller]);
+  }, [start, groups, groupKeys, scroller, s.earlier]);
 
   // Generative UI's answers go as messages (chat/genui/action.ts); a surface is sent once its message is in the transcript.
   // Never into the pre-ready queue: it is this browser's only, and the surface locks from the transcript.
@@ -669,9 +702,16 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
               </div>
             )}
             {windowed.hidden > 0 && (
-              <button type="button" className="btn-tiny chat-earlier" onClick={showEarlier} data-fallback={canScroll || undefined}>
+              <Button variant="minimal" size="small" className="chat-earlier" onPress={showEarlier} data-fallback={canScroll || undefined}>
                 Show {Math.min(windowed.hidden, TRANSCRIPT_WINDOW)} earlier {Math.min(windowed.hidden, TRANSCRIPT_WINDOW) === 1 ? 'message' : 'messages'}
-              </button>
+              </Button>
+            )}
+            {windowed.hidden === 0 && s.earlier.error && <p className="chat-earlier-error" role="status">{s.earlier.error}</p>}
+            {windowed.hidden === 0 && s.earlier.more && (
+              <Button variant="minimal" size="small" className="chat-earlier" onPress={fetchEarlier} isDisabled={s.earlier.loading}
+                data-fallback={(canScroll && !s.earlier.error) || undefined}>
+                {s.earlier.loading ? 'Loading earlier messages…' : s.earlier.error ? 'Try again' : 'Show earlier messages'}
+              </Button>
             )}
             <SubagentsContext.Provider value={agentsUi}>
             <AsksContext.Provider value={asksUi}>
@@ -693,21 +733,33 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
             </HeadingStoreContext.Provider>
             </AsksContext.Provider>
             </SubagentsContext.Provider>
-            {echoShown && <div className="sdk-user"><div className="sdk-user-bubble"><UserMessageText text={(echo ?? '').split(REVIEW_FORMAT_MARK)[0]} /></div><ReviewFormatChip text={echo} /></div>}
+            {echoShown && (
+              <div className="sdk-user">
+                <MessageTextFiles files={echoed.files} boxFiles={echoed.boxFiles} />
+                {echoed.text && <div className="sdk-user-bubble"><UserMessageText text={echoed.text.split(REVIEW_FORMAT_MARK)[0]} /></div>}
+                <ReviewFormatChip text={echoed.text} />
+              </div>
+            )}
             {queued && (
               <div className="sdk-user" data-pending="">
-                <div className="sdk-user-bubble"><UserMessageText text={queued.split(REVIEW_FORMAT_MARK)[0]} /></div>
-                <ReviewFormatChip text={queued} />
+                {(s.queuedImages.length > 0 || queuedParts.files.length > 0 || queuedParts.boxFiles) && <MessageImages images={s.queuedImages} files={queuedParts.files} boxFiles={queuedParts.boxFiles} projectId={project.id} workstream={workstream} />}
+                {queuedParts.text && <div className="sdk-user-bubble"><UserMessageText text={queuedParts.text.split(REVIEW_FORMAT_MARK)[0]} /></div>}
+                <ReviewFormatChip text={splitTextFiles(queued).text} />
                 <div className="sdk-user-note">{queueError ? `not sent: ${queueError}` : 'sent as soon as Claude is ready'}</div>
                 {queueError && <button type="button" className="btn-tiny chat-queued-retry" onClick={retryQueued}>Retry</button>}
               </div>
             )}
-            {s.heldShown.map(m => (
-              <div key={m.id} className="sdk-user" data-pending="">
-                <div className="sdk-user-bubble">{m.text}</div>
+            {/* Held on the orchestrator (chat/continuation.ts): shown in every tab, with its images, until it goes in. */}
+            {s.heldShown.map(m => {
+              const held = splitTextFiles(m.text ?? '');
+              return (
+              <div key={m.id} className="sdk-user" data-pending="" data-held-id={m.id}>
+                {m.images?.length || held.files.length || held.boxFiles ? <MessageImages images={(m.images ?? []).map((i, n) => ({ mediaType: i.mediaType, src: heldImageUrl(project.id, workstream, m.id, n) }))} files={held.files} boxFiles={held.boxFiles} projectId={project.id} workstream={workstream} /> : null}
+                {held.text && <div className="sdk-user-bubble">{held.text}</div>}
                 <div className="sdk-user-note">{m.error ? `not sent: ${m.error}` : 'sent once the chat is back'}</div>
               </div>
-            ))}
+              );
+            })}
             <UnsentMessages texts={unsent} disabled={!canSend} onSend={sendUnsent}
               onDiscard={i => setUnsent(u => u.filter((_, j) => j !== i))} />
           </div>
@@ -722,7 +774,10 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
           ) : agentsUi && keptAgents.length ? <AgentsDrawer list={keptAgents} ui={agentsUi} />
             : asksUi && keptAsks.length ? <AsksDrawer list={keptAsks} ui={asksUi} /> : null}
           placeholder={review ? 'Ask about this PR, or tell Claude what to change in the review…' : undefined}
-          above={review?.section === 'pushed' ? <FollowUpStrip item={review} /> : undefined} />
+          above={<>
+            <SessionRepoPill project={project} />
+            {review?.section === 'pushed' && <FollowUpStrip item={review} />}
+          </>} />
       </section>
     </div>
   );

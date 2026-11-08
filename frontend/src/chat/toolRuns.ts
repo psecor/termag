@@ -220,8 +220,12 @@ export function runSummary(tools: readonly ToolItem[]): RunSummary {
   // so any call still in flight keeps the whole run running.
   const last = tools[tools.length - 1];
   const now = inFlight[inFlight.length - 1] ?? last;
-  // A call whose input is still streaming in has no words yet: the latest call that has some.
-  const labelled = now && toolLabel(now) ? now : [...tools].reverse().find(t => toolLabel(t));
+  // A call in flight names itself, by its tool while its input is still
+  // streaming in ("Read", then "Read a.ts"): the step line is the only place
+  // a shut run says what is running (alwaysShown), so an earlier call's words
+  // there would pass a finished step off as the one going on. With nothing in
+  // flight, the latest call that has words.
+  const labelled = now && toolLabel(now) ? now : inFlight.length ? null : [...tools].reverse().find(t => toolLabel(t));
   return {
     step: (labelled ? toolLabel(labelled) : now && toolSummary(now.name, now.input).title) || '',
     counts: countsText(tools),
@@ -231,7 +235,13 @@ export function runSummary(tools: readonly ToolItem[]): RunSummary {
   };
 }
 
-/** The calls a collapsed run still shows: every failure, the one running now, and those still running in the background. */
+/**
+ * The calls a collapsed run still shows: every failure, and those still
+ * running in the background. Not the call running now: the step line under
+ * the heading says what it is, so the run keeps one height while its calls
+ * start and end. A card that came in with each call and folded away when it
+ * ended moved the text above it, the text being read, at every call.
+ */
 export function alwaysShown(tools: readonly ToolItem[]): ToolItem[] {
-  return tools.filter(t => !t.done || t.isError || t.background === 'running');
+  return tools.filter(t => t.isError || t.background === 'running');
 }

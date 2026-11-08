@@ -10,6 +10,8 @@ import { sessionName } from '../utils/sessionName';
 import { statusKey } from '../utils/statusKey';
 import { recentsBucket, RecentsBucket } from '../utils/recents';
 import { aggregateReviewRing, reviewsOf, ringStateFor, RingState } from '../utils/reviewRing';
+import { withoutAskChats } from '../utils/askChatVisibility';
+import type { ProjectKind } from '../utils/projectKind';
 
 /** Where a row sits in the home list, in list order. */
 export type HomeBand = 'attention' | 'running' | 'reviewing' | 'other';
@@ -23,12 +25,14 @@ export interface InboxRow {
   workstream: string;
   /** The workstream's id; absent for a project with no workstreams yet (its implicit main). */
   workstreamId?: string | null;
-  /** Claude's own title for the session, from its workstream (simple-ui-session-titles-enabled); null before it has one. */
+  /** Claude's own title for the session, from its workstream; null before it has one. */
   sessionTitle?: string | null;
   /** The chat's own space (Workstream.spaceId), by id; null for none. */
   spaceId?: string | null;
   /** The server fixed that space (chat/chatSpaces.ts chatHomeSpace); false only from an older backend. */
   spaceFixed?: boolean;
+  /** Its owner archived it from a space's Files (Workstream.explorerArchivedAt, chat-nested-agents-enabled). */
+  explorerArchived?: boolean;
   /** An ask thread's chat: the thread's title (`termag ask --title`, else from its prompt), shown in place of `ask-<thread>`. */
   askTitle?: string | null;
   /** An ask thread's chat: the thread's id. */
@@ -42,7 +46,7 @@ export interface InboxRow {
   provider: string | null;
   instanceId: string | null;
   /** 'cloud': a Claude Code cloud session on a box; projectId is its key, url its page on claude.ai. */
-  kind: 'normal' | 'metaterm' | 'automation' | 'cloud';
+  kind: ProjectKind | 'cloud';
   url?: string | null;
   pinned: boolean;
   status: AgentStatusValue;
@@ -114,6 +118,7 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
     const workstreams = p.workstreams.filter(ws => !ws.archived);
     const list: Array<{
       id?: string; name: string; sessionTitle?: string | null; spaceId?: string | null; spaceFixedAt?: string | null; askThread?: Workstream['askThread'];
+      explorerArchivedAt?: string | null;
     }> = workstreams.length > 0 ? workstreams : [{ id: undefined, name: 'main' }];
     for (const ws of list) {
       const session = sessionName(owner, p.name, 'agent', ws.name);
@@ -127,6 +132,7 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
         sessionTitle: ws.sessionTitle ?? null,
         spaceId: ws.spaceId ?? null,
         spaceFixed: ws.spaceFixedAt != null,
+        ...(ws.explorerArchivedAt ? { explorerArchived: true } : {}),
         ...(ws.askThread ? {
           askTitle: ws.askThread.title?.trim() || null,
           askThreadId: ws.askThread.id,
@@ -218,6 +224,8 @@ export function sortHome(rows: InboxRow[]): InboxRow[] {
 export interface BuildHomeOptions {
   /** The owner's active cloud sessions; absent or empty adds no rows. */
   cloudSessions?: CloudSession[] | null;
+  /** Drop the ask chats (utils/askChatVisibility.ts): the full UI's lists, whose rows have no pane to open. The phone keeps them. */
+  hideAskChats?: boolean;
 }
 
 export interface HomeCounts {
@@ -247,7 +255,9 @@ export function buildHome(
   username: string,
   opts: BuildHomeOptions = {},
 ): Home {
-  const rows = sortHome([...buildRows(projects, statusMap, username), ...buildCloudRows(opts.cloudSessions, statusMap)]);
+  let normal = buildRows(projects, statusMap, username);
+  if (opts.hideAskChats) normal = withoutAskChats(normal);
+  const rows = sortHome([...normal, ...buildCloudRows(opts.cloudSessions, statusMap)]);
   const count = (f: HomeFilter) => rows.filter(r => matchesFilter(r, f)).length;
   return { rows, counts: { attention: count('attention'), running: count('running'), reviewing: count('reviewing') } };
 }

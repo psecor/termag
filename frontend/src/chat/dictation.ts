@@ -1,4 +1,4 @@
-// Voice dictation into the simple UI's composers (chat-voice-input-enabled),
+// Voice dictation into the simple UI's composers,
 // on the browser's own Web Speech API where it works: Chrome, Edge and Safari
 // recognise the speech (Chrome and Edge on their vendor's servers). Where it
 // can't (Arc, Brave and other Chromium forks fail with `network`; Firefox has

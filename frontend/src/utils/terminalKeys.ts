@@ -24,3 +24,18 @@ export function customKeySequence(ev: KeyEventLike): string | null {
   if (ev.key === 'Enter' && ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) return SHIFT_ENTER_SEQUENCE;
   return null;
 }
+
+/**
+ * Attributes for xterm's hidden `.xterm-helper-textarea` on a touch screen
+ * (a coarse pointer). A phone keyboard would otherwise capitalise the first
+ * letter of a command, "correct" its words and offer predictions that arrive
+ * as composition events xterm only half handles. None on a desktop, where
+ * nothing changes.
+ */
+export function touchTypingAttributes(coarsePointer: boolean): Record<string, string> {
+  if (!coarsePointer) return {};
+  return { autocapitalize: 'off', autocorrect: 'off', autocomplete: 'off', spellcheck: 'false' };
+}
+
+/** The media query for a touch screen's primary pointer. */
+export const COARSE_POINTER_QUERY = '(pointer: coarse)';

@@ -38,12 +38,12 @@ export function terminateChoicesFor(current: number | null): Array<number | null
 }
 
 /**
- * Whether the box menu offers Auto-park: the flag is on and the box is live.
+ * Whether the box menu offers Auto-park: the box is live.
  * A box that can't hibernate gets it too, with a warning, so hibernation is
  * never a precondition for the setting.
  */
-export function offersAutoHibernate(box: Pick<Instance, 'lifecycle' | 'status'>, flagOn: boolean): boolean {
-  return flagOn && !!box.lifecycle && box.status !== 'terminated';
+export function offersAutoHibernate(box: Pick<Instance, 'lifecycle' | 'status'>): boolean {
+  return !!box.lifecycle && box.status !== 'terminated';
 }
 
 const shortDate = (d: Date) => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });

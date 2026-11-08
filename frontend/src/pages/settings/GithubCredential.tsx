@@ -118,7 +118,10 @@ export function GithubCredential({ status, onChanged, onError }: Props) {
       </form>
       {status.available ? (
         <div className="credentials-hint">
-          On your laptop: <code>gh auth token</code> (it needs the <code>repo</code> scope). The token stays on
+          On your laptop: <code>gh auth token</code>. It needs the <code>repo</code> and <code>read:org</code> scopes.{' '}
+          <code>workflow</code> is optional: it lets your agents push changes to <code>.github/workflows</code>, which
+          GitHub refuses without it, even from a branch that is only based on a different main than GitHub's. To add it, run{' '}
+          <code>gh auth refresh -h github.com -s workflow</code> and paste <code>gh auth token</code> here again. The token stays on
           the orchestrator: your boxes' git and <code>gh</code> reach GitHub through it, and no GitHub
           key or token is put on a box. Disconnecting deletes it here, but encrypted backups keep it
           until they expire: to end the token, revoke it on GitHub.

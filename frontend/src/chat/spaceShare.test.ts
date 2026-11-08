@@ -3,24 +3,17 @@ import { DEFAULT_SHARE_ROLE, initials, SHARE_ROLES, shareAbilities, spaceShareAc
 
 describe('shareAbilities', () => {
   it('lets an owner add people, manage and add boxes', () => {
-    expect(shareAbilities('owner', false, true)).toEqual({ addPeople: 'yes', manage: true, addBoxes: true });
-  });
-
-  it('tells an owner sharing is off only once the server says so', () => {
-    expect(shareAbilities('owner', false, false).addPeople).toBe('sharing_off');
-    // Still loading: the form shows, its Add waits for the lists.
-    expect(shareAbilities('owner', false, null).addPeople).toBe('yes');
-    expect(shareAbilities('owner', false, false).manage).toBe(true);
+    expect(shareAbilities('owner', false)).toEqual({ addPeople: 'yes', manage: true, addBoxes: true });
   });
 
   it('lets an editor add their boxes and nothing else, a viewer nothing', () => {
-    expect(shareAbilities('editor', false, true)).toEqual({ addPeople: 'not_owner', manage: false, addBoxes: true });
-    expect(shareAbilities('viewer', false, true)).toEqual({ addPeople: 'not_owner', manage: false, addBoxes: false });
-    expect(shareAbilities(undefined, false, true)).toEqual({ addPeople: 'not_owner', manage: false, addBoxes: false });
+    expect(shareAbilities('editor', false)).toEqual({ addPeople: 'not_owner', manage: false, addBoxes: true });
+    expect(shareAbilities('viewer', false)).toEqual({ addPeople: 'not_owner', manage: false, addBoxes: false });
+    expect(shareAbilities(undefined, false)).toEqual({ addPeople: 'not_owner', manage: false, addBoxes: false });
   });
 
   it('lets no one change a read-only space', () => {
-    expect(shareAbilities('owner', true, true)).toEqual({ addPeople: 'not_owner', manage: false, addBoxes: false });
+    expect(shareAbilities('owner', true)).toEqual({ addPeople: 'not_owner', manage: false, addBoxes: false });
   });
 });
 

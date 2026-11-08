@@ -1,5 +1,5 @@
 // One session row, shared by the home list and the Search tab, plus the
-// row's ⋯ action sheet (pin / archive / open in Lab).
+// row's ⋯ action sheet (pin / archive / open in Chat / open in Lab).
 import React, { useCallback, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useProjects } from '../../contexts/ProjectContext';
@@ -8,6 +8,7 @@ import { contextLevel } from '../../utils/thresholds';
 import { fmtAge } from '../../utils/format';
 import { conversationHref, InboxRow, opensReview, stateSince, STATUS_GLYPH, statusLabel } from '../../mobile/inbox';
 import { optOutOfMobile } from '../../mobile/redirect';
+import { openInChatHref, opensInChat } from '../../mobile/chatLinks';
 import { projectsApi } from '../../services/api';
 import { workstreamLabel, workstreamTip } from '../../chat/explorerAgents';
 import { ActionSheet, ConfirmSheet, apiError } from './Sheet';
@@ -118,6 +119,7 @@ export function useRowActions(): { open: (row: InboxRow) => void; sheets: React.
           actions={[
             { label: menuRow.pinned ? 'Unpin' : 'Pin', onClick: () => { void togglePin(menuRow); }, disabled: menuRow.shared },
             { label: 'Archive project…', onClick: () => setConfirmRow(menuRow), danger: true, disabled: menuRow.shared || menuRow.kind === 'metaterm' },
+            ...(opensInChat(menuRow) ? [{ label: 'Open in Chat', onClick: () => navigate(openInChatHref(menuRow)) }] : []),
             { label: 'Open in Lab', onClick: () => openFull(menuRow) },
           ]}
         />

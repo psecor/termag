@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef, ReactNode } from 'react';
+import { environmentView } from '../utils/environmentStatus';
 import { useSearchParams } from 'react-router-dom';
 import { Project, StatusMap, AgentStatusValue } from '../types';
 import { projectsApi, visitsApi } from '../services/api';
@@ -23,6 +24,8 @@ interface ProjectContextValue {
   projects: Project[];
   /** The project list has been read at least once, so an empty list means none. */
   projectsLoaded: boolean;
+  /** The latest read of the project list failed before any had been read: none is known, not "none". */
+  projectsLoadFailed?: boolean;
   activeProjectId: string | null;
   statusMap: StatusMap;
   setActiveProject: (id: string | null) => void;
@@ -58,6 +61,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const [projectsLoadFailed, setProjectsLoadFailed] = useState(false);
   const projectsRef = useRef<Project[]>([]);
   const listClock = useRef<CloneListState<Project>>({ generation: 0, projects: [] });
   // Initialize from the URL so a refresh restores immediately. The URL is the
@@ -217,12 +221,12 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       listClock.current = next;
       if (next.projects !== projectsRef.current) rememberList(next.projects);
       // A read that finished before a newer one is held, not shown: the list on screen is still the old one.
-      if (next.applied != null) setProjectsLoaded(true);
+      if (next.applied != null) { setProjectsLoaded(true); setProjectsLoadFailed(false); }
     } catch (err) {
       const next = releaseListRead(listClock.current, generation);
       listClock.current = next;
       if (next.projects !== projectsRef.current) rememberList(next.projects);
-      if (next.applied != null) setProjectsLoaded(true);
+      if (next.applied != null) setProjectsLoaded(true); else setProjectsLoadFailed(true);
       throw err;
     }
   }, [rememberList]);
@@ -250,7 +254,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     reloadProjects();
   }, [user, reloadProjects]);
 
-  const cloneLive = projects.some(p => cloneInFlight(p.setupStatus));
+  // An environment's steps report as they go (setup, the run, each port turning healthy): poll while they do.
+  const cloneLive = projects.some(p => cloneInFlight(p.setupStatus) || environmentView(p.environmentStatus)?.inFlight === true);
   useEffect(() => {
     if (!user || !cloneLive) return;
     const timer = setInterval(() => { reloadProjects().catch(() => {}); }, 2000);
@@ -374,7 +379,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
 
   return (
     <ProjectContext.Provider value={{
-      projects, projectsLoaded, activeProjectId, statusMap, setActiveProject, reloadProjects, settleProjectClone,
+      projects, projectsLoaded, projectsLoadFailed, activeProjectId, statusMap, setActiveProject, reloadProjects, settleProjectClone,
       getActiveWorkstream, setActiveWorkstream,
     }}>
       {children}

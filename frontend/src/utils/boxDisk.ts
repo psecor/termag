@@ -39,14 +39,17 @@ export function diskInputError(disk: BoxDiskOptions | null, typed: string | null
 }
 
 /**
- * Every warm-pool box has the default disk, so another disk launches cold.
+ * Every warm-pool box has the default disk, so a bigger one launches cold.
  * Said only when that is slower than what the person would get otherwise: a
- * ready box is waiting.
+ * ready box is waiting. A smaller one is not a cold launch: the server raises
+ * a disk to its image's snapshot (the default's 120 GB, services/
+ * boxImageFloor.ts) before it looks for a warm box, so it can still be
+ * claimed — the same test newBoxSummary applies (pages/chat/LaunchDrawer.tsx).
  */
 export function diskNote(disk: BoxDiskOptions | null, typed: string | null, warmBoxReady: boolean): string | null {
   if (!disk || !warmBoxReady) return null;
   const value = typed === null ? disk.diskGiB : typedValue(disk, typed);
-  if (value === null || value === disk.defaultGiB) return null;
+  if (value === null || value <= disk.defaultGiB) return null;
   return `A ${value} GB disk means launching a new box, a few minutes; the ready ones have ${disk.defaultGiB} GB.`;
 }
 

@@ -1,0 +1,22 @@
+/* Mars Orbiter Mission: Martian rust accents in both UIs and both palettes. Contrast:
+   dark: #ff8a5c on #0d1117 8.15:1, #161b22 7.45:1, #21262d 6.55:1, simple UI #181a1f 7.50:1,
+   #23252a 6.60:1; white on #c04c26 4.88:1, on its hover mix 3.61:1; #c04c26 as a border or outline on
+   #21262d 3.12:1, #23252a 3.14:1.
+   light: #b33a12 on #ffffff 5.95:1, #f6f8fa 5.59:1, #eaeef2 5.10:1, simple UI #f7f9fb 5.64:1;
+   white on #a3330f 6.91:1. */
+
+html[data-daily-theme="2026-11-05"],
+html[data-daily-theme="2026-11-05"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-05"] .lp-theme {
+  --accent: #ff8a5c;
+  --accent-dim: #c04c26;
+  --accent-rgb: 255, 138, 92;
+}
+
+html[data-daily-theme="2026-11-05"][data-palette="light"],
+html[data-daily-theme="2026-11-05"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-05"][data-palette="light"] .lp-theme {
+  --accent: #b33a12;
+  --accent-dim: #a3330f;
+  --accent-rgb: 179, 58, 18;
+}

@@ -1,4 +1,4 @@
-// The simple UI's side panel (behind simple-ui-side-panel-enabled): a
+// The simple UI's side panel: a
 // collapsible column on the right of a conversation, like Cursor's agent
 // side panel, holding the session's ctrl terminal and, where the browser pane
 // is on, its browser. On desktop it docks beside the chat at a width the user
@@ -61,8 +61,8 @@ export function clampSidePanelWidth(width: number, mainWidth: number): number {
  * What the panel is beside: `files`, a space to explore (absent for an agent
  * with no space); `session`, an agent's session, which Terminal and Browser
  * need (absent beside a file or on a new tab); `share`, a session whose
- * preview this user may share (browser-pane-preview-share-enabled, and its
- * owner, not a collaborator); `pr`, a session's Pull request tab (the chrome
+ * preview this user may share (its owner, not a
+ * collaborator); `pr`, a session's Pull request tab (the chrome
  * refresh's, PrTab.tsx); `review`, its review panes.
  */
 export interface SidePanelOffer { files: boolean; session: boolean; share?: boolean; pr?: boolean; review?: boolean }
@@ -71,14 +71,13 @@ const SESSION_ONLY: SidePanelOffer = { files: false, session: true };
 
 /**
  * The tabs the panel offers: Files where there is a space, Terminal and
- * Browser beside a session, Browser only where the browser pane is on, and
- * Share beside a session that may be shared, since a share is a browser too.
+ * Browser beside a session, and Share beside a session that may be shared, since a share is a browser too.
  */
-export function sidePanelTabs(browserOn: boolean, offer: SidePanelOffer = SESSION_ONLY): SidePanelTab[] {
+export function sidePanelTabs(offer: SidePanelOffer = SESSION_ONLY): SidePanelTab[] {
   const tabs: SidePanelTab[] = [];
   if (offer.files) tabs.push('files');
-  if (offer.session) tabs.push(...(browserOn ? ['terminal', 'browser'] as const : ['terminal'] as const));
-  if (offer.session && browserOn && offer.share) tabs.push('share');
+  if (offer.session) tabs.push('terminal', 'browser');
+  if (offer.session && offer.share) tabs.push('share');
   if (offer.session && offer.pr) tabs.push('pr');
   if (offer.session && offer.review) tabs.push('review');
   return tabs;
@@ -88,8 +87,8 @@ export function sidePanelTabs(browserOn: boolean, offer: SidePanelOffer = SESSIO
  * The tab shown: the remembered one if it is offered, else Terminal, else
  * Files. The remembered tab isn't changed, so the next chat shows it again.
  */
-export function shownSidePanelTab(tab: SidePanelTab, browserOn: boolean, offer: SidePanelOffer = SESSION_ONLY): SidePanelTab {
-  const tabs = sidePanelTabs(browserOn, offer);
+export function shownSidePanelTab(tab: SidePanelTab, offer: SidePanelOffer = SESSION_ONLY): SidePanelTab {
+  const tabs = sidePanelTabs(offer);
   if (tabs.includes(tab)) return tab;
   return tabs.includes('terminal') ? 'terminal' : 'files';
 }

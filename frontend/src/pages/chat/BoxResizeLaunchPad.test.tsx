@@ -2,10 +2,10 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { BoxResizeInfo, ResizeView } from '../../utils/boxResize';
+import type { BoxResizeInfo, DiskView, GrowView, ResizeView } from '../../utils/boxResize';
 
-const mocks = vi.hoisted(() => ({ resizeInfo: vi.fn(), resize: vi.fn() }));
-vi.mock('../../services/api', () => ({ instancesApi: { resizeInfo: mocks.resizeInfo, resize: mocks.resize } }));
+const mocks = vi.hoisted(() => ({ resizeInfo: vi.fn(), resize: vi.fn(), growDisk: vi.fn() }));
+vi.mock('../../services/api', () => ({ instancesApi: { resizeInfo: mocks.resizeInfo, resize: mocks.resize, growDisk: mocks.growDisk } }));
 vi.mock('../../launchpad/sprite', () => ({ ensureLaunchPadSprite: () => Promise.resolve() }));
 
 // React Aria's Modal reads a CSP nonce through CSS.escape, which jsdom lacks (as in GenUiSurface.test.tsx).
@@ -43,6 +43,7 @@ async function open() {
 beforeEach(() => {
   mocks.resizeInfo.mockReset();
   mocks.resize.mockReset();
+  mocks.growDisk.mockReset();
   el = document.createElement('div');
   document.body.appendChild(el);
   root = createRoot(el);
@@ -100,5 +101,114 @@ describe('the simple UI Box size… dialog', () => {
     mocks.resizeInfo.mockResolvedValue(info({ status: 'hibernated' }));
     await open();
     expect(text()).toMatch(/resumed first.*stays stopped/);
+  });
+});
+
+describe('the simple UI dialog\'s disk', () => {
+  const disk = (over: Partial<DiskView> = {}): DiskView => ({ sizeGb: 120, maxGb: 300, refusal: null, grow: null, retry: null, ...over });
+  const growing = (over: Partial<GrowView> = {}): GrowView => ({
+    fromGb: 120, toGb: 200, state: 'modifying', running: true, detail: null, startedAt: '2026-11-03T12:00:00Z', finishedAt: null, ...over,
+  });
+  const diskInput = () => document.querySelector('.chat-resize-disk input') as HTMLInputElement | null;
+  async function typeDisk(value: string) {
+    const el = diskInput()!;
+    await act(async () => {
+      el.focus();
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    // LaunchPad's NumberField commits on blur.
+    await act(async () => { el.blur(); });
+  }
+  const warning = () => document.querySelector('.chat-resize-warning')?.textContent ?? '';
+
+  it('sends a disk typed but not yet committed (no blur) with the resize (Cursor on #1214)', async () => {
+    mocks.resizeInfo.mockResolvedValue(info({}, { disk: disk() }));
+    mocks.growDisk.mockResolvedValue({ grow: growing() });
+    await open();
+    const el = diskInput()!;
+    await act(async () => {
+      el.focus();
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(el, '200');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    // No blur: LaunchPad's NumberField hasn't committed, but the dialog must still send what is typed.
+    expect(button('Resize')!.disabled).toBe(false);
+    await act(async () => { button('Resize')!.click(); });
+    await flush();
+    expect(mocks.growDisk).toHaveBeenCalledWith('b1', 200);
+  });
+
+  it('a grow that fails while the dialog follows it offers finishing it there (Devin on #1214)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      mocks.resizeInfo.mockResolvedValueOnce(info({}, { disk: disk() }));
+      mocks.growDisk.mockResolvedValue({ grow: growing() });
+      await open();
+      await typeDisk('200');
+      mocks.resizeInfo.mockResolvedValue(info({}, { disk: disk({
+        sizeGb: 200, grow: growing({ state: 'failed', running: false, detail: 'growpart: FAILED' }), retry: { sizeGb: 200, error: 'growpart: FAILED' },
+      }) }));
+      await act(async () => { button('Resize')!.click(); });
+      await flush();
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      await flush();
+      expect(text()).toContain('The disk grow failed: growpart: FAILED');
+      expect(button('Finish growing the disk')).toBeDefined();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('shows the disk beside the type in LaunchPad\'s NumberField, and opens on no change', async () => {
+    mocks.resizeInfo.mockResolvedValue(info({}, { disk: disk() }));
+    await open();
+    expect(text()).toContain('Now: Medium · 4 vCPU, 16 GB RAM · 120 GB disk');
+    expect(document.querySelector('.box-size-select-button')?.textContent).toContain('Medium · 4 vCPU, 16 GB RAM');
+    expect(diskInput()?.value).toBe('120');
+    expect(document.querySelector('.chat-resize-disk .box-disk-input-hint')?.textContent).toBe('GB, 120–300');
+    expect(button('Resize')!.disabled).toBe(true);
+    expect(document.querySelector('.chat-resize-warning')).toBeNull();
+  });
+
+  it('a disk alone: the warning has no stop, and the grow\'s progress follows', async () => {
+    mocks.resizeInfo.mockResolvedValue(info({}, { disk: disk() }));
+    mocks.growDisk.mockResolvedValue({ grow: growing({ state: 'filesystem' }) });
+    await open();
+    await typeDisk('200');
+    expect(warning()).toBe("Growing the disk doesn't stop the box. A disk never shrinks, and EBS allows one change to it every six hours.");
+    await act(async () => { button('Resize')!.click(); });
+    await flush();
+    expect(mocks.growDisk).toHaveBeenCalledWith('b1', 200);
+    expect(mocks.resize).not.toHaveBeenCalled();
+    const steps = [...document.querySelectorAll('.chat-resize-steps li')].map(li => `${li.getAttribute('data-state')}:${li.textContent}`);
+    expect(steps).toEqual(['done:Growing the disk to 200 GB', 'current:Growing its file system']);
+    expect(text()).toContain('the disk carries on growing');
+  });
+
+  it('offers finishing a grow whose file system step failed, with LaunchPad\'s Button (Devin on #1214)', async () => {
+    mocks.resizeInfo.mockResolvedValue(info({}, { disk: disk({ sizeGb: 200, retry: { sizeGb: 200, error: 'growpart: FAILED' } }) }));
+    mocks.growDisk.mockResolvedValue({ grow: growing({ fromGb: 200, toGb: 200, state: 'filesystem' }) });
+    await open();
+    expect(text()).toContain('The disk is 200 GB, but its file system was not grown into it: growpart: FAILED');
+    await act(async () => { button('Finish growing the disk')!.click(); });
+    await flush();
+    expect(mocks.growDisk).toHaveBeenCalledWith('b1', 200);
+  });
+
+  it('a disk refusal disables the field and says why, in the dialog\'s words', async () => {
+    mocks.resizeInfo.mockResolvedValue(info({}, { disk: disk({ refusal: 'EBS allows one change to a disk every six hours. This one was last changed at 2026-11-03 10:00 UTC, so it can grow again after 2026-11-03 16:00 UTC.' }) }));
+    await open();
+    expect(diskInput()?.disabled).toBe(true);
+    expect(text()).toContain('can grow again after 2026-11-03 16:00 UTC');
+  });
+
+  it('EC2\'s refusal on the grow is the error, and no resize follows', async () => {
+    mocks.resizeInfo.mockResolvedValue(info({}, { disk: disk() }));
+    mocks.growDisk.mockRejectedValue({ response: { status: 409, data: { code: 'disk_cooldown', error: 'EBS allows one change to a disk every six hours, and this one was changed less than six hours ago. Try again later.' } } });
+    await open();
+    await typeDisk('200');
+    await act(async () => { button('Resize')!.click(); });
+    await flush();
+    expect(document.querySelector('.chat-new-error')?.textContent).toMatch(/one change to a disk every six hours/);
+    expect(mocks.resize).not.toHaveBeenCalled();
   });
 });

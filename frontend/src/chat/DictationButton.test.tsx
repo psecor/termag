@@ -1,14 +1,8 @@
 // @vitest-environment jsdom
 import React, { act, useState } from 'react';
 import { createRoot, Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { SpeechRecognitionLike, SpeechResultListLike } from './dictation';
-
-const mocks = vi.hoisted(() => ({ flagOn: true }));
-vi.mock('../flags', () => ({
-  FLAGS: { chatVoiceInput: 'chat-voice-input-enabled' },
-  useFlag: () => mocks.flagOn,
-}));
 
 import { useDictation } from './useDictation';
 import { DictationButton, DictationNote } from './DictationButton';
@@ -66,7 +60,6 @@ let root: Root;
 const w = window as unknown as Record<string, unknown>;
 
 beforeEach(() => {
-  mocks.flagOn = true;
   FakeRecognition.last = null;
   w.webkitSpeechRecognition = FakeRecognition;
   host = document.createElement('div');
@@ -87,12 +80,6 @@ const rec = () => FakeRecognition.last!;
 const key = (init: KeyboardEventInit) => act(() => { box().dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, ...init })); });
 
 describe('DictationButton', () => {
-  it('is not shown with the flag off', () => {
-    mocks.flagOn = false;
-    render(<Composer />);
-    expect(mic()).toBeNull();
-  });
-
   it('is not shown where the browser has no recogniser', () => {
     delete w.webkitSpeechRecognition;
     render(<Composer />);

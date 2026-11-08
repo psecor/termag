@@ -4,7 +4,7 @@
 // deferrals) and what termag knows of each review: a review session on a
 // checkout of the PR, an agent review in a session's review pane (the lab's
 // Review with Devin), and the rounds the user posted. Pure, for the tests.
-import type { PrGroupMember, PrPipelineResponse, PrReviewGroup, PrRow, PrWorkstreamLink } from '../services/api';
+import type { PrGroupMember, PrPipelineResponse, PrReviewers, PrReviewGroup, PrRow, PrWorkstreamLink } from '../services/api';
 import { deferrals, lanesOf, rowParam } from '../utils/prPipeline';
 
 /** Where a PR stands for the user, in the order the queue shows them. */
@@ -97,8 +97,13 @@ export interface QueueItem {
 
 export interface QueueGroup {
   group: PrReviewGroup;
-  /** Members left to review, the viewer's own left out. */
+  /** Members left to review, the viewer's own left out: of `shown` when the filters narrow the card. */
   left: number;
+  /**
+   * With filters set, the members that match them, in the group's order: the card lists only these and says
+   * how many it hides. Review all together still reviews the whole group. Absent with no filters.
+   */
+  shown?: PrGroupMember[];
 }
 
 export interface ReviewQueue {
@@ -311,6 +316,236 @@ function eventWord(e: PostedRound['event']): string {
 export function repoOfUrl(url: string | null | undefined): string | null {
   const m = url ? /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/\d+/.exec(url) : null;
   return m ? `${m[1]}/${m[2]}` : null;
+}
+
+// ── Filters ────────────────────────────────────────────────────────────────
+// The Reviews page's filter bar, GitHub's PR list's in spirit: which
+// repositories, the review state, the author (bots apart), draft or ready,
+// failing CI, and text over the title and number. They narrow every section,
+// the group cards, Deferred and Reviewed; the sidebar's count is the whole queue.
+
+export type ReviewStateFilter = 'not-approved' | 'approved' | 'changes';
+export type DraftFilter = 'draft' | 'ready';
+
+export interface QueueFilters {
+  /** owner/name, compared without case; empty is every repository. */
+  repos: string[];
+  review: ReviewStateFilter | null;
+  /** A GitHub login, compared without case. */
+  author: string | null;
+  hideBots: boolean;
+  draft: DraftFilter | null;
+  ciFailing: boolean;
+  /** A PR reference (12, #12, termag#12, owner/termag#12), matched exactly, or text looked for in the title. */
+  q: string;
+}
+
+export const NO_FILTERS: QueueFilters = { repos: [], review: null, author: null, hideBots: false, draft: null, ciFailing: false, q: '' };
+
+export function hasFilters(f: QueueFilters): boolean {
+  return f.repos.length > 0 || f.review !== null || f.author !== null || f.hideBots || f.draft !== null || f.ciFailing || f.q.trim() !== '';
+}
+
+/** What a filter reads of a PR: a queue item, or a review group's member. */
+export interface FilterSubject {
+  repo: string;
+  number: number;
+  title: string;
+  author: string | null;
+  row: PrRow | null;
+  /** A group member's own read of its reviewers, used when its row has none. */
+  reviewers?: PrReviewers | null;
+}
+
+/**
+ * Where a PR's reviews stand. GitHub's review decision when the repo requires
+ * reviews (REVIEW_REQUIRED is not approved yet, whoever approved: it still
+ * wants a second approver or a code owner); with no review required, people's
+ * latest opinions, a request for changes over an approval. Bots' reviews are
+ * not counted. Unknown when nothing was read (no row, or an older backend).
+ */
+export function reviewStateOf(p: FilterSubject): 'approved' | 'changes' | 'none' | 'unknown' {
+  const decision = p.row?.reviewDecision;
+  if (decision === 'APPROVED') return 'approved';
+  if (decision === 'CHANGES_REQUESTED') return 'changes';
+  if (decision === 'REVIEW_REQUIRED') return 'none';
+  const reviewers = p.row?.reviewers ?? p.reviewers ?? null;
+  if (reviewers) return reviewers.changes.length > 0 ? 'changes' : reviewers.approved.length > 0 ? 'approved' : 'none';
+  // The row says GitHub requires no review and its reviewers weren't read: nobody's opinion is known to be in.
+  if (decision === null) return 'none';
+  return 'unknown';
+}
+
+/** Apps that open PRs, by login as GitHub's GraphQL gives it (no [bot]). */
+const BOT_AUTHORS = new Set([
+  'dependabot', 'renovate', 'devin-ai-integration', 'github-actions', 'copilot', 'copilot-swe-agent', 'cursor', 'claude',
+  'openai-codex', 'snyk-bot', 'mergify', 'pre-commit-ci',
+]);
+
+/** A login that is an app's: any [bot] login, or one of BOT_AUTHORS. */
+export function isBotAuthor(login: string | null | undefined): boolean {
+  if (!login) return false;
+  const l = login.toLowerCase();
+  return l.endsWith('[bot]') || BOT_AUTHORS.has(l);
+}
+
+export function matchesFilters(p: FilterSubject, f: QueueFilters): boolean {
+  if (f.repos.length > 0 && !f.repos.some(r => r.toLowerCase() === p.repo.toLowerCase())) return false;
+  if (f.author !== null && (p.author ?? '').toLowerCase() !== f.author.toLowerCase()) return false;
+  if (f.hideBots && isBotAuthor(p.author)) return false;
+  if (f.review !== null) {
+    const state = reviewStateOf(p);
+    if (f.review === 'not-approved' ? state !== 'none' && state !== 'changes' : state !== (f.review === 'approved' ? 'approved' : 'changes')) return false;
+  }
+  // Draft and CI are the lane row's: a PR with none matches neither filter.
+  if (f.draft !== null && (!p.row || p.row.badges.includes('draft') !== (f.draft === 'draft'))) return false;
+  if (f.ciFailing && !(p.row && (p.row.checksFailed || p.row.failingChecks.length > 0))) return false;
+  const q = f.q.trim().toLowerCase();
+  if (q && !matchesText(p, q)) return false;
+  return true;
+}
+
+/**
+ * The search box: a PR reference (12, #12, termag#12, owner/termag#12) matches
+ * that PR's number exactly, in that repository when one is named; any other
+ * text is looked for in the title. `q` is trimmed and lowercase.
+ */
+function matchesText(p: FilterSubject, q: string): boolean {
+  const ref = /^(?:(?:([\w.-]+)\/)?([\w.-]+)#|#)?(\d+)$/.exec(q);
+  if (ref) {
+    const [, owner, name, n] = ref;
+    if (Number(n) !== p.number) return false;
+    if (!name) return true;
+    const repo = p.repo.toLowerCase();
+    return owner ? repo === `${owner}/${name}` : repo.split('/')[1] === name;
+  }
+  return p.title.toLowerCase().includes(q);
+}
+
+/** The queue as filtered: a group card stays while any of its members matches. */
+export function filterQueue(q: ReviewQueue, f: QueueFilters): ReviewQueue {
+  if (!hasFilters(f)) return q;
+  const keep = (it: QueueItem) => matchesFilters(it, f);
+  const items = q.items.filter(keep);
+  return {
+    ...q,
+    items,
+    deferred: q.deferred.filter(keep),
+    grouped: q.grouped.filter(keep),
+    reviewed: q.reviewed.filter(keep),
+    groups: q.groups.flatMap(g => {
+      const shown = g.group.members.filter(m => matchesFilters(memberSubject(m), f));
+      return shown.length ? [{ ...g, shown, left: leftToReview({ ...g.group, members: shown }, q.viewer).length }] : [];
+    }),
+    needYou: items.filter(it => NEEDS_YOU.includes(it.section)).length,
+  };
+}
+
+function memberSubject(m: PrGroupMember): FilterSubject {
+  return { repo: m.repo, number: m.number, title: m.title, author: m.author, row: m.row, reviewers: m.reviewers ?? null };
+}
+
+/**
+ * The one note under the filter bar, if any: "nothing" when nothing asks for a
+ * review (filters or not), "no-match" when the queue has PRs but the filters
+ * leave none of them, in any section, Deferred and Reviewed included. None
+ * while the queue loads, failed or GitHub isn't connected: those say so themselves.
+ */
+export function queueNote(
+  all: ReviewQueue, shown: ReviewQueue, f: QueueFilters, state: { loading: boolean; failed: boolean; disconnected: boolean },
+): 'nothing' | 'no-match' | null {
+  if (state.loading || state.failed || state.disconnected) return null;
+  if (all.items.length === 0 && all.groups.length === 0) return 'nothing';
+  const any = shown.items.length + shown.groups.length + shown.deferred.length + shown.reviewed.length > 0;
+  return hasFilters(f) && !any ? 'no-match' : null;
+}
+
+/** Each section's count as the page shows it: its rows, and in To review its group cards. */
+export function sectionCounts(q: ReviewQueue): Record<QueueSection, number> {
+  const out = Object.fromEntries([...SECTION_ORDER, 'reviewed'].map(s => [s, 0])) as Record<QueueSection, number>;
+  for (const it of q.items) out[it.section] += 1;
+  out['to-review'] += q.groups.length;
+  out.reviewed = q.reviewed.length;
+  return out;
+}
+
+/** The repositories and authors the whole queue holds, for the filter menus: lowercase repos, logins as GitHub has them, sorted. */
+export function filterOptions(q: ReviewQueue): { repos: string[]; authors: string[] } {
+  const subjects: FilterSubject[] = [...q.items, ...q.deferred, ...q.reviewed, ...q.groups.flatMap(g => g.group.members.map(memberSubject))];
+  const repos = new Set(subjects.map(s => s.repo.toLowerCase()));
+  const authors = new Map<string, string>();
+  for (const s of subjects) if (s.author && !authors.has(s.author.toLowerCase())) authors.set(s.author.toLowerCase(), s.author);
+  const byName = (a: string, b: string) => a.toLowerCase().localeCompare(b.toLowerCase());
+  return { repos: [...repos].sort(byName), authors: [...authors.values()].sort(byName) };
+}
+
+// The URL's names for the filters: ?review=not-approved&repo=owner/name&repo=…&author=…&bots=hide&draft=ready&ci=failing&q=…
+const FILTER_PARAMS = ['review', 'repo', 'author', 'bots', 'draft', 'ci', 'q'] as const;
+const REVIEW_VALUES: readonly ReviewStateFilter[] = ['not-approved', 'approved', 'changes'];
+const DRAFT_VALUES: readonly DraftFilter[] = ['draft', 'ready'];
+const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
+const LOGIN_RE = /^[\w.[\]-]+$/;
+
+/** The filters a URL's query names; a value it does not know is no filter. */
+export function filtersFromSearch(params: URLSearchParams): QueueFilters {
+  const review = params.get('review');
+  const draft = params.get('draft');
+  const author = params.get('author');
+  return {
+    repos: [...new Set(params.getAll('repo').filter(r => REPO_RE.test(r)))],
+    review: REVIEW_VALUES.includes(review as ReviewStateFilter) ? review as ReviewStateFilter : null,
+    author: author && LOGIN_RE.test(author) ? author : null,
+    hideBots: params.get('bots') === 'hide',
+    draft: DRAFT_VALUES.includes(draft as DraftFilter) ? draft as DraftFilter : null,
+    ciFailing: params.get('ci') === 'failing',
+    q: params.get('q') ?? '',
+  };
+}
+
+/** `base` with its filter parameters replaced by these filters' (none set, none written). */
+export function filtersToSearch(f: QueueFilters, base: URLSearchParams = new URLSearchParams()): URLSearchParams {
+  const out = new URLSearchParams(base);
+  for (const k of FILTER_PARAMS) out.delete(k);
+  if (f.review) out.set('review', f.review);
+  for (const r of f.repos) out.append('repo', r);
+  if (f.author) out.set('author', f.author);
+  if (f.hideBots) out.set('bots', 'hide');
+  if (f.draft) out.set('draft', f.draft);
+  if (f.ciFailing) out.set('ci', 'failing');
+  if (f.q.trim()) out.set('q', f.q);
+  return out;
+}
+
+/** Whether a URL's query names any filter, set or not: such a link is followed rather than the remembered choice. */
+export function searchNamesFilters(params: URLSearchParams): boolean {
+  return FILTER_PARAMS.some(k => params.has(k));
+}
+
+/**
+ * What opening the page does with the remembered choice: a URL that names any filter parameter is the
+ * user's choice now (a shared link included), so it is remembered as it is; a URL that names none brings the
+ * remembered choice back, when there is one.
+ */
+export function filtersOnOpen(params: URLSearchParams, remembered: QueueFilters): { apply?: QueueFilters; remember?: QueueFilters } {
+  if (searchNamesFilters(params)) return { remember: filtersFromSearch(params) };
+  return hasFilters(remembered) ? { apply: remembered } : {};
+}
+
+interface FilterStorage { getItem(key: string): string | null; setItem(key: string, value: string): void }
+const rememberedKey = (user: string) => `termag.chat.reviewFilters.${user.toLowerCase()}`;
+
+/** The user's last filters in this browser, kept as the URL's query. */
+export function readRememberedFilters(storage: FilterStorage | null, user: string | null): QueueFilters {
+  if (!storage || !user) return NO_FILTERS;
+  try {
+    const raw = storage.getItem(rememberedKey(user));
+    return raw ? filtersFromSearch(new URLSearchParams(raw)) : NO_FILTERS;
+  } catch { return NO_FILTERS; }
+}
+
+export function writeRememberedFilters(storage: FilterStorage | null, user: string | null, f: QueueFilters): void {
+  if (!storage || !user) return;
+  try { storage.setItem(rememberedKey(user), filtersToSearch(f).toString()); } catch { /* private mode, full storage */ }
 }
 
 // ── Routes and links ───────────────────────────────────────────────────────

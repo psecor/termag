@@ -6,16 +6,15 @@
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import { Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { ConnectionOverlay } from '../../components/ConnectionOverlay';
-import { FLAGS, useFlag } from '../../flags';
 import { useAuth } from '../../contexts/AuthContext';
 import { useProjects } from '../../contexts/ProjectContext';
 import { boxFeed } from '../../services/boxFeed';
 import { checkTappedNotification, dropBlockedSubscription, NAVIGATE_EVENT, registerServiceWorker, routerPathFor, syncAttention } from '../../mobile/push';
-import { isStandalone, setInstalledAppEnabled } from '../../mobile/redirect';
+import { isStandalone } from '../../mobile/redirect';
 import { infersTaps, notificationKey } from '../../mobile/shownNotifications';
 import type { StatusMap } from '../../types';
 import { useHome } from '../../mobile/useHome';
-import { useVisualViewport } from '../../mobile/useVisualViewport';
+import { useVisualViewport } from '../../hooks/useVisualViewport';
 import { Inbox } from './Inbox';
 import { Conversation } from './Conversation';
 import { NewProject } from './NewProject';
@@ -23,6 +22,7 @@ import { NewAutomation } from './NewAutomation';
 import { Prs } from './Prs';
 import { Search } from './Search';
 import { Share } from './Share';
+import { useZoomableViewport } from '../../hooks/useZoomableViewport';
 import './mobile.css';
 
 /**
@@ -48,26 +48,6 @@ function useAttentionSync() {
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
-  }, []);
-}
-
-/**
- * Pinch-zoom back on under /m. index.html locks zoom for
- * the workspace, whose terminals and chrome block touch zoom on purpose
- * (App.css); the phone client's inputs are 16 px, so iOS will not zoom on
- * focus, and a locked viewport keeps Android readers from zooming text.
- */
-function useZoomableViewport() {
-  useEffect(() => {
-    const meta = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
-    if (!meta) return;
-    const original = meta.content;
-    meta.content = original
-      .split(',')
-      .map(p => p.trim())
-      .filter(p => !/^(maximum-scale|user-scalable)=/.test(p))
-      .join(', ');
-    return () => { meta.content = original; };
   }, []);
 }
 
@@ -136,8 +116,6 @@ function useInferredNotificationTap() {
 
 export default function MobileApp() {
   const root = useRef<HTMLDivElement>(null);
-  // The opt-out helpers read it (mobile/redirect.ts); /m can be the first page loaded.
-  setInstalledAppEnabled(useFlag(FLAGS.mobileInstalledApp, false));
   useNotificationNavigation();
   useInferredNotificationTap();
   useZoomableViewport();

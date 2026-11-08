@@ -13,10 +13,10 @@ import { chatProvider } from '../../chat/simpleChat';
 import { DictationButton, DictationNote } from '../../chat/DictationButton';
 import { ModelPicker } from '../../chat/ModelPicker';
 import { chatAgentName } from '../../chat/composer';
-import { CHAT_ATTACHMENT_ACCEPT, CHAT_IMAGE_ACCEPT, filesOf } from '../../chat/chatImageData';
 import { ComposerImages } from '../../chat/ChatImages';
 import { ContextRing } from '../../chat/ContextRing';
-import { PlusIcon, SendIcon, StopIcon } from '../../chat/ComposerIcons';
+import { SendIcon, StopIcon } from '../../chat/ComposerIcons';
+import { ComposerAttach } from '../../chat/ComposerAttach';
 import { ClaudeLoginCard } from '../../chat/ClaudeLoginCard';
 import { claudeSignInApplies } from '../../chat/claudeLogin';
 import type { Project } from '../../types';
@@ -55,7 +55,6 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
     trust,
     canTrust,
     imageInput,
-    pdfInput,
     effortInput,
     loadError,
     trustNoun,
@@ -83,9 +82,11 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
     sendError,
     reclaiming,
     images,
-    setImages,
+    files,
+    boxFiles,
+    removeAttachment,
     imageNote,
-    picker,
+    onPasteImages,
     send,
     returnToChat,
     attach,
@@ -150,7 +151,7 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
       {/* The chrome refresh's notes sit above the composer, past its rounded corner; none, no line. */}
       {refresh && <div className="chat-composer-notes" data-above="">{notes}</div>}
       {statusLine ?? (
-        <div className="chat-status" data-tone={status.tone === 'idle' ? 'idle' : status.tone === 'error' ? 'offline' : showSteps && !runnerReady ? 'setup' : 'working'} role="status" aria-live="polite">
+        <div className="chat-status" data-tone={status.tone === 'idle' ? 'idle' : status.tone === 'error' ? 'offline' : showSteps && !runnerReady ? 'setup' : 'working'} role="status" aria-live="polite" title={status.text}>
           {!recovery && chat.running && status.tone === 'working' && <span className="sdk-spinner" aria-hidden="true" />}{status.text}
         </div>
       )}
@@ -159,19 +160,13 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
           attach, dictate and send (or stop) on the right. Send shows once there is
           something to send. */}
       <form className="chat-composer" onSubmit={e => { e.preventDefault(); void send(); }} {...(canSend ? refDrop.handlers : {})} data-ref-drop={refDrop.over || undefined}>
-        {takesImages && <ComposerImages images={images} onRemove={id => setImages(held => held.filter(i => i.id !== id))} />}
+        {takesImages && <ComposerImages images={images} files={files} boxFiles={boxFiles} onRemove={removeAttachment} />}
         <textarea
           ref={composer}
           className="chat-input"
           value={text}
           onChange={e => { dictation.onEdit(); setText(e.target.value.slice(0, MAX_TEXT)); }}
-          onPaste={takesImages ? e => {
-            const files = filesOf(e.clipboardData.files);
-            if (!files.length) return;
-            // An image copied with its caption (a web page) pastes both; a bare image pastes nothing else.
-            if (!e.clipboardData.getData('text/plain')) e.preventDefault();
-            void attach(files);
-          } : undefined}
+          onPaste={takesImages ? onPasteImages : undefined}
           onKeyDown={e => {
             if (dictation.onKeyDown(e)) return;
             // Enter sends, Shift+Enter is a newline: the runner takes the message as is.
@@ -189,15 +184,7 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
           <div className="chat-compose-actions">
             <ContextRing usage={chat.usage} costUsd={total} sinceClearedUsd={costSinceCleared(chat)} compactedFrom={chat.compactedFrom ?? null} actions={ringActions} />
             {(imageInput || reserve) && (
-              <>
-                <button type="button" className="chat-icon-btn chat-attach" aria-label={pdfInput ? 'Attach images or PDFs' : 'Attach images'} title={pdfInput ? 'Attach images or PDFs (or drop or paste them)' : 'Attach images (or drop or paste them)'}
-                  onClick={() => picker.current?.click()} disabled={!takesImages}
-                  data-reserved={!imageInput || undefined} aria-hidden={!imageInput || undefined} tabIndex={!imageInput ? -1 : undefined}>
-                  <PlusIcon />
-                </button>
-                <input ref={picker} type="file" accept={pdfInput ? CHAT_ATTACHMENT_ACCEPT : CHAT_IMAGE_ACCEPT} multiple hidden
-                  onChange={e => { void attach(Array.from(e.target.files ?? [])); e.target.value = ''; }} />
-              </>
+              <ComposerAttach onFiles={picked => { void attach(picked); }} disabled={!takesImages} reserved={!imageInput} />
             )}
             <DictationButton dictation={dictation} disabled={!canSend} />
             {/* Stop and Send share one slot that is never narrower than a button, so neither one

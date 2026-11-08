@@ -8,32 +8,31 @@ const row = (over: Partial<RefRow> = {}): RefRow => ({
 
 describe('sessionRef', () => {
   it('names the session as the sidebar does, with the termag ask that messages it', () => {
-    expect(sessionRef(row(), 'devbox', false)).toEqual({ text: '@"api" (termag ask devbox/api)' });
-    expect(sessionRef(row({ workstream: 'fix' }), 'devbox', false)).toEqual({ text: '@"api · fix" (termag ask devbox/api@fix)' });
-    // Claude's title leads only where the sidebar shows titles.
+    expect(sessionRef(row(), 'devbox')).toEqual({ text: '@"api" (termag ask devbox/api)' });
+    expect(sessionRef(row({ workstream: 'fix' }), 'devbox')).toEqual({ text: '@"api · fix" (termag ask devbox/api@fix)' });
+    // Claude's title leads, as in the sidebar.
     const titled = row({ workstream: 'fix', sessionTitle: 'Fix the "login" redirect' });
-    expect(sessionRef(titled, 'devbox', true)).toEqual({ text: `@"Fix the 'login' redirect" (termag ask devbox/api@fix)` });
-    expect(sessionRef(titled, 'devbox', false)).toEqual({ text: '@"api · fix" (termag ask devbox/api@fix)' });
+    expect(sessionRef(titled, 'devbox')).toEqual({ text: `@"Fix the 'login' redirect" (termag ask devbox/api@fix)` });
   });
 
   it("names an ask's chat by its title, and messages it with a follow-up on its thread's own target", () => {
     const ask = row({ workstream: 'ask-thr00000001', askThreadId: 'thr00000001', askTitle: 'Members-only composer (#765)', askTarget: { workstream: 'fix', repo: 'web' } });
-    expect(sessionRef(ask, 'devbox', true)).toEqual({ text: '@"Members-only composer (#765)" (termag ask devbox/api@fix:web --thread thr00000001)' });
+    expect(sessionRef(ask, 'devbox')).toEqual({ text: '@"Members-only composer (#765)" (termag ask devbox/api@fix:web --thread thr00000001)' });
     // An older orchestrator doesn't say what the thread asks: most ask main.
-    expect(sessionRef({ ...ask, askTitle: null, askTarget: null }, 'devbox', false)).toEqual({ text: '@"ask-thr00000001" (termag ask devbox/api --thread thr00000001)' });
+    expect(sessionRef({ ...ask, askTitle: null, askTarget: null }, 'devbox')).toEqual({ text: '@"ask-thr00000001" (termag ask devbox/api --thread thr00000001)' });
   });
 
   it('refuses a session whose address a reference would carry characters of a shell', () => {
-    expect(sessionRef(row({ workstream: 'fix$(id)' }), 'devbox', false)).toEqual({ refusal: "api · fix$(id) has a name a reference can't carry, so it can't be messaged from here." });
-    expect(sessionRef(row({ projectName: 'a`b`' }), 'devbox', false)).toMatchObject({ refusal: expect.any(String) });
+    expect(sessionRef(row({ workstream: 'fix$(id)' }), 'devbox')).toEqual({ refusal: "api · fix$(id) has a name a reference can't carry, so it can't be messaged from here." });
+    expect(sessionRef(row({ projectName: 'a`b`' }), 'devbox')).toMatchObject({ refusal: expect.any(String) });
     // The name is only a label: anything but a `"` is fine there.
-    expect(sessionRef(row({ sessionTitle: 'Use $HOME and `ls`', workstream: 'fix' }), 'devbox', true)).toEqual({ text: '@"Use $HOME and `ls`" (termag ask devbox/api@fix)' });
+    expect(sessionRef(row({ sessionTitle: 'Use $HOME and `ls`', workstream: 'fix' }), 'devbox')).toEqual({ text: '@"Use $HOME and `ls`" (termag ask devbox/api@fix)' });
   });
 
   it("says why a session that can't be asked can't be messaged", () => {
-    expect(sessionRef(row({ shared: true, owner: 'bob' }), "bob's box", false)).toEqual({ refusal: "api is bob's session. Only your own sessions can be messaged." });
-    expect(sessionRef(row({ instanceId: null }), null, false)).toEqual({ refusal: "api isn't on a box of yours, so it can't be messaged." });
-    expect(sessionRef(row(), null, false)).toEqual({ refusal: "api isn't on a box of yours, so it can't be messaged." });
+    expect(sessionRef(row({ shared: true, owner: 'bob' }), "bob's box")).toEqual({ refusal: "api is bob's session. Only your own sessions can be messaged." });
+    expect(sessionRef(row({ instanceId: null }), null)).toEqual({ refusal: "api isn't on a box of yours, so it can't be messaged." });
+    expect(sessionRef(row(), null)).toEqual({ refusal: "api isn't on a box of yours, so it can't be messaged." });
   });
 });
 

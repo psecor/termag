@@ -7,7 +7,7 @@ import { groupedChartRows } from './usageRows';
 import { fmtK, fmtDurationShort } from '../../utils/format';
 import { useAdminPolled, pendingText, fmtMs, fmtTok, fmtPct } from './shared';
 
-const TOKEN_GROUPS: TokenGroup[] = ['day', 'user', 'provider', 'host', 'project'];
+const TOKEN_GROUPS: TokenGroup[] = ['day', 'user', 'provider', 'host', 'project', 'model', 'backend'];
 const WT_GROUPS: WorktimeGroup[] = ['day', 'user', 'provider', 'project'];
 const H = 3_600_000;
 const hoursTick = (ms: number) => (ms >= H ? `${Math.round(ms / H)}h` : ms > 0 ? `${Math.round(ms / 60_000)}m` : '0');

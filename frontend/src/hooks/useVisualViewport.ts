@@ -1,9 +1,12 @@
-// The phone client follows the visual viewport.
+// A full-screen phone surface follows the visual viewport (the phone client,
+// and the simple UI's tools overlay).
 // `interactive-widget=resizes-content` (index.html) shrinks the layout
 // viewport for the keyboard in Chromium only; iOS overlays the keyboard and
 // scrolls the layout viewport instead, which slid the fixed header off screen
-// and left the composer under the keyboard. So `.m-root` takes its top and
-// height from `window.visualViewport`, through CSS variables.
+// and left the composer under the keyboard. So the surface (`.m-root`, and
+// `.chat-side-panel[data-overlay]`) takes its top and height from
+// `window.visualViewport`, through CSS variables `--<prefix>-vvh` and
+// `--<prefix>-vvtop`, and is marked `data-keyboard` while a keyboard is up.
 import { useEffect } from 'react';
 
 /** Below this many px of shrink, the change is browser chrome, not a keyboard. */
@@ -15,9 +18,9 @@ export interface ViewportBox {
 }
 
 export interface ViewportVars {
-  /** px height for `.m-root` */
+  /** px height for the surface */
   height: number;
-  /** px top for `.m-root` */
+  /** px top for the surface */
   top: number;
   /** A software keyboard is up: the home-indicator inset is under it. */
   keyboard: boolean;
@@ -42,11 +45,22 @@ export function nextFullHeight(prev: { width: number; height: number } | null, w
   return { width, height: Math.max(prev.height, tallest) };
 }
 
-export function useVisualViewport(rootRef: React.RefObject<HTMLElement | null>): void {
+/** The CSS variables a prefix names: `m` is the phone client's `--m-vvh` / `--m-vvtop`. */
+export function viewportVarNames(prefix: string): { height: string; top: string } {
+  return { height: `--${prefix}-vvh`, top: `--${prefix}-vvtop` };
+}
+
+/**
+ * Keep `rootRef`'s element on the visual viewport while `enabled`: the
+ * `--<prefix>-vvh` / `--<prefix>-vvtop` variables and `data-keyboard`. Turned
+ * off (or unmounted), it removes all three, so CSS falls back to its own size.
+ */
+export function useVisualViewport(rootRef: React.RefObject<HTMLElement | null>, prefix = 'm', enabled = true): void {
   useEffect(() => {
     const vv = typeof window !== 'undefined' ? window.visualViewport : null;
     const el = rootRef.current;
-    if (!vv || !el) return;
+    if (!enabled || !vv || !el) return;
+    const names = viewportVarNames(prefix);
     let frame = 0;
     let full: { width: number; height: number } | null = null;
     const apply = () => {
@@ -54,8 +68,8 @@ export function useVisualViewport(rootRef: React.RefObject<HTMLElement | null>):
       full = nextFullHeight(full, Math.round(window.innerWidth), [window.innerHeight, vv.height]);
       const v = viewportVars(vv, full.height);
       if (!v) return;
-      el.style.setProperty('--m-vvh', `${v.height}px`);
-      el.style.setProperty('--m-vvtop', `${v.top}px`);
+      el.style.setProperty(names.height, `${v.height}px`);
+      el.style.setProperty(names.top, `${v.top}px`);
       if (v.keyboard) el.dataset.keyboard = ''; else delete el.dataset.keyboard;
     };
     const schedule = () => { if (!frame) frame = requestAnimationFrame(apply); };
@@ -66,9 +80,9 @@ export function useVisualViewport(rootRef: React.RefObject<HTMLElement | null>):
       if (frame) cancelAnimationFrame(frame);
       vv.removeEventListener('resize', schedule);
       vv.removeEventListener('scroll', schedule);
-      el.style.removeProperty('--m-vvh');
-      el.style.removeProperty('--m-vvtop');
+      el.style.removeProperty(names.height);
+      el.style.removeProperty(names.top);
       delete el.dataset.keyboard;
     };
-  }, [rootRef]);
+  }, [rootRef, prefix, enabled]);
 }

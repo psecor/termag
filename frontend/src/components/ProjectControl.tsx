@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, useSyncExternalStore } from 'react';
 import { contextLevel } from '../utils/thresholds';
 import { createPortal } from 'react-dom';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { ConfirmDialog, type ConfirmTone } from './ConfirmDialog';
 import { BoxLifecycleDialog } from './BoxLifecycleDialog';
 import { BoxResizeDialog } from './BoxResizeDialog';
@@ -11,7 +11,9 @@ import { SpaceDialog } from './SpaceDialog';
 import { autoTerminatedText, lifecycleNote, offersAutoHibernate, warnedParkAt } from '../utils/boxLifecycle';
 import { SwitchAgentDialog } from './SwitchAgentDialog';
 import { HandoffDialog } from './HandoffDialog';
+import { AddRepoDialog } from './AddRepoDialog';
 import { canHandOff } from '../utils/handoff';
+import { SETUP_OFF_TOOLTIP, isSetupOff } from '../utils/boxSetup';
 import { ShareToSlackDialog, type ShareDraft } from './ShareToSlackDialog';
 import { StatusDot } from './StatusDot';
 import { archiveMessage } from '../utils/archiveProject';
@@ -38,6 +40,7 @@ import { cloudByBox, cloudCountLabel, cloudDotStatus, cloudElsewhere, cloudLabel
 import { FLAGS, useFlag } from '../flags';
 import { useTheme } from '../theme/ThemeProvider';
 import { metatermVisibility } from '../utils/metatermVisibility';
+import { sidebarWorkstreams } from '../utils/askChatVisibility';
 import { boxStripeColor } from '../utils/boxColor';
 import { groupRollup, pruneCollapsedGroups, readCollapsedGroups, writeCollapsedGroups } from '../utils/collapsedGroups';
 import { stoppedBoxGroups } from '../utils/stoppedBoxGroups';
@@ -52,6 +55,7 @@ import { flashesTransition } from '../utils/statusFlash';
 import { shouldShowPrPrompt } from '../utils/prPrompt';
 import { formatStopAge, markSeen, seenStopKey, unseenStopAge, type UnseenAge } from '../utils/unseenStops';
 import { useSeenStops } from '../hooks/useSeenStops';
+import { useSharedProjectIds } from '../hooks/useSharedProjectIds';
 import { aggregateReviewRing, reviewRingTooltip, reviewsOf, ringForReviews, type RingState } from '../utils/reviewRing';
 import {
   boxDisplay,
@@ -69,13 +73,14 @@ import { REPLAY_BLOCK_CLASS } from '../observability';
 import { repoPromptDue } from '../utils/repoPick';
 import { CloneProgress } from './CloneProgress';
 import { automationsApi, type AutomationView } from '../services/api';
-import { projectKindTraits } from '../utils/projectKind';
+import { projectKindTraits, projectWithLabel } from '../utils/projectKind';
 import { automationSubtitle, RUN_STATE_LABEL } from '../utils/automationSchedule';
 import { automationHref, newestRunsFirst, runLabel, runsStatus, runsUnfolded, shownRuns } from '../utils/automationRuns';
 import { workstreamNameFromBranch } from '../utils/workstreamChoices';
 import { chatHref } from '../chat/simpleChat';
 import type { NewProjectMode } from './NewProjectForm';
 import { WhatsNewLabLink } from '../whatsNew/WhatsNewLinks';
+import { useEnvironmentSelection } from '../hooks/useEnvironments';
 
 /** How often a box row's countdown to an automatic park redraws. */
 const COUNTDOWN_TICK_MS = 30_000;
@@ -123,6 +128,7 @@ export function ProjectControl() {
   const palette = usePalette();
   const { user, updateDefaultAgentProvider } = useAuth();
   const navigate = useNavigate();
+  const environmentsOn = useEnvironmentSelection();
   const [searchParams, setSearchParams] = useSearchParams();
   const {
     projects, activeProjectId, statusMap, setActiveProject, reloadProjects, settleProjectClone,
@@ -147,8 +153,6 @@ export function ProjectControl() {
   // Each worktree's pull requests, as pills on its row.
   const prPillsFor = useWorktreePills();
   const [repoPromptBoxId, setRepoPromptBoxId] = useState<string | undefined>();
-  const repoPickerOn = useFlag(FLAGS.repoFirstPicker, false);
-  const simpleUi = useFlag(FLAGS.simpleUi, false);
   // MetaTerm is opt-in (Settings → Appearance): on a first run its sidebar
   // entry reads like a place to work, and people ended up on the orchestrator.
   const { theme } = useTheme();
@@ -299,13 +303,23 @@ export function ProjectControl() {
     return seenStopKey(project.id, wsName, project.workstreams?.find(w => w.name === wsName)?.id);
   }
 
-  // Each agent session of a project with the workstream it belongs to.
+  // Each agent session of a project with the workstream it belongs to. Ask
+  // chats hidden by the setting drop out here too: their dot, unseen stop and
+  // collapsed-group rollup would light a row whose session this UI cannot
+  // open (Devin's review). The workstream on screen stays, so the row never
+  // loses the session being looked at.
   function agentWorkstreamSessions(project: Project): { ws: string; session: string }[] {
     if (!project.workflows.some(w => w.type === 'agent')) return [];
     const owner = project.ownerUsername ?? user?.unixUsername ?? '';
     const wsList = project.workstreams ?? [];
     if (wsList.length === 0) return [{ ws: 'main', session: buildSessionName(owner, project.name, 'agent') }];
-    return wsList.map(ws => ({ ws: ws.name, session: buildSessionName(owner, project.name, 'agent', ws.name) }));
+    return sidebarWorkstreams(wsList, theme.sidebarAskChats, onScreenWsOf(project))
+      .map(ws => ({ ws: ws.name, session: buildSessionName(owner, project.name, 'agent', ws.name) }));
+  }
+
+  /** The workstream of this project the user is looking at — not a remembered selection on a project that is closed (Devin's review). */
+  function onScreenWsOf(project: Project): string | null {
+    return project.id === activeProjectId ? getActiveWorkstream(project.id) : null;
   }
 
   // The session on screen: the active project's active workstream, while the
@@ -442,18 +456,9 @@ export function ProjectControl() {
     }).catch(() => {});
   }, [user]);
 
-  // Track which owned projects have active shares
-  const [sharedProjectIds, setSharedProjectIds] = useState<Set<string>>(new Set());
-
-  useEffect(() => {
-    if (!user) return;
-    const ownedProjects = projects.filter(p => p.role !== 'collaborator');
-    Promise.all(ownedProjects.map(p =>
-      sharingApi.listShares(p.id).then(data => Array.isArray(data) && data.length > 0 ? p.id : null).catch(() => null)
-    )).then(results => {
-      setSharedProjectIds(new Set(results.filter(Boolean) as string[]));
-    });
-  }, [projects, user]);
+  // Which owned projects have active shares, loaded again only when the set
+  // of owned projects changes (useSharedProjectIds).
+  const [sharedProjectIds, setSharedProjectIds] = useSharedProjectIds(projects, user?.id ?? null);
 
   // Load shares when share panel opens
   useEffect(() => {
@@ -467,6 +472,7 @@ export function ProjectControl() {
   // Boxes (compute instances)
   const boxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
   const boxesLoaded = useSyncExternalStore(boxFeed.subscribe, boxFeed.hasLoaded);
+  const onSetupOff = (p: Project) => isSetupOff(boxes.find(b => b.id === p.instanceId));
   // Project-list groups folded to their header and a rollup line, per browser.
   // Everything starts expanded; ids of boxes that are gone are dropped once the
   // box list has loaded.
@@ -546,12 +552,12 @@ export function ProjectControl() {
   // Set after creating a self-managed box: the one-time token + config to paste
   // into agent.config.json on the user's own machine.
   const [createdBox, setCreatedBox] = useState<{ name: string; token: string; agentWsUrl?: string } | null>(null);
-  const warmPoolEnabled = useFlag(FLAGS.warmPool, false);
-  const autoLifecycleOn = useFlag(FLAGS.autoLifecycle, false);
-  const boxRenameOn = useFlag(FLAGS.boxRename, false);
   const boxSharingOn = useFlag(FLAGS.boxSharing, false);
   const slackCollabOn = useFlag(FLAGS.slackCollab, false);
   const handoffOn = useFlag(FLAGS.agentHandoff, false);
+  const multiRepoOn = useFlag(FLAGS.multiRepo, false);
+  // Add repository… on a multi-repo project (AddRepoDialog).
+  const [addRepoTarget, setAddRepoTarget] = useState<Project | null>(null);
   const automationsOn = useFlag(FLAGS.automations, false);
   // The automations behind the automation projects: schedule, next run, last
   // run, for the row's subtitle. Polled gently; the project list itself is live.
@@ -582,8 +588,7 @@ export function ProjectControl() {
 
   const reloadBoxes = boxFeed.reload;
 
-  // Spaces, only with the flag on: off, nothing is fetched.
-  const spacesOn = useFlag(FLAGS.spaces, false);
+  // Spaces.
   const [spaces, setSpaces] = useState<SpaceView[]>([]);
   const [showSpaces, setShowSpaces] = useState(false);
   const [openSpace, setOpenSpace] = useState<SpaceView | null>(null);
@@ -598,9 +603,9 @@ export function ProjectControl() {
     }
   }, []);
   useEffect(() => {
-    if (!user || !spacesOn) { setSpaces([]); return; }
+    if (!user) { setSpaces([]); return; }
     void reloadSpaces();
-  }, [user, spacesOn, reloadSpaces]);
+  }, [user, reloadSpaces]);
   const createSpace = async (e: React.FormEvent) => {
     e.preventDefault();
     const name = newSpaceName.trim();
@@ -616,30 +621,30 @@ export function ProjectControl() {
     }
   };
 
-  // Pool depth for the "N warm, N warming" line and the Add box hint, only with
-  // the flag on (off, nothing is fetched). Refreshed with each box feed update,
+  // Pool depth for the "N warm, N warming" line and the Add box hint.
+  // Refreshed with each box feed update,
   // as the box list's own reload used to refresh it.
   useEffect(() => {
-    if (!user || !warmPoolEnabled) {
+    if (!user) {
       setWarmPool(null);
       return;
     }
     let cancelled = false;
     warmPoolApi.get().then(p => { if (!cancelled) setWarmPool(p); }).catch(() => { /* keep the last line */ });
     return () => { cancelled = true; };
-  }, [user, warmPoolEnabled, boxes]);
+  }, [user, boxes]);
 
   // Boxes the lifecycle sweep terminated this week; a terminated box leaves the
   // list, so refetched when the list shrinks or grows rather than on every poll.
   useEffect(() => {
-    if (!user || !autoLifecycleOn) {
+    if (!user) {
       setAutoTerminated([]);
       return;
     }
     let cancelled = false;
     instancesApi.autoTerminated().then(list => { if (!cancelled) setAutoTerminated(list); }).catch(() => { /* keep the last list */ });
     return () => { cancelled = true; };
-  }, [user, autoLifecycleOn, boxes.length]);
+  }, [user, boxes.length]);
 
   // App keeps the feed polling through transitions; refresh on mount so a
   // list reopened after the sidebar was collapsed starts current.
@@ -663,11 +668,10 @@ export function ProjectControl() {
   // List of all the agent tmux session names for a project, one per workstream
   // (with `main` collapsing to the historical 3-segment name). Falls back to
   // the historical single-session shape if workstreams haven't loaded yet.
+  // The same visible set agentWorkstreamSessions walks, so the project row's
+  // dot and badges read what the sidebar lists.
   function projectAgentSessions(project: Project): string[] {
-    const owner = project.ownerUsername ?? user?.unixUsername ?? '';
-    const wsList = project.workstreams ?? [];
-    if (wsList.length === 0) return [buildSessionName(owner, project.name, 'agent')];
-    return wsList.map(ws => buildSessionName(owner, project.name, 'agent', ws.name));
+    return agentWorkstreamSessions(project).map(({ session }) => session);
   }
 
   // Project-row status aggregates across all workstreams: the worst-priority
@@ -789,7 +793,9 @@ export function ProjectControl() {
   // workstreams run mixed providers.
   function mixedProviderNote(project: Project, mainProvider: string | null): string {
     const others = new Map<string, string>(); // provider → first workstream using it
-    for (const ws of project.workstreams) {
+    // The visible set, like the list below the row: a hidden ask chat does
+    // not name itself in the badge's tooltip (Bugbot).
+    for (const ws of sidebarWorkstreams(project.workstreams, theme.sidebarAskChats, onScreenWsOf(project))) {
       const prov = workstreamAgentProvider(project, ws);
       if (prov && prov !== mainProvider && !others.has(prov)) others.set(prov, ws.name);
     }
@@ -1139,9 +1145,10 @@ export function ProjectControl() {
         await reloadBoxes();
       } catch (err: unknown) {
         // 409 → box has live projects; re-confirm to archive them all.
-        const resp = (err as { response?: { status?: number; data?: { projects?: Array<{ name: string }> } } })?.response;
+        const resp = (err as { response?: { status?: number; data?: { projects?: Array<{ name: string; label?: string }> } } })?.response;
         if (resp?.status === 409) {
-          const names = (resp.data?.projects ?? []).map(p => p.name).join(', ');
+          // Every project it archives, a space orchestrator's named as one (projectKind.ts inProjectLists).
+          const names = (resp.data?.projects ?? []).map(projectWithLabel).join(', ');
           setConfirmState({
             message: `"${box.name}" has live projects (${names}). Terminate anyway? This archives them all.`,
             confirmLabel: 'Terminate',
@@ -1163,8 +1170,11 @@ export function ProjectControl() {
 
   function stopBox(box: Instance) {
     const count = box._count?.projects ?? 0;
+    // A space orchestrator on the box is named, so nobody stops one unknowingly (projectKind.ts inProjectLists).
+    const managed = (box.managedProjects ?? []).map(projectWithLabel);
     setConfirmState({
-      message: `Stop box "${box.name}"? Running agents${count ? ` in its ${count} project${count === 1 ? '' : 's'}` : ''} `
+      message: `Stop box "${box.name}"? Running agents${count ? ` in its ${count} project${count === 1 ? '' : 's'}` : ''}`
+        + `${managed.length ? `, including ${managed.join(', ')},` : ''} `
         + 'will be interrupted. Files and agent conversations stay on its disk, and its sessions are '
         + 'recreated when you start it again. A stopped box costs only its disk.',
       confirmLabel: 'Stop box',
@@ -1293,7 +1303,11 @@ export function ProjectControl() {
     const box = p.instanceId ? boxes.find(b => b.id === p.instanceId) : null;
     const parked = isBoxParked(box?.status);
     const isAutomation = projectKindTraits(p.kind).isAutomation;
-    const wsCount = p.workstreams?.length ?? 0;
+    // The count of the workstreams the row's sub-list would show (ask chats
+    // dropped unless Settings → Appearance shows them): the ↳N badge and the
+    // single-workstream test for the PR pills must agree with the list below
+    // (Bugbot, "Count still includes hidden asks").
+    const wsCount = sidebarWorkstreams(p.workstreams ?? [], theme.sidebarAskChats, onScreenWsOf(p)).length;
     const runCount = isAutomation ? automationRuns(p).length : 0;
     // Only owned projects are pinnable, so only they're selectable in edit mode.
     const selectable = p.role !== 'collaborator';
@@ -1444,6 +1458,11 @@ export function ProjectControl() {
                       Branch off…
                     </button>
                   )}
+                  {multiRepoOn && p.layout === 'workspace' && (
+                    <button data-analytics="project-add-repo" onClick={() => { setAddRepoTarget(p); setMenuOpenId(null); }}>
+                      Add repository…
+                    </button>
+                  )}
                   {slackCollabOn && (
                     <button onClick={() => {
                       const mainWs = p.workstreams.find(ws => ws.name === 'main') ?? p.workstreams[0];
@@ -1469,7 +1488,11 @@ export function ProjectControl() {
                           Switch agent…
                         </button>
                         {handoffOn && canHandOff(storedWorkstreamProvider(p, mainWs)) && (
-                          <button onClick={() => { setHandoffError(''); setHandoffTarget({ project: p, ws: mainWs }); setMenuOpenId(null); }}>
+                          <button
+                            disabled={onSetupOff(p)}
+                            title={onSetupOff(p) ? SETUP_OFF_TOOLTIP : undefined}
+                            onClick={() => { setHandoffError(''); setHandoffTarget({ project: p, ws: mainWs }); setMenuOpenId(null); }}
+                          >
                             Hand off…
                           </button>
                         )}
@@ -1642,23 +1665,25 @@ export function ProjectControl() {
                 title="Phone view"
                 aria-label="Phone view"
               >📱</button>
-              {simpleUi && (
-                <button className="btn-ghost" onClick={() => navigate('/chat')} title="Open in termag" aria-label="Open in termag">💬</button>
-              )}
+              <button className="btn-ghost" onClick={() => navigate('/chat')} title="Open in termag" aria-label="Open in termag">💬</button>
               <button className="btn-ghost" onClick={() => navigate('/settings')} title="Settings" aria-label="Settings">⚙</button>
             </span>
           </div>
           <div className="sidebar-links">
-            <a
-              className="sidebar-docs-link"
-              href={DOCS_SITE_URL}
-              target="_blank"
-              rel="noopener noreferrer"
-              title="Internal docs site"
-            >
-              How it works ↗
-            </a>
+            {DOCS_SITE_URL && (
+              <a
+                className="sidebar-docs-link"
+                href={DOCS_SITE_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="The docs site"
+              >
+                How it works ↗
+              </a>
+            )}
             <WhatsNewLabLink />
+            {/* Shared environments: repositories plus the file that sizes their box. */}
+            {environmentsOn && <Link className="sidebar-docs-link" to="/environments">Environments</Link>}
           </div>
         </div>
 
@@ -1870,10 +1895,15 @@ export function ProjectControl() {
               // unfolds them or one is open: newest first and without main (no
               // agent ever runs there), the last ten, then the page.
               const activeWs = getActiveWorkstream(p.id);
-              const runRows = isAutomation ? automationRuns(p) : p.workstreams;
+              // Ask chats (ask-<thread>, the simple UI's asks) have no pane to
+              // open here, so the sidebar leaves them out unless Settings →
+              // Appearance shows them; the one on screen stays listed
+              // (utils/askChatVisibility.ts).
+              const visibleWs = sidebarWorkstreams(p.workstreams, theme.sidebarAskChats, onScreenWsOf(p));
+              const runRows = isAutomation ? automationRuns(p) : visibleWs;
               const runsOpen = isAutomation && runsUnfolded(p.id, unfoldedRuns, activeProjectId === p.id && activeWs ? { projectId: p.id, workstream: activeWs } : null);
-              const shownRows = isAutomation ? (runsOpen ? shownRuns(runRows, ws => activeProjectId === p.id && ws.name === activeWs) : []) : runRows;
-              const showWorkstreams = isAutomation ? shownRows.length > 0 : p.workstreams.length > 1;
+              const shownRows = isAutomation ? (runsOpen ? shownRuns(runRows, ws => activeProjectId === p.id && ws.name === activeWs) : []) : visibleWs;
+              const showWorkstreams = isAutomation ? shownRows.length > 0 : visibleWs.length > 1;
               const owner = p.ownerUsername ?? user?.unixUsername ?? '';
               return (
                 <React.Fragment key={p.id}>
@@ -1953,9 +1983,9 @@ export function ProjectControl() {
                         // pane is a shell that cannot show it.
                         onClick={() => {
                           if (!isAutomation) openWorkstream(p.id, ws.name);
-                          else navigate(simpleUi ? chatHref(p.id, ws.name) : `/automations/${encodeURIComponent(p.id)}`);
+                          else navigate(chatHref(p.id, ws.name));
                         }}
-                        title={isAutomation ? (simpleUi ? "Open this run's conversation" : 'Open the automation') : `branch: ${ws.branch}`}
+                        title={isAutomation ? "Open this run's conversation" : `branch: ${ws.branch}`}
                       >
                         <span className={`workstream-status${statusesStale ? ' stale' : ''}`}>
                           {wsHasAgent ? <StatusDot status={wsStatus} /> : '—'}
@@ -2027,7 +2057,11 @@ export function ProjectControl() {
                                   </button>
                                 )}
                                 {wsHasAgent && handoffOn && projectKindTraits(p.kind).canHandOff && canHandOff(storedWorkstreamProvider(p, ws)) && (
-                                  <button onClick={() => { setHandoffError(''); setHandoffTarget({ project: p, ws }); setMenuOpenId(null); }}>
+                                  <button
+                                    disabled={onSetupOff(p)}
+                                    title={onSetupOff(p) ? SETUP_OFF_TOOLTIP : undefined}
+                                    onClick={() => { setHandoffError(''); setHandoffTarget({ project: p, ws }); setMenuOpenId(null); }}
+                                  >
                                     Hand off…
                                   </button>
                                 )}
@@ -2165,7 +2199,7 @@ export function ProjectControl() {
         )}
         {showBoxes && (
           <div className="boxes-expanded">
-            {warmPoolEnabled && warmPool && (
+            {warmPool && (
               <div className="box-pool">{warmPool.warm} warm, {warmPool.warming} warming</div>
             )}
             {boxError && <div className="error-banner">{boxError}<button onClick={() => setBoxError('')}>×</button></div>}
@@ -2205,7 +2239,7 @@ export function ProjectControl() {
                       <span
                         className="box-name"
                         title={boxNameTitle(b.hostname, b.imageId)}
-                        onDoubleClick={boxRenameOn ? () => beginRename(b.id, b.name) : undefined}
+                        onDoubleClick={() => beginRename(b.id, b.name)}
                       >{b.name}</span>
                     )}
                     {(b.onClaimStatus === 'pending' || b.onClaimStatus === 'running') && (
@@ -2240,22 +2274,20 @@ export function ProjectControl() {
                           {canStopBox(b) && (
                             <button onClick={() => { stopBox(b); setBoxMenuOpenId(null); }}>Stop box</button>
                           )}
-                          {offersAutoHibernate(b, autoLifecycleOn) && (
+                          {offersAutoHibernate(b) && (
                             <button
                               title="Stop this box on its own after it has been idle for a while"
                               onClick={() => { setLifecycleBox(b); setBoxMenuOpenId(null); }}
                             >Auto-park…</button>
                           )}
-                          {boxRenameOn && (
-                            <button onClick={() => { beginRename(b.id, b.name); setBoxMenuOpenId(null); }}>Rename…</button>
-                          )}
+                          <button onClick={() => { beginRename(b.id, b.name); setBoxMenuOpenId(null); }}>Rename…</button>
                           {offersResize(b) && (
                             <button
                               title="Change how many vCPUs and how much memory this box has; it restarts"
                               onClick={() => { setResizeBox(b); setBoxMenuOpenId(null); }}
                             >Resize box</button>
                           )}
-                          {spacesOn && b.status !== 'terminated' && (
+                          {b.status !== 'terminated' && (
                             <button
                               title="Choose which spaces this box can reach"
                               onClick={() => { setBoxSpaces(b); setBoxMenuOpenId(null); }}
@@ -2266,7 +2298,7 @@ export function ProjectControl() {
                           </button>
                       </AnchoredMenu>
                     </span>}
-                    {repoPickerOn && repoPromptDue({
+                    {repoPromptDue({
                       kind: b.kind,
                       dismissedAt: b.repoPromptDismissedAt ?? null,
                       liveCount: projects.filter(p => !p.archived && p.instanceId === b.id).length,
@@ -2341,38 +2373,36 @@ export function ProjectControl() {
         )}
       </section>
 
-      {spacesOn && (
-        <section className="control-section spaces-section">
-          <h3 className="clickable-header" onClick={() => setShowSpaces(s => !s)}>
-            Spaces {showSpaces ? '▾' : '▸'}
-            {spaces.length > 0 && <span className="boxes-summary">{spaces.length}</span>}
-          </h3>
-          {showSpaces && (
-            <div className="boxes-expanded">
-              {spacesError && <div className="error-banner">{spacesError}<button onClick={() => setSpacesError('')}>×</button></div>}
-              <ul className="box-list">
-                {spaces.map(sp => (
-                  <li key={sp.id} className="box-item space-item" onClick={() => setOpenSpace(sp)} title={sp.description ?? undefined}>
-                    <span className="box-name">{sp.name}</span>
-                    <span className="box-meta">{sp.role}{sp.readOnly ? ' · read-only' : ''} · {formatSpaceBytes(sp.usedBytes)}</span>
-                  </li>
-                ))}
-                {spaces.length === 0 && <li className="box-empty">No spaces yet: shared folders your boxes can reach</li>}
-              </ul>
-              <form className="inline-form box-create-form" onSubmit={createSpace}>
-                <input
-                  value={newSpaceName}
-                  onChange={e => setNewSpaceName(e.target.value)}
-                  placeholder="new space"
-                  aria-label="New space name"
-                  title={SPACE_NAME_HINT}
-                />
-                <button type="submit" title="Create a space; you become its owner">+</button>
-              </form>
-            </div>
-          )}
-        </section>
-      )}
+      <section className="control-section spaces-section">
+        <h3 className="clickable-header" onClick={() => setShowSpaces(s => !s)}>
+          Spaces {showSpaces ? '▾' : '▸'}
+          {spaces.length > 0 && <span className="boxes-summary">{spaces.length}</span>}
+        </h3>
+        {showSpaces && (
+          <div className="boxes-expanded">
+            {spacesError && <div className="error-banner">{spacesError}<button onClick={() => setSpacesError('')}>×</button></div>}
+            <ul className="box-list">
+              {spaces.map(sp => (
+                <li key={sp.id} className="box-item space-item" onClick={() => setOpenSpace(sp)} title={sp.description ?? undefined}>
+                  <span className="box-name">{sp.name}</span>
+                  <span className="box-meta">{sp.role}{sp.readOnly ? ' · read-only' : ''} · {formatSpaceBytes(sp.usedBytes)}</span>
+                </li>
+              ))}
+              {spaces.length === 0 && <li className="box-empty">No spaces yet: shared folders your boxes can reach</li>}
+            </ul>
+            <form className="inline-form box-create-form" onSubmit={createSpace}>
+              <input
+                value={newSpaceName}
+                onChange={e => setNewSpaceName(e.target.value)}
+                placeholder="new space"
+                aria-label="New space name"
+                title={SPACE_NAME_HINT}
+              />
+              <button type="submit" title="Create a space; you become its owner">+</button>
+            </form>
+          </div>
+        )}
+      </section>
 
       <section className="control-section">
         <h3 className="clickable-header" onClick={() => setShowTokens(s => !s)}>
@@ -2440,6 +2470,10 @@ export function ProjectControl() {
             resetBranchOffForm();
           }}
         />
+      )}
+      {addRepoTarget && createPortal(
+        <AddRepoDialog project={addRepoTarget} onClose={() => setAddRepoTarget(null)} onChanged={() => { void reloadProjects(); }} />,
+        document.body,
       )}
       {lifecycleBox && createPortal(
         <BoxLifecycleDialog box={lifecycleBox} onClose={() => setLifecycleBox(null)} onSaved={() => { void reloadBoxes(); }} />,

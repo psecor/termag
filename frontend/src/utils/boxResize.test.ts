@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  busyRefusal, currentSizeLabel, defaultResizeTarget, resizeFromStatus, losesHibernation, offersResize, resizeBadge, resizeOptionLabel, resizeOutcome, resizeSteps, resizeWarning,
-  type BoxResizeInfo, type ResizeView,
+  busyRefusal, changeWarning, currentDiskLabel, currentSizeLabel, defaultResizeTarget, growFieldOptions, growOutcome, growSteps, phaseLabel,
+  resizeFromStatus, losesHibernation, offersResize, resizeBadge, resizeOptionLabel, resizeOutcome, resizeSteps, resizeWarning,
+  type BoxResizeInfo, type DiskView, type GrowView, type ResizeView,
 } from './boxResize';
 import type { BoxSizeChoice } from './boxSize';
 
@@ -112,5 +113,50 @@ describe('hibernation and refusals', () => {
     expect(busyRefusal({ response: { status: 409, data: { code: 'box_busy', error: 'busy', blockers, forceable: true } } }))
       .toEqual({ error: 'busy', blockers, forceable: true });
     expect(busyRefusal({ response: { status: 409, data: { code: 'resize_running', error: 'x' } } })).toBe(null);
+  });
+});
+
+describe('the disk, beside the size', () => {
+  const disk = (over: Partial<DiskView> = {}): DiskView => ({ sizeGb: 120, maxGb: 300, refusal: null, grow: null, ...over });
+  const grow = (over: Partial<GrowView> = {}): GrowView => ({
+    fromGb: 120, toGb: 200, state: 'modifying', running: true, detail: null, startedAt: '2026-11-03T12:00:00Z', finishedAt: null, ...over,
+  });
+
+  it('reads the current disk beside the current type', () => {
+    expect(currentDiskLabel(disk())).toBe('120 GB disk');
+    expect(currentDiskLabel(disk({ sizeGb: null }))).toBeNull();
+    expect(currentDiskLabel(null)).toBeNull();
+  });
+
+  it("the field's range starts at the current disk (grow only) and ends at the server's cap", () => {
+    expect(growFieldOptions(disk())).toEqual({ minGiB: 120, maxGiB: 300, defaultGiB: 120, diskGiB: 120 });
+    expect(growFieldOptions(disk({ sizeGb: null }))).toBeNull();
+  });
+
+  it('only mentions the stop when the instance type changes', () => {
+    expect(changeWarning('ready', { size: false, disk: true }))
+      .toBe("Growing the disk doesn't stop the box. A disk never shrinks, and EBS allows one change to it every six hours.");
+    expect(changeWarning('ready', { size: true, disk: false })).toBe(resizeWarning('ready'));
+    expect(changeWarning('ready', { size: true, disk: true }))
+      .toBe(`${resizeWarning('ready')} The disk grows first, with the box up; a disk never shrinks, and EBS allows one change to it every six hours.`);
+    expect(changeWarning('ready', { size: true, disk: false }, true)).toBe(resizeWarning('ready', true));
+    expect(changeWarning('ready', { size: false, disk: false })).toBeNull();
+  });
+
+  it('the grow has its own steps and outcome, like the resize', () => {
+    expect(growSteps(grow()).map(s => `${s.state}:${s.label}`)).toEqual(['current:Growing the disk to 200 GB', 'todo:Growing its file system']);
+    expect(growSteps(grow({ state: 'filesystem' })).map(s => s.state)).toEqual(['done', 'current']);
+    expect(growSteps(grow({ state: 'done', running: false })).map(s => s.state)).toEqual(['done', 'done']);
+    expect(growOutcome(grow())).toBeNull();
+    expect(growOutcome(grow({ state: 'done', running: false }))).toBe('The disk is now 200 GB.');
+    expect(growOutcome(grow({ state: 'failed', running: false, detail: 'growpart: FAILED' }))).toBe('The disk grow failed: growpart: FAILED');
+  });
+
+  it('a resize that waits for the disk shows that step first', () => {
+    expect(resizeSteps(view({ phase: 'disk' }), 'ready').map(s => `${s.state}:${s.label}`)).toEqual([
+      'current:Waiting for the disk to grow', 'todo:Stopping', 'todo:Changing its instance type', 'todo:Starting, waiting for its agent', 'todo:Running at the new size',
+    ]);
+    expect(resizeSteps(view({ phase: 'stopping' }), 'ready', true).map(s => s.state)).toEqual(['done', 'current', 'todo', 'todo', 'todo']);
+    expect(phaseLabel('disk')).toBe('Waiting for the disk to grow');
   });
 });

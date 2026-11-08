@@ -1,15 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { mcpConnectorsApi, McpCatalogServer, McpConnector, McpConnectorList } from '../../services/api';
+import { mcpConnectorsApi, McpConnector, McpConnectorList, McpReturnTo } from '../../services/api';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
-import { FLAGS, useFlag } from '../../flags';
 import { PROVIDERS } from '../../providers/registry';
+import { McpPasteLink, type PendingSignIn } from './McpPasteLink';
+import { apiError, ConnectorNameLine, McpCatalogList, ServerName, useMcpSignIn, type BeginLink, type Failure } from './McpCatalog';
+import { McpCallbackUrl } from './McpCallbackUrl';
+import { McpPermissions } from './McpPermissions';
 import { DocsLink } from './DocsLink';
 import { connectorStatus, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
-
-function apiError(err: unknown, fallback: string): string {
-  const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-  return typeof msg === 'string' ? msg : fallback;
-}
 
 const DEFAULT_HEADERS = 'Authorization: Bearer {{secret.token}}';
 
@@ -40,11 +38,17 @@ function SecretInputs({ names, stored, values, onChange }: {
   );
 }
 
-function ConnectorRow({ c, focused, onChanged, onError }: {
+/** One of the user's servers, in Settings and in the setup wizard's MCP step. */
+export function ConnectorRow({ c, focused, signIn, returnTo, onLink, onChanged, onError }: {
   c: McpConnector;
   focused: boolean;
+  // Where the paste box's answer returns the browser (McpCatalog.tsx useMcpSignIn).
+  returnTo?: McpReturnTo;
+  // This connector's sign-in open in a new tab, if any.
+  signIn: PendingSignIn | null;
+  onLink: BeginLink;
   onChanged: () => void;
-  onError: (msg: string) => void;
+  onError: (failure: Failure) => void;
 }) {
   const [editing, setEditing] = useState(focused && c.missingSecrets.length > 0);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -80,12 +84,16 @@ function ConnectorRow({ c, focused, onChanged, onError }: {
   async function link() {
     setBusy(true);
     try {
-      window.location.assign(await mcpConnectorsApi.startOAuth(c.id));
+      // Settings stays when the checklist or a new sign-in tab opens: the row is free again.
+      if (await onLink(c)) setBusy(false);
     } catch (err) {
       onError(apiError(err, 'Could not start signing in to the server'));
       setBusy(false);
     }
   }
+  const choosable = !!c.oauth?.scopeChoice;
+  // What the server granted at the last sign-in, or what it was asked for when it didn't say.
+  const permissions = linked ? (c.oauth?.grantedScopes ?? c.oauth?.requestedScopes ?? null) : null;
 
   async function unlink() {
     setBusy(true);
@@ -115,12 +123,17 @@ function ConnectorRow({ c, focused, onChanged, onError }: {
     <li ref={ref} className={`settings-row mcp-row${focused ? ' mcp-row-focused' : ''}`}>
       <div className="settings-row-text">
         <span className="mcp-row-head">
-          <span className="settings-row-name">{c.name}</span>
+          <ServerName display={c.displayName ?? c.name} name={c.name} kind={c.kind} />
           <span className={`settings-pill is-${status.tone}`}>{status.label}</span>
         </span>
+        <ConnectorNameLine display={c.displayName ?? c.name} name={c.name} />
         <span className="settings-row-mono">{c.upstream}</span>
-        <span className="settings-row-meta">{c.authType === 'static' ? 'API key' : 'OAuth'}</span>
+        <span className="settings-row-meta">{c.authType === 'static' ? 'API key' : c.kind === 'api' ? 'OAuth, REST API for a CLI (not an MCP server)' : 'OAuth'}</span>
+        {permissions && permissions.length > 0 && (
+          <McpPermissions granted={!!c.oauth?.grantedScopes} labels={permissions.map(s => s.label)} />
+        )}
         {c.authType === 'oauth' && !linked && c.linkError && <span className="credentials-error">{c.linkError}</span>}
+        {c.authType === 'oauth' && c.pasteLink && <McpPasteLink c={c} signIn={signIn} returnTo={returnTo} />}
         {editing && (
           <>
             <SecretInputs names={names} stored={c.secretNames ?? []} values={values}
@@ -134,13 +147,15 @@ function ConnectorRow({ c, focused, onChanged, onError }: {
       </div>
       <div className="mcp-row-actions">
         {!editing && names.length > 0 && <button className="btn-ghost" disabled={busy} onClick={() => setEditing(true)}>Secrets</button>}
-        {c.authType === 'oauth' && <button className="btn-ghost" disabled={busy} onClick={link}>{linked ? 'Re-link' : 'Link'}</button>}
+        {c.authType === 'oauth' && (
+          <button className="btn-ghost" disabled={busy} onClick={link}>{!linked ? 'Link' : choosable ? 'Change permissions' : 'Re-link'}</button>
+        )}
         {c.authType === 'oauth' && linked && <button className="btn-ghost" disabled={busy} onClick={unlink}>Unlink</button>}
         <button className="btn-ghost" disabled={busy} onClick={() => setConfirming(true)}>Delete</button>
       </div>
       {confirming && (
         <ConfirmDialog
-          message={`Delete ${c.name}? Your boxes lose this MCP server at their next delivery, a running session's next call to it is refused, and its ${c.authType === 'oauth' ? 'sign-in is revoked' : 'secrets are deleted'}.`}
+          message={`Delete ${c.displayName ?? c.name}? Your boxes lose this MCP server at their next delivery, a running session's next call to it is refused, and its ${c.authType === 'oauth' ? 'sign-in is revoked' : 'secrets are deleted'}.`}
           confirmLabel="Delete"
           onConfirm={remove}
           onCancel={() => setConfirming(false)}
@@ -150,55 +165,15 @@ function ConnectorRow({ c, focused, onChanged, onError }: {
   );
 }
 
-/**
- * A server the orchestrator offers that the user hasn't connected yet.
- * Connect creates their connector for it and sends them to the server's
- * sign-in page; after that it shows under their own servers instead.
- */
-function CatalogRow({ server, storeAvailable, onReload, onError }: {
-  server: McpCatalogServer;
-  storeAvailable: boolean;
-  // Reloads the list and keeps the error banner.
-  onReload: () => void;
-  onError: (msg: string) => void;
-}) {
-  const [busy, setBusy] = useState(false);
-
-  async function connect() {
-    setBusy(true);
-    try {
-      window.location.assign(await mcpConnectorsApi.connectCatalog(server.name));
-    } catch (err) {
-      onError(apiError(err, 'Could not connect the server'));
-      // Connect can create the connector and then fail to start sign-in; the
-      // reload moves the server to Your servers (not authed, with Link) rather
-      // than leaving it offered here.
-      onReload();
-      setBusy(false);
-    }
-  }
-
-  return (
-    <li className="settings-row mcp-row">
-      <div className="settings-row-text">
-        <span className="settings-row-name">{server.name}</span>
-        <span className="settings-row-mono">{server.upstream}</span>
-      </div>
-      <div className="mcp-row-actions">
-        <button className="btn-ghost" disabled={busy || !storeAvailable} onClick={connect}>Connect</button>
-      </div>
-    </li>
-  );
-}
-
-function AddForm({ initialUpstream, storeAvailable, onAdded, onReload, onError }: {
+function AddForm({ initialUpstream, storeAvailable, onLink, onAdded, onReload, onError }: {
   initialUpstream: string | null;
   storeAvailable: boolean;
+  onLink: BeginLink;
   onAdded: () => void;
   // Reloads the list and keeps the error banner: a failed sign-in start can
   // follow a create that went through.
   onReload: () => void;
-  onError: (msg: string) => void;
+  onError: (failure: Failure) => void;
 }) {
   const [upstream, setUpstream] = useState(initialUpstream ?? '');
   const [name, setName] = useState(initialUpstream ? suggestName(initialUpstream) : '');
@@ -216,7 +191,12 @@ function AddForm({ initialUpstream, storeAvailable, onAdded, onReload, onError }
       setBusy(true);
       try {
         const created = await mcpConnectorsApi.create({ name, upstream, auth: { type: 'oauth' } });
-        window.location.assign(await mcpConnectorsApi.startOAuth(created.id));
+        if (await onLink(created)) {
+          // The checklist or a new sign-in tab is open over the new connector, which the reload lists under Your servers.
+          setUpstream(''); setName(''); setNameTouched(false);
+          onReload();
+          setBusy(false);
+        }
       } catch (err) {
         onError(apiError(err, 'Could not add the connector'));
         onReload();
@@ -224,7 +204,7 @@ function AddForm({ initialUpstream, storeAvailable, onAdded, onReload, onError }
       }
       return;
     }
-    if (parsed.error) { onError(parsed.error); return; }
+    if (parsed.error) { onError({ message: parsed.error }); return; }
     setBusy(true);
     try {
       const secrets = Object.fromEntries(names.filter(n => values[n]).map(n => [n, values[n]]));
@@ -250,7 +230,7 @@ function AddForm({ initialUpstream, storeAvailable, onAdded, onReload, onError }
       </label>
       <label className="inline-form settings-form mcp-field">
         <span>Name</span>
-        <input value={name} placeholder="example" onChange={e => { setName(e.target.value); setNameTouched(true); }} />
+        <input value={name} placeholder="Example Docs" onChange={e => { setName(e.target.value); setNameTouched(true); }} />
       </label>
       <label className="inline-form settings-form mcp-field">
         <span>Sign-in</span>
@@ -295,25 +275,26 @@ function AddForm({ initialUpstream, storeAvailable, onAdded, onReload, onError }
 
 /**
  * The user's MCP servers, given to every box they own through the termag MCP
- * broker. Only while mcp-broker-enabled is on; the API
- * answers 404 otherwise. Secrets are write-only.
+ * broker. Secrets are write-only.
  */
 export function McpSection({ focus, search }: { focus: boolean; search: string }) {
-  const enabled = useFlag(FLAGS.mcpBroker, false);
   const agents = mcpAgentNames(PROVIDERS);
   const [list, setList] = useState<McpConnectorList | null>(null);
-  const [error, setError] = useState('');
-  const ref = useRef<HTMLElement>(null);
+  const [error, setError] = useState<Failure | null>(null);
   const param = useMemo(() => serverParam(search), [search]);
   const result = useMemo(() => linkResult(search), [search]);
+  // The localhost sign-in open in another tab, for its connector's paste box,
+  // kept across a reload of Settings until its connector links (mcpSignIn.ts).
+  const signIn = useMcpSignIn(setError, undefined, result.linked ? param.connectorId : null);
+  const { beginLink, pending } = signIn;
+  const ref = useRef<HTMLElement>(null);
 
   const load = () => mcpConnectorsApi.list().then(setList).catch(err => setError(apiError(err, 'Could not load MCP servers')));
-  useEffect(() => { if (enabled) void load(); }, [enabled]);
+  useEffect(() => { void load(); }, []);
   useEffect(() => {
-    if (enabled && focus && !param.connectorId) ref.current?.scrollIntoView({ block: 'start' });
-  }, [enabled, focus, param.connectorId, list === null]);
+    if (focus && !param.connectorId) ref.current?.scrollIntoView({ block: 'start' });
+  }, [focus, param.connectorId, list === null]);
 
-  if (!enabled) return null;
   return (
     <section ref={ref} className="dash-section" aria-labelledby="mcp-h">
       <div className="dash-section-title" id="mcp-h">
@@ -327,7 +308,15 @@ export function McpSection({ focus, search }: { focus: boolean; search: string }
         </p>
         {result.linked && <div className="settings-notice" role="status">Linked. Your agents can use this MCP now.</div>}
         {result.error && <div className="error-banner" role="alert">{result.error}</div>}
-        {error && <div className="error-banner" role="alert">{error}<button onClick={() => setError('')}>×</button></div>}
+        {error && (
+          <div className="error-banner" role="alert">
+            <div className="mcp-error-text">
+              {error.message}
+              {error.callbackUrl && <McpCallbackUrl url={error.callbackUrl} />}
+            </div>
+            <button onClick={() => setError(null)}>×</button>
+          </div>
+        )}
         {list && !list.available && (
           <div className="settings-notice warn" role="status">No MCP broker is set up on this orchestrator yet, so boxes don't get these servers.</div>
         )}
@@ -336,24 +325,18 @@ export function McpSection({ focus, search }: { focus: boolean; search: string }
           <ul className="settings-list mcp-list">
             {list.connectors.length === 0 && <li className="settings-empty">No MCP servers yet.</li>}
             {list.connectors.map(c => (
-              <ConnectorRow key={c.id} c={c} focused={c.id === param.connectorId} onChanged={() => { setError(''); void load(); }} onError={setError} />
+              <ConnectorRow key={c.id} c={c} focused={c.id === param.connectorId} signIn={pending?.connectorId === c.id ? pending : null} onLink={beginLink} onChanged={() => { setError(null); void load(); }} onError={setError} />
             ))}
           </ul>
         )}
         {list && !!list.catalog?.length && (
-          <>
-            <div className="mcp-form-title">Available to connect</div>
-            <ul className="settings-list mcp-list" aria-label="Available to connect">
-              {list.catalog.map(s => (
-                <CatalogRow key={s.name} server={s} storeAvailable={list.storeAvailable} onReload={() => void load()} onError={setError} />
-              ))}
-            </ul>
-          </>
+          <McpCatalogList catalog={list.catalog} storeAvailable={list.storeAvailable} signIn={signIn} onReload={() => void load()} onError={setError} />
         )}
         {list && (
-          <AddForm key={param.upstream ?? ''} initialUpstream={param.upstream} storeAvailable={list.storeAvailable}
-            onAdded={() => { setError(''); void load(); }} onReload={() => void load()} onError={setError} />
+          <AddForm key={param.upstream ?? ''} initialUpstream={param.upstream} storeAvailable={list.storeAvailable} onLink={beginLink}
+            onAdded={() => { setError(null); void load(); }} onReload={() => void load()} onError={setError} />
         )}
+        {signIn.scopeDialog}
       </div>
     </section>
   );

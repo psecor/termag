@@ -2,11 +2,13 @@
 // permissions (chat/newChat.ts orchestratorOption): its name and a small
 // on/off track, so it reads as a toggle rather than a menu. It needs Full
 // access, so while the session is read-only it stays off, dimmed, and says why
-// on hover: it never grants commands by itself.
+// on hover: it never grants commands by itself. On a box with termag
+// setup off it is off the same way: there is no skill to use.
 import React from 'react';
 import { Tooltip } from '../components/Tooltip';
+import { SETUP_OFF_TOOLTIP } from '../utils/boxSetup';
 
-export type OrchestratorState = 'needs-trust' | 'available';
+export type OrchestratorState = 'needs-trust' | 'setup-off' | 'available';
 
 function HubIcon() {
   return (
@@ -26,6 +28,7 @@ const ABOUT = 'Claude starts with the agent-orchestrator skill: it splits the wo
 /** The tooltip's first line: what the switch does, or why it can't yet. */
 export function orchestratorLead(on: boolean, state: OrchestratorState): string {
   if (state === 'needs-trust') return 'Needs Full access: a read-only session cannot run commands';
+  if (state === 'setup-off') return SETUP_OFF_TOOLTIP;
   return on ? 'On for this session' : 'Act as an orchestrator';
 }
 
@@ -40,13 +43,13 @@ export function OrchestratorToggle({ on, onChange, state, disabled }: {
   const unavailable = state !== 'available';
   const pressed = on && !unavailable;
   return (
-    <Tooltip content={<><strong>{orchestratorLead(pressed, state)}</strong><span className="ui-tooltip-sub">{ABOUT}</span></>}>
+    <Tooltip content={state === 'setup-off' ? orchestratorLead(pressed, state) : <><strong>{orchestratorLead(pressed, state)}</strong><span className="ui-tooltip-sub">{ABOUT}</span></>}>
     <button
       type="button"
       className="chat-compose-model-btn chat-orchestrator-btn"
       role="switch"
       aria-checked={pressed}
-      // aria-disabled, not disabled, while it needs Full access: a disabled button gets no hover, so no tooltip.
+      // aria-disabled, not disabled, while it is unavailable: a disabled button gets no hover, so no tooltip.
       aria-disabled={unavailable || undefined}
       disabled={disabled}
       onClick={() => { if (!unavailable) onChange(!on); }}

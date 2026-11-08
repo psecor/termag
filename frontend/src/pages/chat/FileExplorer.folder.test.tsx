@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({ tree: vi.fn() }));
 vi.mock('./simpleData', () => {
   const data = () => ({
     items: { pick: () => 't1', state: { items: [] } }, rows: [], live: new Map(), setupOf: new Map(), links: [], activeTab: 't1', itemsShown: true,
-    spaces: { enabled: true, loaded: true, spaces: [{ name: 'notes' }, { name: 'other' }], index: new Map() },
+    spaces: { loaded: true, spaces: [{ name: 'notes' }, { name: 'other' }], index: new Map() },
   });
   return { WithSimpleData: ({ children }: { children: React.ReactNode }) => children, useSimpleData: data, useSimpleDataIfAny: data };
 });

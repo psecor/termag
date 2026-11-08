@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatItem } from './sdkChat';
-import { askCallOf, askCallsOf, askLine, askThreadIds, askViews, askWaitingText, asksSummary, callThreads, sendsOf, targetBox, type ChatAskMessage, type ChatAskThread } from './asks';
+import { NOTICE_POLL_FAST_FOR_MS, NOTICE_POLL_GIVE_UP_MS, NOTICE_POLL_SLOW_MS, askAgentName, askNoticePollMs, askCallOf, askCallsOf, askLine, askThreadIds, askViews, askWaitingText, asksSummary, callThreads, paneAskViews, paneKeptAsks, PANE_ASK_KEEP_MS, sendsOf, targetBox, type ChatAskMessage, type ChatAskThread } from './asks';
 
 type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
 
@@ -17,7 +17,7 @@ function bash(id: string, command: string, over: Partial<ToolItem> = {}): ToolIt
 
 function msg(over: Partial<ChatAskMessage> = {}): ChatAskMessage {
   return {
-    id: M1, hop: 1, status: 'working', queued: false, error: null, reply: 'pending', supersededBy: null, publish: null,
+    id: M1, hop: 1, status: 'working', queued: false, error: null, reply: 'pending', notice: 'none', supersededBy: null, publish: null,
     createdAt: '2026-10-29T13:23:12.000Z', startedAt: '2026-10-29T13:23:18.000Z', completedAt: null, ...over,
   };
 }
@@ -98,11 +98,11 @@ describe('callThreads and askViews', () => {
 
   it('takes its state from the thread\'s newest turn a follow-up didn\'t join', () => {
     const threads = new Map([
-      [T1, thread(T1, { messages: [msg({ status: 'superseded', supersededBy: M2, reply: 'follow-up' }), msg({ id: M2, hop: 2, status: 'completed', completedAt: '2026-10-29T13:25:48.000Z', reply: 'dropped' })] })],
+      [T1, thread(T1, { messages: [msg({ status: 'superseded', supersededBy: M2, reply: 'follow-up' }), msg({ id: M2, hop: 2, status: 'completed', completedAt: '2026-10-29T13:25:48.000Z', reply: 'dropped', notice: 'sent' })] })],
       [T2, thread(T2, { title: null, messages: [msg({ id: 'm2a0000000', status: 'submitted', queued: true, startedAt: null })] })],
     ]);
     const views = askViews(calls, callThreads(calls, tools, threads), tools, threads);
-    expect(views.get(T1)).toMatchObject({ state: 'done', turns: 2, reply: 'dropped', known: true, chat: { projectId: 'p4', workstream: `ask-${T1}` } });
+    expect(views.get(T1)).toMatchObject({ state: 'done', turns: 2, reply: 'dropped', notice: 'sent', known: true, chat: { projectId: 'p4', workstream: `ask-${T1}` } });
     // Untitled on the orchestrator: the call's --title names it.
     expect(views.get(T2)).toMatchObject({ state: 'queued', title: 'Titanic wreck: location' });
   });
@@ -115,7 +115,7 @@ describe('callThreads and askViews', () => {
     const threads = new Map([[T1, thread(T1, { title: null })]]);
     const by = callThreads(wc, new Map([['1', { ...waiting[0], startedAt: '2026-10-29T13:23:00.000Z' }]]), threads);
     expect(by.get('1')).toEqual([T1]);
-    expect(askViews(wc, by, wt, threads).get(T1)?.waiting).toBe('claude');
+    expect(askViews(wc, by, wt, threads).get(T1)?.waiting).toBe('agent');
   });
 
   it('is still waited on when the ask has ended but the call waiting for it hasn\'t returned yet', () => {
@@ -124,9 +124,9 @@ describe('callThreads and askViews', () => {
     const wc = askCallsOf(waiting);
     const threads = new Map([[T1, thread(T1, { title: null, messages: [msg({ status: 'completed', completedAt: '2026-10-29T13:25:00.000Z', reply: 'dropped' })] })]]);
     const v = askViews(wc, callThreads(wc, wt, threads), wt, threads).get(T1)!;
-    expect(v.waiting).toBe('claude');
+    expect(v.waiting).toBe('agent');
     // So it never says the reply went to nobody while the call may still get it.
-    expect(askWaitingText(v)).toBeNull();
+    expect(askWaitingText(v, 'Claude')).toBeNull();
   });
 
   it('matches a background ask by its --title, and never takes a thread another call printed', () => {
@@ -149,11 +149,43 @@ describe('the words', () => {
   });
 
   it('say plainly when nobody is waiting for the reply', () => {
-    expect(askWaitingText({ state: 'working', waiting: 'nobody', reply: 'pending' })).toBe('Claude isn’t waiting for a reply');
-    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'dropped' })).toBe('Not sent back to Claude');
-    expect(askWaitingText({ state: 'working', waiting: 'claude', reply: 'pending' })).toBe('Claude is waiting');
-    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'delivered' })).toBe('Returned to Claude');
-    expect(askWaitingText({ state: 'failed', waiting: 'nobody', reply: 'none' })).toBeNull();
+    expect(askWaitingText({ state: 'working', waiting: 'nobody', reply: 'pending' }, 'Claude')).toBe('Claude isn’t waiting for a reply');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'dropped' }, 'Claude')).toBe('Not sent back to Claude');
+    expect(askWaitingText({ state: 'working', waiting: 'agent', reply: 'pending' }, 'Claude')).toBe('Claude is waiting');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'delivered' }, 'Claude')).toBe('Returned to Claude');
+    expect(askWaitingText({ state: 'failed', waiting: 'nobody', reply: 'none' }, 'Claude')).toBeNull();
+  });
+
+  it('name the chat\'s agent: Codex, or the agent when it is unknown', () => {
+    expect(askWaitingText({ state: 'working', waiting: 'agent', reply: 'pending' }, 'Codex')).toBe('Codex is waiting');
+    expect(askWaitingText({ state: 'working', waiting: 'nobody', reply: 'pending', notice: 'due' }, 'Codex')).toBe('Codex is told when it finishes');
+    expect(askWaitingText({ state: 'working', waiting: 'nobody', reply: 'pending' }, 'Codex')).toBe('Codex isn’t waiting for a reply');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'stored', notice: 'sent' }, 'Codex')).toBe('Codex was told it finished');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'stored', notice: 'due' }, 'Codex')).toBe('Telling Codex it finished');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'delivered' }, 'Codex')).toBe('Returned to Codex');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'dropped' }, 'Codex')).toBe('Not sent back to Codex');
+    expect(askWaitingText({ state: 'working', waiting: 'agent', reply: 'pending' }, 'the agent')).toBe('The agent is waiting');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'dropped' }, 'the agent')).toBe('Not sent back to the agent');
+  });
+
+  it('take the agent\'s name from the provider registry', () => {
+    expect(askAgentName('claude-chat')).toBe('Claude');
+    expect(askAgentName('claude')).toBe('Claude');
+    expect(askAgentName('codex')).toBe('Codex');
+    expect(askAgentName('pi-chat')).toBe('pi');
+    expect(askAgentName(null)).toBe('the agent');
+    expect(askAgentName(undefined)).toBe('the agent');
+    expect(askAgentName('no-such-provider')).toBe('the agent');
+  });
+
+  it('say when Claude is told of the finish instead', () => {
+    expect(askWaitingText({ state: 'working', waiting: 'nobody', reply: 'pending', notice: 'due' }, 'Claude')).toBe('Claude is told when it finishes');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'stored', notice: 'due' }, 'Claude')).toBe('Telling Claude it finished');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'stored', notice: 'sent' }, 'Claude')).toBe('Claude was told it finished');
+    expect(askWaitingText({ state: 'failed', waiting: 'nobody', reply: 'none', notice: 'sent' }, 'Claude')).toBe('Claude was told it ended');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'delivered', notice: 'sent' }, 'Claude')).toBe('Returned to Claude');
+    expect(askWaitingText({ state: 'done', waiting: 'nobody', reply: 'stored', notice: 'unsent' }, 'Claude')).toBe('Not sent back to Claude');
+    expect(askWaitingText({ state: 'working', waiting: 'agent', reply: 'pending', notice: 'due' }, 'Claude')).toBe('Claude is waiting');
   });
 
   it('sum up a list, and name a target\'s box', () => {
@@ -167,7 +199,7 @@ describe('the words', () => {
 describe('asks kept in view', () => {
   const v = (thread: string, over: Partial<import('./asks').AskView> = {}): import('./asks').AskView => ({
     thread, title: thread, target: 'termag-4/termag-4', chat: null, state: 'done', turns: 1, error: null, startedAt: '2026-10-29T13:23:18.000Z',
-    completedAt: '2026-10-29T13:25:48.000Z', waiting: 'nobody', noWait: true, reply: 'dropped', prs: [], known: true, ...over,
+    completedAt: '2026-10-29T13:25:48.000Z', waiting: 'nobody', noWait: true, reply: 'dropped', notice: 'none', prs: [], known: true, ...over,
   });
   const items: ChatItem[] = [
     { kind: 'tool', key: 'tool:a', id: 'a', name: 'Bash', input: {}, inputJson: '', result: null, isError: false, done: true },
@@ -184,11 +216,58 @@ describe('asks kept in view', () => {
 
   it('say where each is and whether Claude is waiting, mid-line', async () => {
     const { askRowSub, askElapsed } = await import('./asks');
-    expect(askRowSub(v(T1, { state: 'working', reply: 'pending' }))).toBe('Working · Claude isn’t waiting for a reply');
-    expect(askRowSub(v(T1, { turns: 2 }))).toBe('Finished · 2 turns · not sent back to Claude');
-    expect(askRowSub(v(T1, { state: 'starting', reply: 'pending' }))).toBe('Starting on termag-4 · Claude isn’t waiting for a reply');
-    expect(askRowSub(v(T1, { state: 'failed', reply: 'none', error: 'box_offline' }))).toBe('Failed: box_offline');
+    expect(askRowSub(v(T1, { state: 'working', reply: 'pending' }), 'Claude')).toBe('Working · Claude isn’t waiting for a reply');
+    expect(askRowSub(v(T1, { turns: 2 }), 'Claude')).toBe('Finished · 2 turns · not sent back to Claude');
+    expect(askRowSub(v(T1, { state: 'starting', reply: 'pending' }), 'Claude')).toBe('Starting on termag-4 · Claude isn’t waiting for a reply');
+    expect(askRowSub(v(T1, { state: 'failed', reply: 'none', error: 'box_offline' }), 'Claude')).toBe('Failed: box_offline');
+    // Mid-line, an agent's name keeps its capital, and "the agent" doesn't take one.
+    expect(askRowSub(v(T1, { state: 'working', reply: 'pending' }), 'Codex')).toBe('Working · Codex isn’t waiting for a reply');
+    expect(askRowSub(v(T1), 'Codex')).toBe('Finished · not sent back to Codex');
+    expect(askRowSub(v(T1, { state: 'working', reply: 'pending' }), 'the agent')).toBe('Working · the agent isn’t waiting for a reply');
     expect(askElapsed(v(T1), 0)).toBe(150_000);
     expect(askElapsed(v(T1, { state: 'working', completedAt: null }), Date.parse('2026-10-29T13:24:18.000Z'))).toBe(60_000);
+  });
+});
+
+describe('a pane chat\'s asks', () => {
+  const later = thread(T2, { title: null, createdAt: '2026-10-29T13:30:00.000Z', messages: [msg({ id: M2, status: 'completed', reply: 'delivered', completedAt: '2026-10-29T13:31:00.000Z' })] });
+  const views = paneAskViews(new Map([[T2, later], [T1, thread(T1, { messages: [msg({ notice: 'due' })] })]]));
+
+  it('are a view per thread the pane sent, oldest first, with no row in the transcript', () => {
+    expect([...views.keys()]).toEqual([T1, T2]);
+    expect(views.get(T1)).toMatchObject({ title: 'Titanic wreck: discovery', state: 'working', waiting: 'nobody', noWait: false, notice: 'due', known: true, noRow: true, chat: { projectId: 'p4' } });
+    expect(views.get(T2)).toMatchObject({ title: `ask-${T2}`, state: 'done', reply: 'delivered', completedAt: '2026-10-29T13:31:00.000Z' });
+  });
+
+  it('say what the notice and the reply say, never that a command waits', () => {
+    expect(askWaitingText(views.get(T1)!, 'Claude')).toBe('Claude is told when it finishes');
+    expect(askWaitingText(views.get(T2)!, 'Claude')).toBe('Returned to Claude');
+    expect(askWaitingText({ ...views.get(T1)!, notice: 'none' }, 'Claude')).toBeNull();
+  });
+
+  it('are kept in view while going, and for an hour after they end', () => {
+    const end = Date.parse('2026-10-29T13:31:00.000Z');
+    expect(paneKeptAsks(views, end + 60_000).map(v => v.thread)).toEqual([T1, T2]);
+    expect(paneKeptAsks(views, end + PANE_ASK_KEEP_MS + 1).map(v => v.thread)).toEqual([T1]);
+  });
+});
+
+describe('askNoticePollMs', () => {
+  const now = Date.parse('2026-10-29T14:00:00.000Z');
+  const ago = (ms: number) => new Date(now - ms).toISOString();
+  const of = (...messages: ChatAskMessage[]) => [thread(T1, { messages })];
+  it('keeps reading a finished ask while its notice is due: often at first, then once a minute, for the sweep\'s day', () => {
+    expect(askNoticePollMs(of(msg({ status: 'completed', completedAt: ago(10_000), notice: 'due' })), now, 5000)).toBe(5000);
+    expect(askNoticePollMs(of(msg({ status: 'completed', completedAt: ago(NOTICE_POLL_FAST_FOR_MS + 1), notice: 'due' })), now, 5000)).toBe(NOTICE_POLL_SLOW_MS);
+    expect(askNoticePollMs(of(msg({ status: 'failed', completedAt: ago(NOTICE_POLL_GIVE_UP_MS + 1), notice: 'due' })), now, 5000)).toBeNull();
+  });
+  it('stops once every finished message\'s notice is settled', () => {
+    for (const notice of ['sent', 'none', 'unsent'] as const) {
+      expect(askNoticePollMs(of(msg({ status: 'completed', completedAt: ago(10_000), notice })), now, 5000)).toBeNull();
+    }
+    expect(askNoticePollMs([], now, 5000)).toBeNull();
+  });
+  it('leaves a message still going to the ordinary poll', () => {
+    expect(askNoticePollMs(of(msg({ status: 'working', notice: 'due' })), now, 5000)).toBeNull();
   });
 });

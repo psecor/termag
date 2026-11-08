@@ -30,7 +30,7 @@ export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: 
   onLeft: () => void;
 }) {
   const m = useSpaceMembers(space.name);
-  const can = shareAbilities(space.role, Boolean(space.readOnly), m.sharing);
+  const can = shareAbilities(space.role, Boolean(space.readOnly));
   const myBoxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
   const [email, setEmail] = useState('');
   const [pickedName, setPickedName] = useState<string | undefined>();
@@ -108,9 +108,6 @@ export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: 
           </select>
           <button type="submit" className="chat-share-primary" disabled={!m.loaded || !email.trim()}>Add</button>
         </form>
-      )}
-      {can.addPeople === 'sharing_off' && (
-        <div className="chat-share-gate">Sharing spaces with other people is not turned on for you yet. You can still add your own boxes.</div>
       )}
       {can.addPeople === 'not_owner' && !space.readOnly && (
         <div className="chat-share-gate">

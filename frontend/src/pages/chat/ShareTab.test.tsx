@@ -36,7 +36,7 @@ const flush = () => act(async () => { await new Promise(r => setTimeout(r, 0)); 
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
-  mocks.flags = { 'browser-pane-preview-share-enabled': true, 'browser-pane-pr-link-shares-enabled': true };
+  mocks.flags = {};
   mocks.shares.list.mockReset().mockResolvedValue([]);
   mocks.shares.stackCheck.mockReset().mockResolvedValue({ checked: false });
   mocks.shares.settings.mockReset().mockResolvedValue({ prLinksEnabled: false, pathFilter: [], reviewerAccountHint: null });
@@ -90,18 +90,10 @@ describe('the side panel\'s Share tab', () => {
     expect(el.textContent).toContain('Share any PR by hand from this workstream\'s PRs above.');
   });
 
-  it('says when the workstream has no PR to share, and lists none with PR link shares off', async () => {
+  it('says when the workstream has no PR to share', async () => {
     act(() => root.render(<ShareTab projectId="p1" workstream="feature-x" />));
     await flush();
     expect(el.textContent).toContain('No open PR of yours from this workstream.');
-    act(() => root.unmount());
-    root = createRoot(el);
-    mocks.flags = { 'browser-pane-preview-share-enabled': true };
-    mocks.prs.list.mockClear();
-    act(() => root.render(<ShareTab projectId="p1" workstream="feature-x" />));
-    await flush();
-    expect(el.querySelector('[aria-label="This workstream\'s PRs"]')).toBeNull();
-    expect(mocks.prs.list).not.toHaveBeenCalled();
   });
 
   it('lists a PR share made from its row, keeps the row through other list changes, and offers it again once the list stops it', async () => {

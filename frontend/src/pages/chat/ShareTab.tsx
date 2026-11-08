@@ -16,7 +16,6 @@ import { FLAGS, useFlag } from '../../flags';
 
 export function ShareTab({ projectId, workstream }: { projectId: string; workstream: string }) {
   const ttl = useFlag(FLAGS.previewShareTtlHours, 24);
-  const prLinks = useFlag(FLAGS.prLinkShares, false);
   const [url] = useRememberedBrowserUrl(projectId, workstream);
   const [sharesKey, setSharesKey] = useState(0);
   const [ended, setEnded] = useState<ReadonlySet<string>>(() => new Set());
@@ -32,7 +31,7 @@ export function ShareTab({ projectId, workstream }: { projectId: string; workstr
         reloadKey={sharesKey}
         onEnded={id => setEnded(prev => new Set(prev).add(id))}
       >
-        {prLinks && <WorkstreamPrs projectId={projectId} workstream={workstream} ended={ended} onChanged={() => setSharesKey(k => k + 1)} />}
+        <WorkstreamPrs projectId={projectId} workstream={workstream} ended={ended} onChanged={() => setSharesKey(k => k + 1)} />
       </SharePreview>
     </div>
   );

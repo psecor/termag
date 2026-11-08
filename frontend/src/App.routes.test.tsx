@@ -53,7 +53,7 @@ const USER = {
   needsOnboarding: false,
 };
 
-const SIMPLE_UI = { 'simple-ui-enabled': true };
+const SIMPLE_UI: Record<string, boolean> = {};
 
 // Every socket URL the app dialled, in order.
 let dialled: string[] = [];
@@ -274,7 +274,7 @@ describe('top-level routes', { timeout: 10_000 }, () => {
   });
 
   it('a share link its owner opened goes to the simple UI\'s side panel when that UI was last', async () => {
-    const flags = { ...SIMPLE_UI, 'simple-ui-side-panel-enabled': true };
+    const flags = { ...SIMPLE_UI };
     net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: flags });
     setFlagValues(flags);
     localStorage.setItem('termag-ui-mode', 'simple');
@@ -286,7 +286,7 @@ describe('top-level routes', { timeout: 10_000 }, () => {
   });
 
   it('a share link its owner opened dials the share from a side panel already open on Browser', async () => {
-    const flags = { ...SIMPLE_UI, 'simple-ui-side-panel-enabled': true, 'browser-pane-enabled': true };
+    const flags = { ...SIMPLE_UI };
     net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: flags });
     setFlagValues(flags);
     net.routes.set('/api/projects', [{
@@ -311,19 +311,12 @@ describe('top-level routes', { timeout: 10_000 }, () => {
   });
 
   it('a share link its owner opened stays in the workspace when the full UI was last', async () => {
-    const flags = { ...SIMPLE_UI, 'simple-ui-side-panel-enabled': true };
+    const flags = { ...SIMPLE_UI };
     net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: flags });
     setFlagValues(flags);
     await open('/?project=p1&ws=main&browser=open&browserShare=cshare0000000001', has('.app-layout'), 'the workspace');
     expect(where).toBe('/');
     expect(visited.some(v => v.startsWith('/chat'))).toBe(false);
-    expect(errors).toEqual([]);
-  });
-
-  it('without simple-ui-enabled, /chat goes to the workspace', async () => {
-    net.routes.set('/api/example-org/bootstrap', { clientSideId: null, context: null, bootstrap: null, overrides: {} });
-    setFlagValues({});
-    await open('/chat', () => where === '/' && has('.app-layout')(), 'the workspace');
     expect(errors).toEqual([]);
   });
 

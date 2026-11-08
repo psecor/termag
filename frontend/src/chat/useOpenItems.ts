@@ -46,8 +46,11 @@ function subscribe(l: Listener): () => void {
 
 export interface OpenItemsApi {
   state: OpenItemsState;
-  /** A route showing `ref` in tab `tab` (a new tab when no tab has that id), or in the first tab showing it, else a new one. Moves nothing. */
-  open: (ref: OpenItemRef, tab: string | null) => void;
+  /**
+   * A route showing `ref` in tab `tab` (a new tab when no tab has that id), or in the first tab showing it, else a new one. Moves nothing.
+   * `active`: the route on screen, whose tab goes first in the tabs shown most recently (OpenItemsState.recent).
+   */
+  open: (ref: OpenItemRef, tab: string | null, active?: boolean) => void;
   /** `ref` picked from an explorer, recents or a chat link, from tab `current` (openItems.pickItem); returns the tab to show it in. */
   /** `chatSpace`: a picked agent's own space, so another space's agent gets its own tab (openItems.ts pickItem). */
   /** `openedIn`: the space it was picked in, null for No space's explorer (OpenItem.openedIn). */
@@ -90,7 +93,9 @@ function useStoreState(key: string | null): OpenItemsState {
 export function useOpenItems(userId: string | null | undefined): OpenItemsApi {
   const key = userId ? openItemsKey(userId) : null;
   const state = useStoreState(key);
-  const open = useCallback((ref: OpenItemRef, tab: string | null) => { if (key) update(key, s => openItem(s, ref, tab, Date.now()).state); }, [key]);
+  const open = useCallback((ref: OpenItemRef, tab: string | null, active?: boolean) => {
+    if (key) update(key, s => openItem(s, ref, tab, Date.now(), newTabId, undefined, active).state);
+  }, [key]);
   const pick = useCallback((ref: OpenItemRef, current: string | null, chatSpace?: string | null, openedIn?: string | null) => {
     if (!key) return newTabId();
     let id = '';
@@ -122,11 +127,12 @@ export function useOpenItems(userId: string | null | undefined): OpenItemsApi {
 
 /**
  * Every open of a tab's route records it, moving nothing: in the tab the route names, else the first showing it, else a new tab.
+ * Its tab is the one shown most recently from then (OpenItemsState.recent), which closing the open tab goes back along.
  * A layout effect, so a route the tabs don't know yet (a direct load, back) is recorded before the first paint.
  */
 export function useOpenOnRoute(api: OpenItemsApi, ref: OpenItemRef | null, tab: string | null): void {
   const k = ref ? JSON.stringify(ref) : '';
   useLayoutEffect(() => {
-    if (ref) api.open(ref, tab);
+    if (ref) api.open(ref, tab, true);
   }, [k, tab, api.open]);
 }

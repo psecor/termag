@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { automationsApi, spacesApi, type SchedulePreview, type SpaceView } from '../services/api';
-import { FLAGS, useFlag } from '../flags';
 import { PRESETS, WEEKDAYS, occurrenceShort, type PresetInput } from '../utils/automationSchedule';
 import { draftCron, type AutomationDraft } from '../utils/automationDraft';
 
@@ -100,15 +99,13 @@ export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix
   const { preview, error: previewError, valid: scheduleValid } = check ?? ownCheck;
   useEffect(() => { onValidity?.(scheduleValid); }, [scheduleValid, onValidity]);
   const tzOptions = useMemo(() => (TIMEZONES.length && !TIMEZONES.includes(draft.timezone) ? [draft.timezone, ...TIMEZONES] : TIMEZONES), [draft.timezone]);
-  // The spaces the owner can write to, for mirroring the notes file (only with spaces on).
-  const spacesOn = useFlag(FLAGS.spaces, false);
+  // The spaces the owner can write to, for mirroring the notes file.
   const [spaces, setSpaces] = useState<SpaceView[] | null>(null);
   useEffect(() => {
-    if (!spacesOn) return;
     let cancelled = false;
     spacesApi.list().then(r => { if (!cancelled) setSpaces(r.spaces.filter(s => (s.role === 'owner' || s.role === 'editor') && !s.readOnly)); }).catch(() => { if (!cancelled) setSpaces([]); });
     return () => { cancelled = true; };
-  }, [spacesOn]);
+  }, []);
   const id = (s: string) => `${idPrefix}-${s}`;
 
   return (
@@ -201,17 +198,15 @@ export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix
             <label htmlFor={id('keep')}>Runs to keep</label>
             <input id={id('keep')} type="number" min={1} max={50} value={draft.keepRuns} onChange={e => set('keepRuns', Math.max(1, Number(e.target.value) || 1))} />
           </div>
-          {spacesOn && (
-            <div className="npf-field">
-              <label htmlFor={id('space')}>Mirror notes to a space</label>
-              <select id={id('space')} value={draft.spaceName ?? ''} onChange={e => set('spaceName', e.target.value || null)}>
-                <option value="">the box only</option>
-                {draft.spaceName && !spaces?.some(s => s.name === draft.spaceName) && <option value={draft.spaceName}>{draft.spaceName}</option>}
-                {(spaces ?? []).map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
-              </select>
-              <span className="npf-note usage-dim">The notes file is pulled from the space before each run and pushed after it, so it outlives the box.</span>
-            </div>
-          )}
+          <div className="npf-field">
+            <label htmlFor={id('space')}>Mirror notes to a space</label>
+            <select id={id('space')} value={draft.spaceName ?? ''} onChange={e => set('spaceName', e.target.value || null)}>
+              <option value="">the box only</option>
+              {draft.spaceName && !spaces?.some(s => s.name === draft.spaceName) && <option value={draft.spaceName}>{draft.spaceName}</option>}
+              {(spaces ?? []).map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+            </select>
+            <span className="npf-note usage-dim">The notes file is pulled from the space before each run and pushed after it, so it outlives the box.</span>
+          </div>
           {showEnabled && (
             <label className="npf-check"><input type="checkbox" checked={draft.enabled} onChange={e => set('enabled', e.target.checked)} /> Enabled</label>
           )}

@@ -189,6 +189,10 @@ export interface SubagentView {
   items: ChatItem[];
   /** Its own chat, for its subagents (`subagentsOf(view.nested)`): running while it runs, so one it left going stops with it. */
   nested: Pick<ChatState, 'items' | 'subagents' | 'running'>;
+  /** A pane chat's (chat/paneSubagents.ts): read from beside its Claude's session, with no row in the transcript; its tab reads it through GET …/chat/pane-subagents/:agentId. */
+  pane?: boolean;
+  /** A session running alongside a pane chat's Claude (chat/paneSubagents.ts paneAlongsideViews): its tab reads that session's transcript, GET …/chat/pane-sessions/:sessionId. */
+  paneSession?: string;
 }
 
 /**

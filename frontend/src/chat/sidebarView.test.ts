@@ -13,10 +13,11 @@ describe('parseSidebarView', () => {
       .toEqual({ density: 'standard', groupBy: 'status', showFiles: false, showIdle: false });
     expect(parseSidebarView(JSON.stringify({ density: 'roomy', groupBy: 'status', showFiles: 'no', sampleStates: true })))
       .toEqual({ ...DEFAULT_SIDEBAR_VIEW, groupBy: 'status' });
+    expect(parseSidebarView(JSON.stringify({ groupBy: 'project' }))).toEqual({ ...DEFAULT_SIDEBAR_VIEW, groupBy: 'project' });
   });
 });
 
-const chat = (id: string): OpenItem => ({ id, openedAt: 0, kind: 'chat', projectId: id, workstream: 'main' });
+const chat = (id: string, projectId = id): OpenItem => ({ id, openedAt: 0, kind: 'chat', projectId, workstream: id });
 const file = (id: string, space: string): OpenItem => ({ id, openedAt: 0, kind: 'file', space, path: `${id}.md` });
 
 describe('viewGroups', () => {
@@ -57,5 +58,30 @@ describe('viewGroups', () => {
     ]);
     expect(names(viewGroups(groups, { groupBy: 'status', showFiles: false, showIdle: false }, stateOf)).map(g => g[0]))
       .toEqual(['Needs you', 'Working', 'Recent']);
+  });
+
+  it('groups by project, by name, files last, and keeps the open tab whatever the filters', () => {
+    const tabs = [
+      { space: 'notes', items: [chat('a', 'p-web'), file('readme', 'notes'), chat('c', 'p-api')] },
+      { space: null, items: [chat('e', 'p-web'), chat('z', 'p-gone')] },
+    ];
+    const projectOf = (i: OpenItem & { kind: 'chat' }) =>
+      ({ 'p-web': 'web-app', 'p-api': 'api-server' } as Record<string, string>)[i.projectId] ?? null;
+    const project = { groupBy: 'project' as const, showFiles: true, showIdle: true };
+    const g = viewGroups(tabs, project, () => null, null, projectOf);
+    expect(names(g)).toEqual([
+      ['api-server', ['c']],
+      ['p-gone', ['z']],
+      ['web-app', ['a', 'e']],
+      ['Files', ['readme']],
+    ]);
+    expect(g.map(x => x.status?.key)).toEqual(['project:p-api', 'project:p-gone', 'project:p-web', 'files']);
+    const off = { ...project, showFiles: false, showIdle: false };
+    const offState = (i: OpenItem) => (i.kind === 'chat' && i.id === 'c' ? 'off' : 'working');
+    expect(names(viewGroups(tabs, off, offState, 'c', projectOf))).toEqual([
+      ['api-server', ['c']],
+      ['p-gone', ['z']],
+      ['web-app', ['a', 'e']],
+    ]);
   });
 });
