@@ -222,7 +222,7 @@ export function prsRouter(): Router {
     }
   }));
 
-  // The same sync from an export an admin uploads (the org-explorer box's
+  // The same sync from an export an admin uploads (the org-tree box's
   // `teams-export.json`), for a deployment that can reach neither the export
   // file nor the API. Its body limit is set ahead of the global parser
   // (index.ts, TEAMS_EXPORT_BODY_LIMIT).

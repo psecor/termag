@@ -99,7 +99,7 @@ function memberProblem(raw: unknown): string | null {
 }
 
 /**
- * The export's shape, produced on the org-explorer box (`teams-export.json`):
+ * The export's shape, produced on the org-tree box (`teams-export.json`):
  *   { teams: [...], members: { "<tag>": { current: [...], former: [...] } } }
  * This is `/history/teams` and each `/history/team/<tag>` bundled into one file.
  */

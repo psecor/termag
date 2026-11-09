@@ -1970,7 +1970,7 @@ model RepoGroupPr {
 }
 
 /// A team roster: a named set of people, sourced from the org-tree
-/// (ld-org-explorer). A parent's roster is the de-duped union of its descendants'.
+/// service. A parent's roster is the de-duped union of its descendants'.
 model Team {
   key       String   @id
   name      String

@@ -1,6 +1,6 @@
 /**
  * Teams: a roster of people, sourced from the
- * org-tree (ld-org-explorer) with effective-dated membership intervals. Pure,
+ * org-tree service with effective-dated membership intervals. Pure,
  * so the roster rules are tested without a database or GitHub.
  *
  *   A team is a named set of GitHub logins. Membership is a list of intervals
