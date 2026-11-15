@@ -56,6 +56,7 @@ Implements `SpaceObjects` on a directory, with S3's semantics where the rest of 
 - **Backups.** The directory is not in the database's backups; back it up with the host. A container deploy needs a volume for it.
 - **Moving to S3 later** needs a copy script (`scripts/moveAutomationFolders.ts` is a precedent); copying current versions only is the simple first cut.
 - **No per-identity audit in CloudTrail.** `space_events` still records who did what.
+- **Host accounts.** Folders are 0700 and files 0600 whatever the umask, and `prepare()` makes the root 0700 at startup, so other accounts on a shared host can't read members' files. The first release created them 0755/0644 under the service's `UMask=0022`, which left them readable by every account; `prepare()` closes that on an existing install by tightening the root. Processes running as the orchestrator's own user (its agents included) can still read the bytes directly, as they can read `backend/.env`.
 
 ## Status
 

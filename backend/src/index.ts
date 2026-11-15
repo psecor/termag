@@ -229,7 +229,7 @@ import { previewLinkRouter, previewSharesRouter, defaultPreviewShareRouteDeps, i
 import { installPreviewShareLinkHooks, startPreviewShareSweep, stopPreviewShareSweep } from './services/previewShareLinks';
 import { FILE_LINK_PREFIX, spaceFileLinkPath, spaceFolderPagePath } from './services/spaces/spaceLinks';
 import {
-  localSpaceStorage, notifySpaceFileChange, spaceObjects, spacesSweeper,
+  localSpaceStorage, notifySpaceFileChange, prepareLocalSpaceStorage, spaceObjects, spacesSweeper,
   spaceStore, startSpaceFileFeed,
 } from './services/spaces/spacesRuntime';
 import { spaceStorageRouter } from './routes/spaceStorage';
@@ -310,7 +310,8 @@ app.use(cors({ origin: termagCorsOrigin(), credentials: true }));
 const localSpaces = localSpaceStorage();
 if (localSpaces) {
   app.use(`${BASE_PATH}/api/space-storage`, spaceStorageRouter(localSpaces));
-  localSpaces.cleanTmp()
+  prepareLocalSpaceStorage()
+    .then(refused => (refused ? 0 : localSpaces.cleanTmp()))
     .then(n => { if (n) console.log(`[SPACES] removed ${n} abandoned uploads from local storage`); })
     .catch(err => console.warn(`[SPACES] local storage tmp cleanup failed: ${(err as Error).message}`));
 }

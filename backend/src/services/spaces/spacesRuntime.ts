@@ -41,12 +41,32 @@ export function localSpaceStorage(): LocalSpaceObjects | null {
   return local;
 }
 
+let localReady: Promise<string | null> | null = null;
+
+/**
+ * Local storage's prepare() (its root made private), once per process: null
+ * when ready, else why spaces refuse to serve from it. index.ts starts it at
+ * boot; spaceObjects() waits for it.
+ */
+export function prepareLocalSpaceStorage(): Promise<string | null> {
+  const objects = localSpaceStorage();
+  if (!objects) return Promise.resolve(null);
+  localReady ??= objects.prepare().then(() => null, err => {
+    const reason = `local storage refused: ${(err as Error).message}`;
+    console.error(`[SPACES] ${reason}`);
+    return reason;
+  });
+  return localReady;
+}
+
 export async function spaceObjects(identity: PresignerIdentity): Promise<SpaceObjects> {
   if (storage.kind === 'invalid') {
     if (!logged) { logged = true; console.warn(`[SPACES] unavailable: ${storage.reason}`); }
     throw new SpacesUnavailableError(storage.reason);
   }
   if (storage.kind === 'local') {
+    const refused = await prepareLocalSpaceStorage();
+    if (refused) throw new SpacesUnavailableError(refused);
     if (!logged) { logged = true; console.log(`[SPACES] storage on local disk at ${storage.root}`); }
     return localSpaceStorage()!;
   }

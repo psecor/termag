@@ -24,6 +24,11 @@
  *   uploads/  `<uploadId>/` per multipart upload: `upload.json` and the parts.
  *   tmp/      writes in progress, renamed into place at commit.
  *
+ * Everything is private to the orchestrator's user: folders 0700 and files
+ * 0600 whatever the umask, and prepare() makes the root 0700 before anything
+ * is served. Other accounts on the host must not read members' files around
+ * termag's access checks.
+ *
  * Each commit holds a lock on the object directory (a `mkdir` lock, so two
  * orchestrator processes on one host serialise too) while it checks the
  * condition and rewrites index.json by write-and-rename. ETags are opaque and
@@ -43,6 +48,8 @@ import { signGrant, storageSigningKey, verifyGrant, type StorageGrant } from './
 import { sameEtag, type ObjectVersionInfo } from './spaceVersions';
 
 export const MAX_SEGMENT_BYTES = 200;
+const DIR_MODE = 0o700;
+const FILE_MODE = 0o600;
 export const STALE_LOCK_MS = 30_000;
 const LOCK_WAIT_MS = 15_000;
 const INDEX = 'index.json';
@@ -134,6 +141,7 @@ export interface LocalSpaceObjectsOptions {
 }
 
 export class LocalSpaceObjects implements SpaceObjects {
+  private readonly root: string;
   private readonly objectsDir: string;
   private readonly uploadsDir: string;
   private readonly tmpDir: string;
@@ -142,6 +150,7 @@ export class LocalSpaceObjects implements SpaceObjects {
   private readonly now: () => number;
 
   constructor(opts: LocalSpaceObjectsOptions) {
+    this.root = opts.root;
     this.objectsDir = join(opts.root, 'objects');
     this.uploadsDir = join(opts.root, 'uploads');
     this.tmpDir = join(opts.root, 'tmp');
@@ -169,8 +178,8 @@ export class LocalSpaceObjects implements SpaceObjects {
     for (let i = 0; i < segs.length; i++) {
       const name = entryName(i === segs.length - 1 ? 'o' : 'd', segs[i]);
       dir = join(dir, name);
-      await fs.mkdir(dir, { recursive: true });
-      if (name[0] === 'D' || name[0] === 'O') await fs.writeFile(join(dir, NAME), segs[i], { flag: 'w' });
+      await fs.mkdir(dir, { recursive: true, mode: DIR_MODE });
+      if (name[0] === 'D' || name[0] === 'O') await fs.writeFile(join(dir, NAME), segs[i], { flag: 'w', mode: FILE_MODE });
     }
     return dir;
   }
@@ -186,7 +195,7 @@ export class LocalSpaceObjects implements SpaceObjects {
 
   private async writeIndex(dir: string, versions: VersionEntry[]): Promise<void> {
     const tmp = join(dir, `${INDEX}.${randomBytes(6).toString('hex')}`);
-    await fs.writeFile(tmp, JSON.stringify({ versions }));
+    await fs.writeFile(tmp, JSON.stringify({ versions }), { mode: FILE_MODE });
     await fs.rename(tmp, join(dir, INDEX));
   }
 
@@ -201,7 +210,7 @@ export class LocalSpaceObjects implements SpaceObjects {
     const deadline = this.now() + LOCK_WAIT_MS;
     for (;;) {
       try {
-        await fs.mkdir(lock);
+        await fs.mkdir(lock, { mode: DIR_MODE });
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
@@ -251,7 +260,7 @@ export class LocalSpaceObjects implements SpaceObjects {
 
   /** A hard link to an immutable version file in tmp/ (a copy where links don't work), for copy and restore. */
   private async stage(source: string): Promise<string> {
-    await fs.mkdir(this.tmpDir, { recursive: true });
+    await fs.mkdir(this.tmpDir, { recursive: true, mode: DIR_MODE });
     const tmp = this.tmpPath();
     try {
       await fs.link(source, tmp);
@@ -264,7 +273,7 @@ export class LocalSpaceObjects implements SpaceObjects {
 
   /** Streams `body` into tmp/: exactly `size` bytes, or it fails and leaves nothing. */
   private async receive(body: Readable, size: number): Promise<{ file: string; md5: string }> {
-    await fs.mkdir(this.tmpDir, { recursive: true });
+    await fs.mkdir(this.tmpDir, { recursive: true, mode: DIR_MODE });
     const file = this.tmpPath();
     const hash = md5();
     let seen = 0;
@@ -277,7 +286,7 @@ export class LocalSpaceObjects implements SpaceObjects {
       },
     });
     try {
-      await pipeline(body, meter, createWriteStream(file, { flags: 'wx' }));
+      await pipeline(body, meter, createWriteStream(file, { flags: 'wx', mode: FILE_MODE }));
       if (seen !== size) throw new StorageError('IncompleteBody', 400, `The body was ${seen} bytes of the ${size} signed`);
     } catch (err) {
       await fs.rm(file, { force: true });
@@ -327,7 +336,7 @@ export class LocalSpaceObjects implements SpaceObjects {
       const etag = `"${hex}"`;
       await fs.rename(file, join(dir, String(grant.partNumber)));
       const meta: PartMeta = { size: grant.size, etag };
-      await fs.writeFile(join(dir, `${grant.partNumber}.json`), JSON.stringify(meta));
+      await fs.writeFile(join(dir, `${grant.partNumber}.json`), JSON.stringify(meta), { mode: FILE_MODE });
       return { etag };
     } finally {
       await fs.rm(file, { force: true });
@@ -482,9 +491,9 @@ export class LocalSpaceObjects implements SpaceObjects {
     segmentsOf(key, { object: true });
     const uploadId = randomBytes(16).toString('hex');
     const dir = join(this.uploadsDir, uploadId);
-    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(dir, { recursive: true, mode: DIR_MODE });
     const meta: UploadMeta = { key, contentType, initiated: new Date(this.now()).toISOString() };
-    await fs.writeFile(join(dir, UPLOAD), JSON.stringify(meta));
+    await fs.writeFile(join(dir, UPLOAD), JSON.stringify(meta), { mode: FILE_MODE });
     return uploadId;
   }
 
@@ -511,10 +520,10 @@ export class LocalSpaceObjects implements SpaceObjects {
       all.update(Buffer.from(held.etag.replace(/"/g, ''), 'hex'));
       size += held.size;
     }
-    await fs.mkdir(this.tmpDir, { recursive: true });
+    await fs.mkdir(this.tmpDir, { recursive: true, mode: DIR_MODE });
     const file = this.tmpPath();
     try {
-      const out = createWriteStream(file, { flags: 'wx' });
+      const out = createWriteStream(file, { flags: 'wx', mode: FILE_MODE });
       try {
         for (const p of parts) await pipeline(createReadStream(join(dir, String(p.partNumber))), out, { end: false });
       } finally {
@@ -659,6 +668,26 @@ export class LocalSpaceObjects implements SpaceObjects {
       inProgress.push({ key: meta.key, uploadId, parts });
     }
     return { aborted, inProgress };
+  }
+
+  /**
+   * Makes the root private before anything is served: created 0700 when
+   * missing, set to 0700 when it is this user's and open to others. Throws
+   * when it is open to others and belongs to another user, since every
+   * member's files would then be readable by any account on the host. Only
+   * the root is checked: 0700 there closes everything under it.
+   */
+  async prepare(): Promise<void> {
+    await fs.mkdir(this.root, { recursive: true, mode: DIR_MODE });
+    const st = await fs.stat(this.root);
+    const mode = (st.mode & 0o777).toString(8);
+    if ((st.mode & 0o077) === 0) return;
+    const uid = process.getuid?.();
+    if (uid !== undefined && st.uid !== uid) {
+      throw new Error(`${this.root} is open to other accounts (mode ${mode}) and belongs to uid ${st.uid}, not this process's ${uid}; make it 700 and owned by this user`);
+    }
+    await fs.chmod(this.root, DIR_MODE);
+    console.warn(`[SPACES] ${this.root} was open to other accounts (mode ${mode}); set it to 700`);
   }
 
   /** Removes writes abandoned in tmp/ (a crash mid-upload); for startup. */
