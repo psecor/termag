@@ -88,6 +88,8 @@ FAKE_CLAUDE=${E2E_FAKE_CLAUDE:-}
 CLAUDE_SIGNED_IN=${E2E_CLAUDE_SIGNED_IN:-}
 FAKE_GITHUB=${E2E_FAKE_GITHUB:-}
 DOTFILES_SCRIPTS=${E2E_DOTFILES_SCRIPTS:-}
+# E2E_POOL_BROKER_CA=<pem>: boxes fetch through a broker on https://localhost (fakes/pool-broker.mjs), trusting <pem>.
+POOL_BROKER_CA=${E2E_POOL_BROKER_CA:-}
 FAKE_TLS=${E2E_TLS:-}
 BROKER_443=${E2E_BROKER_443:-}
 FAKE_BEDROCK=${E2E_FAKE_BEDROCK:-}
@@ -121,7 +123,7 @@ WARM_POOL_TICK=${E2E_WARM_POOL_TICK:-5}
 FLAGS=${E2E_FLAGS:-}
 AWS_PORT=${E2E_AWS_PORT:-$aws_port_default}
 FLOCI_MODE=${E2E_FLOCI:-}
-FLOCI_IMAGE=${E2E_FLOCI_IMAGE:-floci/floci:2.1.0-compat}
+FLOCI_IMAGE=${E2E_FLOCI_IMAGE:-floci/floci:2.2.0-compat}
 AWS_REGION_E2E=${E2E_AWS_REGION:-us-east-2}
 GITHUB_PORT=${E2E_GITHUB_PORT:-4580}
 TLS_PORT=${E2E_TLS_PORT:-3443}
@@ -208,6 +210,15 @@ fakes_check() {
       || die "E2E_FLAGS must be a JSON object of flag key to value, got '$FLAGS'"
     # PR reviews on bring Review's clone with them, as in production (lib.sh).
     FLAGS=$(e2e_flags_like_production "$FLAGS")
+  fi
+  # The fake MCP server is on the stack's mcp-upstream-allowlist, which
+  # otherwise refuses every MCP server, unless E2E_FLAGS names the list itself.
+  if [ -n "$FAKE_MCP" ]; then
+    FLAGS=$(node -e '
+      const v = process.argv[1] ? JSON.parse(process.argv[1]) : {};
+      if (!("mcp-upstream-allowlist" in v)) v["mcp-upstream-allowlist"] = ["https://localhost:" + process.argv[2]];
+      process.stdout.write(JSON.stringify(v));
+    ' "$FLAGS" "$MCP_PORT")
   fi
   if [ -n "$AWS_SEED" ] && [ ! -r "$AWS_SEED" ]; then die "E2E_AWS_SEED: cannot read $AWS_SEED"; fi
   if [ -n "$T3_COMMAND" ] && [ -z "$T3" ]; then die "E2E_T3_COMMAND needs E2E_T3=1"; fi
@@ -371,7 +382,7 @@ fakes_before_backend() {
     # the local cluster. rds_iam is a plain role here, and trust auth accepts the
     # token each new connection presents.
     log "pg-iam: bootstrapping the application and migration roles"
-    env -i "${base_env[@]}" "$PG_BIN/psql" -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PG_PORT" -U termag -d termag \
+    env -i "${base_env[@]}" ${PG_LIB:+"LD_LIBRARY_PATH=$PG_LIB"} "$PG_BIN/psql" -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PG_PORT" -U termag -d termag \
       -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_iam') THEN CREATE ROLE rds_iam NOLOGIN; END IF; END \$\$" \
       -f "$repo/deploy/termag-rds-bootstrap.sql" >"$ROOT/logs/pg-iam-bootstrap.log" 2>&1 \
       || die "the role bootstrap failed (logs/pg-iam-bootstrap.log)"
@@ -428,7 +439,7 @@ EOF
     wait_http "http://127.0.0.1:$AWS_PORT/_floci/health" floci
     if [ -n "$AWS_SEED" ]; then
       log "seeding floci with $AWS_SEED"
-      env -i "${base_env[@]}" "PATH=$fakes_dir:$PATH" "E2E_AWS_URL=http://127.0.0.1:$AWS_PORT" \
+      env -i "${base_env[@]}" "PATH=$fakes_dir:$PATH" "E2E_AWS_URL=http://127.0.0.1:$AWS_PORT" "E2E_AWS_REGION=$AWS_REGION_E2E" \
         bash "$AWS_SEED" >"$ROOT/logs/aws-seed.log" 2>&1 || die "E2E_AWS_SEED failed (logs/aws-seed.log)"
     fi
     if [ -n "$SPACES" ]; then
@@ -589,7 +600,7 @@ fakes_after_backend() {
   fi
   if [ -n "$PG_IAM" ]; then
     local who
-    who=$(env -i "${base_env[@]}" "$PG_BIN/psql" -X -At -h 127.0.0.1 -p "$PG_PORT" -U termag -d termag \
+    who=$(env -i "${base_env[@]}" ${PG_LIB:+"LD_LIBRARY_PATH=$PG_LIB"} "$PG_BIN/psql" -X -At -h 127.0.0.1 -p "$PG_PORT" -U termag -d termag \
       -c "SELECT string_agg(DISTINCT usename, ',') FROM pg_stat_activity WHERE datname = 'termag' AND usename <> 'termag'")
     [ "$who" = application ] || die "pg-iam: expected the backend's connections as application, saw '$who'"
   fi
@@ -826,7 +837,12 @@ fakes_box_github_gitconfig() {
   local cfg=$1 stub="http://127.0.0.1:$GITHUB_PORT/_github.com/"
   git config -f "$cfg" --unset-all "url.$stub.insteadOf" 2>/dev/null || true
   git config -f "$cfg" --unset-all "url.$stub.pushInsteadOf" 2>/dev/null || true
-  if [ -n "$REAL_GITHUB" ]; then
+  if [ -n "${POOL_BROKER_CA:-}" ]; then
+    # E2E_POOL_BROKER_CA: fetches go through the broker block termag-credentials writes (an environment pool box
+    # writes it before claim, fakes/pool-broker.mjs stands in for the broker on https://localhost), so the stub's own
+    # rewrite, which would win a tie, is left out for them, and the stand-in's certificate is trusted.
+    git config -f "$cfg" http.https://localhost/.sslCAInfo "$POOL_BROKER_CA"
+  elif [ -n "$REAL_GITHUB" ]; then
     # Clones and fetches go to github.com, with your credentials through the
     # box's environment (real_github_helper); a push goes to the stub, which
     # has none of your repositories.
@@ -868,7 +884,8 @@ fakes_clone_box() {
   local box=$1 co="$1/home/src/termag"
   ln -sfn "$repo/deploy/termag-project-clone" "$co/deploy/termag-project-clone"
   ln -sfn "$repo/agent" "$co/agent"
-  if [ -z "$GITHUB_BROKER" ]; then
+  # E2E_POOL_BROKER_CA has a broker (fakes/pool-broker.mjs): no skip, or termag-credentials would write no broker block.
+  if [ -z "$GITHUB_BROKER" ] && [ -z "${POOL_BROKER_CA:-}" ]; then
     mkdir -p "$box/home/.config/termag"
     : >"$box/home/.config/termag/github.skip"
   fi

@@ -103,6 +103,33 @@ pg_bindir() {
   find /usr/lib/postgresql -maxdepth 2 -name bin -type d 2>/dev/null | sort -V | tail -n1
 }
 
+# Where pg_fetch unpacks PostgreSQL <major>: the e2e download cache the fakes
+# use too (E2E_CACHE_DIR), kept across stacks, so only a box's first
+# `make e2e-up` downloads it. e2e_leaks skips it: a suite's stack may be the
+# one that fills it.
+pg_cache_dir() { printf '%s/pg/%s\n' "${E2E_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/termag-e2e}" "$1"; }
+
+# A box made for an ask, or from an image, never ran .cursor/install.sh (the
+# environment's setup), so it has the PostgreSQL client and no server. Unpack
+# PGDG's server for <major> into pg_cache_dir with scripts/stage/pg-tools.sh:
+# signature-checked like apt, no sudo, nothing installed. Prints the bin
+# directory, then the library directory the binaries need (their libpq), one
+# per line. A lock keeps two stacks starting at once from unpacking together.
+pg_fetch() {
+  local major=$1 dest pgtools lock lib
+  dest=$(pg_cache_dir "$major")
+  pgtools="$(cd "$(dirname "${BASH_SOURCE[0]}")/../stage" && pwd)/pg-tools.sh"
+  mkdir -p "$dest"
+  lock="$dest.lock"
+  (
+    if command -v flock >/dev/null 2>&1; then exec 9>"$lock"; flock 9; fi
+    # Explicit exits: pg_fetch runs in `$(...) || die`, where errexit is off.
+    bash "$pgtools" "$major" "$dest" server || exit 1
+    lib=$(bash "$pgtools" env "$dest") || exit 1
+    printf '%s\n' "${lib#LD_LIBRARY_PATH=}"
+  )
+}
+
 # The S256 PKCE challenge for a CLI device sign-in's verifier (RFC 7636), as
 # `termag login` and the desktop app make it. A base64url verifier starts with
 # "-" one time in 64, and node takes such an argument for one of its own
@@ -128,6 +155,7 @@ e2e_leaks() {
     -not -path "$work/*" -not -path "$repo/.git/*" -not -path '*/node_modules/*' \
     -not -path '/tmp/termag-e2e.*/*' -not -path '/var/tmp/termag-e2e.*/*' \
     -not -path "$HOME/.cursor/*" -not -path "$HOME/.cursor-server/*" \
+    -not -path "$(dirname "$(pg_cache_dir 0)")/*" \
     -not -path "$HOME/.config/google-chrome/*" -not -path "$HOME/.cache/google-chrome/*" \
     -not -path /tmp/agent-store-fuse.log -not -path '/tmp/computer-use/*' 2>/dev/null \
     | { if [ -n "${E2E_LEAK_IGNORE:-}" ]; then grep -Ev "$E2E_LEAK_IGNORE"; else cat; fi; } | head -n 20

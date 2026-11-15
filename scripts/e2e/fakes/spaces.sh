@@ -3,8 +3,8 @@
 # backend derives them (backend/src/services/spaces/spaceConfig.ts) and the
 # terraform creates them (projects/termag/root-modules/orchestrator/spaces.tf):
 # bucket termag-spaces-<account>-<region>-an, versioned, with the browser CORS
-# rule; KMS alias alias/termag-spaces. The presigner role needs no seed: Floci
-# answers AssumeRole for any role ARN.
+# rule; KMS alias alias/termag-spaces; and the presigner role,
+# termag-spaces-presigner, which Floci only lets the backend assume once it exists.
 #
 #   spaces.sh seed <origin>...   create both, CORS open to each browser origin;
 #                                print the bucket name
@@ -24,7 +24,11 @@ account=$(curl -fsS -X POST "$url/" -H 'Content-Type: application/x-www-form-url
 [ -n "$account" ] || { echo "spaces: STS GetCallerIdentity gave no account" >&2; exit 1; }
 bucket="termag-spaces-$account-$region-an"
 
-status=$(curl -sS -X PUT "$url/$bucket" -o /dev/null -w '%{http_code}')
+# Outside us-east-1 Floci, as S3, refuses a CreateBucket without the region's LocationConstraint.
+create=()
+[ "$region" = us-east-1 ] || create=(-H 'Content-Type: application/xml' \
+  -d "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$region</LocationConstraint></CreateBucketConfiguration>")
+status=$(curl -sS -X PUT "$url/$bucket" "${create[@]}" -o /dev/null -w '%{http_code}')
 case $status in 200|409) ;; *) echo "spaces: creating $bucket answered HTTP $status" >&2; exit 1 ;; esac
 curl -fsS -X PUT "$url/$bucket?versioning" -H 'Content-Type: application/xml' -o /dev/null \
   -d '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>'
@@ -37,6 +41,11 @@ curl -fsS -X PUT "$url/$bucket?cors" -H 'Content-Type: application/xml' -o /dev/
     <MaxAgeSeconds>3000</MaxAgeSeconds>
   </CORSRule>
 </CORSConfiguration>"
+
+status=$(curl -sS -X POST "$url/" -o /dev/null -w '%{http_code}' -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode Action=CreateRole --data-urlencode Version=2010-05-08 --data-urlencode RoleName=termag-spaces-presigner \
+  --data-urlencode "AssumeRolePolicyDocument={\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::$account:root\"},\"Action\":\"sts:AssumeRole\"}]}")
+case $status in 200|409) ;; *) echo "spaces: creating the presigner role answered HTTP $status" >&2; exit 1 ;; esac
 
 kms() {
   curl -fsS -X POST "$url/" -H "X-Amz-Target: TrentService.$1" -H 'Content-Type: application/x-amz-json-1.1' -d "$2"

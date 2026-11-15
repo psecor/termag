@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end check of the native port forward: the real
-# `termag forward` from cli/, the real orchestrator route behind
-# box-port-forward-enabled, and the real box agent (port-forward-v1), on a
-# local stack with E2E_FLAGS turning the flag on and the EC2 launch fake for a
-# box to stop. On the box's loopback, as the test's own uid (the agent's port
+# `termag forward` from cli/, the real orchestrator route, and the real box
+# agent (port-forward-v1), on a local stack with the EC2 launch fake for a box
+# to stop. On the box's loopback, as the test's own uid (the agent's port
 # guard allows only that), fakes/forward-stand-ins.cjs serves an HTTP file, a
 # WebSocket echo, a half-close echo and a server that speaks first. Through the
 # forward: an HTTP GET; a 50 MiB download, then six at once (each whole, and
@@ -40,8 +39,7 @@ repo=$(cd "$here/../.." && pwd)
 WORK=$(mktemp -d)
 export TMPDIR=$WORK
 export E2E_PORT=${E2E_TEST_PORT:-3990} E2E_FRONTEND_PORT=${E2E_TEST_FRONTEND_PORT:-6016} E2E_PG_PORT=${E2E_TEST_PG_PORT:-55479} E2E_BOXES=1 \
-  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4696} E2E_EC2_PORT=${E2E_TEST_EC2_PORT:-4697} E2E_FAKE_AWS=1 E2E_EC2_LAUNCH=1 \
-  E2E_FLAGS='{"box-port-forward-enabled":true}'
+  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4696} E2E_EC2_PORT=${E2E_TEST_EC2_PORT:-4697} E2E_FAKE_AWS=1 E2E_EC2_LAUNCH=1
 SLOW_MB=${E2E_FORWARD_SLOW_MB:-24}
 SLOW_KBPS=${E2E_FORWARD_SLOW_KBPS:-192}
 pids=()
@@ -70,7 +68,7 @@ if ! bash "$here/up.sh" >"$WORK/up.log" 2>&1; then
   echo "FAIL: up.sh"
   exit 1
 fi
-pass "up.sh brought the stack up with box-port-forward-enabled and the EC2 launch fake"
+pass "up.sh brought the stack up with the EC2 launch fake"
 
 # shellcheck source-path=SCRIPTDIR
 . "$here/lib.sh"
@@ -335,15 +333,12 @@ check "and normal closes with byte counts" yes \
 check "and refusals with their code" yes \
   "$(grep -Eq "\[FORWARD\] refused user=[^ ]+ box=$BOX port=$CLOSED status=502 code=port_closed$" "$ROOT/logs/backend.log" && echo yes || echo no)"
 
-# ── the flag off: the CLI points at ssh instead ─────────────────────────────
+# ── a backend restart ends the forwards it carries ──────────────────────────
 # A connection still open through the restart: its close is logged, though the process exits before the handshake ends.
 opens=$(grep -c "\[FORWARD\] open user=[^ ]* box=$BOX port=$WSP " "$ROOT/logs/backend.log")
 node "$SI" hold "$L_WS" 60 2 >"$WORK/restart-hold.out" 2>&1 &
 pids+=($!)
 for _ in $(seq 1 40); do [ "$(grep -c "\[FORWARD\] open user=[^ ]* box=$BOX port=$WSP " "$ROOT/logs/backend.log")" -gt "$opens" ] && break; sleep 0.25; done
-# Through a temp file, then cat over the original so it keeps its mode: BSD sed -i takes the expression as a backup suffix.
-sed 's/^TERMAG_FLAGS=.*/TERMAG_FLAGS='"'"'{"box-port-forward-enabled":false}'"'"'/' "$ROOT/backend.env" >"$WORK/backend.env" \
-  && cat "$WORK/backend.env" >"$ROOT/backend.env"
 bash "$here/ctl.sh" restart backend >/dev/null 2>&1
 check "a restart logs the close of the forward it ends (1001)" yes \
   "$(grep -Eq "\[FORWARD\] close user=[^ ]+ box=$BOX port=$WSP .* code=1001$" "$ROOT/logs/backend.log" && echo yes || echo no)"
@@ -351,17 +346,8 @@ fwd_stop main
 check "Ctrl-C on the main forward exits 0" 0 $?
 # The restart retired the CLI's cached access token (the stack's key is in the backend's
 # memory, localCliJwtKey); the CLI refreshes it on the 401, so nothing here helps it.
-creds="$LAPTOP/.config/termag/credentials.json"
 for _ in $(seq 1 120); do termag box list >/dev/null 2>&1 && break; sleep 0.5; done
-auth=(-H "Authorization: Bearer $(jq -r '.hosts[].accessToken' "$creds")")
-check "flag off: the probe is not_found" "not_found 404" "$(refusal "${auth[@]}" "$CLI/boxes/$BOX/forward")"
-start=$(date +%s)
-timeout 30 "${TERMAG[@]}" forward box-1 "$HTTP:$L_MISC" >"$WORK/flag-off.out" 2>&1
-code=$?
-took=$(($(date +%s) - start))
-check "flag off: termag forward exits 1 at once (${took} s)" "1 yes" "$code $([ "$took" -le 10 ] && echo yes || echo no)"
-check "flag off: and prints the ssh fallback" yes \
-  "$(grep -qF "\`termag ssh box-1 -N -L $L_MISC:localhost:$HTTP\` forwards the same ports over SSM" "$WORK/flag-off.out" && echo yes || echo no)"
+check "after the restart, the CLI refreshes its access token on its own" 0 "$(termag box list >/dev/null 2>&1; echo $?)"
 
 echo
 if [ "$failures" -eq 0 ]; then echo "all forward checks passed"; else echo "$failures forward check(s) failed"; fi

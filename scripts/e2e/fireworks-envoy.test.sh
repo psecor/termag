@@ -4,8 +4,8 @@
 # against a stub of the orchestrator's check and a Fireworks stub. No backend or
 # boxes: this pins Envoy's half of the contract: which
 # calls are routed, the model read from the body and handed to the check, the
-# box token swapped for the shared key, streaming, Fireworks' own refusals
-# passed through, and the access log. The check allows any model (Fireworks'
+# box token swapped for the owner's own key or the shared key, streaming,
+# Fireworks' own refusals passed through, and the access log. The check allows any model (Fireworks'
 # account governance decides which run); the stub Fireworks refuses two as
 # Fireworks does.
 #
@@ -17,6 +17,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 tf_repo=$(cd "${1:?usage: fireworks-envoy.test.sh <terraform checkout>}" && pwd)
 module="$tf_repo/projects/termag/root-modules/orchestrator/modules/claude-gateway/envoy-config"
 grep -q fireworks_listen_port "$module/main.tf" || { echo "SKIP: $tf_repo has no Fireworks listener"; exit 0; }
+# A checkout whose check can hand Envoy the owner's key (fireworks_key_swap).
+user_keys=; grep -q fireworks_key_swap "$module/main.tf" && user_keys=1
 terraform=${E2E_TERRAFORM:-terraform}
 P=${E2E_FIREWORKS_TEST_PORT:-29080}
 AUTHZ=$((P + 10)) UP=$((P + 11)) FW=$((P + 7))
@@ -70,7 +72,9 @@ TF
 grep -q '"name": "fireworks"' "$work/envoy.yaml" 2>/dev/null || { echo "rendering the envoy-config module failed"; exit 1; }
 
 # The orchestrator's check: a Bearer or
-# x-api-key of tmag_good is a managed box; tmag_off is a box termag does not
+# x-api-key of tmag_good is a managed box whose owner has no Fireworks key of
+# their own; tmag_mine one whose owner's key is fw-user-key, which the allow
+# carries as x-termag-fireworks-key; tmag_off is a box termag does not
 # manage; anything else is unknown. It allows any model; auth-check
 # carries no model.
 cat >"$work/authz.mjs" <<'JS'
@@ -83,6 +87,7 @@ createServer({ cert: readFileSync(cert), key: readFileSync(key) }, (req, res) =>
   const model = req.headers['x-termag-fireworks-model'] ?? null;
   seen.push({ path: req.url, caller: Boolean(req.headers['x-termag-caller-authorization']), model });
   const tok = /^Bearer (\S+)$/.exec(req.headers.authorization ?? '')?.[1] ?? req.headers['x-api-key'];
+  if (tok === 'tmag_mine') { res.writeHead(200, { 'x-termag-user': 'u2', 'x-termag-instance': 'i2', 'x-termag-fireworks-key': 'Bearer fw-user-key' }).end(); return; }
   if (tok === 'tmag_good') { res.writeHead(200, { 'x-termag-user': 'u1', 'x-termag-instance': 'i1', 'x-termag-email': 'a@example.com' }).end(); return; }
   if (tok === 'tmag_off') { res.writeHead(403, { 'content-type': 'application/json' }).end('{"message":"Only a termag-managed box can use the Fireworks gateway"}'); return; }
   res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer realm="termag Fireworks gateway"' }).end('{"message":"Unknown or revoked box token"}');
@@ -126,10 +131,13 @@ JS
 node "$work/authz.mjs" "$work/srv.pem" "$work/srv.key" "$AUTHZ" >"$work/authz.log" 2>&1 & pids+=($!)
 node "$work/fireworks.mjs" "$UP" >"$work/fireworks.log" 2>&1 & pids+=($!)
 envoy=$(bash "$here/fakes/envoy.sh" fetch)
-FIREWORKS_API_KEY=fw-test-key AWS_ACCESS_KEY_ID=AKIATEST AWS_SECRET_ACCESS_KEY=test AWS_EC2_METADATA_DISABLED=true \
-  "$envoy" -c "$work/envoy.yaml" --disable-hot-restart --log-level warn >"$work/envoy.log" 2>&1 & pids+=($!)
-for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$FW/healthz" >/dev/null 2>&1 && break; sleep 0.25; done
-curl -sf "http://127.0.0.1:$FW/healthz" >/dev/null || { cat "$work/envoy.log"; echo "Envoy did not start"; exit 1; }
+start_envoy() { # shared key ("" for none), log file
+  FIREWORKS_API_KEY=$1 AWS_ACCESS_KEY_ID=AKIATEST AWS_SECRET_ACCESS_KEY=test AWS_EC2_METADATA_DISABLED=true \
+    "$envoy" -c "$work/envoy.yaml" --disable-hot-restart --log-level warn >"$2" 2>&1 & envoy_pid=$!; pids+=($envoy_pid)
+  for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$FW/healthz" >/dev/null 2>&1 && break; sleep 0.25; done
+  curl -sf "http://127.0.0.1:$FW/healthz" >/dev/null || { cat "$2"; echo "Envoy did not start"; exit 1; }
+}
+start_envoy fw-test-key "$work/envoy.log"
 
 B="http://127.0.0.1:$FW/fireworks/inference/v1"
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
@@ -157,6 +165,25 @@ check "a box-sent x-termag-user is dropped too" 200 \
 check "  (and Fireworks saw none)" "[]" "$(upcalls | jq -c '.[-1].termag')"
 check "a box-sent x-termag-fireworks-model cannot stand in for the body's model" "404 accounts/fireworks/models/glm-9" \
   "$(code -H 'Authorization: Bearer tmag_good' -H "x-termag-fireworks-model: accounts/fireworks/models/kimi-k3" -d '{"model":"accounts/fireworks/models/glm-9"}' "$B/chat/completions") $(checks | jq -r '.[-1].model')"
+
+echo "--- the owner's own key"
+if [ -n "$user_keys" ]; then
+  check "a box whose owner has a key: 200" 200 \
+    "$(code -H 'Authorization: Bearer tmag_mine' -d "{\"model\":$kimi,\"messages\":[]}" "$B/chat/completions")"
+  last=$(upcalls | jq -c '.[-1]')
+  check "  Fireworks saw the owner's key, not the box token or the shared key" "Bearer fw-user-key" "$(jq -r .authorization <<<"$last")"
+  check "  and no x-termag-* header, the check's key header included" "[]" "$(jq -c .termag <<<"$last")"
+  check "the owner's key for Claude Code's x-api-key too" "200 null Bearer fw-user-key" \
+    "$(code -H 'x-api-key: tmag_mine' -d "{\"model\":$kimi,\"max_tokens\":1,\"messages\":[]}" "$B/messages?beta=true") $(upcalls | jq -r '.[-1] | "\(.apiKey) \(.authorization)"')"
+  check "an allow with no key of the owner's: the shared key, never the box token" "200 Bearer fw-test-key" \
+    "$(code -H 'Authorization: Bearer tmag_good' -d "{\"model\":$kimi,\"messages\":[]}" "$B/chat/completions") $(upcalls | jq -r '.[-1].authorization')"
+  check "a box-sent x-termag-fireworks-key is dropped: the shared key" "200 Bearer fw-test-key" \
+    "$(code -H 'Authorization: Bearer tmag_good' -H 'x-termag-fireworks-key: Bearer fw-forged' -d "{\"model\":$kimi,\"messages\":[]}" "$B/chat/completions") $(upcalls | jq -r '.[-1].authorization')"
+  check "a box-sent x-termag-fireworks-key with no box token: the check's 401" 401 \
+    "$(code -H 'x-termag-fireworks-key: Bearer fw-forged' -d "{\"model\":$kimi}" "$B/chat/completions")"
+else
+  echo "skip (this checkout's route injects only the shared key)"
+fi
 
 echo "--- refusals"
 before=$(upcalls | jq length)
@@ -231,6 +258,17 @@ for _ in $(seq 1 40); do
 done
 check "it names the user, box, email and model" "u1 i1 a@example.com accounts/fireworks/models/kimi-k3" \
   "$(jq -r '"\(.user) \(.instance) \(.email) \(.model)"' <<<"$logline")"
-check "it never holds the key or a box token" "" "$(grep -E 'fw-test-key|tmag_good' "$work/envoy.log" || true)"
+check "it never holds a key or a box token" "" "$(grep -E 'fw-test-key|fw-user-key|tmag_good|tmag_mine' "$work/envoy.log" || true)"
+
+if [ -n "$user_keys" ]; then
+  echo "--- no shared key in Envoy's environment"
+  kill "$envoy_pid"; wait "$envoy_pid" 2>/dev/null || true
+  start_envoy "" "$work/envoy-nokey.log"
+  check "an allow with no key of the owner's: Bearer alone, never the box token" "Bearer" \
+    "$(code -H 'Authorization: Bearer tmag_good' -d "{\"model\":$kimi,\"messages\":[]}" "$B/chat/completions" >/dev/null; upcalls | jq -r '.[-1].authorization')"
+  check "  nor Claude Code's x-api-key" "null" "$(code -H 'x-api-key: tmag_good' -d "{\"model\":$kimi,\"max_tokens\":1}" "$B/messages" >/dev/null; upcalls | jq -r '.[-1].apiKey')"
+  check "the owner's key still goes through" "Bearer fw-user-key" \
+    "$(code -H 'Authorization: Bearer tmag_mine' -d "{\"model\":$kimi,\"messages\":[]}" "$B/chat/completions" >/dev/null; upcalls | jq -r '.[-1].authorization')"
+fi
 
 exit $fail

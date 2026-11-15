@@ -35,7 +35,7 @@ for f in "$root"/pids/*.pid; do
   fi
   printf '%-12s %-8s %-20s %s\n' "$name" "$state" "logs/$name.log" "$extra"
 done
-if "$PG_BIN/pg_isready" -q -h 127.0.0.1 -p "$PG_PORT"; then
+if env ${PG_LIB:+"LD_LIBRARY_PATH=$PG_LIB"} "$PG_BIN/pg_isready" -q -h 127.0.0.1 -p "$PG_PORT"; then
   printf '%-12s %-8s %s\n' postgres running logs/postgres.log
 else
   printf '%-12s %-8s %s\n' postgres DEAD logs/postgres.log; rc=1

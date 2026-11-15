@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Minimal client for the e2e stack's Floci, for E2E_AWS_SEED scripts and
 # checks; needs no AWS CLI or SDK. Floci accepts unsigned requests and files
-# them under its default region, which up.sh sets to the stack's AWS_REGION.
+# them under its default region, which up.sh sets to the stack's AWS_REGION;
+# `mb` names that region as its LocationConstraint, which Floci (as S3) wants
+# outside us-east-1.
 #
 #   aws.sh mb <bucket>                       create an S3 bucket
 #   aws.sh call <X-Amz-Target> '<json>'      any JSON-protocol API, e.g.
@@ -9,7 +11,8 @@
 #       aws.sh call AmazonSSM.PutParameter '{"Name":"/x","Value":"v","Type":"SecureString"}'
 #       aws.sh call secretsmanager.CreateSecret '{"Name":"x","SecretString":"v"}'
 #
-# Env: E2E_AWS_URL (set by up.sh for seed scripts; else read from the stack).
+# Env: E2E_AWS_URL and E2E_AWS_REGION (set by up.sh for seed scripts; else read
+# from the stack).
 set -euo pipefail
 if [ -z "${E2E_AWS_URL:-}" ]; then
   here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -18,9 +21,13 @@ if [ -z "${E2E_AWS_URL:-}" ]; then
   root=$(e2e_root) || die "no e2e stack is up"
   E2E_AWS_URL=$(sed -n 's/^AWS_URL=//p' "$root/stack.env")
   [ -n "$E2E_AWS_URL" ] || die "the stack was started without E2E_FAKE_AWS=1"
+  E2E_AWS_REGION=${E2E_AWS_REGION:-$(sed -n 's/^AWS_REGION=//p' "$root/stack.env")}
 fi
 case ${1:-} in
-  mb)   curl -fsS -X PUT "$E2E_AWS_URL/$2" -o /dev/null ;;
+  mb)   region=${E2E_AWS_REGION:-us-east-2} create=()
+        [ "$region" = us-east-1 ] || create=(-H 'Content-Type: application/xml' \
+          -d "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$region</LocationConstraint></CreateBucketConfiguration>")
+        curl -fsS -X PUT "$E2E_AWS_URL/$2" "${create[@]}" -o /dev/null ;;
   call) curl -fsS -X POST "$E2E_AWS_URL/" -H "X-Amz-Target: $2" \
           -H 'Content-Type: application/x-amz-json-1.1' -d "$3"; echo ;;
   *)    echo "usage: aws.sh mb <bucket> | call <X-Amz-Target> '<json>'" >&2; exit 2 ;;

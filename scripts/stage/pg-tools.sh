@@ -4,6 +4,7 @@
 # <dest>. Used by prod-snapshot.sh on the orchestrator (pg_dump must be at
 # least the server's version, and the image ships an older one) and by
 # `stage.sh refresh` here (the staging cluster should run the dump's version).
+# Also by scripts/e2e/up.sh, on a box with no PostgreSQL server installed.
 # Debian/Ubuntu only.
 #
 #   pg-tools.sh <major> <dest> [server]   prints the bin directory
@@ -39,8 +40,12 @@ for c in curl gpg gpgv gunzip sha256sum dpkg-deb; do command -v "$c" >/dev/null 
 arch=$(dpkg --print-architecture)
 suite=$VERSION_CODENAME-pgdg
 bin="$dest/root/usr/lib/postgresql/$major/bin"
-need=pg_dump; [ -n "$want_server" ] && need=postgres
-if [ -x "$bin/$need" ]; then printf '%s\n' "$bin"; exit 0; fi
+# Everything callers run: a cache missing any of them (unpacked by an older
+# copy of this script, which wrote into <dest> in place and could stop
+# part-way) is unpacked again.
+need=(pg_dump psql); [ -n "$want_server" ] && need+=(postgres initdb pg_ctl createdb pg_isready)
+complete() { local b; for b in "${need[@]}"; do [ -x "$1/$b" ] || return 1; done; }
+if complete "$bin"; then printf '%s\n' "$bin"; exit 0; fi
 
 work="$dest/work"
 rm -rf "$work"; mkdir -p "$work"
@@ -88,7 +93,11 @@ for p in "${pkgs[@]}"; do
   deb="$work/$(basename "$file")"
   fetch "$base/$file" "$deb"
   echo "$sha  $deb" | sha256sum -c --quiet - || die "checksum mismatch for $p $ver"
-  dpkg-deb -x "$deb" "$dest/root"
+  dpkg-deb -x "$deb" "$work/root"
 done
-[ -x "$bin/$need" ] || die "$bin/$need missing after unpacking"
+complete "$work/root/usr/lib/postgresql/$major/bin" || die "$bin is missing one of ${need[*]} after unpacking"
+# Unpacked beside <dest>/root and moved into place whole, so an interrupted
+# run leaves no root (unpacked again next time), never a partial one.
+rm -rf "$dest/root"
+mv "$work/root" "$dest/root"
 printf '%s\n' "$bin"

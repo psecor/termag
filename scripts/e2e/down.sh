@@ -42,7 +42,9 @@ chmod u+w "$root"/boxes/*/tmux "$root"/tmux/* 2>/dev/null || true
 if [ -f "$root/pg/data/postmaster.pid" ]; then
   # shellcheck disable=SC1091
   PG_BIN=$(. "$root/stack.env" && printf '%s' "$PG_BIN")
-  "$PG_BIN/pg_ctl" -D "$root/pg/data" -m fast -w stop >/dev/null 2>&1 || true
+  # shellcheck disable=SC1091
+  PG_LIB=$(. "$root/stack.env" && printf '%s' "${PG_LIB:-}")
+  env ${PG_LIB:+"LD_LIBRARY_PATH=$PG_LIB"} "$PG_BIN/pg_ctl" -D "$root/pg/data" -m fast -w stop >/dev/null 2>&1 || true
 fi
 
 survivors() { e2e_pids "$root" | grep -vx -e "$$" -e "${BASHPID:-$$}" || true; }

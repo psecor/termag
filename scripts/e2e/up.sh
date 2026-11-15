@@ -7,7 +7,8 @@
 #
 # Env: E2E_BOXES (2), E2E_PORT (3040; the box network takes E2E_PORT+1),
 #      E2E_FRONTEND_PORT (5174),
-#      E2E_PG_PORT (55432), E2E_EMAIL (e2e@termag.local), E2E_PG_BIN, and the
+#      E2E_PG_PORT (55432), E2E_EMAIL (e2e@termag.local), E2E_PG_BIN (else an
+#      installed server, else PGDG's unpacked into the e2e cache; E2E_PG_MAJOR), and the
 #      opt-in fakes listed in scripts/e2e/fakes/fakes.sh. E2E_WATCH=1 restarts
 #      the backend on source changes (tsx watch).
 set -euo pipefail
@@ -38,7 +39,22 @@ for c in node npm tmux jq curl git; do
   command -v "$c" >/dev/null 2>&1 || die "missing '$c' (see .cursor/install.sh for the package list)"
 done
 command -v setsid >/dev/null 2>&1 || command -v perl >/dev/null 2>&1 || die "missing 'setsid' (or perl, which stands in for it)"
-PG_BIN=$(pg_bindir)
+PG_BIN=$(pg_bindir) PG_LIB=''
+if [ ! -x "$PG_BIN/initdb" ] && [ -z "${E2E_PG_BIN:-}" ]; then
+  # No server installed (a box that never ran .cursor/install.sh): unpack
+  # PGDG's, the major of the psql that is here (16 if none), once per box.
+  # `|| true`: with no psql the pipeline fails, and errexit would exit here
+  # silently instead of falling back to 16.
+  pg_major=${E2E_PG_MAJOR:-$({ psql --version 2>/dev/null || true; } | sed -n 's/^psql (PostgreSQL) \([0-9]*\).*/\1/p')}
+  pg_major=${pg_major:-16}
+  if [ -x "$(pg_cache_dir "$pg_major")/root/usr/lib/postgresql/$pg_major/bin/initdb" ]; then
+    log "no PostgreSQL server installed; using PGDG's PostgreSQL $pg_major unpacked under $(pg_cache_dir "$pg_major")"
+  else
+    log "no PostgreSQL server installed; unpacking PGDG's PostgreSQL $pg_major under $(pg_cache_dir "$pg_major") (signature-checked; nothing is installed)"
+  fi
+  pg_got=$(pg_fetch "$pg_major") || die "could not unpack PostgreSQL $pg_major from PGDG (above); install postgresql or set E2E_PG_BIN"
+  PG_BIN=$(sed -n 1p <<<"$pg_got") PG_LIB=$(sed -n 2p <<<"$pg_got")
+fi
 [ -x "$PG_BIN/initdb" ] || die "no PostgreSQL server binaries found; install postgresql or set E2E_PG_BIN"
 # Inside a stand-in box (a box running termag's own environment file, whose
 # run is this stack), `tmux` is that box's wrapper, which
@@ -105,6 +121,7 @@ wait_http() {
 cat >"$ROOT/stack.env" <<EOF
 REPO=$repo
 PG_BIN=$PG_BIN
+PG_LIB=$PG_LIB
 PORT=$PORT
 BOX_NET_PORT=$BOX_NET_PORT
 FRONTEND_PORT=$FRONTEND_PORT
@@ -118,10 +135,10 @@ log "generating the Prisma client"
   || die "prisma generate failed (logs/prisma-generate.log)"
 
 log "starting postgres on 127.0.0.1:$PG_PORT"
-env -i "${base_env[@]}" "$PG_BIN/initdb" -D "$ROOT/pg/data" -U termag --auth=trust -E UTF8 >"$ROOT/logs/initdb.log"
-env -i "${base_env[@]}" "$PG_BIN/pg_ctl" -D "$ROOT/pg/data" -l "$ROOT/logs/postgres.log" -w \
+env -i "${base_env[@]}" ${PG_LIB:+"LD_LIBRARY_PATH=$PG_LIB"} "$PG_BIN/initdb" -D "$ROOT/pg/data" -U termag --auth=trust -E UTF8 >"$ROOT/logs/initdb.log"
+env -i "${base_env[@]}" ${PG_LIB:+"LD_LIBRARY_PATH=$PG_LIB"} "$PG_BIN/pg_ctl" -D "$ROOT/pg/data" -l "$ROOT/logs/postgres.log" -w \
   -o "-p $PG_PORT -k $ROOT/pg -c listen_addresses=127.0.0.1" start >/dev/null
-env -i "${base_env[@]}" "$PG_BIN/createdb" -h 127.0.0.1 -p "$PG_PORT" -U termag termag
+env -i "${base_env[@]}" ${PG_LIB:+"LD_LIBRARY_PATH=$PG_LIB"} "$PG_BIN/createdb" -h 127.0.0.1 -p "$PG_PORT" -U termag termag
 
 umask 077
 cat >"$ROOT/backend.env" <<EOF
@@ -190,7 +207,7 @@ wait_http "http://localhost:$FRONTEND_PORT/termag/" frontend
 {
   declare -p ROOT REAL_TMUX EMAIL agent_ws_url base_env box_extra
   declare -p FAKE_CLAUDE CLAUDE_SIGNED_IN FAKE_GITHUB GITHUB_PORT TMUX_FAULTS CLAUDE_BIN CLAUDE_KEYCHAINS
-  declare -p T3 REAL_GITHUB PANE_CLONE GITHUB_BROKER ASK_RUNNER
+  declare -p T3 REAL_GITHUB PANE_CLONE GITHUB_BROKER ASK_RUNNER POOL_BROKER_CA
 } >"$ROOT/box.env"
 
 api_env=("${base_env[@]}" "E2E_API_URL=http://127.0.0.1:$PORT/termag" "E2E_AGENT_WS_URL=$agent_ws_url"

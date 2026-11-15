@@ -1,6 +1,9 @@
 // Theme of the day's preview: screenshots of a
-// day's theme in both UIs and both palettes, before and after, and axe-core's
-// colour-contrast rule over each, against a running e2e stack with the flag on:
+// day's theme in both UIs, and a session open in the simple UI with its side
+// panel shut and open, in both
+// palettes, before and after, and axe-core's
+// colour-contrast rule over each, against a running e2e stack with the theme of
+// the day on:
 //
 //   make e2e-up E2E_FLAGS='{"daily-theme-enabled":true}'
 //
@@ -10,7 +13,7 @@
 // <out>/contrast.json. Exits 1 when the theme adds a contrast violation that
 // the same page without it does not have, or lowers the ratio of one it
 // already has (the app's own are not the day's to fix, but it may not make
-// them worse), 2 on a usage or setup error. The default out is
+// them worse), and 2 on a usage or setup error. The default out is
 // .termag/theme-of-the-day/out/<date>/screenshots (gitignored).
 //
 // Screenshots are taken with reduced motion, so a sprite draws one still frame.
@@ -72,6 +75,19 @@ try {
   const me = await api('GET', 'auth/me');
   original = me?.theme ?? {};
 
+
+  // An open session too, with its side panel shut and open (remembered in
+  // localStorage per session, its main workstream's here, with the tab and width
+  // shared, frontend/src/chat/sidePanel.ts): its header
+  // and panel take the top right, where a day's corner piece is easiest to bury.
+  const project = (await api('GET', 'api/projects'))?.find(p => !p.archived);
+  if (project) {
+    const path = `chat/p/${encodeURIComponent(project.id)}`;
+    const place = `session:${project.id}|main`;
+    PAGES.push({ name: 'session', path, sidePanel: false, place }, { name: 'session-panel', path, sidePanel: true, place });
+  }
+  else console.log('note: no project on the stack, so no screenshot of an open session');
+
   // Run axe's colour-contrast rule: each failing node, by selector, with its ratio.
   const contrast = async () => {
     await page.addScriptTag({ path: axePath });
@@ -86,7 +102,15 @@ try {
     });
     return result;
   };
-  const load = async (path, theme) => {
+  const load = async ({ path, sidePanel, place }, theme) => {
+    if (sidePanel !== undefined) {
+      await page.evaluate(({ open, place }) => {
+        localStorage.setItem('termag-chat-side-panel', JSON.stringify({ width: 480 }));
+        localStorage.setItem('termag-chat-side-panel-open', JSON.stringify(open ? [place] : []));
+        // No tab remembered: the session opens on Terminal.
+        localStorage.setItem('termag-chat-side-panel-tabs', JSON.stringify([]));
+      }, { open: sidePanel, place });
+    }
     await page.goto(`${ui}${path}?dailyTheme=${theme ? date : 'off'}`);
     if (theme) {
       await page.waitForSelector(`html[data-daily-theme="${date}"]`, { state: 'attached', timeout: 120_000 }).catch(() => {
@@ -100,10 +124,10 @@ try {
   for (const palette of PALETTES) {
     await api('PUT', 'auth/me/preferences', { theme: { version: 1, background: { mode: 'hyperspace' }, palette } });
     for (const p of PAGES) {
-      await load(p.path, false);
+      await load(p, false);
       await page.screenshot({ path: join(out, `${p.name}-${palette}-before.png`) });
       const before = new Map((await contrast()).map(v => [v.target, v.ratio]));
-      await load(p.path, true);
+      await load(p, true);
       await page.screenshot({ path: join(out, `${p.name}-${palette}.png`) });
       // New failures, and old ones the theme made worse (a lower ratio).
       const added = (await contrast()).filter(v => {

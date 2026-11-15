@@ -138,6 +138,17 @@ hdrs=()
 while IFS= read -r h; do hdrs+=(-H "$h"); done < <(echo "$up" | jq -r '.headers | to_entries[] | "\(.key): \(.value)"')
 check "the PUT to storage succeeds" 200 "$(printf "# hi!\\n" | curl -s -o /dev/null -w '%{http_code}' -X PUT "${hdrs[@]}" --data-binary @- "$(echo "$up" | jq -r .url)")"
 check "and is recorded" 6 "$(browser POST /spaces/team/files/uploaded '{"path":"docs/from-browser.md"}' | jq -r .size)"
+# A conditional upload (the Files page's new name, a chat attachment): its confirm checks the proof the
+# PUT's presigned query carries as x-amz-meta-termag-upload, which storage must keep on the version.
+up=$(browser POST /spaces/team/files/upload '{"path":"docs/new-name.md","size":4,"contentType":"text/markdown","ifNoneMatch":"*"}')
+hdrs=()
+while IFS= read -r h; do hdrs+=(-H "$h"); done < <(echo "$up" | jq -r '.headers | to_entries[] | "\(.key): \(.value)"')
+etag=$(printf "new\\n" | curl -s -o /dev/null -D - -X PUT "${hdrs[@]}" --data-binary @- "$(echo "$up" | jq -r .url)" | tr -d '\r' | sed -n 's/^etag: //Ip')
+check "a conditional PUT answers an ETag" yes "$([ -n "$etag" ] && echo yes || echo no)"
+check "the version keeps the upload proof" yes \
+  "$(curl -sI "$AWS/$BUCKET/$space_id/docs/new-name.md" | grep -qi '^x-amz-meta-termag-upload:' && echo yes || echo no)"
+check "and its confirm is recorded, not 412" 4 \
+  "$(browser POST /spaces/team/files/uploaded "$(jq -nc --arg etag "$etag" '{path:"docs/new-name.md",ifNoneMatch:"*",etag:$etag}')" | jq -r .size)"
 dl=$(browser POST /spaces/team/files/download '{"path":"docs/note.txt"}')
 check "a download URL serves the file" "hello spaces" "$(curl -s "$(echo "$dl" | jq -r .url)")"
 check "it downloads as an attachment" yes "$(curl -sI "$(echo "$dl" | jq -r .url)" | grep -qi '^content-disposition: attachment' && echo yes || echo no)"

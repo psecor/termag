@@ -23,12 +23,12 @@
 # Env: E2E_CACHE_DIR (default ${XDG_CACHE_HOME:-~/.cache}/termag-e2e).
 set -euo pipefail
 
-VERSION=2.1.0
+VERSION=2.2.0
 LAYER=
 if [ "$(uname -s)" = Linux ]; then
   case $(uname -m) in
-    x86_64)  LAYER=sha256:8a7604b4ba0cae6d072510ae088e4bd19dc37567d885d9f96a3237dfabd1fef7 ;;
-    aarch64) LAYER=sha256:373cd93bb106d150cd3583fee84c3b3b646ec9de6b527d04633c530e311a6e58 ;;
+    x86_64)  LAYER=sha256:e45badac8c9af89b9dd0229eab3db3019c1d2d008761a8a3abd385901d9fd39d ;;
+    aarch64) LAYER=sha256:5e34a28c641f1933e2fb7a97720c65276a1b9d66e52b68f6044866999eb85747 ;;
   esac
 fi
 

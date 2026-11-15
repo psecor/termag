@@ -562,7 +562,9 @@ createServer((req, res) => {
     // answers 404.
     // `commits/<branch>` too: an environment pointer's branch head, 422 for no such branch.
     const headPath = /^\/repos\/([^/]+)\/([^/]+)\/commits\/(.+)$/.exec(path);
-    const contentsPath = /^\/repos\/([^/]+)\/([^/]+)\/contents\/(.+)$/.exec(path);
+    // `contents` with no path, or a directory's, lists it as GitHub does (JSON: name, path, type, size), what
+    // project icon detection reads; a file is its raw bytes.
+    const contentsPath = /^\/repos\/([^/]+)\/([^/]+)\/contents(?:\/(.*))?$/.exec(path);
     if (req.method === 'GET' && (headPath || contentsPath)) {
       const [, owner, name] = headPath ?? contentsPath;
       const bare = servedBare(owner, name);
@@ -578,12 +580,24 @@ createServer((req, res) => {
         return res.end(sha);
       }
       const ref = url.searchParams.get('ref') ?? 'HEAD';
-      let text = null;
-      try { text = execFileSync('git', ['-C', bare, 'show', `${ref}:${decodeURIComponent(contentsPath[3])}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); } catch { text = null; }
-      record(`GET ${path}?ref=${ref} -> ${text === null ? 404 : 200} token=${fp(auth)}`);
-      if (text === null) return send(404, { message: 'Not Found' });
+      const file = decodeURIComponent(contentsPath[3] ?? '').replace(/\/+$/, '');
+      const git = (args, encoding) => { try { return execFileSync('git', ['-C', bare, ...args], { encoding, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return null; } };
+      const object = `${ref}:${file}`;
+      const kind = git(['cat-file', '-t', object], 'utf8')?.trim() ?? null;
+      if (kind === 'tree') {
+        const listing = (git(['ls-tree', '-l', object], 'utf8') ?? '').split('\n').filter(Boolean).map(line => {
+          const [meta, name] = line.split('\t');
+          const [, type, , size] = meta.split(/\s+/);
+          return { name, path: file ? `${file}/${name}` : name, type: type === 'tree' ? 'dir' : 'file', size: type === 'blob' ? Number(size) : 0 };
+        });
+        record(`GET ${path}?ref=${ref} -> 200 dir token=${fp(auth)}`);
+        return send(200, listing);
+      }
+      const body = kind === 'blob' ? git(['cat-file', 'blob', object], 'buffer') : null;
+      record(`GET ${path}?ref=${ref} -> ${body === null ? 404 : 200} token=${fp(auth)}`);
+      if (body === null) return send(404, { message: 'Not Found' });
       res.writeHead(200, { 'content-type': 'application/vnd.github.raw' });
-      return res.end(text);
+      return res.end(body);
     }
     if (!auth) { record(`${req.method} ${path} -> 401 (no token)`); return send(401, { message: 'Requires authentication' }); }
     if (tokenOf(auth).includes('_bad')) { record(`${req.method} ${path} -> 401 token=${fp(auth)}`); return send(401, { message: 'Bad credentials' }); }

@@ -742,9 +742,11 @@ check "and the Claude check" "backend /termag/internal/claude-authz/model/x/invo
   "$(checks_get '/termag/internal/claude-authz/model/x/invoke')"
 check "the checks ALB answers anything else with its fixed 404" "404 404" \
   "$(for pth in /termag/health /termag/api/projects; do curl -s --cacert "$ROOT/tls/ca.pem" -o /dev/null -w '%{http_code} ' "https://localhost:$E2E_CHECKS_ALB_PORT$pth"; done | sed 's/ $//')"
-check "the :3041 listener serves its health check and the checks only" "200 404 404" \
+check "the :3041 listener serves its health check and the checks only" "200(reached) 404 404" \
   "$(for pth in /healthz /termag/health /termag/internal/other; do curl -s -o "$WORK/c.out" -w '%{http_code}' "http://127.0.0.1:$E2E_CHECKS_PORT$pth"
        grep -q '^backend ' "$WORK/c.out" && printf '(reached)'; printf ' '; done | sed 's/ $//')"
+check "its health check is the backend's serving check" "backend /termag/health/serving" \
+  "$(curl -s "http://127.0.0.1:$E2E_CHECKS_PORT/healthz")"
 check "the plain :3040 gateway answers /termag/internal/ with 404 and never reaches the backend" "404 404" \
   "$(for c in github-authz/api/v3/user claude-authz/model/x/invoke; do
        curl -s -o "$WORK/internal.out" -w '%{http_code}' "http://127.0.0.1:$E2E_GATEWAY_PORT/termag/internal/$c"
@@ -756,6 +758,8 @@ check "and no longer serves GitHub paths itself" 404 \
 [ -n "${E2E_BROKER_443:-}" ] || check "without E2E_BROKER_443 the backend gets no GitHub broker URL" "" \
   "$(sed -n 's/^GITHUB_BROKER_URL=//p' "$ROOT/backend.env")"
 kill "$echo_pid"; wait "$echo_pid" 2>/dev/null
+check "with no backend listening the checks health check fails, so the checks ALB sends this host no checks" 502 \
+  "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$E2E_CHECKS_PORT/healthz")"
 bash "$here/ctl.sh" start backend >/dev/null
 code=
 for _ in $(seq 1 60); do code=$(curl -s -o /dev/null -w '%{http_code}' "$API/health"); [ "$code" = 200 ] && break; sleep 0.5; done

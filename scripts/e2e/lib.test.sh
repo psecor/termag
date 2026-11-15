@@ -24,16 +24,20 @@ sleep 1
 echo leak > "$H/leak"
 echo own > "$WORK/own"
 echo future > "$H/future"
+# PostgreSQL unpacked by the stack itself (pg_fetch) lands in the download cache.
+mkdir -p "$H/.cache/termag-e2e/pg/16/root"
+echo pg > "$H/.cache/termag-e2e/pg/16/root/postgres"
 touch -t "$(($(date +%Y) + 10))01010000" "$H/future"
 
 # $HOME is the first place e2e_leaks looks, so this sandbox's files come first
 # and the 20-line cap can't drop them; anything else it finds is not ours. The
 # sandbox sits under /tmp, which it also scans, hence sort -u.
-all=$(HOME="$H" bash -c '. "$1/lib.sh"; e2e_leaks "$2/.started" "$2"' _ "$here" "$WORK")
+all=$(HOME="$H" E2E_CACHE_DIR='' XDG_CACHE_HOME='' bash -c '. "$1/lib.sh"; e2e_leaks "$2/.started" "$2"' _ "$here" "$WORK")
 got=$(printf '%s\n' "$all" | grep -F "$H/" | sort -u || true)
 
 [ "$got" = "$H/leak" ] || fail 'e2e_leaks reports only the file written after the marker' "$H/leak" "$got"
 case $got in *"$H/future"*) fail 'a file dated after the check is skipped (bazel install tree)' 'not listed' "$got" ;; esac
+case $got in *"$H/.cache/termag-e2e/pg/"*) fail "PostgreSQL the stack unpacked into the e2e cache is skipped" 'not listed' "$got" ;; esac
 case $got in *"$H/before"*) fail 'a file from before the marker is skipped' 'not listed' "$got" ;; esac
 case $all in *"$WORK/own"*) fail "a file in the test's own work dir is skipped" 'not listed' "$all" ;; esac
 
@@ -86,5 +90,42 @@ if command -v tmux >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
   wait "$silent" 2>/dev/null || true
 fi
 
-if [ "$failures" -eq 0 ]; then echo 'PASS: e2e_leaks reports writes after the marker, and skips older, future-dated and own-work files; pkce_challenge; e2e_tmux_isolation skips a socket that never answers'; fi
+# pg_fetch, up.sh's fallback when no server is installed, runs the
+# pg-tools.sh beside it in ../stage; a copy of lib.sh beside a stand-in tells
+# what it does with that script's output and its failures.
+F="$T/pgfetch"; mkdir -p "$F/e2e" "$F/stage"
+cp "$here/lib.sh" "$F/e2e/lib.sh"
+cat >"$F/stage/pg-tools.sh" <<'STUB'
+if [ "$1" = env ]; then echo "LD_LIBRARY_PATH=$2/root/usr/lib/x86_64-linux-gnu"; exit 0; fi
+[ -n "${STUB_FAIL:-}" ] && { echo 'download failed' >&2; exit 1; }
+echo "$2/root/usr/lib/postgresql/$1/bin"
+STUB
+got=$(E2E_CACHE_DIR="$T/cache" bash -c '. "$1/e2e/lib.sh"; pg_fetch 16' _ "$F")
+want="$T/cache/pg/16/root/usr/lib/postgresql/16/bin
+$T/cache/pg/16/root/usr/lib/x86_64-linux-gnu"
+[ "$got" = "$want" ] || fail 'pg_fetch prints the bin directory, then the library directory' "$want" "$got"
+# As up.sh calls it: in $(...) || die, where errexit is off.
+if E2E_CACHE_DIR="$T/cache" STUB_FAIL=1 bash -c 'set -e; . "$1/e2e/lib.sh"; got=$(pg_fetch 16) || exit 0; exit 1' _ "$F" 2>/dev/null; then :; else
+  fail "pg_fetch fails when pg-tools.sh does, as up.sh calls it" 'non-zero' '0'
+fi
+
+# pg-tools.sh reuses an unpacked server only when every binary the stack runs
+# is there: a cache with postgres and no initdb (an unpack that stopped
+# part-way) is fetched again, here from a curl that cannot reach PGDG.
+S="$T/pgstub"; mkdir -p "$S"
+for c in gpg gpgv gunzip sha256sum dpkg-deb; do printf '#!/bin/sh\nexit 0\n' >"$S/$c"; done
+printf '#!/bin/sh\necho amd64\n' >"$S/dpkg"
+printf '#!/bin/sh\necho offline >&2\nexit 22\n' >"$S/curl"
+chmod +x "$S"/*
+C="$T/pgcache"; pgbin="$C/root/usr/lib/postgresql/16/bin"; mkdir -p "$pgbin"
+for b in pg_dump psql postgres; do printf '#!/bin/sh\n' >"$pgbin/$b"; chmod +x "$pgbin/$b"; done
+if PATH="$S:$PATH" bash "$here/../stage/pg-tools.sh" 16 "$C" server >/dev/null 2>&1; then
+  fail 'a server cache without initdb is not reused' 'non-zero (fetched again)' '0 (reused)'
+fi
+[ -x "$pgbin/postgres" ] || fail 'a failed fetch leaves the old cache in place' "$pgbin/postgres" 'gone'
+for b in initdb pg_ctl createdb pg_isready; do printf '#!/bin/sh\n' >"$pgbin/$b"; chmod +x "$pgbin/$b"; done
+got=$(PATH="$S:$PATH" bash "$here/../stage/pg-tools.sh" 16 "$C" server 2>&1) \
+  || fail 'a complete server cache is reused without fetching' "$pgbin" "$got"
+
+if [ "$failures" -eq 0 ]; then echo 'PASS: e2e_leaks reports writes after the marker, and skips older, future-dated and own-work files; pkce_challenge; e2e_tmux_isolation skips a socket that never answers; pg_fetch and the pg-tools.sh server cache'; fi
 [ "$failures" -eq 0 ]

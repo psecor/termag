@@ -176,6 +176,7 @@ async function setup() {
   if (!subnet) throw new Error('floci has no default subnet');
   const fallback = sorted.find(s => s.VpcId === subnet.VpcId && s.SubnetId !== subnet.SubnetId) ?? await createSubnet(subnet.VpcId);
   await bake();
+  await boundaryPolicy();
   console.log([
     `AWS_ENDPOINT_URL_EC2=http://127.0.0.1:${process.env.E2E_EC2_PORT}`,
     'BOX_RESOURCE_PREFIX=termag-e2e-box',
@@ -184,6 +185,16 @@ async function setup() {
     `BOX_SUBNET_ID=${subnet.SubnetId}`,
     `BOX_FALLBACK_SUBNET_IDS=${fallback.SubnetId}`,
   ].join('\n'));
+}
+
+/** The permissions boundary box roles are created under, which Floci (from 2.2.0) wants to exist. */
+async function boundaryPolicy() {
+  const form = new URLSearchParams({
+    Action: 'CreatePolicy', Version: '2010-05-08', PolicyName: 'termag-e2e-box-boundary',
+    PolicyDocument: JSON.stringify({ Version: '2012-10-17', Statement: [{ Effect: 'Allow', Action: '*', Resource: '*' }] }),
+  });
+  const res = await fetch(`${floci}/`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form });
+  if (!res.ok && res.status !== 409) throw new Error(`creating the box permissions boundary answered HTTP ${res.status}: ${await res.text()}`);
 }
 
 /** A second subnet in the VPC, for a stack whose Floci came up with only one. */
