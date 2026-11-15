@@ -21,7 +21,14 @@
  * credentials (the orchestrator role), the region from the SDK's region chain
  * (AWS_REGION, which box provisioning already needs). On the e2e stack both
  * come from Floci through the standard AWS_ENDPOINT_URL, so no override exists.
+ *
+ * The one setting spaces do have is where the bytes live: SPACES_STORAGE=local
+ * keeps them on the orchestrator's own disk instead (localSpaceObjects.ts,
+ * docs/spaces-local-storage.md), for a single-host install with no bucket.
+ * It is an explicit choice, never a fallback when AWS is missing, so a
+ * deployment meant for S3 can't quietly write to local disk.
  */
+import { isAbsolute } from 'path';
 import { GetCallerIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 
 export const SPACES_RESOURCE_NAME = 'termag-spaces';
@@ -114,4 +121,22 @@ export function spaceResourcesResolver(
     ).finally(() => { inFlight = null; });
     return inFlight;
   };
+}
+
+export const DEFAULT_SPACES_LOCAL_DIR = '/var/lib/termag/spaces';
+
+export type SpacesStorage =
+  | { kind: 's3' }
+  | { kind: 'local'; root: string }
+  /** A value that is neither: spaces answer 503 rather than guess which was meant. */
+  | { kind: 'invalid'; reason: string };
+
+/** Where spaces keep their bytes, from SPACES_STORAGE and SPACES_LOCAL_DIR. */
+export function spacesStorageFromEnv(env: NodeJS.ProcessEnv): SpacesStorage {
+  const kind = env.SPACES_STORAGE?.trim().toLowerCase() ?? '';
+  if (kind === '' || kind === 's3') return { kind: 's3' };
+  if (kind !== 'local') return { kind: 'invalid', reason: `SPACES_STORAGE=${JSON.stringify(env.SPACES_STORAGE)} is neither s3 nor local` };
+  const root = env.SPACES_LOCAL_DIR?.trim() || DEFAULT_SPACES_LOCAL_DIR;
+  if (!isAbsolute(root)) return { kind: 'invalid', reason: `SPACES_LOCAL_DIR=${JSON.stringify(root)} must be an absolute path` };
+  return { kind: 'local', root };
 }

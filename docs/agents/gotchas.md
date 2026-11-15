@@ -355,6 +355,11 @@ the bot needs `app_mentions:read`, `assistant:write`, `chat:write`, `chat:write.
 
 `backend/src/slack/executor.ts` deliberately removes any inherited `ANTHROPIC_API_KEY` before spawning `claude`, so the subprocess uses the user's own auth (Claude Code login / subscription) instead of a stale workspace key. Don't "helpfully" add it back; doing so silently routes Slack-driven sessions onto the wrong account and burns the wrong quota.
 
+<a id="space-local-same-origin"></a>
+## Spaces on local storage serve members' files from termag's own origin, so every download keeps its sandbox headers
+
+S3 serves a presigned GET from its own origin, so an uploaded HTML or SVG file opened from its URL can't touch termag's cookies or API. With `SPACES_STORAGE=local`, `routes/spaceStorage.ts` serves the same files from termag's origin. Every response there is `X-Content-Type-Options: nosniff`, and every type outside `SAFE_INLINE` (raster images, PDF, audio, video) also gets `Content-Security-Policy: sandbox`, so the file runs no script as the viewer. Don't drop either header, widen `SAFE_INLINE` to a type that can carry script (`text/html`, `image/svg+xml`, `application/xhtml+xml`, XML), or serve a stored file from another route without them. PDF is in the list only because Chrome's viewer won't render in a sandboxed document. The router is mounted before `express.json()` in `index.ts` and takes no session: the HMAC token is the authority, as a presigned URL's signature is, because the CLI on a box has no cookie. Moving it after the JSON parser would consume every upload sent as `application/json`.
+
 <a id="space-memory-frozen-prompt"></a>
 ## A chat session's space memory is frozen into its system prompt at the session's first turn; changes come as a notice in the message
 
