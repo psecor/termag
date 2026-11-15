@@ -2,6 +2,9 @@ import type { ResizeView } from '../utils/boxResize';
 import type { ThemeSettings } from '../theme/schema';
 import type { ProjectKind } from '../utils/projectKind';
 
+/** Where a New session runs when nobody picks a box. */
+export type BoxPlacementPolicy = 'reuse-first' | 'fresh-first';
+
 export interface User {
   id: string;
   email: string;
@@ -16,9 +19,23 @@ export interface User {
   telemetryTitles?: boolean;
   /** Settings > Box notices: Slack DMs before and after termag stops a box on its own; on unless turned off. Absent on older backends. */
   boxIdleNotify?: boolean;
+  /**
+   * Settings > Where new sessions run: this person's own default, null while they follow the org's.
+   * Absent while box-placement-enabled is off, as boxPlacementOrg is.
+   */
+  boxPlacement?: BoxPlacementPolicy | null;
+  /** The org default it beats: what box-placement-policy serves this person. */
+  boxPlacementOrg?: BoxPlacementPolicy;
+  /**
+   * Their My files space's name, null until it's made or chosen.
+   * Absent while project-files-enabled is off, as myFilesOnBoxes is.
+   */
+  myFilesSpace?: string | null;
+  /** Settings > My files, "Put My files on my boxes"; on unless turned off. */
+  myFilesOnBoxes?: boolean;
   dotfilesRepoUrl: string | null;
   theme: ThemeSettings;
-  /** Effective role from /auth/me; drives the admin nav entry only (the server re-checks). */
+  /** Effective role from /auth/me; drives the admin nav entry and which shared-environment controls show (the server re-checks). */
   role?: 'admin' | 'member';
   /** When the first-run wizard was finished or skipped; null = never. */
   onboardedAt?: string | null;
@@ -30,6 +47,8 @@ export interface User {
    * onboarding-refresh-enabled is on for this user; null until chosen.
    */
   uiMode?: 'simple' | 'full' | null;
+  /** Lab's toast recommending termag's chat was answered; present only under chat-ui-nudge-enabled. */
+  chatNudgeDismissed?: boolean;
 }
 
 export type WorkflowType = 'agent' | 'data';
@@ -58,8 +77,10 @@ export interface Workstream {
   branch: string;
   slackChannelId?: string | null;
   archived: boolean;
-  /** Claude's own title for the workstream's chat session; null before its first. */
+  /** Claude's own title for the workstream's chat session, or a person's rename; null before its first. */
   sessionTitle?: string | null;
+  /** Who set sessionTitle: `person` (a rename) or `claude`; null from before it was kept (chat/sessionTitle.ts). */
+  sessionTitleSource?: string | null;
   /** Its chat has a stored transcript; absent from orchestrators before it. */
   hasTranscript?: boolean;
   /** On main: working time was banked for it, an agent's turns or typing in its panes; absent elsewhere and from older orchestrators. */
@@ -99,6 +120,18 @@ export interface Project {
   repoDefaultBranch?: string | null;
   /** 'workspace': a folder of repositories, its repoUrl null. */
   layout?: 'repo' | 'workspace';
+  /**
+   * Its repositories' lowercased `owner/name`, a workspace's in checkout order;
+   * [] for none (backend services/projectRepos.ts projectRepoKeys). The
+   * sidebar's Projects view groups sessions by this set (chat/sidebarGroups.ts).
+   */
+  repoKeys?: string[];
+  /**
+   * The project this checkout belongs to, under
+   * user-projects-enabled; null with it off, on a shared checkout, and for MetaTerm,
+   * automations and space orchestrators.
+   */
+  userProjectId?: string | null;
   setupStatus?: SetupStatus | null;
   setupError?: string | null;
   /** The box's last report of the environment file's steps (utils/environmentStatus.ts). */
@@ -130,6 +163,11 @@ export interface Instance {
   region?: string | null;
   hostname?: string | null;
   provisioningError?: string | null;
+  /** A New session's wake of this box that failed, for the session to say so; absent otherwise. */
+  wakeError?: string;
+  /** The chat engines beside Claude its connected agent can run (backend chatEnginesOf: 'cursor', 'devin'); absent
+   *  while its agent isn't connected. On the list response only. */
+  chatEngines?: string[];
   createdAt: string;
   // The agent's first connect; readyAt - createdAt is the box's cold boot time.
   readyAt?: string | null;
@@ -328,6 +366,8 @@ export interface AgentStatus {
   rateLimited?: string | null;
   /** When the agent last came to rest (working/waiting → idle/not_running); ISO. Drives the unseen-stop marker. */
   stoppedAt?: string | null;
+  /** When the session entered this status, as the status frame carries it (backend statusSince); ISO. The sidebar card's time in status. */
+  statusSince?: string | null;
   /** "Just opened/merged a PR" — the natural moment to compact or clear context. */
   milestone?: SessionMilestone | null;
   /**
@@ -401,13 +441,15 @@ export interface SessionReview {
 }
 
 /**
- * What each status is called wherever it is spelled out. `idle` is "Ready":
- * the agent finished and is waiting for its next task, which is not a fault.
+ * What each status is called wherever it is spelled out, in Lab too: the four
+ * status words (chat/statusWords.ts). `idle` is "Idle":
+ * the agent finished its turn and waits for your next message, which is not a fault; `waiting` is
+ * "Needs you": nothing moves until you act.
  */
 export const STATUS_LABEL: Record<AgentStatusValue, string> = {
   working: 'Working',
-  waiting: 'Waiting',
-  idle: 'Ready',
+  waiting: 'Needs you',
+  idle: 'Idle',
   not_running: 'Not running',
 };
 

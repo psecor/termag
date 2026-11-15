@@ -11,7 +11,6 @@
 // in termag's own characters, never anything a shell would read.
 import type React from 'react';
 import type { InboxRow } from '../mobile/inbox';
-import { agentLabel } from './explorerAgents';
 import { chatRowName } from './simpleChat';
 
 export const SESSION_REF_TYPE = 'application/x-termag-session-ref';
@@ -39,7 +38,7 @@ function askTarget(box: string, project: string, workstream: string, repo: strin
  * name is what the sidebar calls the session. Else why it can't be messaged.
  */
 export function sessionRef(row: RefRow, box: string | null): SessionRef {
-  const name = (chatRowName(row).title ?? agentLabel(row)).replace(/"/g, "'");
+  const name = chatRowName(row).title.replace(/"/g, "'");
   if (row.shared) return { refusal: `${name} is ${row.owner}'s session. Only your own sessions can be messaged.` };
   if (!row.instanceId || !box) return { refusal: `${name} isn't on a box of yours, so it can't be messaged.` };
   // A follow-up names the thread's own target; an older orchestrator doesn't say it, and most threads ask main.

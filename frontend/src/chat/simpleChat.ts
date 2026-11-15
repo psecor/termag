@@ -2,13 +2,15 @@
 // it lists, the one-line status under the transcript, when the answer keys
 // show, and the links out of it.
 import type { AgentStatus, AgentStatusValue, Project } from '../types';
-import { isChatRunnerProvider } from '../providers/registry';
+import { isChatRunnerProvider, PROVIDERS } from '../providers/registry';
 import { buildRows, sortHome, statusLabel, waitingLabel, type InboxRow } from '../mobile/inbox';
 import { repoKey } from '../utils/repoPick';
 import type { Block } from './paneChat';
 import type { ChatLiveStatus } from './chatLiveStatus';
-import { agentLabel } from './explorerAgents';
 import { isAskChatWorkstream } from '../utils/askChatVisibility';
+import { LAB_PARAM } from './uiMode';
+import { asDetail, DONE_YOUR_TURN, rowStatusText, statusText } from './statusWords';
+import { sessionTitle } from './sessionTitle';
 
 /**
  * GitHub owners whose new simple-UI sessions start trusted. Empty: every
@@ -28,6 +30,21 @@ const COMPANY_GITHUB_OWNERS: ReadonlySet<string> = new Set<string>([]);
  */
 export function chatRows(rows: readonly InboxRow[]): InboxRow[] {
   return sortHome(rows.filter(r => r.kind === 'normal' || (r.kind === 'automation' && r.workstream !== 'main')));
+}
+
+/**
+ * Whether a Lab link's session has a conversation in the chat, so the link
+ * can open it there (uiMode.ts simpleUiDeepLink): a listed project with that
+ * workstream, live, of a kind chatRows lists: not MetaTerm, nor an
+ * automation's `main`, where no agent runs. Anything else stays in Lab.
+ */
+export function sessionHasChat(
+  projects: readonly Pick<Project, 'id' | 'kind' | 'workstreams'>[], projectId: string, workstream: string,
+): boolean {
+  const project = projects.find(p => p.id === projectId);
+  if (!project?.workstreams.some(w => w.name === workstream && !w.archived)) return false;
+  const kind = project.kind ?? 'normal';
+  return kind === 'normal' || (kind === 'automation' && workstream !== 'main');
 }
 
 /**
@@ -106,32 +123,27 @@ export function chatListRows(
 }
 
 export interface ChatRowName {
-  /** What the row leads with: an ask's title or, untitled, its thread id (ask-<id>); else Claude's title for the session; null to lead with the project as before. */
-  title: string | null;
+  /** What the row leads with: the session's one title (chat/sessionTitle.ts), the same string on every surface. */
+  title: string;
   /**
-   * Under the title, or the name itself without one: the project, and the
-   * workstream when it is not main. For an ask, Claude's own title for its
-   * session when that is shown and says something else, else nothing (the
-   * project and box are in the tooltip).
+   * Under the title, or after it in a tooltip: the project, when the title
+   * isn't the project's name. For an ask, its session's own title when that
+   * says something else than the one shown, else nothing (the project and
+   * box are in the tooltip). Never the workstream's name.
    */
   where: string | null;
-  /** The row is an ask thread's chat, named by its title or its thread id. */
+  /** The row is an ask thread's chat. */
   ask: boolean;
 }
 
-/**
- * What a sidebar row is called. An ask thread leads with its title, or with
- * its thread id (ask-<id>) when its caller gave none; Claude's session title
- * comes second. Otherwise, with a title Claude gave the session, the title leads and the project (and workstream) is secondary;
- * else the row is named after the project.
- */
-export function chatRowName(row: Pick<InboxRow, 'projectName' | 'workstream' | 'sessionTitle' | 'askTitle' | 'askThreadId'>): ChatRowName {
-  const session = row.sessionTitle?.trim() || null;
-  // Callers name their threads (the person on #743): an ask is called by its title, else by its
-  // thread id in the workstream's form (ask-<thread id>), never by anything derived.
-  const askName = row.askThreadId ? row.askTitle?.trim() || row.workstream : null;
-  if (askName) return { title: askName, where: session && session !== askName ? session : null, ask: true };
-  return { title: session, where: agentLabel(row), ask: false };
+/** What a sidebar row is called: its session's title (sessionTitle), and where it is. */
+export function chatRowName(row: Pick<InboxRow, 'projectName' | 'workstream' | 'sessionTitle' | 'sessionTitleSource' | 'askTitle' | 'askThreadId'>): ChatRowName {
+  const title = sessionTitle(row);
+  if (row.askThreadId) {
+    const own = row.sessionTitle?.trim() || null;
+    return { title, where: own && own !== title ? own : null, ask: true };
+  }
+  return { title, where: title !== row.projectName ? row.projectName : null, ask: false };
 }
 
 export interface SidebarLine {
@@ -146,19 +158,20 @@ export interface SidebarLine {
 /**
  * A sidebar row's state and preview. The open chat publishes its own status
  * line and last assistant text (chat/chatLiveStatus.ts), so its row says what
- * its header says; another chat reads the status pipeline, and one whose box
- * or checkout is still coming up says so rather than "Not running".
+ * its header says (a plain finished turn is "Idle", the transcript's line
+ * alone adds "your turn"); another chat reads the status pipeline, and one
+ * whose box or checkout is still coming up says so rather than "Not running".
  */
 export function sidebarLine(row: InboxRow, live: ChatLiveStatus | undefined, setupStatus: string | null | undefined): SidebarLine {
   if (live) {
     return {
-      state: live.text,
+      state: rowStatusText(live.text),
       message: live.preview,
-      glyph: live.tone === 'working' || live.tone === 'setup' ? 'working' : 'idle',
+      glyph: live.tone === 'working' || live.tone === 'setup' ? 'working' : live.tone === 'off' ? 'not_running' : 'idle',
     };
   }
   if (row.status === 'not_running' && (setupStatus === 'pending' || setupStatus === 'cloning')) {
-    return { state: 'Setting up…', message: null, glyph: 'working' };
+    return { state: statusText('Working', 'setting up'), message: null, glyph: 'working' };
   }
   return { state: statusLabel(row), message: row.message, glyph: row.status };
 }
@@ -210,22 +223,25 @@ export interface StatusLineInput {
   offline?: boolean;
 }
 
-/** The single line under the transcript saying what the agent is doing now. */
+/**
+ * The single line under the transcript saying what the agent is doing now,
+ * leading with one of the four status words (chat/statusWords.ts).
+ */
 export function statusLine(i: StatusLineInput): StatusLine {
-  if (i.setupLabel) return { tone: 'setup', text: `Setting up · ${i.setupLabel}` };
-  if (i.offline) return { tone: 'offline', text: "The box's agent is offline · showing the last capture" };
+  if (i.setupLabel) return { tone: 'setup', text: statusText('Working', `setting up · ${i.setupLabel}`) };
+  if (i.offline) return { tone: 'offline', text: statusText('Not running', 'box offline, showing the last capture') };
   const message = i.message?.trim() || null;
   switch (i.status) {
     case 'working': {
       const spin = i.spinner?.replace(/^[✻✶✳✢·*]\s*/, '').trim() || null;
-      return { tone: 'working', text: message ? `Working · ${message}` : spin ?? 'Working' };
+      return { tone: 'working', text: statusText('Working', message ?? (spin && asDetail(spin))) };
     }
     case 'waiting':
       return { tone: 'waiting', text: message ? `${waitingLabel(i.waitingReason)} · ${message}` : waitingLabel(i.waitingReason) };
     case 'idle':
-      return { tone: 'idle', text: 'Done · your turn' };
+      return { tone: 'idle', text: DONE_YOUR_TURN };
     default:
-      return { tone: 'off', text: 'Not running' };
+      return { tone: 'off', text: statusText('Not running') };
   }
 }
 
@@ -244,11 +260,16 @@ export function chatHref(projectId: string, workstream: string): string {
   return workstream === 'main' ? base : `${base}?ws=${encodeURIComponent(workstream)}`;
 }
 
-/** The same session in the classic workspace (the deep link ProjectContext reads). */
+/**
+ * The same session in the classic workspace (the deep link ProjectContext
+ * reads), marked as opening Lab on purpose (LAB_PARAM), so a new tab or a
+ * reload of it stays in Lab rather than going back to the chat.
+ */
 export function fullUiHref(projectId: string | null | undefined, workstream = 'main'): string {
   if (!projectId) return '/';
   const q = new URLSearchParams({ project: projectId });
   if (workstream !== 'main') q.set('ws', workstream);
+  q.set(LAB_PARAM, '1');
   return `/?${q.toString()}`;
 }
 
@@ -298,6 +319,25 @@ export function repoSlug(url: string | null | undefined): string | null {
 export function isSdkChat(project: Pick<Project, 'workflows' | 'workstreams'>, workstream: string): boolean {
   return isChatRunnerProvider(chatProvider(project, workstream));
 }
+
+/**
+ * Who a chat's agent is, by its provider's engine: Claude Code, with its model picker, effort and the rest; or
+ * another engine's agent (a Cursor or Devin review chat), named as the registry names it, which takes none of those.
+ */
+export function chatAgentOf(project: Pick<Project, 'workflows' | 'workstreams'>, workstream: string): { name: string; claudeCode: boolean; readTier: string } {
+  const provider = chatProvider(project, workstream);
+  const config = provider ? PROVIDERS[provider] : undefined;
+  if (!config || !config.chatEngine || config.chatEngine === 'claude') return { name: 'Claude', claudeCode: true, readTier: READ_TIERS.claude };
+  return { name: config.displayName.replace(/\s*\(chat\)$/, ''), claudeCode: false, readTier: READ_TIERS[config.chatEngine] };
+}
+
+/** What each engine's read-only turn can do (agent chat-runner.js: confinedTools, PI_READ_ONLY_TOOLS, cursorTurnArgs' plan mode, devinTurnArgs' ask mode). */
+const READ_TIERS: Record<'claude' | 'pi' | 'cursor' | 'devin', string> = {
+  claude: 'only Read, Grep and Glob this turn: no shell, no edits, no MCP servers',
+  pi: 'only read, grep, find and ls this turn: no shell, no edits, no MCP servers',
+  cursor: 'only its plan mode this turn: it reads the code, and runs no shell, makes no edits and loads no MCP servers',
+  devin: 'only its ask mode this turn: it reads the code, and runs no shell, makes no edits and loads no MCP servers',
+};
 
 /** The provider of a workstream's agent workflow, else the project's main one. */
 export function chatProvider(project: Pick<Project, 'workflows' | 'workstreams'>, workstream: string): string | null | undefined {

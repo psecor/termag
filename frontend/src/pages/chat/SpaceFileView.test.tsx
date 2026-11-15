@@ -337,6 +337,83 @@ describe('SpaceFileView', () => {
   });
 });
 
+describe('SpaceFileView Copy link', () => {
+  const clipboard = (writeText: () => Promise<void>) => vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText: vi.fn(writeText) } });
+  const status = () => host.querySelector('.chat-header-actions > [role=status]')!.textContent;
+
+  it('answers on its button: a check and Link copied, for a moment, and the same to a screen reader', async () => {
+    clipboard(() => Promise.resolve());
+    mocks.view.mockResolvedValue(signed(null));
+    await open('README.md');
+    vi.useFakeTimers();
+    try {
+      const link = host.querySelector<HTMLButtonElement>('.fv-share-link')!;
+      await act(async () => { link.click(); });
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(expect.stringContaining('README.md'));
+      expect(link.hasAttribute('data-copied')).toBe(true);
+      expect(link.getAttribute('data-tip')).toBe('Link copied');
+      expect(link.textContent).toBe('Copied');
+      expect(status()).toBe('Link copied');
+      act(() => { vi.advanceTimersByTime(1500); });
+      expect(link.hasAttribute('data-copied')).toBe(false);
+      expect(link.textContent).toBe('Copy link');
+      expect(status()).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('says so when the clipboard refuses', async () => {
+    clipboard(() => Promise.reject(new Error('denied')));
+    mocks.view.mockResolvedValue(signed(null));
+    await open('README.md');
+    const link = host.querySelector<HTMLButtonElement>('.fv-share-link')!;
+    await act(async () => { link.click(); });
+    expect(link.hasAttribute('data-copied')).toBe(false);
+    expect(link.getAttribute('data-tip')).toBe("Couldn't copy the link");
+    expect(status()).toBe("Couldn't copy the link");
+  });
+
+  it('answers on ⋮ when it came from the menu, which closed', async () => {
+    clipboard(() => Promise.resolve());
+    mocks.view.mockResolvedValue(signed(null));
+    await open('README.md', 'phone', { mode: 'drawer' });
+    const more = host.querySelector<HTMLButtonElement>('.fv-more')!;
+    act(() => { more.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 300, clientY: 40 })); });
+    const item = [...document.querySelectorAll<HTMLElement>('.chat-ctx-menu [role=menuitem]')].find(b => b.textContent === 'Copy link')!;
+    await act(async () => { item.click(); });
+    expect(more.hasAttribute('data-copied')).toBe(true);
+    expect(more.getAttribute('data-tip')).toBe('Link copied');
+    expect(status()).toBe('Link copied');
+  });
+});
+
+describe('SpaceFileView in a side panel\'s file tab', () => {
+  it('shows the file it is given, without the page\'s back, Tools or chat, and leads with Open in main panel', async () => {
+    mocks.view.mockResolvedValue(signed(null));
+    const openInMain = vi.fn();
+    await act(async () => {
+      root.render(
+        <MemoryRouter initialEntries={['/chat/p/p1']}>
+          <ChatChromeProvider value={{ mode: 'docked', historyOpen: false, openHistory: () => {}, closeHistory: () => {}, sidePanel: { open: true, toggle: () => {}, revealDir: () => {} } }}>
+            <SpaceFileView file={{ space: 'notes', path: 'docs/deep/plan.md' }} inPanel={{ openInMain }} />
+          </ChatChromeProvider>
+          <Probe />
+        </MemoryRouter>,
+      );
+    });
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    expect(mocks.view).toHaveBeenCalledWith('notes', 'docs/deep/plan.md');
+    expect(host.querySelector('.chat-page-back, .fv-tools')).toBeNull();
+    expect(host.querySelector('.fv-crumb-link')).toBeNull();
+    const main = host.querySelector<HTMLButtonElement>('.fv-open-main')!;
+    expect(main.getAttribute('aria-label')).toBe('Open in main panel');
+    act(() => { main.click(); });
+    expect(openInMain).toHaveBeenCalledTimes(1);
+    expect(location).toBe('/chat/p/p1');
+  });
+});
+
 describe('SpaceFileView through a share', () => {
   const panel = { sidePanel: { open: false, toggle: () => {}, revealDir: () => {} } };
   const notMember = () => Object.assign(new Error('not found'), { response: { status: 404, data: {} } });

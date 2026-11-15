@@ -4,12 +4,14 @@
  */
 import axios from 'axios';
 import { sendClientHeader } from '../buildInfo';
+import { holdWhileEdgeSignedOut } from '../utils/edgeSession';
 import type { BoxSize } from '../utils/boxSize';
 import type { BoxResizeInfo, ResizeView } from '../utils/boxResize';
 import type { BoxLifecycle } from '../types';
 
 const api = axios.create({ baseURL: '/termag', withCredentials: true });
 sendClientHeader(api);
+holdWhileEdgeSignedOut(api);
 
 export type AdminRange = 'today' | '7d' | '30d';
 const q = (range: AdminRange, extra: Record<string, string | number | boolean | undefined> = {}) => ({
@@ -50,7 +52,7 @@ export interface CloudCounts { running: number; starting: number }
 export interface AdminInstanceDetail extends AdminInstance {
   projectList: Array<{ id: string; name: string; archived: boolean; lastActiveAt: string }>;
   tokens: Array<{ id: string; name: string; tokenPrefix: string; createdAt: string; lastUsedAt: string | null; revokedAt: string | null }>;
-  securityGroupId: string | null; iamRoleName: string | null;
+  securityGroupId: string | null; iamRoleName: string | null; iamRoleShared?: boolean;
   hibernationConfigured: boolean;
   /** Null until an admin quarantines the box (backend/src/services/boxQuarantine.ts); kept after its terminate. */
   quarantine: BoxQuarantine | null;
@@ -124,14 +126,40 @@ export interface ActiveUsers { days: ActiveUsersDay[]; totals: Record<string, nu
 /** UTC buckets; weeks start on Monday (backend services/admin/userGrowth.ts). */
 export type GrowthBucket = 'day' | 'week' | 'month';
 // ── Deployed software ──
-export type SoftwareState = 'current' | 'behind' | 'outdated' | 'ahead' | 'pending' | 'missing' | 'unknown';
-export interface SoftwareCell { version: string | null; raw: string | null; path: string | null; state: SoftwareState; observedAt: string }
+/** `below-floor` and `held` only for the tools termag updates, graded against each box's policy (backend services/software/toolGrade.ts). */
+export type SoftwareState = 'current' | 'below-floor' | 'behind' | 'outdated' | 'ahead' | 'held' | 'pending' | 'missing' | 'unknown';
+/** What a tool termag updates was graded against on that host: its policy's mode, floor and target, and the reference "behind" compares with. */
+export interface SoftwareCellPolicy { mode: 'off' | 'manual' | 'auto'; floor: string; target: string; reference: string | null }
+/**
+ * Why the fleet update would not act on a tool cell: its own skip for a box (backend toolUpdate/fleet.ts
+ * FleetSkip, which the backend takes from selectFleet), or `orchestrator`, which the fleet buttons never take.
+ */
+export type SoftwareRefusal = 'claude_update_off' | 'offline' | 'not_capable' | 'run_in_flight' | 'not_installed' | 'version_unreadable' | 'no_inventory' | 'unknown_version' | 'orchestrator' | 'orchestrator_panel_off';
+export interface SoftwareCell {
+  version: string | null; raw: string | null; path: string | null; state: SoftwareState; observedAt: string; policy?: SoftwareCellPolicy;
+  /** A box's tool with a policy: why the fleet update would skip it, or null when it would act on it (hostRefusal, on the backend). */
+  refusal?: SoftwareRefusal | null;
+  /** A box's tool with a policy: whether each scope's fleet update takes it (the backend's selectFleet). What the buttons count. */
+  fleet?: { 'below-floor': boolean; behind: boolean };
+  /** The orchestrator's Claude Code: whether the viewing admin's host panel offers an Update, and their own mode. Its grade is the orchestrator's own. */
+  panel?: { offered: boolean; mode: 'off' | 'manual' | 'auto' };
+  /** An owned box whose policy read failed: graded as an unowned box's, and not for want of an owner. */
+  policyUnavailable?: true;
+  /** Why the automatic sweep's last pass left a tool alone, when that blocks its update (floor-failing, backing-off, not-capable). */
+  sweep?: { why: string; at: string };
+  /** A box's tool: its run in flight, as the backend's runActive decides it, or absent. The tab's one source for "updating". */
+  inFlight?: { id: string; status: 'requested' | 'running'; requestedAt: string; atStart?: true };
+}
 export interface SoftwareHost {
   hostKey: string; kind: 'orchestrator' | 'box' | 'agent'; name: string; owner: string | null;
   boxKind: string | null; status: string | null; connected: boolean; lastInventoryAt: string | null;
   cells: Record<string, SoftwareCell>;
 }
-export interface SoftwareSummary { component: string; reference: string | null; referenceNote: string; counts: Record<SoftwareState, number>; spread: Array<{ version: string; hosts: number }> }
+export interface SoftwareSummary {
+  component: string; reference: string | null; referenceNote: string; counts: Record<SoftwareState, number>; spread: Array<{ version: string; hosts: number }>;
+  /** A tool termag updates: its policies' floor (each distinct one). Absent for anything else, and from an older backend. */
+  floor?: string | null;
+}
 export interface SoftwareMatrix {
   components: string[]; summary: SoftwareSummary[]; hosts: SoftwareHost[];
   /** `summary` without offline hosts (the orchestrator always counts), and how many were left out. Absent from an older backend. */
@@ -545,6 +573,22 @@ export interface BugDetail {
   duplicates: BugSummary[];
 }
 export interface BugFilters { status?: string; area?: string; severity?: string; q?: string }
+
+// ── Feedback (backend routes/admin/feedback.ts) ──
+export const FEEDBACK_STATUSES = ['new', 'seen'] as const;
+export const FEEDBACK_KINDS = ['praise', 'problem', 'idea', 'other'] as const;
+export type FeedbackStatus = typeof FEEDBACK_STATUSES[number];
+export type FeedbackKind = typeof FEEDBACK_KINDS[number];
+export interface FeedbackItem {
+  id: string; body: string; kind: FeedbackKind; status: FeedbackStatus; createdAt: string;
+  seenAt: string | null; seenBy: string | null;
+  reporter: string; reporterUserId: string; credential: 'box' | 'device';
+  box: string | null; boxId: string | null; project: string | null; projectId: string | null;
+  workstream: string | null; threadId: string | null;
+  agentProvider: string | null; agentModel: string | null; agentVersion: string | null;
+  cliVersion: string | null; boxAgentCommit: string | null; redacted: string[];
+}
+export interface FeedbackFilters { status?: string; kind?: string }
 export interface BugChange { status?: BugStatus; duplicateOf?: string; link?: string | null; note?: string }
 
 export const adminApi = {
@@ -636,4 +680,10 @@ export const adminApi = {
   bugCounts: (): Promise<{ counts: Record<BugStatus, number> }> => api.get('/api/admin/bug-reports/counts').then(r => r.data),
   bugReport: (id: string): Promise<BugDetail> => api.get(`/api/admin/bug-reports/${encodeURIComponent(id)}`).then(r => r.data),
   triageBug: (id: string, change: BugChange): Promise<{ report: BugReport }> => api.patch(`/api/admin/bug-reports/${encodeURIComponent(id)}`, change).then(r => r.data),
+  /** `more`: older feedback matched too, past the route's 500. */
+  feedback: (f: FeedbackFilters): Promise<{ feedback: FeedbackItem[]; more?: boolean }> =>
+    api.get('/api/admin/feedback', { params: Object.fromEntries(Object.entries(f).filter(([, v]) => v)) }).then(r => r.data),
+  feedbackCounts: (): Promise<{ counts: Record<FeedbackStatus, number> }> => api.get('/api/admin/feedback/counts').then(r => r.data),
+  setFeedbackStatus: (id: string, status: FeedbackStatus): Promise<{ feedback: FeedbackItem }> =>
+    api.patch(`/api/admin/feedback/${encodeURIComponent(id)}`, { status }).then(r => r.data),
 };

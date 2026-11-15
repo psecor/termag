@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from 'vitest';
 import { chatEffortPending, readEffortPick, writeEffortPick } from './useChatEffort';
-import { modelMenuPlacement, modelPickerLabel } from './ModelPicker';
+import { modelMenuPlacement, modelPickerLabel, modelPickerParts } from './ModelPicker';
 import { chatModelOptions } from './composer';
 
 beforeEach(() => localStorage.clear());
@@ -33,6 +33,12 @@ describe('modelPickerLabel', () => {
     expect(modelPickerLabel('opus', options, null)).toBe('Opus 5.5');
     expect(modelPickerLabel('fireworks:accounts/fireworks/models/kimi-k3', options, 'high')).not.toContain('High');
     expect(modelPickerLabel(null, options, 'high')).toBe('…');
+  });
+
+  it('keeps the name and the effort apart, so the narrowest composer can leave the effort to the menu', () => {
+    expect(modelPickerParts('opus', options, 'high')).toEqual({ name: 'Opus 5.5', effort: 'High' });
+    expect(modelPickerParts('opus', options, 'default')).toEqual({ name: 'Opus 5.5', effort: null });
+    expect(modelPickerParts(null, options, 'high')).toEqual({ name: '…', effort: null });
   });
 });
 

@@ -1,6 +1,6 @@
 import type { EnvironmentView } from '../services/api';
 import { describe, expect, it } from 'vitest';
-import { definitionError, describeEvent, draftFromEnvironment, draftInput, emptyEnvironmentDraft, environmentCommands, environmentLine, environmentMatches, environmentRepos, matchesEnvironment, pointerLabel, repoName, shareBlocker, visibilityGroups } from './environments';
+import { definitionError, describeEvent, draftFromEnvironment, draftInput, emptyEnvironmentDraft, environmentCommands, environmentLine, environmentMatches, environmentRepos, environmentRights, matchesEnvironment, pointerLabel, repoName, shareBlocker, visibilityGroups } from './environments';
 
 const INLINE = { name: 'full-stack', kind: 'inline' as const, definition: { resources: 'large', repos: [{ repo: 'example-org/webapp' }] } };
 const POINTER = { name: 'full-stack', kind: 'pointer' as const, file: { repo: 'example-org/webapp', branch: 'main', path: '.termag/full-stack/environment.json' } };
@@ -124,6 +124,15 @@ describe("New session's environment dialog: search", () => {
 });
 
 describe('personal and shared', () => {
+  it("gives nobody but its owner anything on a personal environment, an admin included", () => {
+    const sam = { id: 'u2' };
+    const none = { edit: false, remove: false, share: false, unshare: false };
+    expect(environmentRights({ visibility: 'personal', owner: sam }, { id: 'u1', role: 'admin' })).toMatchObject(none);
+    expect(environmentRights({ visibility: 'personal', owner: null }, { id: 'u1', role: 'admin' })).toMatchObject(none);
+    expect(environmentRights({ visibility: 'personal', owner: sam }, { id: 'u2', role: 'member' })).toEqual({ edit: true, remove: true, share: false, unshare: false, reason: null });
+    expect(environmentRights({ visibility: 'personal', owner: sam }, { id: 'u2', role: 'admin' })).toMatchObject({ edit: true, remove: true, share: true });
+    expect(environmentRights({ visibility: 'shared', owner: sam }, { id: 'u1', role: 'admin' })).toMatchObject({ edit: true, remove: true, unshare: true });
+  });
   it('groups personal first, then shared, each in list order, leaving out an empty group', () => {
     const list = [{ name: 'b', visibility: 'shared' as const }, { name: 'a', visibility: 'personal' as const }, { name: 'c', visibility: 'shared' as const }];
     expect(visibilityGroups(list).map(g => [g.label, g.items.map(e => e.name)])).toEqual([['Personal', ['a']], ['Shared', ['b', 'c']]]);

@@ -4,14 +4,15 @@
 // it. The history says where that stands (`continuation`); these are what the
 // chat view shows for it.
 import type { ChatContinuation } from '../services/api';
+import { statusText } from './statusWords';
 
 /** How often a chat that is coming back looks again. */
 export const CONTINUATION_POLL_MS = 3000;
 
 const PHASE_TEXT = {
-  'starting-box': 'Starting a new box for this chat…',
-  restoring: 'Restoring this conversation…',
-  starting: 'Starting the box…',
+  'starting-box': statusText('Working', 'starting a new box for this chat…'),
+  restoring: statusText('Working', 'restoring this conversation…'),
+  starting: statusText('Working', 'starting the box…'),
 } as const;
 
 /** The status line while the chat comes back, or null for its own. */

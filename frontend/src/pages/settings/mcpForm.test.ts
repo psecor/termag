@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { connectorStatus, formatHeaderLines, initialScopes, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
+import { connectAction, connectorStatus, formatHeaderLines, initialScopes, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
 import { PROVIDERS } from '../../providers/registry';
 
 describe('parseHeaderLines', () => {
@@ -66,9 +66,14 @@ describe('connectorStatus', () => {
     expect(connectorStatus({ authType: 'static', missingSecrets: [], secretNames: null })).toEqual({ label: 'secrets unreadable', tone: 'bad' });
   });
 
-  it('is authed or not authed for an OAuth server, whatever its secrets say', () => {
-    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: null, linkStatus: 'linked' })).toEqual({ label: 'authed', tone: 'good' });
-    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: [], linkStatus: 'needs_link' })).toEqual({ label: 'not authed', tone: 'warn' });
+  it('is connected or not connected for an OAuth server, whatever its secrets say', () => {
+    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: null, linkStatus: 'linked' })).toEqual({ label: 'connected', tone: 'good' });
+    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: [], linkStatus: 'needs_link' })).toEqual({ label: 'not connected', tone: 'warn' });
+  });
+
+  it('says blocked for a connector off the allowlist, whatever else it is', () => {
+    expect(connectorStatus({ authType: 'oauth', missingSecrets: [], secretNames: [], linkStatus: 'linked', blocked: "This MCP server isn't on termag's allowlist" })).toEqual({ label: 'blocked', tone: 'bad' });
+    expect(connectorStatus({ authType: 'static', missingSecrets: [], secretNames: ['token'], blocked: "This MCP server isn't on termag's allowlist" })).toEqual({ label: 'blocked', tone: 'bad' });
   });
 });
 
@@ -99,5 +104,15 @@ describe('initialScopes', () => {
 
   it('uses what was asked for when the server did not say what it granted', () => {
     expect(initialScopes({ scopeChoice: choice, requestedScopes: named('channels:history'), grantedScopes: null }, true)).toEqual(['channels:history']);
+  });
+});
+
+describe('connectAction', () => {
+  it('is Connect until linked, then Change permissions or Reconnect', () => {
+    expect(connectAction({ linkStatus: 'needs_link' })).toBe('Connect');
+    expect(connectAction({})).toBe('Connect');
+    expect(connectAction({ linkStatus: 'needs_link', oauth: { scopeChoice: {} } })).toBe('Connect');
+    expect(connectAction({ linkStatus: 'linked', oauth: { scopeChoice: {} } })).toBe('Change permissions');
+    expect(connectAction({ linkStatus: 'linked', oauth: { scopeChoice: null } })).toBe('Reconnect');
   });
 });

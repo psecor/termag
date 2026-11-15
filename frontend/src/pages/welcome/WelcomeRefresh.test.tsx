@@ -6,17 +6,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   list: vi.fn(), add: vi.fn(), credentials: vi.fn(), connectGithub: vi.fn(),
   navigate: vi.fn(), setOnboarded: vi.fn(), updateDotfiles: vi.fn(), event: vi.fn(),
+  mcpList: vi.fn(), connectCatalog: vi.fn(), startOAuth: vi.fn(), search: '',
   created: null as null | ((p: { id: string }) => Promise<void> | void),
   user: { email: 'owner@example.com', dotfilesRepoUrl: null as string | null },
 }));
 vi.mock('../../services/api', () => ({
   sshKeysApi: { list: mocks.list, add: mocks.add },
   credentialsApi: { get: mocks.credentials, connectGithub: mocks.connectGithub },
+  mcpConnectorsApi: { list: mocks.mcpList, connectCatalog: mocks.connectCatalog, startOAuth: mocks.startOAuth },
 }));
 vi.mock('../../contexts/AuthContext', () => ({
   useAuth: () => ({ user: mocks.user, setOnboarded: mocks.setOnboarded, updateDotfilesRepoUrl: mocks.updateDotfiles }),
 }));
-vi.mock('react-router-dom', () => ({ useNavigate: () => mocks.navigate }));
+vi.mock('react-router-dom', () => ({ useNavigate: () => mocks.navigate, useLocation: () => ({ search: mocks.search }) }));
 vi.mock('../../services/boxFeed', () => ({ boxFeed: { start: vi.fn(), stop: vi.fn() } }));
 vi.mock('../../launchpad/sprite', () => ({ ensureLaunchPadSprite: () => Promise.resolve() }));
 vi.mock('../../observability', () => ({ recordProductEvent: mocks.event }));
@@ -83,6 +85,7 @@ beforeEach(async () => {
   mocks.credentials.mockResolvedValue(connected);
   mocks.setOnboarded.mockResolvedValue(undefined);
   mocks.created = null;
+  mocks.search = '';
   container = document.createElement('div');
   document.body.append(container);
   root = createRoot(container);
@@ -119,6 +122,19 @@ describe('the redrawn first run', () => {
     expect(mocks.setOnboarded).toHaveBeenCalledWith(true);
     expect(localStorage.getItem('termag-ui-mode')).toBe('full');
     expect(mocks.navigate).toHaveBeenCalledWith('/?project=p1', { replace: true });
+  });
+
+  it('opens each step at its top, not where the last one was scrolled to', async () => {
+    const page = document.querySelector('.wel-root') as HTMLDivElement;
+    page.scrollTop = 400;
+    await press(button('Continue'));
+    expect(heading()).toBe('How do you want to work?');
+    expect(page.scrollTop).toBe(0);
+    page.scrollTop = 300;
+    await press(document.querySelector('input[value="lab"]') as HTMLInputElement);
+    await press(button('Continue'));
+    expect(heading()).toBe('Start your first project');
+    expect(page.scrollTop).toBe(0);
   });
 
   it('starts a skipping user in termag', async () => {
@@ -271,5 +287,131 @@ describe('the SSH key field', () => {
     await press(button('Continue'));
     expect(dialog()).toBeNull();
     expect(mocks.add).not.toHaveBeenCalled();
+  });
+});
+
+describe('the MCP servers step', () => {
+  const LD = { name: 'acme-observability', upstream: 'https://mcp.obs.example/mcp' };
+  const ACME = { name: 'acme', upstream: 'https://mcp.acme.example/mcp' };
+  const ldConnector = {
+    id: 'c1', name: 'acme-observability', displayName: 'acme-observability', upstream: LD.upstream, authType: 'oauth',
+    headers: {}, secretNames: [], missingSecrets: [], brokerUrl: null, updatedAt: '2026-11-09T00:00:00Z', linkStatus: 'linked',
+  };
+  const page = (over: Record<string, unknown> = {}) => ({ available: true, storeAvailable: true, connectors: [], catalog: [], ...over });
+  const progress = () => [...document.querySelectorAll('.wel-progress-label')].map(l => l.textContent);
+  const rows = () => [...document.querySelectorAll('.wel-tool')].map(r => r.textContent);
+  async function open(list: unknown, search = '', flag = true) {
+    mocks.mcpList.mockResolvedValue(list);
+    mocks.search = search;
+    setFlagValues({ 'onboarding-mcp-step-enabled': flag });
+    await remount();
+  }
+  async function toMcp() {
+    await press(button('Continue'));
+    await press(button('Continue'));
+  }
+
+  it('comes between how you work and start, in the catalog\'s order, and Skip goes on to start', async () => {
+    await open(page({ catalog: [ACME, LD] }));
+    expect(progress()).toEqual(['GitHub', 'How you work', 'Tools', 'Start']);
+    await toMcp();
+    expect(heading()).toBe('Connect your tools');
+    expect(rows()[0]).toContain('mcp.acme.example');
+    expect(rows()[1]).toContain('acme-observability');
+    await press(button('Back'));
+    expect(heading()).toBe('How do you want to work?');
+    await press(button('Continue'));
+    await press(button('Skip'));
+    expect(heading()).toBe("You're ready");
+    await press(button('Back'));
+    expect(heading()).toBe('Connect your tools');
+  });
+
+  it('has three steps with the flag off, and does not load the list', async () => {
+    await open(page({ catalog: [LD] }), '?step=mcp&server=c1&linked=1', false);
+    expect(progress()).toEqual(['GitHub', 'How you work', 'Start']);
+    expect(heading()).toBe('Connect GitHub');
+    expect(mocks.mcpList).not.toHaveBeenCalled();
+    await toMcp();
+    expect(heading()).toBe("You're ready");
+  });
+
+  it('has three steps when the catalog offers nothing, or only an API provider', async () => {
+    await open(page({ catalog: [{ name: 'google', upstream: 'https://api.example', kind: 'api' }] }));
+    expect(progress()).toEqual(['GitHub', 'How you work', 'Start']);
+  });
+
+  it('has three steps when the list cannot be loaded', async () => {
+    mocks.search = '';
+    setFlagValues({ 'onboarding-mcp-step-enabled': true });
+    mocks.mcpList.mockRejectedValue(new Error('down'));
+    await remount();
+    expect(progress()).toEqual(['GitHub', 'How you work', 'Start']);
+  });
+
+  it('connects a server with the sign-in returning to the wizard', async () => {
+    const assign = vi.fn();
+    vi.stubGlobal('location', { ...window.location, assign });
+    try {
+      await open(page({ catalog: [LD] }));
+      await toMcp();
+      mocks.connectCatalog.mockResolvedValue({ id: 'c1', authorizeUrl: 'https://auth.obs.example/authorize', connector: { ...ldConnector, linkStatus: 'needs_link' } });
+      await press(button('Connect'));
+      expect(mocks.connectCatalog).toHaveBeenCalledWith('acme-observability', { chooseScopes: true, returnTo: 'welcome' });
+      expect(assign).toHaveBeenCalledWith('https://auth.obs.example/authorize');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('reopens on the step after a sign-in with the server connected, and Continue goes to start', async () => {
+    await open(page({ connectors: [ldConnector] }), '?step=mcp&server=c1&linked=1');
+    expect(heading()).toBe('Connect your tools');
+    expect(progress()).toEqual(['GitHub', 'How you work', 'Tools', 'Start']);
+    expect(document.body.textContent).toContain('acme-observability is connected.');
+    expect(rows()[0]).toContain('Connected');
+    await press(button('Continue'));
+    expect(heading()).toBe("You're ready");
+    await press(button('Start a session'));
+    expect(mocks.navigate).toHaveBeenCalledWith('/chat/new', { replace: true });
+  });
+
+  it('shows a failed sign-in with Retry, which signs in again', async () => {
+    const assign = vi.fn();
+    vi.stubGlobal('location', { ...window.location, assign });
+    try {
+      await open(page({ connectors: [{ ...ldConnector, linkStatus: 'needs_link' }] }), '?step=mcp&server=c1&error=The+server+did+not+grant+access');
+      expect(heading()).toBe('Connect your tools');
+      expect(document.body.textContent).toContain('The server did not grant access');
+      mocks.startOAuth.mockResolvedValue('https://auth.obs.example/again');
+      await press(button('Retry'));
+      expect(mocks.startOAuth).toHaveBeenCalledWith('c1', undefined, 'welcome');
+      expect(assign).toHaveBeenCalledWith('https://auth.obs.example/again');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('offers Skip, not Continue, when no connected server is a usable MCP server', async () => {
+    const staticMissing = { ...ldConnector, id: 'c2', name: 'acme', authType: 'static', linkStatus: undefined, secretNames: ['token'], missingSecrets: ['token'] };
+    const apiLinked = { ...ldConnector, id: 'c3', name: 'google', kind: 'api' };
+    await open(page({ catalog: [LD], connectors: [staticMissing, apiLinked] }));
+    await toMcp();
+    expect(heading()).toBe('Connect your tools');
+    expect(() => button('Continue')).toThrow();
+    await press(button('Skip'));
+    expect(heading()).toBe("You're ready");
+  });
+
+  it('shows a failed load with Retry on the return from a sign-in', async () => {
+    mocks.search = '?step=mcp&server=c1&linked=1';
+    setFlagValues({ 'onboarding-mcp-step-enabled': true });
+    mocks.mcpList.mockRejectedValueOnce(new Error('down'));
+    mocks.mcpList.mockResolvedValue(page({ connectors: [ldConnector] }));
+    await remount();
+    expect(heading()).toBe('Connect your tools');
+    expect(document.body.textContent).toContain("Couldn't load MCP servers.");
+    await press(button('Retry'));
+    expect(rows()[0]).toContain('Connected');
   });
 });

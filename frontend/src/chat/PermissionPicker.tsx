@@ -48,23 +48,49 @@ function LinkIcon() {
 }
 
 /**
+ * What FollowsPermissions says under chat-session-permissions-enabled: the
+ * setting the session gets (its checkout's), and that checkout with its
+ * project. A checkout is named like a box (`termag-22`), so the words never
+ * leave it as a bare name a person could read as the box.
+ */
+export function followsWords(w: { checkout: string; project: string | null; trusted: boolean; fetched: boolean }): { label: string; lead: string; sub: string } {
+  const project = w.project && w.project !== w.checkout ? w.project : null;
+  const who = project ? `${w.checkout}, your checkout of ${project},` : w.checkout;
+  const setting = w.trusted ? 'Full access' : 'Read only';
+  return {
+    label: `${setting} · from ${w.checkout}`,
+    lead: `${setting}, from ${w.checkout}`,
+    sub: w.trusted
+      ? `A worktree runs with its checkout's permissions: ${who} is trusted, so this session runs commands and edits files without asking.`
+      : w.fetched
+        ? `A worktree runs with its checkout's permissions, and ${who} isn't trusted. Freshly fetched code stays read only, even if ${w.checkout} is trusted later.`
+        : `A worktree runs with its checkout's permissions, and ${who} isn't trusted. Trust ${w.checkout} from the session to run commands.`,
+  };
+}
+
+/**
  * The pill in place of the picker for a worktree session (pages/chat/
  * CheckoutPicker.tsx): a workstream runs with its project's permissions, so
- * there is no choice to make here, only whose they are.
+ * there is no choice to make here, only whose they are. With `named`
+ * (chat-session-permissions-enabled) it names the setting and the checkout
+ * (followsWords) rather than "As <checkout>".
  */
-export function FollowsPermissions({ project, fetched = false }: {
+export function FollowsPermissions({ project, fetched = false, named }: {
   project: string;
   /** From a fresh fetch of a read-only project: read only for good, whatever the project later gets. */
   fetched?: boolean;
+  /** The checkout's trust and the project it is a checkout of, for words that name the setting. */
+  named?: { trusted: boolean; of: string | null };
 }) {
-  const sub = fetched
+  const words = named ? followsWords({ checkout: project, project: named.of, trusted: named.trusted, fetched }) : null;
+  const sub = words ? words.sub : fetched
     ? `Read only, as ${project} is. A worktree of freshly fetched code stays read only, even if ${project} is trusted later.`
     : `A worktree runs with its project's permissions. Trust ${project} or keep it read only from its session.`;
   return (
-    <Tooltip content={<><strong>{project}'s permissions</strong><span className="ui-tooltip-sub">{sub}</span></>}>
-      <span className="chat-compose-model-btn chat-permission-btn" data-choice="follows" tabIndex={0} aria-label={`Permissions: ${project}'s`}>
+    <Tooltip content={<><strong>{words ? words.lead : `${project}'s permissions`}</strong><span className="ui-tooltip-sub">{sub}</span></>}>
+      <span className="chat-compose-model-btn chat-permission-btn" data-choice="follows" tabIndex={0} aria-label={`Permissions: ${words ? words.label : `${project}'s`}`}>
         <LinkIcon />
-        <span>As {project}</span>
+        <span className="chat-compose-pill-label">{words ? words.label : `As ${project}`}</span>
       </span>
     </Tooltip>
   );
@@ -111,7 +137,7 @@ export function PermissionPicker({ value, onChange, open, onOpenChange, schedule
         onClick={() => { if (!disabled) onOpenChange(!open); }}
       >
         {value === 'full' ? <BoltIcon /> : <LockIcon />}
-        <span>{LABEL[value]}</span>
+        <span className="chat-compose-pill-label">{LABEL[value]}</span>
       </button>
       </Tooltip>
       {open && (

@@ -81,6 +81,8 @@ import { chatHref } from '../chat/simpleChat';
 import type { NewProjectMode } from './NewProjectForm';
 import { WhatsNewLabLink } from '../whatsNew/WhatsNewLinks';
 import { useEnvironmentSelection } from '../hooks/useEnvironments';
+import { recordUiMode } from '../chat/uiMode';
+import { ChatNudge } from '../chatNudge/ChatNudge';
 
 /** How often a box row's countdown to an automatic park redraws. */
 const COUNTDOWN_TICK_MS = 30_000;
@@ -128,6 +130,8 @@ export function ProjectControl() {
   const palette = usePalette();
   const { user, updateDefaultAgentProvider } = useAuth();
   const navigate = useNavigate();
+  // Lab's switch to the chat, which ChatNudge spotlights once its toast is dismissed.
+  const chatSwitchRef = useRef<HTMLButtonElement>(null);
   const environmentsOn = useEnvironmentSelection();
   const [searchParams, setSearchParams] = useSearchParams();
   const {
@@ -1179,17 +1183,29 @@ export function ProjectControl() {
         + 'recreated when you start it again. A stopped box costs only its disk.',
       confirmLabel: 'Stop box',
       tone: 'primary',
-      onConfirm: async () => {
-        try {
-          await instancesApi.stop(box.id);
-          setBoxError('');
-        } catch (err: unknown) {
-          const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-          setBoxError(msg || 'Failed to stop box');
-        }
-        await reloadBoxes();
-      },
+      onConfirm: () => doStop(box, false),
     });
+  }
+
+  async function doStop(box: Instance, force: boolean) {
+    try {
+      await instancesApi.stop(box.id, force);
+      setBoxError('');
+    } catch (err: unknown) {
+      const data = (err as { response?: { data?: { error?: string; code?: string; forceable?: boolean } } })?.response?.data;
+      // Claude Code cloud sessions run on it: a second question, since the stop ends them.
+      if (!force && data?.code === 'box_busy' && data.forceable) {
+        setConfirmState({
+          message: data.error ?? `Box "${box.name}" is running Claude Code cloud sessions, and stopping it ends them.`,
+          confirmLabel: 'Stop anyway',
+          tone: 'danger',
+          onConfirm: () => doStop(box, true),
+        });
+        return;
+      }
+      setBoxError(data?.error || 'Failed to stop box');
+    }
+    await reloadBoxes();
   }
 
   async function dismissRepoPrompt(box: Instance) {
@@ -1665,7 +1681,9 @@ export function ProjectControl() {
                 title="Phone view"
                 aria-label="Phone view"
               >📱</button>
-              <button className="btn-ghost" onClick={() => navigate('/chat')} title="Open in termag" aria-label="Open in termag">💬</button>
+              {/* A switch: the chat is where termag opens from now on (chat/uiMode.ts). */}
+              <button ref={chatSwitchRef} className="btn-ghost" onClick={() => { recordUiMode('simple'); navigate('/chat'); }} title="Open in termag" aria-label="Open in termag">💬</button>
+              <ChatNudge anchor={chatSwitchRef} />
               <button className="btn-ghost" onClick={() => navigate('/settings')} title="Settings" aria-label="Settings">⚙</button>
             </span>
           </div>

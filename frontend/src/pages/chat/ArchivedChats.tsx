@@ -5,13 +5,22 @@
 // box stays. The confirm says which of those will happen. Under the chrome
 // refresh the list is drawn as the refresh's sidebar is (ArchivedRows.tsx);
 // with it off, as below. A load that fails on the orchestrator's side (a
-// deploy rolling it) is asked again, so the list doesn't stay hidden.
+// deploy rolling it) is asked again, so the list doesn't stay hidden. Under
+// user-projects-enabled and the refresh, the person's archived projects head
+// the list, each with Unarchive.
+// In the sidebar redesign (`dock`) it's one of
+// the bottom row's sections: it loads as ever and reports its count for the
+// row's button, and draws its list, under ProjectsList's head, only while open:
+// session cards (ArchivedRows.tsx), with the person's archived sessions
+// ProjectsList hands it.
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { useMatch, useNavigate } from 'react-router-dom';
 import { useProjects } from '../../contexts/ProjectContext';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
-import { chatsApi, type ArchivedChat } from '../../services/api';
+import { chatsApi, userProjectsApi, type ArchivedChat } from '../../services/api';
+import { FLAGS, useFlag } from '../../flags';
+import { useSimpleDataIfAny } from './simpleData';
 import { boxFeed } from '../../services/boxFeed';
 import { announceChatsChanged, applyRunningBoxes, archiveSettling, archivedBoxLabel, archivedLoadRetries, archivedRetryDelayMs, canReopen, reopenTitle, CHATS_CHANGED_EVENT, chatsAfterPermanentDelete, clearRunningBox, deleteLeavesOpenChat, offerRunningBox, permanentDeleteDetail, reopenCatchUp, reopenOpensChat, runningBoxSnapshot, settleRunningBoxes, subscribeRunningBoxes } from '../../chat/archive';
 import { chatHref, repoSlug } from '../../chat/simpleChat';
@@ -24,7 +33,16 @@ function apiError(err: unknown, fallback: string): string {
   return (err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? fallback;
 }
 
-export function ArchivedChats() {
+export interface ArchivedDock {
+  /** Its section is open, from the bottom row's button. */
+  open: boolean;
+  /** How many archived chats and projects there are, for the button (ProjectsList adds its archived sessions). */
+  onCount: (n: number) => void;
+  /** The person's archived sessions, as ProjectsList draws their cards. */
+  sessions?: React.ReactNode[];
+}
+
+export function ArchivedChats({ dock }: { dock?: ArchivedDock } = {}) {
   const { refresh } = useChatChrome();
   const navigate = useNavigate();
   // The sidebar sits beside the conversation route, so this match is the
@@ -43,6 +61,27 @@ export function ArchivedChats() {
   const [notice, setNotice] = useState('');
   const recoveries = useSyncExternalStore(subscribeRunningBoxes, runningBoxSnapshot);
   const pendingFlight = useRef(false);
+  // The person's archived projects (simpleData.tsx reads them), under the flag and the refresh.
+  const projectsOn = useFlag(FLAGS.userProjects, false);
+  const userProjects = useSimpleDataIfAny()?.userProjects;
+  const archivedProjects = projectsOn && refresh
+    ? (userProjects?.list ?? []).filter(p => p.archived).map(p => ({ id: p.id, name: p.name, repos: p.repos?.map(r => r.repoKey) ?? [] }))
+    : [];
+  // The bottom row's Archived draws cards, with the archived sessions ProjectsList hands it.
+  const cards = Boolean(dock) && refresh;
+  const sessions = cards ? dock?.sessions ?? [] : [];
+  const [unarchiving, setUnarchiving] = useState<string | null>(null);
+  const unarchive = async (project: { id: string; name: string }) => {
+    setUnarchiving(project.id); setError('');
+    try {
+      await userProjectsApi.update(project.id, { archived: false });
+      await userProjects?.reload();
+    } catch (err) {
+      setError(apiError(err, `Could not unarchive ${project.name}`));
+    } finally {
+      setUnarchiving(null);
+    }
+  };
 
   // A GET that started before a delete must not put the deleted chat, or its
   // old otherProjects, back over the recount below.
@@ -176,11 +215,35 @@ export function ArchivedChats() {
     }
   };
 
+  // The bottom row's count: the archived chats and projects as the section draws them, each once it's read (the
+  // archived sessions ProjectsList adds itself), so the count and the list agree whatever has loaded or failed.
+  const projectsRead = !(projectsOn && refresh && userProjects && !userProjects.settled);
+  const total = (chats?.length ?? 0) + (projectsRead ? archivedProjects.length : 0);
+  const reportCount = dock?.onCount;
+  useEffect(() => { reportCount?.(total); }, [reportCount, total]);
+
+  // Hidden until the archived sessions are read, as before, and under the flag until the projects are
+  // too: either alone would undercount the fold, and the other would pop in after. The bottom row's
+  // section (cards) draws whatever it knows instead, as its count does: the archived sessions
+  // ProjectsList hands it, and the archived chats and projects each once read, so a read that fails
+  // doesn't hide the other.
+  if (dock && !dock.open) return null;
+  const projectsPending = projectsOn && refresh && userProjects && !userProjects.settled;
+  const shownProjects = projectsPending ? [] : archivedProjects;
+  if (cards ? !chats && sessions.length === 0 && shownProjects.length === 0 : !chats || projectsPending) return null;
+  if (refresh && (shownProjects.length > 0 || sessions.length > 0) && (chats ?? []).length === 0) {
+    return (
+      <ArchivedSection chats={[]} open={open} bare={Boolean(dock)} cards={cards} sessions={sessions} onOpenChange={setOpen} activeId={openId} busy={busy} pendingId={pendingId}
+        recoveries={recoveries} notice={notice} error={error} onReopen={() => {}} onBoxRunning={() => {}} onDelete={() => {}}
+        projects={shownProjects} unarchiving={unarchiving} onUnarchive={p => { void unarchive(p); }} />
+    );
+  }
   if (!chats || chats.length === 0) return null;
   if (refresh) {
     return (
       <>
-        <ArchivedSection chats={chats} open={open} onOpenChange={setOpen} activeId={openId} busy={busy} pendingId={pendingId}
+        <ArchivedSection chats={chats} open={open} bare={Boolean(dock)} cards={cards} sessions={sessions} onOpenChange={setOpen} activeId={openId} busy={busy} pendingId={pendingId}
+          projects={archivedProjects} unarchiving={unarchiving} onUnarchive={p => { void unarchive(p); }}
           recoveries={recoveries} notice={notice} error={error}
           onReopen={c => { void reopen(c); }}
           onBoxRunning={c => navigate(chatHref(c.id, 'main'))}

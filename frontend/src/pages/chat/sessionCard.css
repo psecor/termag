@@ -1,0 +1,339 @@
+/* The Projects view's session cards (SessionCard.tsx, ProjectGlyph.tsx, ModelMark.tsx), drawn
+   under user-projects-enabled and the chrome refresh. Every rule here
+   names a class only the cards use, or the sidebar's [data-sidebar-ux], so the sidebar without the
+   flag is unchanged. Colours are termag's theme variables. */
+
+/* The sidebar's own background: the window's when docked, the panel's as a drawer or a
+   page. A stuck head, the bottom row and the fades are this colour exactly, in every theme, so nothing shows through. */
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] { --sb-bg: var(--bg-surface); }
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-sidebar[data-sidebar-ux] { --sb-bg: var(--chrome-window, var(--bg-base)); }
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] {
+  --sc-hover-solid: color-mix(in srgb, var(--text-primary) 6%, var(--sb-bg));
+  --sc-open-solid: color-mix(in srgb, var(--text-primary) 10%, var(--sb-bg));
+  --sb-fade: 16px;
+  --pg-bg: var(--sb-bg);
+}
+
+.chat-root[data-chrome='refresh'] {
+  /* Titles are quieter than the text around them, and brighten on hover, when open and when unseen. */
+  --sc-title: color-mix(in srgb, var(--text-primary) 80%, var(--text-secondary));
+  --sc-idle: #5cc48f;
+  --sc-hover-solid: color-mix(in srgb, var(--text-primary) 6%, var(--chrome-window, var(--bg-base)));
+  --sc-open-solid: color-mix(in srgb, var(--text-primary) 10%, var(--chrome-window, var(--bg-base)));
+}
+html[data-palette='light'] .chat-root[data-chrome='refresh'] { --sc-idle: #12804c; }
+
+/* New session keeps its fill, with no border. */
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .chat-new-row { box-shadow: none; }
+
+/* Project icon: one fixed square */
+.pg { position: relative; width: var(--pg-size); height: var(--pg-size); flex: none; display: block; }
+.pg-letter { position: absolute; inset: 0; border-radius: 26%; display: grid; place-items: center; overflow: hidden;
+  background: hsl(var(--pg-hue) 52% 44%); color: #fff; font: 700 calc(var(--pg-size) * 0.6) / 1 var(--font-ui); }
+.pg-split { position: absolute; inset: 0; border-radius: 26%; overflow: hidden; }
+.pg-split .pg-letter { border-radius: 0; display: block; font-size: calc(var(--pg-size) * 0.46); }
+.pg-split .pg-letter > span { position: absolute; line-height: 1; transform: translate(-50%, -50%); }
+/* Each letter sits on its own triangle's centroid, clear of the diagonal. On a card the model's
+   mark covers the second one's corner, so there the second repository is its colour alone. */
+.pg-letter[data-half='a'] { clip-path: polygon(0 0, 100% 0, 0 100%); }
+.pg-letter[data-half='a'] > span { left: 34%; top: 36%; }
+.pg-letter[data-half='b'] { clip-path: polygon(100% 0, 100% 100%, 0 100%); }
+.pg-letter[data-half='b'] > span { left: 67%; top: 69%; }
+.pg[data-badged] .pg-letter[data-half='b'] > span { visibility: hidden; }
+/* The diagonal and the mark's ring are the colour behind the icon (--pg-bg: the card's or the head's fill). */
+.pg-split::after { content: ''; position: absolute; inset: 0;
+  background: linear-gradient(to top left, transparent calc(50% - 0.8px), var(--pg-bg, var(--chrome-window, var(--bg-base))) calc(50% - 0.8px),
+    var(--pg-bg, var(--chrome-window, var(--bg-base))) calc(50% + 0.8px), transparent calc(50% + 0.8px)); }
+.pg-scratch { position: absolute; inset: 0; border-radius: 26%; border: 1.5px dashed var(--text-muted); }
+.pg-badge { position: absolute; right: -4px; bottom: -4px; width: 10px; height: 10px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--pg-bg, var(--chrome-window, var(--bg-base))); box-shadow: 0 0 0 1.5px var(--pg-bg, var(--chrome-window, var(--bg-base))); }
+.sc-mark, .sc-mark svg { display: block; width: 8px; height: 8px; }
+
+/* Card */
+.chat-root[data-chrome='refresh'] .sc-li { list-style: none; position: relative; }
+/* Six pixels between cards. A nested card starts where its parent's title does: the 15 px icon and its 8 px gap. */
+.chat-root[data-chrome='refresh'] .sc-wrap { position: relative; margin: 3px 0 3px calc(var(--sc-depth, 0) * 23px); }
+.chat-root[data-chrome='refresh'] .sc { display: flex; flex-direction: column; justify-content: center; gap: 4px; min-height: 34px; padding: 0 8px;
+  border-radius: 8px; color: inherit; text-decoration: none; font-family: var(--font-ui); font-size: 13px; line-height: 18px; }
+.chat-root[data-chrome='refresh'] .sc[data-density='standard'] { min-height: 52px; padding-top: 8px; padding-bottom: 8px; }
+.chat-root[data-chrome='refresh'] .sc:hover { background: var(--chrome-row-hover); --pg-bg: var(--sc-hover-solid); }
+/* The open card is a fill, never a border. Keyboard focus (Tab, or the list's j and k: useListKeys.ts) is the hover's
+   fill, never an outline, so the open card still stands out from the one the keys are on. */
+.chat-root[data-chrome='refresh'] .sc[aria-current='page'] { outline: none; background: var(--chrome-row-active); --pg-bg: var(--sc-open-solid); }
+.chat-root[data-chrome='refresh'] .sc:focus-visible:not([aria-current='page']) { outline: none; background: var(--chrome-row-hover); --pg-bg: var(--sc-hover-solid); }
+.chat-root[data-chrome='refresh'] .sc[aria-current='page']:focus-visible { outline: none; }
+.chat-root[data-chrome='refresh'] .sc-l1 { display: flex; align-items: center; gap: 8px; min-width: 0; height: 18px; }
+.chat-root[data-chrome='refresh'] .sc-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--sc-title); }
+.chat-root[data-chrome='refresh'] .sc:is(:hover, :focus-visible, [aria-current='page'], [data-unseen]) .sc-title { color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .sc[data-unseen] .sc-title { font-weight: 600; }
+.chat-root[data-chrome='refresh'] .sc[data-state='off']:not(:hover, [aria-current='page']) .sc-title { color: var(--text-secondary); }
+
+/* Status chip: the mark and the time in this status, on one line. Both sit in the
+   chip's 18 px box, centred: the mark's 10 px box, and the time trimmed to its cap height (text-box), so the mark is
+   centred on the digits, not on the line box. Without text-box the time's box is its 1em line, whose middle is
+   Inter's cap middle too. Tabular figures, so the time doesn't wobble as it counts. */
+.chat-root[data-chrome='refresh'] .sc-chip { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 18px; font-size: 11.5px;
+  color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.chat-root[data-chrome='refresh'] .sc-chip-mark { flex: none; width: 10px; height: 10px; display: grid; place-items: center; }
+.chat-root[data-chrome='refresh'] .sc-chip-time { display: block; line-height: 1; text-box: trim-both cap alphabetic; font-variant-numeric: tabular-nums; }
+.chat-root[data-chrome='refresh'] .sc-chip[data-kind='working'] { color: var(--accent); }
+.chat-root[data-chrome='refresh'] .sc-chip[data-kind='needs'] { color: var(--warning); }
+.chat-root[data-chrome='refresh'] .sc-chip[data-kind='error'] { color: var(--danger); }
+.chat-root[data-chrome='refresh'] .sc-chip[data-unseen] { color: var(--accent); }
+/* LaunchPad's small spinner draws a 16 px svg from its box's corner, 3 px low and right of a 10 px box: fill the box. */
+.chat-root[data-chrome='refresh'] .sc-chip [role='progressbar'] { --fill-color: var(--accent); display: block; width: 10px; height: 10px; }
+.chat-root[data-chrome='refresh'] .sc-chip [role='progressbar'] svg { display: block; width: 100%; height: 100%; }
+.chat-root[data-chrome='refresh'] .sc-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.chat-root[data-chrome='refresh'] .sc-chip[data-kind='needs'] .sc-dot { animation: sc-pulse 1.6s ease-in-out infinite; }
+.chat-root[data-chrome='refresh'] .sc-ring { width: 7px; height: 7px; border-radius: 50%; box-shadow: inset 0 0 0 1.5px currentColor; }
+.chat-root[data-chrome='refresh'] .sc-tick { width: 10px; height: 10px; fill: none; stroke: color-mix(in srgb, var(--sc-idle) 75%, var(--text-muted));
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+@keyframes sc-pulse { 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) { .chat-root[data-chrome='refresh'] .sc-chip[data-kind='needs'] .sc-dot { animation: none; } }
+
+/* Standard's second line, flush under the icon: the branch (code, so mono), the PR, the box */
+.chat-root[data-chrome='refresh'] .sc-l2 { display: flex; align-items: center; gap: 6px; min-width: 0; height: 16px; color: var(--text-muted); font-size: 12px; }
+.chat-root[data-chrome='refresh'] .sc-branch-icon { width: 12px; height: 12px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; }
+.chat-root[data-chrome='refresh'] .sc-branch { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-family: var(--font-mono); font-size: 11.5px; }
+.chat-root[data-chrome='refresh'] .sc-pr { flex: none; font-size: 11px; line-height: 16px; padding: 0 5px; border-radius: 4px; background: var(--bg-surface);
+  color: color-mix(in srgb, var(--success) 70%, var(--text-primary)); }
+.chat-root[data-chrome='refresh'] .sc-box { flex: none; width: 18px; height: 16px; display: grid; place-items: center; border-radius: 4px; }
+.chat-root[data-chrome='refresh'] .sc-box svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.4; }
+.chat-root[data-chrome='refresh'] .sc-box:hover { color: var(--text-primary); background: var(--chrome-row-hover); }
+
+/* Controls float over the right end; they take no width, and the chip keeps its place under them. */
+.chat-root[data-chrome='refresh'] .sc-over { position: absolute; right: 5px; top: 5px; height: 24px; display: none; align-items: center; gap: 1px;
+  padding-left: 18px; border-radius: 6px; background: linear-gradient(to right, transparent, var(--sc-hover-solid) 16px); }
+.chat-root[data-chrome='refresh'] .sc-wrap:has(.sc[aria-current='page']) .sc-over { background: linear-gradient(to right, transparent, var(--sc-open-solid) 16px); }
+.chat-root[data-chrome='refresh'] .sc-wrap:is(:hover, :focus-within) .sc-over,
+.chat-root[data-chrome='refresh'] .sc-over:has([aria-haspopup][aria-expanded='true']) { display: flex; }
+.chat-root[data-chrome='refresh'] .sc-wrap:is(:hover, :focus-within) .sc-chip,
+.chat-root[data-chrome='refresh'] .sc-wrap:has(.sc-over [aria-haspopup][aria-expanded='true']) .sc-chip { visibility: hidden; }
+.chat-root[data-chrome='refresh'] .sc-over :is(button, [role='button']) { width: 22px; height: 22px; min-width: 22px; padding: 0; border-radius: 5px; }
+.chat-root[data-chrome='refresh'] .sc-over .item-menu-btn { position: static; opacity: 1; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .sc-over .item-menu-btn:is(:hover, [aria-expanded='true']) { background: var(--chrome-row-active); color: var(--text-primary); }
+@media (hover: none) {
+  .chat-root[data-chrome='refresh'] .sc-over { display: none; }
+  .chat-root[data-chrome='refresh'] .sc-wrap .sc-chip { visibility: visible; }
+}
+/* A touchscreen holds a card for its menu (useLongPress), so the press must not select text or pop up
+   iOS's link preview, and a card is a full finger's height, as the tabs' rows are (chat.css). */
+@media (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .sc { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+  .chat-root[data-chrome='refresh'] .sc[data-density='compact'] { min-height: 44px; }
+}
+
+/* Heads (ProjectsList.tsx cardHead): the icon, the name, the count on its baseline with no bubble; 32 px.
+   Each sticks to the very top of the list while its section scrolls under it, and only within its own section, so
+   the next head pushes it up and out pixel for pixel. A sticky head is held inside its section's content box, so
+   the 18 px between sections is a block at the end of that box (::after), not a margin or padding, and the head
+   has no margin of its own: the head can stay stuck until its section's very end, which is the next head's top. */
+/* Sticky heads stick inside the list's padding, so the list has none at its top (a stuck head would leave rows showing
+   above it). The space before the first section is the list's own margin, outside the scroller, so the first head
+   rests exactly where every head sticks: nothing in the list sits above it, and it never moves up to stick. (A
+   margin on the first section put its head 6 px below the stuck spot, so the first scroll moved it up 6 px.) */
+/* It never scrolls sideways: a narrow sidebar truncates its titles rather than show a scrollbar for a pixel. */
+/* It's a column, so the bottom row's auto margin keeps it flush at the bottom of the sidebar with a short or empty
+   list; a long one scrolls and the row stays stuck there. Nothing in it shrinks to fit. */
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .chat-projects { display: flex; flex-direction: column; margin-top: 6px;
+  padding-top: 0; overflow-x: hidden; }
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .chat-projects > * { flex: none; }
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .chat-projects > .chat-group { margin: 0; padding: 0; }
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .chat-projects > .chat-group::after { content: ''; display: block; height: 18px; }
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .chat-projects > .chat-group > .chat-group-list { margin: 2px 0 0; }
+/* The head's box is square and opaque, the sidebar's colour, so nothing peeks past a corner while it's stuck; its
+   hover and focus are a rounded fill inside it. */
+.chat-root[data-chrome='refresh'] .pj-head { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; height: 32px; margin: 0;
+  border-radius: 0; background: var(--sb-bg, var(--chrome-window, var(--bg-base))); --pg-bg: var(--sb-bg, var(--chrome-window, var(--bg-base))); }
+.chat-root[data-chrome='refresh'] .pj-head::before { content: ''; position: absolute; inset: 0; z-index: -1; border-radius: 7px; pointer-events: none; }
+.chat-root[data-chrome='refresh'] .pj-head:is(:hover, :focus-within)::before { background: var(--sc-hover-solid); }
+.chat-root[data-chrome='refresh'] .pj-head:is(:hover, :focus-within) { --pg-bg: var(--sc-hover-solid); }
+/* The top fade starts at the stuck head's bottom edge, so rows fade in under it, never over it; the next head
+   (later, the same layer) covers it during a handover. Never in the way of a click or a hover. */
+.chat-root[data-chrome='refresh'] .chat-projects[data-more-above] .pj-head[data-stuck]::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 100%; height: var(--sb-fade); pointer-events: none;
+  background: linear-gradient(to bottom, var(--sb-bg), color-mix(in srgb, var(--sb-bg) 0%, transparent)); }
+/* The fold also carries the old Projects view's .chat-projects-fold (the rail and a head's focus find it by that), and
+   chrome.css styles that class later at the same weight: secondary text, a 2 px focus ring. Under .pj-head these win,
+   so a head's name is strong (titles are the quiet ones) and its keyboard focus is the head's fill, never a ring. */
+.chat-root[data-chrome='refresh'] .pj-head .pj-fold { flex: 1; min-width: 0; height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 6px;
+  justify-content: flex-start; background: none; border: 0; box-shadow: none; color: var(--text-primary); font-family: var(--font-ui); }
+.chat-root[data-chrome='refresh'] .pj-fold:is(:hover, [data-hovered], [data-pressed]) { background: none; }
+.chat-root[data-chrome='refresh'] .pj-head .pj-fold:is(:focus-visible, [data-focus-visible]) { outline: none; }
+.chat-root[data-chrome='refresh'] .pj-icon { width: 20px; height: 20px; flex: none; display: grid; place-items: center; color: var(--text-secondary); }
+/* LaunchPad's icons fill with its own primary text colour; a head's takes the head's. */
+.chat-root[data-chrome='refresh'] .pj-head :is(.pj-icon, .pj-lone, .pj-folded-mark, .pj-chev) [data-icon],
+.chat-root[data-chrome='refresh'] .pj-head svg.pj-chev { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .pj-lbl { display: flex; align-items: baseline; gap: 6px; min-width: 0; line-height: 18px; }
+.chat-root[data-chrome='refresh'] .pj-name { font: 600 13px/18px var(--font-ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.chat-root[data-chrome='refresh'] .pj-count { flex: none; font: 500 12px/18px var(--font-ui); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.chat-root[data-chrome='refresh'] .pj-head[data-empty] .pj-name { color: var(--text-secondary); }
+/* By status (and Needs you, always): the head takes its status's colour. */
+.chat-root[data-chrome='refresh'] .pj-head[data-tone='needs'] :is(.pj-name, .pj-icon) { color: var(--warning); }
+.chat-root[data-chrome='refresh'] .pj-head[data-tone='working'] :is(.pj-name, .pj-icon) { color: var(--accent); }
+.chat-root[data-chrome='refresh'] .pj-head[data-tone='idle'] :is(.pj-name, .pj-icon) { color: var(--sc-idle); }
+.chat-root[data-chrome='refresh'] .pj-head[data-tone='off'] :is(.pj-name, .pj-icon) { color: var(--text-muted); }
+.chat-root[data-chrome='refresh'] .pj-head[data-tone='quiet'] .pj-name { color: var(--text-secondary); font-weight: 500; }
+/* The head's controls: +, the project menu, the PR count and the chevron, over its right end on hover or focus. */
+.chat-root[data-chrome='refresh'] .pj-over { position: absolute; right: 2px; top: 0; bottom: 0; display: none; align-items: center; gap: 1px; padding-left: 18px;
+  border-radius: 0 7px 7px 0; background: linear-gradient(to right, transparent, var(--sc-hover-solid) 16px); color: var(--text-muted); pointer-events: none; }
+/* Only the controls take a click; the rest of the overlay, the chevron included, lets it through to the head's fold. */
+.chat-root[data-chrome='refresh'] .pj-over > :not(.pj-chev) { pointer-events: auto; }
+.chat-root[data-chrome='refresh'] .pj-head:is(:hover, :focus-within) .pj-over,
+.chat-root[data-chrome='refresh'] .pj-over:has([aria-haspopup][aria-expanded='true']) { display: flex; }
+.chat-root[data-chrome='refresh'] .pj-over :is(button, [role='button']):not(.chat-group-prs) { width: 24px; height: 24px; min-width: 24px; padding: 0; border-radius: 6px; }
+.chat-root[data-chrome='refresh'] .chat-items .pj-over .chat-project-menu { position: static; opacity: 1; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .pj-over .chat-group-prs { height: 24px; padding: 0 6px; font-size: 12px; }
+.chat-root[data-chrome='refresh'] .pj-chev { width: 20px; height: 20px; margin-right: 2px; color: var(--text-muted); transition: transform 0.12s ease; }
+.chat-root[data-chrome='refresh'] .chat-group[data-folded] .pj-chev { transform: rotate(-90deg); }
+/* A folded group keeps its chevron in sight; an empty project keeps its +. Both sit over the head's end, let a
+   click through to its fold (or its New session), and hide under the controls. The name stops short of them. */
+.chat-root[data-chrome='refresh'] .pj-folded-mark, .chat-root[data-chrome='refresh'] .pj-lone {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%); display: grid; place-items: center; color: var(--text-muted);
+  pointer-events: none; }
+.chat-root[data-chrome='refresh'] :is(.pj-head[data-empty], .chat-group[data-folded] .pj-head) .pj-fold { padding-right: 32px; }
+.chat-root[data-chrome='refresh'] .pj-head:is(:hover, :focus-within) :is(.pj-folded-mark, .pj-lone) { visibility: hidden; }
+@media (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .pj-head { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+}
+/* No hover on a touchscreen: the controls always show, with the chevron for the fold, and the resting marks go. */
+@media (hover: none) {
+  .chat-root[data-chrome='refresh'] .pj-over { display: flex; background: none; }
+  .chat-root[data-chrome='refresh'] :is(.pj-lone, .pj-folded-mark) { display: none; }
+}
+
+/* The bottom row (ProjectsList.tsx): Shared with me, Automations, Older and Archived as LaunchPad toggle buttons, each
+   with its count, sticky at the bottom of the list; a pressed one's section is open at the list's end. Its auto top
+   margin (the list is a column) holds it flush at the bottom of the sidebar however few sessions there are. */
+.chat-root[data-chrome='refresh'] .sb-dock { list-style: none; position: sticky; bottom: 0; z-index: 3; display: flex; gap: 4px; margin: 0;
+  margin-top: auto; padding: 6px 0 8px; border-top: 1px solid color-mix(in srgb, var(--text-primary) 6%, transparent);
+  background: var(--sb-bg, var(--chrome-window, var(--bg-base))); }
+/* With no bottom row, the list's end carries the bottom fade alone. */
+.chat-root[data-chrome='refresh'] .sb-end { list-style: none; position: sticky; bottom: 0; z-index: 3; height: 0; margin: 0; margin-top: auto; padding: 0; }
+.chat-root[data-chrome='refresh'] .chat-projects[data-more-below] :is(.sb-dock, .sb-end)::before {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 100%; height: var(--sb-fade); pointer-events: none;
+  background: linear-gradient(to top, var(--sb-bg), color-mix(in srgb, var(--sb-bg) 0%, transparent)); }
+.chat-root[data-chrome='refresh'] .sb-dock-btn { height: 28px; padding: 0 8px; gap: 5px; border-radius: 7px; font: 12px var(--font-ui);
+  font-variant-numeric: tabular-nums; color: var(--text-secondary); background: none; border: 0; box-shadow: none; }
+.chat-root[data-chrome='refresh'] .sb-dock-btn:is([data-hovered], :hover) { background: var(--chrome-row-hover); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .sb-dock-btn[data-selected] { background: var(--chrome-row-active); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .sb-dock-btn [data-icon] { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .sb-archived { list-style: none; }
+.chat-root[data-chrome='refresh'] .sb-archived:empty { display: none; }
+/* Archived's list under its redesign head, without the section's own (ArchivedRows.tsx `bare`). */
+.chat-root[data-chrome='refresh'] .sb-archived .chat-archived-group[data-bare] { margin: 0; padding: 0; border: 0; max-height: none; overflow: visible; }
+.chat-root[data-chrome='refresh'] .pj-pin { color: inherit; }
+/* The list ends at the bottom row, so nothing scrolls into a gap under it. */
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .chat-projects { padding-bottom: 0; }
+
+/* An archived card (ArchivedRows.tsx) is a LaunchPad Button, since a press opens its menu, not a conversation: its own
+   box is undone so it reads exactly as the session cards around it. */
+.chat-root[data-chrome='refresh'] .sc.sc-button { width: 100%; height: auto; margin: 0; border: 0; box-shadow: none; align-items: stretch;
+  text-align: left; font-weight: 400; color: inherit; background: transparent; cursor: pointer; }
+.chat-root[data-chrome='refresh'] .sc.sc-button:is(:hover, [data-hovered], [data-pressed], [aria-expanded='true']) { background: var(--chrome-row-hover); --pg-bg: var(--sc-hover-solid); }
+.chat-root[data-chrome='refresh'] .sc.sc-button[data-focus-visible] { outline: none; background: var(--chrome-row-active); --pg-bg: var(--sc-open-solid); }
+.chat-root[data-chrome='refresh'] .sc.sc-button .sc-l1 { width: 100%; }
+
+/* Pointing at the card's floating controls keeps the card's own hover: they're a sibling of the card, not inside it. */
+.chat-root[data-chrome='refresh'] .sc-wrap:has(> .sc-over:hover) > .sc:not([aria-current='page'], :focus-visible) {
+  background: var(--chrome-row-hover); --pg-bg: var(--sc-hover-solid); }
+.chat-root[data-chrome='refresh'] .sc-wrap:has(> .sc-over:hover) > .sc .sc-title { color: var(--text-primary); }
+
+/* The card's Pin: LaunchPad's Button around termag's pin (LaunchPad has none), quiet as the other controls. */
+.chat-root[data-chrome='refresh'] .sc-over .sc-pin { color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .sc-over .sc-pin:is(:hover, [data-hovered]) { background: var(--chrome-row-active); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .sc-over .sc-pin .pj-pin { width: 15px; height: 15px; }
+/* A pinned card's Pin (it unpins) is in the accent, as a pressed toggle. */
+.chat-root[data-chrome='refresh'] .sc-over .sc-pin[aria-pressed='true'] { color: var(--accent); }
+
+/* Archive's Undo toast (useCardActions.tsx): LaunchPad's snackbar over the sidebar's bottom left, above its bottom row,
+   instead of the page's bottom centre, where it would sit on the composer. The region is portalled to the body, so
+   these are doubled up to outrank LaunchPad's own region classes rather than scoped under .chat-root. */
+.sb-toast-region.sb-toast-region { left: 12px; right: auto; bottom: 112px; align-items: flex-start; font-family: var(--font-ui); }
+.sb-toast.sb-toast { width: min(320px, calc(100vw - 24px)); }
+.sb-toast .sb-toast-actions { margin-top: var(--lp-spacing-200); }
+
+/* The sidebar collapsed to its rail (SidebarRail.tsx): 52 px, one column of 34 px buttons, centred. */
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux][data-collapsed] { min-width: 52px; max-width: 52px; }
+/* The sidebar stays mounted under the rail (its list keeps its state); only the rail shows. */
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux][data-collapsed] > :not(.sb-rail) { display: none; }
+.chat-root[data-chrome='refresh'] .sb-rail { display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; min-height: 0;
+  box-sizing: border-box; padding: calc(7px + env(safe-area-inset-top, 0px)) 0 10px; overflow-y: auto; scrollbar-width: none; font-family: var(--font-ui); }
+.chat-root[data-chrome='refresh'] .sb-rail-projects { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.chat-root[data-chrome='refresh'] .sb-rail-btn { position: relative; flex: none; width: 34px; height: 34px; min-width: 34px; padding: 0; border: 0;
+  border-radius: 9px; display: grid; place-items: center; color: var(--text-secondary); background: transparent; }
+.chat-root[data-chrome='refresh'] .sb-rail-btn:is(:hover, [data-hovered]) { background: var(--chrome-row-hover); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .sb-rail-btn[data-focus-visible] { outline: none; background: var(--chrome-row-hover); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .sb-rail-btn .pg { --pg-bg: var(--chrome-window, var(--bg-base)); }
+.chat-root[data-chrome='refresh'] .sb-rail-btn:is(:hover, [data-hovered], [data-focus-visible]) .pg { --pg-bg: var(--sc-hover-solid); }
+.chat-root[data-chrome='refresh'] .sb-rail-sep { width: 22px; height: 0; margin: 4px 0; border-top: 1px solid var(--chrome-card-border); }
+/* LaunchPad's minimal button fills its icon itself, so Needs you's amber goes on the icon (as the head's does). */
+.chat-root[data-chrome='refresh'] .sb-rail-needs svg { color: var(--warning); fill: currentColor; }
+.chat-root[data-chrome='refresh'] .sb-rail-badge { position: absolute; top: 2px; right: 2px; min-width: 14px; height: 14px; padding: 0 3px;
+  box-sizing: border-box; border-radius: 7px; background: var(--warning); color: var(--chrome-window, var(--bg-base)); font: 700 9px/14px var(--font-ui); text-align: center;
+  font-variant-numeric: tabular-nums; }
+/* A project's live dot: amber while a session needs you, the accent while one works; ringed in the rail's own colour. */
+.chat-root[data-chrome='refresh'] .sb-rail-dot { position: absolute; right: 4px; bottom: 4px; width: 7px; height: 7px; border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--chrome-window, var(--bg-base)); }
+.chat-root[data-chrome='refresh'] .sb-rail-dot[data-dot='needs'] { background: var(--warning); }
+.chat-root[data-chrome='refresh'] .sb-rail-dot[data-dot='working'] { background: var(--accent); }
+.chat-root[data-chrome='refresh'] .sb-rail-btn:is(:hover, [data-hovered]) .sb-rail-dot { box-shadow: 0 0 0 2px var(--sc-hover-solid); }
+/* The brand row's collapse, at its end after How it works. */
+.chat-root[data-chrome='refresh'] .chat-sidebar-head .sb-collapse { flex: none; margin-left: 6px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .chat-sidebar-head .sb-collapse:is(:hover, [data-hovered]) { color: var(--text-primary); }
+
+/* Reviews under the redesign (ReviewAsks.tsx). The blue row: a call to action in the
+   accent's tint, the requesters' initials at its end, overlapping a little. */
+.chat-root[data-chrome='refresh'] .sb-reviews { padding: 2px 8px 6px; container-type: inline-size; }
+.chat-root[data-chrome='refresh'] .sb-reviews-short { display: none; }
+@container (max-width: 232px) {
+  .chat-root[data-chrome='refresh'] .sb-reviews-long { display: none; }
+  .chat-root[data-chrome='refresh'] .sb-reviews-short { display: inline; }
+}
+.chat-root[data-chrome='refresh'] .sb-reviews .sb-reviews-row {
+  display: flex; align-items: center; gap: 9px; width: 100%; height: 34px; padding: 0 10px; box-sizing: border-box;
+  border-radius: 9px; justify-content: flex-start; font-family: var(--font-ui); font-size: 13px; font-weight: 500;
+  background: color-mix(in srgb, var(--accent) 13%, transparent); color: var(--accent); text-decoration: none;
+}
+.chat-root[data-chrome='refresh'] .sb-reviews .sb-reviews-row[data-hovered] { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.chat-root[data-chrome='refresh'] .sb-reviews .sb-reviews-row [data-icon] { fill: currentColor; flex: none; }
+.chat-root[data-chrome='refresh'] .sb-reviews-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.chat-root[data-chrome='refresh'] .sb-reviews-who { display: inline-flex; align-items: center; flex: none; }
+.chat-root[data-chrome='refresh'] .sb-reviews-ava { width: 18px; height: 18px; font-size: 8px; box-shadow: 0 0 0 2px var(--sb-bg, var(--bg-surface)); }
+.chat-root[data-chrome='refresh'] .sb-reviews-ava + .sb-reviews-ava { margin-left: -3px; }
+.chat-root[data-chrome='refresh'] .sb-reviews-more { margin-left: 4px; font-size: 11px; font-variant-numeric: tabular-nums; }
+/* With none asking: New session, then the Reviews button, the row's own height, square. */
+.chat-root[data-chrome='refresh'] .sb-new-line { display: flex; gap: 6px; }
+.chat-root[data-chrome='refresh'] .sb-new-line > :first-child { flex: 1; min-width: 0; }
+.chat-root[data-chrome='refresh'] .sb-reviews-button {
+  flex: none; width: 36px; min-width: 36px; padding: 0; justify-content: center; border-radius: 8px;
+  background: color-mix(in srgb, var(--text-primary) 7%, transparent); color: var(--text-secondary);
+}
+.chat-root[data-chrome='refresh'] .sb-reviews-button[data-hovered] { background: color-mix(in srgb, var(--text-primary) 11%, transparent); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .sb-reviews-button [data-icon] { fill: currentColor; }
+/* A review session's card: the review mark just before its title. */
+.sc-review { display: inline-flex; align-items: center; flex: none; color: var(--text-secondary); margin-right: -3px; }
+.sc-review svg { display: block; }
+/* The phone's swipe (useCardSwipe.ts): the card slides over what releasing will do, Pin on the left, Archive on the
+   right, in the theme's colours; vertical scrolling stays the browser's. */
+@media (hover: none) {
+  .chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .sc-li { touch-action: pan-y; }
+}
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .sc-li[data-swipe] { position: relative; }
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .sc-li[data-swipe]::before {
+  content: attr(data-swipe-label); position: absolute; inset: 0; z-index: 0; display: flex; align-items: center; padding: 0 14px;
+  border-radius: 8px; font-family: var(--font-ui); font-size: 12.5px; font-weight: 600;
+}
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .sc-li[data-swipe='pin']::before {
+  justify-content: flex-start; background: color-mix(in srgb, var(--accent) 22%, var(--sb-bg, var(--bg-surface))); color: var(--accent);
+}
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .sc-li[data-swipe='archive']::before {
+  justify-content: flex-end; background: color-mix(in srgb, var(--text-primary) 12%, var(--sb-bg, var(--bg-surface))); color: var(--text-primary);
+}
+.chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .sc-li[data-swipe] > .sc-wrap {
+  position: relative; z-index: 1; border-radius: 8px; background: var(--sb-bg, var(--bg-surface));
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-root[data-chrome='refresh'] .chat-sidebar[data-sidebar-ux] .sc-li > .sc-wrap { transition: none !important; }
+}

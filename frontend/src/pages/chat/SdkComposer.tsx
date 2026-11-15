@@ -25,7 +25,7 @@ import { useChatChrome } from './chatChrome';
 import { ComposerStop } from './ComposerStop';
 import { useSessionRefDrop } from '../../chat/useSessionRefDrop';
 
-export function SdkComposer({ s, project, workstream, unseen = false, onJump = () => {}, className, above, barStart, statusLine, placeholderWho, placeholder, noReserve, drawer }: {
+export function SdkComposer({ s, project, workstream, unseen = false, onJump = () => {}, className, above, barStart, statusLine, statusEnd, placeholderWho, placeholder, noReserve, drawer, claudeCode = true, agentName = 'Claude' }: {
   s: SdkChat; project: Project; workstream: string;
   /** The transcript has output below the fold: the conversation's "↓ new output". */
   unseen?: boolean; onJump?: () => void;
@@ -33,8 +33,14 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
   className?: string; above?: React.ReactNode; barStart?: React.ReactNode;
   /** The file view: one fixed-height line in place of the status line, which says everything it has to say there. */
   statusLine?: React.ReactNode;
+  /** At the status line's end, on its row: the conversation's repo pill (SessionRepoPill.tsx). Not with statusLine. */
+  statusEnd?: React.ReactNode;
   /** Who the placeholder names ("Message <who>…"); the conversation's is the model the picker shows (chat/composer.ts chatAgentName). */
   placeholderWho?: string;
+  /** The chat's agent is Claude Code (chat/simpleChat.ts chatAgentOf): another engine's offers no Claude model or effort. */
+  claudeCode?: boolean;
+  /** What the composer's notices call the chat's agent (chatAgentOf), Claude unless another engine runs it. */
+  agentName?: string;
   /** The whole placeholder, where the session says what it's for (a review session). */
   placeholder?: string;
   /** No reserved space for the trust note while the history loads (under a file, a row that comes and goes). */
@@ -125,7 +131,7 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
       <DictationNote dictation={dictation} />
       {takesImages && imageNote && <div className="chat-composer-note" data-error="">{imageNote}</div>}
       {showHold && (
-        <TerminalHoldNotice busy={reclaiming || opening} onReturn={() => { void returnToChat(); }} onFullUi={() => { void openFull(); }} refresh={refresh} />
+        <TerminalHoldNotice busy={reclaiming || opening} onReturn={() => { void returnToChat(); }} onFullUi={() => { void openFull('terminal-hold'); }} refresh={refresh} />
       )}
       {sendError && <div className="chat-composer-note" data-error="">{sendError}</div>}
       {refDrop.note && <div className="chat-composer-note" data-error="">{refDrop.note}</div>}
@@ -142,7 +148,7 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
       )}
       {((reserve && !noReserve) || (trust && !trust.trusted)) && (
         <div className="chat-trust" role={reserve ? undefined : 'note'} aria-hidden={reserve || undefined} data-reserved={reserve || undefined}>
-          <span>Claude can read {repo ?? 'this project'} but can't run commands or edit files in this session until the {trustNoun} is trusted.</span>
+          <span>{agentName} can read {repo ?? 'this project'} but can't run commands or edit files in this session until the {trustNoun} is trusted.</span>
           {canTrust || (reserve && project.role !== 'collaborator')
             ? <button type="button" className="btn-tiny" onClick={trustRepo} disabled={trusting || liveChrome == null} tabIndex={reserve ? -1 : undefined}>{trusting ? 'Trusting…' : `Trust this ${trustNoun}`}</button>
             : <span className="chat-trust-note">Only the project's owner can trust it.</span>}
@@ -151,8 +157,11 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
       {/* The chrome refresh's notes sit above the composer, past its rounded corner; none, no line. */}
       {refresh && <div className="chat-composer-notes" data-above="">{notes}</div>}
       {statusLine ?? (
-        <div className="chat-status" data-tone={status.tone === 'idle' ? 'idle' : status.tone === 'error' ? 'offline' : showSteps && !runnerReady ? 'setup' : 'working'} role="status" aria-live="polite" title={status.text}>
-          {!recovery && chat.running && status.tone === 'working' && <span className="sdk-spinner" aria-hidden="true" />}{status.text}
+        <div className="chat-status-row">
+          <div className="chat-status" data-tone={status.tone === 'idle' || status.tone === 'off' ? status.tone : status.tone === 'error' ? 'offline' : showSteps && !runnerReady ? 'setup' : 'working'} role="status" aria-live="polite" title={status.text}>
+            {!recovery && chat.running && status.tone === 'working' && <span className="sdk-spinner" aria-hidden="true" />}{status.text}
+          </div>
+          {statusEnd}
         </div>
       )}
       {drawer}
@@ -178,8 +187,10 @@ export function SdkComposer({ s, project, workstream, unseen = false, onJump = (
         />
         <div className="chat-composer-bar">
           {barStart}
-          <ModelPicker model={shownModel} options={modelOptions} onChange={chooseModel} open={modelOpen} onOpenChange={setModelOpen} disabled={!modelReady}
-            effort={effortInput ? effort : null} onEffortChange={chooseEffort} />
+          {claudeCode && (
+            <ModelPicker model={shownModel} options={modelOptions} onChange={chooseModel} open={modelOpen} onOpenChange={setModelOpen} disabled={!modelReady}
+              effort={effortInput ? effort : null} onEffortChange={chooseEffort} />
+          )}
           {(modelPick || (effortInput && effortPending)) && <span className="chat-composer-note">From your next message</span>}
           <div className="chat-compose-actions">
             <ContextRing usage={chat.usage} costUsd={total} sinceClearedUsd={costSinceCleared(chat)} compactedFrom={chat.compactedFrom ?? null} actions={ringActions} />

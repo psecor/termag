@@ -49,10 +49,12 @@ import { terminalSessionName } from './utils/sessionName';
 import { boxFeed } from './services/boxFeed';
 import { useStartParkedBoxOnOpen } from './hooks/useStartParkedBoxOnOpen';
 import { BriefingCard } from './components/BriefingCard';
-import { APP_START_PATH, appStartTarget, useLaunchQueue } from './mobile/launch';
-import { currentUiMode, leavePageEntry, notePageLocation, pageEntry, recordUiMode, shouldOpenSimpleUi, simpleUiShareHandoff } from './chat/uiMode';
-import { currentOptOut, installedAppMode, isStandalone, mobileHrefFromWorkspaceSearch, MOBILE_MEDIA_QUERY, shouldRedirectToMobile, TOUCH_MEDIA_QUERY } from './mobile/redirect';
+import { APP_START_LANDING, APP_START_PATH, appStartTarget, isAppStartLanding, useLaunchQueue } from './mobile/launch';
+import { currentUiMode, INITIAL_LOCATION_KEY, leavePageEntry, notePageLocation, pageEntry, recordUiMode, shouldOpenSimpleUi, simpleUiDeepLink, simpleUiShareHandoff } from './chat/uiMode';
+import { sessionHasChat } from './chat/simpleChat';
+import { currentOptOut, installedAppMode, isStandalone, MOBILE_MEDIA_QUERY, phoneChatSession, phoneLandingHref, shouldRedirectToMobile, TOUCH_MEDIA_QUERY } from './mobile/redirect';
 import { readRefreshHint } from './onboarding/refreshHint';
+import { NoticeBanner } from './notice/NoticeBanner';
 
 const BROWSER_EXPANDED_KEY = 'termag.browserPane.expanded';
 function readBrowserExpanded(): Record<string, boolean> {
@@ -473,6 +475,7 @@ function MainLayout() {
         )}
       </div>
       <div className="app-terminals">
+        <NoticeBanner className="app-notice" />
         {connection.state !== 'online' && (
           <div
             className="connection-banner"
@@ -738,16 +741,40 @@ const ChatApp = lazy(() => import('./pages/chat/ChatApp'));
 /**
  * Phone-sized viewports go to the mobile client unless
  * this browser has pressed "Lab". An app installed on a touch
- * device always does (§5.1) and its "Lab" lasts for that window only. Sits
+ * device always does (§5.1) and its "Lab" lasts for that window only. Under
+ * chat-phone-home-enabled a page loaded here goes to the chat instead, and a
+ * link to a session to its chat once the project list shows it has one
+ * (mobile/redirect.ts phoneLandingHref), as SimpleUiReturnGate waits for it;
+ * in-app navigation here (the chat's Open Lab) still goes to /m. Sits
  * inside FeatureFlagsProvider (for the flags) and before MainLayout, so no
  * terminal socket is opened for a page that is about to leave.
  */
 function MobileRedirectGate({ children }: { children: React.ReactNode }) {
+  const location = useLocation();
+  const phoneHome = useFlag(FLAGS.chatPhoneHome, false);
+  const { projects, projectsLoaded, projectsLoadFailed } = useProjects();
   const phoneLike = typeof window !== 'undefined' && window.matchMedia(MOBILE_MEDIA_QUERY).matches;
   const installed = typeof window !== 'undefined' && installedAppMode(window);
   const optedOut = currentOptOut(installed);
-  if (shouldRedirectToMobile({ phoneLike, optedOut, installed })) {
-    return <Navigate to={mobileHrefFromWorkspaceSearch(window.location.search)} replace />;
+  const toPhone = shouldRedirectToMobile({ phoneLike, optedOut, installed });
+  // Decided once, from where the page was loaded: the project list can rewrite the URL while it loads.
+  // The app icon's start route (AppStart) sends a tab here as part of the same landing.
+  const [landing] = useState(() => {
+    const loaded = location.key === INITIAL_LOCATION_KEY || isAppStartLanding(location.state);
+    const phoneChat = phoneHome && loaded;
+    return { search: location.search, phoneChat, session: toPhone && phoneChat ? phoneChatSession(location.search) : null };
+  });
+  // Whether the chat can show the linked session: undefined until the list is read; a failed read is no.
+  const [hasChat, setHasChat] = useState<boolean | undefined>(landing.session ? undefined : false);
+  useEffect(() => {
+    const session = landing.session;
+    if (hasChat !== undefined || !session) return;
+    if (projectsLoaded) setHasChat(sessionHasChat(projects, session.projectId, session.workstream));
+    else if (projectsLoadFailed) setHasChat(false);
+  }, [hasChat, landing.session, projects, projectsLoaded, projectsLoadFailed]);
+  if (toPhone) {
+    if (hasChat === undefined) return <div className="loading-screen">Loading…</div>;
+    return <GateRedirect to={phoneLandingHref({ search: landing.search, phoneChat: landing.phoneChat, hasChat })} />;
   }
   return <>{children}</>;
 }
@@ -756,19 +783,55 @@ function MobileRedirectGate({ children }: { children: React.ReactNode }) {
  * The workspace, or the simple UI when that is where this browser was last
  * and the page was loaded at the bare workspace URL (chat/uiMode.ts), or for
  * a share link its owner opened: its side panel's browser, not the dock.
+ * Under chat-ui-nudge-enabled, a page loaded at a link to a project's session
+ * opens its chat too, when the session has one there.
  */
 function SimpleUiReturnGate({ children }: { children: React.ReactNode }) {
   const location = useLocation();
-  const [toSimple] = useState(() => simpleUiShareHandoff({ mode: currentUiMode(), search: location.search })
-    ?? (shouldOpenSimpleUi({
-      mode: currentUiMode(), entry: pageEntry(), here: `${location.pathname}${location.search}`, locationKey: location.key,
-    }) ? '/chat' : null));
+  // Under chat-ui-nudge-enabled only a switch changes where termag opens
+  // (chat/uiMode.ts), so a visit here, a deep link included, records nothing.
+  const switchesOnly = useFlag(FLAGS.chatUiNudge, false);
+  const { projects, projectsLoaded, projectsLoadFailed } = useProjects();
+  const [landing] = useState(() => {
+    const at = { mode: currentUiMode(), entry: pageEntry(), here: `${location.pathname}${location.search}`, locationKey: location.key };
+    const to = simpleUiShareHandoff({ mode: at.mode, search: location.search }) ?? (shouldOpenSimpleUi(at) ? '/chat' : null);
+    return { to, link: to == null && switchesOnly ? simpleUiDeepLink(at) : null };
+  });
+  // A link to a session opens its chat only if the project list shows it has
+  // one there (sessionHasChat: not an automation's main, nor MetaTerm). It
+  // waits for the list, decides once, and opens Lab otherwise, or when the
+  // list can't be read. undefined: not decided yet.
+  const [linkTo, setLinkTo] = useState<string | null | undefined>(landing.link ? undefined : null);
+  useEffect(() => {
+    const link = landing.link;
+    if (linkTo !== undefined || !link) return;
+    if (projectsLoaded) setLinkTo(sessionHasChat(projects, link.projectId, link.workstream) ? link.href : null);
+    else if (projectsLoadFailed) setLinkTo(null);
+  }, [linkTo, landing.link, projects, projectsLoaded, projectsLoadFailed]);
+  const toSimple = landing.to ?? linkTo ?? null;
   useEffect(() => {
     leavePageEntry();
-    if (!toSimple) recordUiMode('full');
-  }, [toSimple]);
-  if (toSimple) return <Navigate to={toSimple} replace />;
+    if (!toSimple && !switchesOnly) recordUiMode('full');
+  }, [toSimple, switchesOnly]);
+  if (toSimple) return <GateRedirect to={toSimple} />;
+  if (linkTo === undefined) return <div className="loading-screen">Loading…</div>;
   return <>{children}</>;
+}
+
+/**
+ * A landing gate's redirect (MobileRedirectGate, SimpleUiReturnGate). A
+ * <Navigate> navigates only when it mounts, and the gates decide once, from
+ * where the page was loaded. So when something above them writes the URL in
+ * the same commit, the page lands back on the workspace URL under a gate that
+ * renders only this, and stays blank until a refresh. ProjectContext does
+ * that: on a bare `/` it seeds ?project=<last>, resolved against `/`, in an
+ * effect that runs after the redirect's. Keyed by the location, it
+ * navigates again while the page is still here. Every target is outside `/*`
+ * (/chat…, /m…), so it can't loop.
+ */
+function GateRedirect({ to }: { to: string }) {
+  const { key } = useLocation();
+  return <Navigate key={key} to={to} replace />;
 }
 
 /** Forgets where the page was loaded once it navigates anywhere (chat/uiMode.ts). */
@@ -778,11 +841,12 @@ function PageEntryTracker() {
   return null;
 }
 
-/** The installed app's start_url (mobile/launch.ts): the phone client or the simple UI. */
+/** The installed app's start_url (mobile/launch.ts): on a touch device the phone client, or the chat under chat-phone-home-enabled; the simple UI on a desktop. */
 function AppStart() {
+  const phoneChat = useFlag(FLAGS.chatPhoneHome, false);
   const touch = typeof window !== 'undefined' && window.matchMedia(TOUCH_MEDIA_QUERY).matches;
   const standalone = typeof window !== 'undefined' && isStandalone(window);
-  return <Navigate to={appStartTarget({ touch, standalone })} replace />;
+  return <Navigate to={appStartTarget({ touch, standalone, phoneChat })} replace state={APP_START_LANDING} />;
 }
 
 /**

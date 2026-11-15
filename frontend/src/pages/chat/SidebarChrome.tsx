@@ -14,6 +14,7 @@ import { Icon } from '@launchpad-ui/icons';
 import { useAuth } from '../../contexts/AuthContext';
 import { useConnection } from '../../contexts/ConnectionContext';
 import { LP_THEME } from '../../launchpad/theme';
+import { FLAGS, useFlag } from '../../flags';
 import { DOCS_SITE_URL } from '../settings/settingsDocs';
 import { OPEN_PALETTE_EVENT } from '../../utils/searchPalette';
 import { currentSearchShortcut } from '../../utils/workspaceTarget';
@@ -55,7 +56,14 @@ export function accountInitials(name: string): string {
  * ChatSearch, kept mounted for ⌘K and its palette; SearchButton stands in for
  * its trigger, which the refresh hides.
  */
-export function SidebarTop({ newSessionKeys, search }: { newSessionKeys: string; search: React.ReactNode }) {
+export function SidebarTop({ newSessionKeys, search, collapse, besideNew }: {
+  newSessionKeys: string;
+  search: React.ReactNode;
+  /** Beside New session: the redesign's Reviews button, while nothing asks for your review (ReviewAsks.tsx). */
+  besideNew?: React.ReactNode;
+  /** The redesign's collapse to the rail (SidebarRail.tsx), at the brand row's end, with its shortcut. */
+  collapse?: { onPress: () => void; keys: string };
+}) {
   return (
     <>
       <div className="chat-sidebar-head">
@@ -64,9 +72,17 @@ export function SidebarTop({ newSessionKeys, search }: { newSessionKeys: string;
           termag
         </Link>
         <DocsSiteLink className="chat-docs-link" />
+        {collapse && (
+          <TooltipTrigger delay={300}>
+            <IconButton icon="sidebar-left-collapse" variant="minimal" size="small" className="sb-collapse"
+              aria-label="Hide the sidebar" aria-expanded aria-controls="chat-conversations"
+              aria-keyshortcuts={collapse.keys.startsWith('⌘') ? 'Meta+\\' : 'Control+\\'} onPress={collapse.onPress} />
+            <Tooltip placement="bottom" className={LP_THEME}>Hide the sidebar {collapse.keys}</Tooltip>
+          </TooltipTrigger>
+        )}
       </div>
       <div className="chat-sidebar-actions">
-        <NewSessionRow keys={newSessionKeys} />
+        {besideNew ? <div className="sb-new-line"><NewSessionRow keys={newSessionKeys} />{besideNew}</div> : <NewSessionRow keys={newSessionKeys} />}
         <div className="chat-search-row">
           <div className="chat-search">
             {search}
@@ -119,6 +135,8 @@ export function AccountFoot({ openFullUi, phoneView }: { openFullUi: () => void;
   const name = user?.displayName || user?.email || '';
   const whatsNew = useWhatsNewDialog('termag');
   const environmentsOn = useEnvironmentSelection();
+  // Under chat-ui-nudge-enabled the switch itself sets where termag opens (chat/uiMode.ts).
+  const switchesOnly = useFlag(FLAGS.chatUiNudge, false);
   return (
     <AppRouter>
       <MenuTrigger>
@@ -150,7 +168,7 @@ export function AccountFoot({ openFullUi, phoneView }: { openFullUi: () => void;
             <MenuItem id="full" textValue="Open Lab">
               <Icon name="arrow-up-right" size="medium" aria-hidden="true" />
               <Text slot="label">Open Lab</Text>
-              <Text slot="description">termag opens in the UI you used last</Text>
+              <Text slot="description">{switchesOnly ? 'termag opens in Lab from now on' : 'termag opens in the UI you used last'}</Text>
             </MenuItem>
             {environmentsOn && (
               <MenuItem id="environments" textValue="Environments">

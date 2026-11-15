@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   compareVersions, conflictText, hostButtonLabel, fleetButtonLabel, fleetConfirmText, fleetResultLines, hostConfirmText, hostUpdateAction, followedRunLine, runReason, runInFlight, isUpdateOff,
-  defaultRestart, latestRunByHost, restartChoices, restartLabel, runAt, runClass, runSessionsText, runStateText, runVersions, scopeCount, toolForInventory, updateTool, UPDATE_TOOLS,
+  cellBlocks, cellPolicyText, defaultRestart, latestRunByHost, restartChoices, restartLabel, runAt, runClass, runSessionsText, runStateText, runVersions, scopeCount, scopeCountWhy, toolForInventory, updateTool, UPDATE_TOOLS,
 } from './toolUpdate';
-import type { ToolUpdatePreview, SoftwareHost, SoftwareState, SoftwareUpdateRun } from '../services/adminApi';
+import type { ToolUpdatePreview, SoftwareCell, SoftwareHost, SoftwareState, SoftwareUpdateRun } from '../services/adminApi';
 
 const claude = updateTool('claude');
 const codex = updateTool('codex');
@@ -69,14 +69,74 @@ describe('the fleet action', () => {
     expect(compareVersions('2.1.10 (Claude Code)', '2.1.10')).toBe(0);
     expect(compareVersions('latest', '2.1.10')).toBeNull();
   });
-  it('counts hosts below the floor only once a floor is known, leaving out the orchestrator and missing installs', () => {
-    expect(scopeCount(claude, hosts, 'below-floor', { floor: '2.1.308', target: 'latest' })).toBe(2);
-    expect(scopeCount(claude, hosts, 'below-floor', null)).toBeNull();
+  it('counts nothing, and says why, when the matrix sends no fleet selection (Devin on #1607)', () => {
+    // The tab and its backend ship together: cells with no `fleet` are not graded here, whatever their state.
+    expect(scopeCount(claude, hosts, 'below-floor')).toBe(0);
+    expect(scopeCount(claude, hosts, 'behind')).toBe(0);
+    expect(scopeCountWhy(claude, hosts, 'behind')).toMatch(/no fleet selection for Claude Code/);
   });
-  it('counts behind against an exact target, else the matrix states', () => {
-    expect(scopeCount(claude, hosts, 'behind', { floor: '2.1.308', target: '2.1.320' })).toBe(3);
-    expect(scopeCount(claude, hosts, 'behind', { floor: '2.1.308', target: 'latest' })).toBe(3);
-    expect(scopeCount(claude, [host('box:a', 'box', '2.1.300', 'current')], 'behind', null)).toBe(0);
+  it('counts exactly the boxes the backend says each scope\'s fleet update takes (its selectFleet), whatever their state', () => {
+    const policy = { mode: 'auto' as const, floor: '24.23.0', target: 'latest', reference: '24.22.1' };
+    const box = (hostKey: string, state: SoftwareState, fleet: SoftwareCell['fleet'], refusal: SoftwareCell['refusal'] = null): SoftwareHost => {
+      const h = host(hostKey, 'box', '24.22.1', state);
+      return { ...h, cells: { claude: { ...h.cells.claude, policy, refusal, fleet } } };
+    };
+    // Bugbot on #1607: a floor-only raise under latest. Every box is below the floor and on its reference,
+    // so "Update behind" takes none of them; the state alone would have counted them all.
+    const raised = [box('a', 'below-floor', { 'below-floor': true, behind: false }), box('b', 'below-floor', { 'below-floor': true, behind: false })];
+    expect(scopeCount(claude, raised, 'below-floor')).toBe(2);
+    expect(scopeCount(claude, raised, 'behind')).toBe(0);
+    // Refused, stale and held cells are whatever the backend said: here, not taken.
+    const mixed = [
+      ...raised, box('c', 'below-floor', { 'below-floor': false, behind: false }, 'claude_update_off'),
+      box('d', 'behind', { 'below-floor': false, behind: true }), box('e', 'held', { 'below-floor': false, behind: false }, 'claude_update_off'),
+      host('agent:g', 'agent', '2.1.200', 'outdated'), { ...box('orchestrator', 'below-floor', { 'below-floor': true, behind: true }), kind: 'orchestrator' as const },
+    ];
+    expect(scopeCount(claude, mixed, 'below-floor')).toBe(2);
+    expect(scopeCount(claude, mixed, 'behind')).toBe(1);
+    expect(scopeCountWhy(claude, mixed, 'behind')).toBeNull();
+    expect(scopeCountWhy(claude, raised, 'behind')).toBe('the fleet update takes no host: none is behind its reference and updatable now');
+  });
+  it('says in a cell\'s hover what really happens, for each state and mode', () => {
+    const p = (mode: 'off' | 'manual' | 'auto') => ({ mode, floor: '2.1.308', target: 'latest', reference: '2.1.314' });
+    const c = (state: SoftwareState, mode: 'off' | 'manual' | 'auto', refusal: SoftwareCell['refusal'] = null, over: Partial<SoftwareCell> = {}): SoftwareCell =>
+      ({ version: '2.1.240', raw: null, path: null, state, observedAt: '2026-11-10T10:00:00Z', policy: p(mode), refusal, ...over });
+    const what = (cell: SoftwareCell) => cellPolicyText(cell)?.split('\n')[1] ?? null;
+    expect(cellPolicyText(c('current', 'auto'))).toBe('target latest → 2.1.314 · floor 2.1.308 · mode auto');
+    // Bugbot on #1607: below the floor with mode off is not "held".
+    expect(what(c('below-floor', 'off', 'claude_update_off'))).toBe('below the floor, but Update below floor skips it: mode off; the sweep leaves it too');
+    expect(what(c('below-floor', 'manual'))).toBe('below the floor: Update below floor reaches it; the sweep leaves it (mode manual)');
+    expect(what(c('below-floor', 'auto'))).toBe('below the floor: Update below floor reaches it, and so does the sweep’s floor run');
+    expect(what(c('below-floor', 'auto', 'offline'))).toBe('below the floor, but Update below floor skips it: the box is offline');
+    expect(what(c('behind', 'auto'))).toBe('behind: Update behind reaches it, and so does the nightly run');
+    expect(what(c('behind', 'manual', 'not_capable'))).toBe('behind, but Update behind skips it: its agent can’t run this update');
+    expect(what(c('held', 'off', 'claude_update_off'))).toBe('held: mode off, so neither this tab nor the sweep updates it');
+    // Devin and Bugbot on #1607: an online box with a row over a day old is skipped as no_inventory.
+    expect(what(c('below-floor', 'auto', 'no_inventory'))).toBe('below the floor, but Update below floor skips it: its inventory is over a day old');
+    expect(what(c('behind', 'auto', 'no_inventory'))).toBe('behind, but Update behind skips it: its inventory is over a day old');
+    // Bugbot on #1607: the orchestrator's grade is its own policy's; the host panel is the viewing admin's.
+    const orch = (state: SoftwareState, mode: 'off' | 'manual' | 'auto', refusal: SoftwareCell['refusal'], panel?: SoftwareCell['panel']) =>
+      cellPolicyText(c(state, mode, refusal, { panel }), true)?.split('\n')[1];
+    // Two admins on one orchestrator cell (mode auto, nightly on): one has an Update in their host panel, one not.
+    expect(orch('below-floor', 'auto', 'orchestrator', { offered: true, mode: 'auto' })).toBe('below the floor: your host panel’s Update reaches it; the orchestrator’s own nightly run still applies its policy (mode auto); the fleet buttons skip the orchestrator');
+    // The nightly run on while this admin's own policy is off.
+    expect(orch('below-floor', 'auto', 'orchestrator_panel_off', { offered: false, mode: 'off' })).toBe('below the floor: your host panel has no Update for it (your policy is mode off); the orchestrator’s own nightly run still applies its policy (mode auto); the fleet buttons skip the orchestrator');
+    // The orchestrator's own gate off (its own policy), whatever the admin's.
+    expect(orch('below-floor', 'off', 'orchestrator_panel_off', { offered: false, mode: 'auto' })).toBe('below the floor: your host panel has no Update for it (the orchestrator’s own policy is mode off); the orchestrator’s own policy is mode off, so no nightly run; the fleet buttons skip the orchestrator');
+    expect(orch('held', 'manual', 'orchestrator', { offered: true, mode: 'auto' })).toBe('held: your host panel’s Update reaches it; the orchestrator’s own policy is mode manual, so no nightly run; the fleet buttons skip the orchestrator');
+    // With no admin (the MCP tools), no "your".
+    expect(orch('behind', 'auto', 'orchestrator')).toBe('behind: its host panel’s Update reaches it; the orchestrator’s own nightly run still applies its policy (mode auto); the fleet buttons skip the orchestrator');
+    expect(orch('current', 'auto', 'orchestrator', { offered: false, mode: 'off' })).toBeUndefined();
+    // cellBlocks: the orchestrator by its own mode, the same for every admin.
+    expect(cellBlocks(c('below-floor', 'auto', 'orchestrator_panel_off', { panel: { offered: false, mode: 'off' } }))).toBe(false);
+    expect(cellBlocks(c('below-floor', 'off', 'orchestrator', { panel: { offered: true, mode: 'auto' } }))).toBe(true);
+    expect(cellBlocks(c('below-floor', 'auto', 'claude_update_off'))).toBe(true);
+    expect(cellBlocks(c('below-floor', 'auto', 'run_in_flight'))).toBe(false);
+    // Devin on #1608: a run in flight is an update on its way, not a skip.
+    expect(what(c('below-floor', 'auto', 'run_in_flight'))).toBe('below the floor: an update is already running');
+    expect(what(c('ahead', 'off', 'claude_update_off'))).toBeNull();
+    expect(cellPolicyText(c('held', 'auto', undefined, { policy: undefined }))).toBe('no owner: no policy, so nothing updates it until someone takes the box');
+    expect(cellPolicyText(c('held', 'auto', undefined, { policy: undefined, policyUnavailable: true }))).toMatch(/^policy unavailable: /);
   });
   it('labels the button and the confirm with the count', () => {
     expect(fleetButtonLabel('behind', 3)).toBe('Update behind (3)');
@@ -167,41 +227,17 @@ describe('per tool', () => {
     expect(restartChoices(updateTool('pi')).map(c => c.value)).toEqual(['none', 'idle', 'force']);
   });
 
-  it('counts the Cursor agent\'s fleet from its column, against an exact build', () => {
+  it('counts the Cursor agent\'s fleet from its own column, as the backend\'s selection says', () => {
+    // How dated builds compare (same-day hashes, a pinned latest, floors by day) is the backend's
+    // selectFleet now (backend toolUpdate/fleet.test.ts); the tab only counts what it answered.
     const cursor = updateTool('cursor');
-    const hs = [host('box:a', 'box', '2026.10.01-0a1b2c3', 'behind', 'cursor-agent'), host('box:b', 'box', '2026.10.22-27dcf5f', 'current', 'cursor-agent')];
-    expect(scopeCount(cursor, hs, 'behind', { floor: '2025.09.17-25b418f', target: '2026.10.22-27dcf5f' })).toBe(1);
-    expect(scopeCount(cursor, hs, 'below-floor', { floor: '2025.09.17-25b418f', target: 'latest' })).toBe(0);
-    // Another build of the target's day is behind it, whatever its hash (Bugbot on #1080).
-    const sameDay = [host('box:c', 'box', '2026.10.22-0a1b2c3', 'behind', 'cursor-agent'), host('box:d', 'box', '2026.10.22-9f9f9f9', 'behind', 'cursor-agent'), ...hs];
-    expect(scopeCount(cursor, sameDay, 'behind', { floor: '2025.09.17-25b418f', target: '2026.10.22-27dcf5f' })).toBe(3);
-    // Under latest, as the server's behindReference: the newest day's one build, or every build of that
-    // day when there are several, whatever the matrix's states say (Bugbot on #1080).
-    const latest = { floor: '2025.09.17-25b418f', target: 'latest' };
-    expect(scopeCount(cursor, hs, 'behind', latest)).toBe(1);
-    const twoOfDay = [host('box:c', 'box', '2026.10.22-0a1b2c3', 'current', 'cursor-agent'), host('box:d', 'box', '2026.10.22-9f9f9f9', 'current', 'cursor-agent'), host('box:e', 'box', '2026.10.01-aaaaaaa', 'current', 'cursor-agent')];
-    expect(scopeCount(cursor, twoOfDay, 'behind', latest)).toBe(3);
-    expect(scopeCount(cursor, [twoOfDay[0], twoOfDay[2]], 'behind', latest)).toBe(1);
-    // The reference is every box's, counted or not: another build of the day on an offline host makes
-    // the day ambiguous, as on the server, so the online one on it counts too.
-    expect(scopeCount(cursor, [twoOfDay[0], twoOfDay[2]], 'behind', latest, twoOfDay)).toBe(2);
-    // A tool whose versions are not dated keeps the matrix's own states.
-    expect(scopeCount(updateTool('codex'), [host('box:f', 'box', '0.165.0', 'behind', 'codex'), host('box:g', 'box', '0.166.0', 'current', 'codex')], 'behind', { floor: '0.131.0', target: 'latest' })).toBe(1);
-    // A floor compares by day: another build of the floor's day is not below it.
-    expect(scopeCount(cursor, sameDay, 'below-floor', { floor: '2026.10.22-27dcf5f', target: 'latest' })).toBe(1);
+    const taken = (h: SoftwareHost, behind: boolean): SoftwareHost => ({ ...h, cells: { 'cursor-agent': { ...h.cells['cursor-agent'], fleet: { 'below-floor': false, behind } } } });
+    const hs = [taken(host('box:a', 'box', '2026.10.01-0a1b2c3', 'behind', 'cursor-agent'), true), taken(host('box:b', 'box', '2026.10.22-27dcf5f', 'current', 'cursor-agent'), false)];
+    expect(scopeCount(cursor, hs, 'behind')).toBe(1);
+    expect(scopeCount(cursor, hs, 'below-floor')).toBe(0);
+    // Claude Code's column says nothing about Cursor's.
+    expect(scopeCount(claude, hs, 'behind')).toBe(0);
     expect(hostConfirmText(cursor, 'otter-box', preview({ current: '2026.10.01-0a1b2c3', target: 'latest', floor: '2025.09.17-25b418f' }), 'none')).toContain('Update Cursor agent on otter-box?');
-  });
-  it('counts the Cursor agent behind its newest pin, as the preview names it, never a newer build in the fleet (Bugbot on #1080)', () => {
-    const cursor = updateTool('cursor');
-    // The server's preview names latest as the newest pinned build (runs.ts previewTarget).
-    const pinned = { floor: '2025.09.17-25b418f', target: '2026.10.22-27dcf5f' };
-    const hs = [
-      host('box:pin', 'box', '2026.10.22-27dcf5f', 'behind', 'cursor-agent'),
-      host('box:ahead', 'box', '2026.11.02-9f8e7d6', 'current', 'cursor-agent'),
-      host('box:old', 'box', '2026.10.01-0a1b2c3', 'outdated', 'cursor-agent'),
-    ];
-    // On the pin is current and past it is ahead: only the older one is behind.
-    expect(scopeCount(cursor, hs, 'behind', pinned)).toBe(1);
   });
   it('keeps Claude Code\'s words as they were', () => {
     expect(restartChoices(claude).map(c => [c.value, c.label, c.note])).toEqual([
@@ -221,15 +257,13 @@ describe('per tool', () => {
     expect(fleetConfirmText(codex, 'behind', 4, 'none', { floor: '0.131.0', target: '0.166.0' })).toMatch(/^Update Codex on about 4 hosts behind the target 0\.166\.0\?/);
   });
   it('counts Codex\'s fleet from the codex column, never Claude Code\'s', () => {
-    const hosts = [
-      host('box:a', 'box', '0.162.0', 'outdated', 'codex'), host('box:b', 'box', '0.165.0', 'current', 'codex'),
-      host('box:c', 'box', '2.1.300', 'outdated'), host('box:d', 'box', null, 'missing', 'codex'),
-    ];
-    expect(scopeCount(codex, hosts, 'behind', { floor: '0.131.0', target: '0.165.0' })).toBe(1);
-    expect(scopeCount(codex, hosts, 'behind', { floor: '0.131.0', target: 'latest' })).toBe(1);
-    expect(scopeCount(codex, hosts, 'below-floor', { floor: '0.131.0', target: 'latest' })).toBe(0);
-    expect(scopeCount(claude, hosts, 'behind', null)).toBe(1);
+    const t = (h: SoftwareHost, c: string, behind: boolean): SoftwareHost => ({ ...h, cells: { [c]: { ...h.cells[c], fleet: { 'below-floor': false, behind } } } });
+    const hosts = [t(host('box:a', 'box', '0.162.0', 'outdated', 'codex'), 'codex', true), t(host('box:b', 'box', '0.165.0', 'current', 'codex'), 'codex', false), t(host('box:c', 'box', '2.1.300', 'outdated'), 'claude', true)];
+    expect(scopeCount(codex, hosts, 'behind')).toBe(1);
+    expect(scopeCount(codex, hosts, 'below-floor')).toBe(0);
+    expect(scopeCount(claude, hosts, 'behind')).toBe(1);
   });
+
 });
 
 describe('the host panel\'s line, following its run', () => {

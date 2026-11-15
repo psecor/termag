@@ -27,6 +27,7 @@ import { useTranscriptFocus } from '../../chat/transcriptFocus';
 import { quickKeys, QuickKey } from '../../chat/quickKeys';
 import { useCapture } from '../../chat/useCapture';
 import { conversationBlocks, fullUiHref, repoSlug, showAnswerKeys, statusLine } from '../../chat/simpleChat';
+import { recordLabOpened } from '../../chat/labOpened';
 import { desktopSessionHref, openDesktopLink } from '../../chat/desktopLinks';
 import { agentUp, bootEstimateMinutes, preLaunchTail, setupSteps, showSetup } from '../../chat/newChat';
 import { SetupSteps } from '../../chat/SetupSteps';
@@ -38,6 +39,10 @@ import { REPLAY_BLOCK_CLASS } from '../../observability';
 import { providerFor, STATUS_GLYPH } from '../../mobile/inbox';
 import { FLAGS, useFlag } from '../../flags';
 import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
+import { ProjectCrumb, useOwnProject } from './SessionHeader';
+import { useProvideScreenCommands } from '../../chat/screenCommands';
+import { Button } from '@launchpad-ui/components';
+import { LP_THEME } from '../../launchpad/theme';
 import { SessionRepoPill } from './SessionRepoPill';
 import { AgentIcon } from './OpenItems';
 import { ChatSpaceChip } from './SpaceSwatch';
@@ -56,6 +61,8 @@ import { AgentsDrawer, type SubagentsUi } from './Subagents';
 import { subagentStore } from '../../chat/subagentStore';
 import { usePaneKeptSubagents, usePaneSubagents } from '../../chat/usePaneSubagents';
 import type { SubagentView } from '../../chat/subagents';
+import { branchChip, workstreamTitle } from '../../chat/sessionTitle';
+import { useDocumentTitle } from '../../chat/useDocumentTitle';
 
 // Remembered across conversations in this tab so visits carry a previous id.
 let lastVisitedProjectId: string | null = null;
@@ -81,6 +88,12 @@ export function ChatView() {
   const desktopHref = project ? desktopSessionHref({ projectId: project.id, workstream: ws, shared: project.role === 'collaborator' }) : null;
   const owner = project?.ownerUsername ?? user?.unixUsername ?? '';
   const workstream = project?.workstreams.find(w => w.name === ws);
+  // The session's one title: the sidebar row's, the header's and the browser tab's (chat/sessionTitle.ts).
+  const title = project ? workstreamTitle(project, ws, workstream) : null;
+  const branch = project ? branchChip(project, ws) : null;
+  // Under user-projects-enabled, the checkout's project leads the header: project ▸ title (SessionHeader.tsx).
+  const ownProject = useOwnProject(project?.id ?? '');
+  useDocumentTitle(title);
   const agentSession = project ? sessionName(owner, project.name, 'agent', ws) : '';
   const status = project ? statusMap[statusKey(project.instanceId, agentSession)] : undefined;
   const provider = project ? providerFor(project, workstream?.id, status?.source) : null;
@@ -118,9 +131,11 @@ export function ChatView() {
   const eta = useMemo(() => bootEstimateMinutes(boxes), [boxes]);
   const up = Boolean(project) && !held && agentUp(status?.status, parsed?.draft);
   const repo = repoSlug(project?.repoUrl);
+  // Runs on: Auto: a session opened on a parked box narrates its wake.
+  const wakes = useFlag(FLAGS.boxPlacement, false) && project?.setupStatus === 'pending';
   const steps = useMemo(() => (project ? setupSteps({
-    box, setupStatus: project.setupStatus, setupError: project.setupError, repo, agentUp: up, etaMinutes: eta,
-  }) : []), [project, box, repo, up, eta]);
+    box, setupStatus: project.setupStatus, setupError: project.setupError, repo, agentUp: up, etaMinutes: eta, wakes,
+  }) : []), [project, box, repo, up, eta, wakes]);
 
   useEffect(() => {
     if (!project) return;
@@ -285,25 +300,29 @@ export function ChatView() {
                 {STATUS_GLYPH[status?.status ?? 'not_running']}
               </span>
             )}
-            <span className="chat-title-name">{project?.name ?? '…'}</span>
-            {liveWorkstreams.length > 1 ? (
-              <select className="chat-ws-select" value={ws} onChange={e => setWs(e.target.value)} aria-label="Workstream">
-                {liveWorkstreams.map(w => <option key={w.id} value={w.name}>{w.name}</option>)}
+            {ownProject && <ProjectCrumb project={ownProject} />}
+            <span className="chat-title-name">{title ?? '…'}</span>
+            {liveWorkstreams.length > 1 && (
+              <select className="chat-ws-select" value={ws} onChange={e => setWs(e.target.value)} aria-label="Session">
+                {liveWorkstreams.map(w => <option key={w.id} value={w.name}>{project ? workstreamTitle(project, w.name, w) : w.name}</option>)}
               </select>
-            ) : ws !== 'main' ? <span className="chat-title-ws">· {ws}</span> : null}
-            <ChatSpaceChip place={{ instanceId: project?.instanceId ?? null, spaceId: workstream?.spaceId, spaceFixed: workstream?.spaceFixedAt != null }} />
-            {repo && <span className="chat-title-repo" title={project?.repoUrl ?? undefined}>{repo}</span>}
+            )}
+            {/* The project and a non-default branch beside the title, as SessionHeader's chips say them; the project, when it leads, says the rest. */}
+            {!ownProject && <ChatSpaceChip place={{ instanceId: project?.instanceId ?? null, spaceId: workstream?.spaceId, spaceFixed: workstream?.spaceFixedAt != null }} />}
+            {!ownProject && project && title !== project.name && <span className="chat-title-repo" title="Project">{project.name}</span>}
+            {!ownProject && repo && <span className="chat-title-repo" title={project?.repoUrl ?? undefined}>{repo}</span>}
+            {branch && <span className="chat-title-repo" title="Branch">{branch}</span>}
             {project && <ChatBoxTag project={project} box={box} />}
           </div>
           <div className="chat-header-actions">
             {phone ? (
               <ChatMoreButton label={`${project?.name ?? 'Session'}: actions`} actions={[
-                { label: 'Open in Lab', onSelect: () => navigate(fullUiHref(project?.id, ws)) },
+                { label: 'Open in Lab', onSelect: () => { recordLabOpened('session-menu'); navigate(fullUiHref(project?.id, ws)); } },
                 ...(desktopHref ? [{ label: 'Open in termag desktop', onSelect: () => openDesktopLink(desktopHref) }] : []),
                 ...(sidePanel ? [{ label: sidePanel.open ? 'Hide tools' : 'Show tools', onSelect: sidePanel.toggle }] : []),
               ]} />
             ) : <>
-              <Link className="btn-ghost chat-full-ui" to={fullUiHref(project?.id, ws)}>
+              <Link className="btn-ghost chat-full-ui" to={fullUiHref(project?.id, ws)} onClick={() => recordLabOpened('header')}>
                 <span className="chat-full-ui-long">Open in Lab</span>
                 <span className="chat-full-ui-short">Lab</span>
               </Link>
@@ -324,7 +343,7 @@ export function ChatView() {
                   <div className="chat-box-says">
                     <div className="chat-box-says-label">Latest from the box</div>
                     <pre className={REPLAY_BLOCK_CLASS}>{boxSays.join('\n')}</pre>
-                    <div className="chat-box-says-hint">Stuck on a question? <Link to={fullUiHref(project.id, ws)}>Answer it in Lab</Link>.</div>
+                    <div className="chat-box-says-hint">Stuck on a question? <Link to={fullUiHref(project.id, ws)} onClick={() => recordLabOpened('stuck-hint')}>Answer it in Lab</Link>.</div>
                   </div>
                 )}
                 {project.role !== 'collaborator' && (setup.retry || setup.startEmpty) && (
@@ -374,8 +393,11 @@ export function ChatView() {
             <ClaudeLoginCard projectId={project.id} owner={project.role !== 'collaborator'} enabled box={box?.status}
               hostShowsBox={line.tone === 'offline' || line.tone === 'setup'} />
           )}
-          {project && <SessionRepoPill project={project} />}
-          <div className="chat-status" data-tone={line.tone} role="status" aria-live="polite" title={line.text}>{line.text}</div>
+          {/* The status line, and at its end a multi-repo session's repo pill: one row, as SdkComposer's. */}
+          <div className="chat-status-row">
+            <div className="chat-status" data-tone={line.tone} role="status" aria-live="polite" title={line.text}>{line.text}</div>
+            {project && <SessionRepoPill project={project} />}
+          </div>
           {answerKeys.length > 0 && (
             <div className="chat-keys" role="toolbar" aria-label="Answer keys">
               {answerKeys.map(k => (

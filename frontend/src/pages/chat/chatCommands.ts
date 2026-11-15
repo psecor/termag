@@ -43,6 +43,10 @@ export interface ChatCommandInput {
   screen: readonly PaletteAction[];
   /** PR reviews are on (simple-ui-reviews-enabled): Review a pull request… opens the Reviews page. */
   reviews?: boolean;
+  /** The sidebar redesign (user-projects-enabled): one list, so no Show, Group by orders it, and Sort says how. */
+  redesign?: boolean;
+  /** project-files-enabled: no Group by space. */
+  projectFiles?: boolean;
 }
 
 
@@ -52,7 +56,7 @@ const GROUP_BY_COMMANDS: ReadonlyArray<{ groupBy: SidebarGroupBy; label: string 
   { groupBy: 'status', label: 'Group by status' },
 ];
 
-export function chatCommands({ navigate, openLab, newSessionKeys, panel, tools, view, setView, screen, reviews = false }: ChatCommandInput): PaletteAction[] {
+export function chatCommands({ navigate, openLab, newSessionKeys, panel, tools, view, setView, screen, reviews = false, redesign = false, projectFiles = false }: ChatCommandInput): PaletteAction[] {
   const out: PaletteAction[] = [
     { id: 'new-session', label: 'New session', icon: 'edit', keys: newSessionKeys, keywords: ['new chat', 'start', 'create'], suggested: true, run: () => navigate('/chat/new') },
     ...screen,
@@ -91,13 +95,21 @@ export function chatCommands({ navigate, openLab, newSessionKeys, panel, tools, 
   if (view) {
     const words = ['view', 'sidebar'];
     out.push(
+      // Show: the tabs or every session (Projects); the redesign has one list.
+      ...(redesign ? [] : [view.show === 'projects'
+        ? { id: 'view:tabs', label: 'Show tabs', detail: 'Sidebar', icon: 'layout-side-by-side' as const, keywords: [...words, 'tabs'], run: () => setView({ show: 'tabs' }) }
+        : { id: 'view:projects', label: 'Show every session', detail: 'Sidebar', icon: 'layout-structured' as const, keywords: [...words, 'projects', 'all', 'sessions'], run: () => setView({ show: 'projects' }) }]),
       view.density === 'compact'
         ? { id: 'view:standard', label: 'Standard rows', detail: 'Sidebar', icon: 'list', keywords: [...words, 'density'], run: () => setView({ density: 'standard' }) }
         : { id: 'view:compact', label: 'Compact rows', detail: 'Sidebar', icon: 'list', keywords: [...words, 'density'], run: () => setView({ density: 'compact' }) },
-      // Every grouping but the one shown, in View options' order.
-      ...GROUP_BY_COMMANDS.filter(g => g.groupBy !== view.groupBy).map(g => ({
+      // Every grouping but the one shown, in View options' order; Projects has its own.
+      ...GROUP_BY_COMMANDS.filter(g => (view.show === 'tabs' || redesign) && g.groupBy !== view.groupBy && !(redesign && projectFiles && g.groupBy === 'space')).map(g => ({
         id: `view:by-${g.groupBy}`, label: g.label, detail: 'Sidebar', icon: 'stack' as const, keywords: words, run: () => setView({ groupBy: g.groupBy }),
       })),
+      // The redesign's Sort (chat/sidebarSort.ts): the one not shown.
+      ...(redesign ? [view.sort === 'recent'
+        ? { id: 'view:sort-created', label: 'Sort by created', detail: 'Sidebar', icon: 'calendar' as const, keywords: [...words, 'sort', 'order', 'newest'], run: () => setView({ sort: 'created' }) }
+        : { id: 'view:sort-recent', label: 'Sort by recent activity', detail: 'Sidebar', icon: 'clock' as const, keywords: [...words, 'sort', 'order', 'latest', 'activity'], run: () => setView({ sort: 'recent' }) }] : []),
       { id: 'view:files', label: view.showFiles ? 'Hide files and new tabs' : 'Show files and new tabs', detail: 'Sidebar', icon: 'filter', keywords: words, run: () => setView({ showFiles: !view.showFiles }) },
       { id: 'view:idle', label: view.showIdle ? "Hide sessions that aren't running" : "Show sessions that aren't running", detail: 'Sidebar', icon: 'filter', keywords: [...words, 'idle', 'stopped'], run: () => setView({ showIdle: !view.showIdle }) },
     );
@@ -118,6 +130,8 @@ export function useChatCommands({ refresh, openLab, newSessionKeys, activeKey }:
   const view = useSidebarView();
   const screen = useScreenCommands();
   const reviews = useFlag(FLAGS.simpleUiReviews, false);
+  const redesign = useFlag(FLAGS.userProjects, false);
+  const projectFiles = useFlag(FLAGS.projectFiles, false);
   const activeRow = activeKey ? data?.rows.find(r => r.key === activeKey) : undefined;
   // Each tool as the panel offers it (SidePanel.tsx's offer): Files for a chat in a space,
   // Terminal and Browser beside a session, the Pull request tab on a desktop width.
@@ -129,6 +143,6 @@ export function useChatCommands({ refresh, openLab, newSessionKeys, activeKey }:
   // Built on each render, so every command runs the latest render's callbacks (the panel's close over ChatApp's state).
   if (!refresh) return [];
   return chatCommands({
-    navigate, openLab, newSessionKeys, panel: sidePanel ?? null, tools, view, setView: setSidebarView, screen, reviews,
+    navigate, openLab, newSessionKeys, panel: sidePanel ?? null, tools, view, setView: setSidebarView, screen, reviews, redesign, projectFiles,
   });
 }

@@ -16,10 +16,10 @@ beforeEach(() => {
 
 afterEach(() => { act(() => root.unmount()); });
 
-const done = { tone: 'idle', text: 'Done · your turn' };
+const done = { tone: 'idle', text: 'Idle · your turn' };
 
 describe('terminal hold', () => {
-  it('a live Claude keeps the notice up and replaces Done · your turn', () => {
+  it('a live Claude keeps the notice up and replaces Idle · your turn', () => {
     const held = reduceHold({ held: false, refused: false }, true);
     expect(held.show).toBe(true);
     expect(statusBesideHold(held.show, false, done).text).toBe(TERMINAL_HOLD_VIEW.statusText);
@@ -30,7 +30,7 @@ describe('terminal hold', () => {
     expect(TERMINAL_HOLD_VIEW.returnLabel).toMatch(/Return it to this chat/);
     expect(TERMINAL_HOLD_VIEW.fullUiLabel).toBe('Continue in Lab');
     expect(TERMINAL_HOLD_VIEW.text).toBe("Claude is open in Lab, so this chat can't send yet.");
-    expect(TERMINAL_HOLD_VIEW.statusText).toBe('Open in Lab');
+    expect(TERMINAL_HOLD_VIEW.statusText).toBe('Idle · open in Lab');
   });
 
   it('a history poll that says Claude has left clears the refusal so Send works', () => {
@@ -38,7 +38,7 @@ describe('terminal hold', () => {
     expect(cleared).toEqual({ held: false, refused: false, show: false });
     expect(statusBesideHold(cleared.show, false, done)).toEqual(done);
     // A turn that is actually running keeps its own line.
-    const working = { tone: 'working', text: 'Thinking…' };
+    const working = { tone: 'working', text: 'Working · thinking…' };
     expect(statusBesideHold(true, true, working)).toEqual(working);
   });
 

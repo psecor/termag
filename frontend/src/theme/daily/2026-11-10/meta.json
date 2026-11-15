@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-10",
+  "title": "Fog, then sun",
+  "blurb": "Patchy fog over Oakland this Tuesday morning, burning off to a sunny afternoon near 73 degrees, warm for November. Clear-sky blue accents today, and a few soft wisps of fog drifting past the edges.",
+  "sources": [
+    { "label": "National Weather Service forecast, Oakland", "url": "https://forecast.weather.gov/MapClick.php?lat=37.8044&lon=-122.2712" },
+    { "label": "Wikipedia: Fog", "url": "https://en.wikipedia.org/wiki/Fog" },
+    { "label": "Wikipedia: November 10", "url": "https://en.wikipedia.org/wiki/November_10" }
+  ]
+}

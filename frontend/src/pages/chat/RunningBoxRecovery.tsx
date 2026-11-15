@@ -9,6 +9,7 @@ import {
   announceChatsChanged, archiveBoxNotice, clearRunningBox, dismissRunningBoxNotice, dropLastActiveProject,
   parkedPowerError, saveRunningBox, stillRunningWorkspaceHref, type RunningBoxRecovery,
 } from '../../chat/archive';
+import { recordLabOpened } from '../../chat/labOpened';
 import { LAST_ACTIVE_PROJECT_KEY } from '../../contexts/ProjectContext';
 import { instancesApi } from '../../services/api';
 import { boxFeed } from '../../services/boxFeed';
@@ -23,6 +24,7 @@ export function RunningBoxRecoveryView({ recovery }: { recovery: RunningBoxRecov
   const canRetry = recovery.retry != null && recovery.instanceId != null;
 
   const openFull = () => {
+    recordLabOpened('archived');
     dropLastActiveProject(recovery.projectId, typeof localStorage === 'undefined' ? null : localStorage, LAST_ACTIVE_PROJECT_KEY);
     navigate(stillRunningWorkspaceHref());
   };

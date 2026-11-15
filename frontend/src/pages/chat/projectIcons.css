@@ -1,0 +1,24 @@
+/* Project icons' images (ProjectGlyph.tsx, ProjectIconPicker.tsx). The square
+   and its letters are sessionCard.css's .pg rules; an image takes a letter's place, whole or in one half of the
+   diagonal split, and is drawn as the repository made it (a favicon brings its own background). */
+.pg-img { position: absolute; inset: 0; border-radius: 26%; overflow: hidden; display: block; }
+.pg-img > img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.pg-split .pg-img { border-radius: 0; }
+.pg-img[data-half='a'] { clip-path: polygon(0 0, 100% 0, 0 100%); }
+.pg-img[data-half='b'] { clip-path: polygon(100% 0, 100% 100%, 0 100%); }
+
+/* The picker: a row of tiles (LaunchPad's RadioGroup of RadioButtons), each a 36 px preview over its caption. */
+.pi-picker { display: flex; flex-direction: column; gap: 8px; font-family: var(--font-ui); }
+.pi-tiles { display: flex; flex-wrap: wrap; gap: 6px; }
+.pi-tile.pi-tile { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 5px;
+  width: 72px; height: auto; min-height: 70px; padding: 8px 4px 6px; white-space: normal; font: 500 11px/1.25 var(--font-ui); }
+.pi-group.pi-group { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+.pi-label { font: 600 12px/1.3 var(--font-ui); color: var(--text-muted); }
+.pi-caption { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+.pi-tile[data-selected] .pi-caption { color: var(--text); }
+.pi-foot { display: flex; align-items: center; gap: 8px; min-height: 28px; }
+.pi-note { color: var(--text-muted); font: 400 12px/1.35 var(--font-ui); }
+.pi-error { color: var(--lp-color-text-feedback-error, #e5484d); font: 400 12px/1.35 var(--font-ui); }
+/* New project's icon, between the repositories list and the action (RepoStep's `extra`). */
+.chat-repo-step-extra { flex-shrink: 0; padding: 8px 6px 4px; border-top: 1px solid var(--border-subtle, var(--border)); }
+.chat-repo-step-extra .pi-tile.pi-tile { width: 60px; min-height: 56px; padding: 6px 3px 5px; }

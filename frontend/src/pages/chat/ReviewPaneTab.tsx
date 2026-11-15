@@ -15,7 +15,7 @@ import { Button, LinkButton, ProgressBar, TextField, Input, Label } from '@launc
 import { Icon } from '@launchpad-ui/icons';
 import { reviewApi, sessionsApi } from '../../services/api';
 import type { AgentStatusValue, Project } from '../../types';
-import { parsePane, stripSgr } from '../../chat/paneChat';
+import { parsePane, stripOsc, stripSgr } from '../../chat/paneChat';
 import { BlockView } from '../../chat/Blocks';
 import { conversationBlocks } from '../../chat/simpleChat';
 import { useCapture } from '../../chat/useCapture';
@@ -31,6 +31,33 @@ const STATE_WORD: Record<AgentReview['state'], string> = { reviewing: 'Reading',
 
 /** The most of the reviewer's pane the copy takes: its end, where the review is. */
 const QUOTE_MAX = 6000;
+
+/** The most rows of the reviewer's screen the tab shows when it can't read it as turns. */
+export const SCREEN_ROWS = 24;
+
+/**
+ * The reviewer's screen as plain text, for when the tab can't read it as turns: its last rows with colours and
+ * links taken off, blank rows trimmed from both ends. Null for a screen with nothing on it.
+ */
+export function screenTail(content: string | null, rows = SCREEN_ROWS): string | null {
+  if (!content) return null;
+  const lines = content.split('\n').map(l => stripOsc(stripSgr(l)).trimEnd());
+  while (lines.length && !lines[lines.length - 1]) lines.pop();
+  const tail = lines.slice(-rows);
+  while (tail.length && !tail[0]) tail.shift();
+  return tail.length ? tail.join('\n') : null;
+}
+
+/**
+ * Whether the tab shows the reviewer's screen as it is: its turns read as nothing (Cursor's login, a dialog the
+ * parser doesn't know), or it waits on an answer whose choices weren't read off its screen (Claude's first-run
+ * theme picker, its folder trust, a Cursor approval), where the keys alone would be answering blind.
+ */
+export function showsScreen(state: AgentReview['state'], blocks: number, lastIsDialog: boolean, choicesRead: boolean): boolean {
+  if (state === 'exited') return false;
+  if (blocks === 0) return true;
+  return state === 'waiting' && !lastIsDialog && !choicesRead;
+}
 
 /**
  * The reviewer's review of the session's own PR, for the person to paste into
@@ -143,6 +170,9 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
   const lastDialog = parsed?.blocks.at(-1);
   const options = lastDialog?.kind === 'dialog' ? lastDialog.options ?? 0 : 0;
   const { choices, keys } = pane ? reviewKeys(pane.state, paneStatus, content, options, reviewerId(pane.reviewer)) : { choices: [], keys: [] };
+  // What the reviewer shows, as it is, when the turns above don't say what it asks (showsScreen).
+  const choicesRead = pane?.state === 'waiting' && (paneOptions(content).length > 0 || arrowOptions(content).length > 0);
+  const screen = pane && showsScreen(pane.state, blocks.length, lastDialog?.kind === 'dialog', choicesRead) ? screenTail(content) : null;
   // GitHub's owner/name case differs between a typed path and the pipeline's row.
   const ownPr = pane && own && own.repo && own.number === pane.number && (!repo || repo.toLowerCase() === own.repo.toLowerCase());
 
@@ -217,7 +247,13 @@ export function ReviewPaneTab({ project, workstream }: { project: Project; works
       <div className="rv-pane-body chat-transcript-inner" ref={scroller}>
         {capture.error === 'offline' && <p className="rv-note">The box is offline.</p>}
         {blocks.map((b, i) => <BlockView key={i} block={b} agentLabel={pane.reviewer} dialogHint={`${pane.reviewer} is asking · answer below`} />)}
-        {blocks.length === 0 && !capture.error && (
+        {screen != null && (
+          <figure className="rv-pane-screen">
+            <figcaption className="rv-pane-screen-cap">{pane.state === 'waiting' ? `${pane.reviewer} is asking. Its screen, as it is; answer below.` : `${pane.reviewer}'s screen, as it is`}</figcaption>
+            <pre className="rv-pane-screen-text">{screen}</pre>
+          </figure>
+        )}
+        {blocks.length === 0 && screen == null && !capture.error && (
           <p className="rv-note">{pane.state === 'exited' ? `${pane.reviewer} exited.` : content == null ? `Reading ${pane.reviewer}'s pane…` : `${pane.reviewer} is starting…`}</p>
         )}
       </div>

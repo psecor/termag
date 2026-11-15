@@ -1,11 +1,10 @@
 import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { usersApi, type PersonMatch } from '../services/api';
-import { browserStorage, personMatches, readRecentPeople } from '../utils/recentPeople';
+import type { PersonMatch } from '../services/api';
+import { usePeopleSuggestions } from '../hooks/usePeopleSuggestions';
 
-/** Wait this long after the last keystroke before asking the server. */
-export const PERSON_SEARCH_DEBOUNCE_MS = 150;
-const MIN_QUERY = 2;
+export { PERSON_SEARCH_DEBOUNCE_MS } from '../hooks/usePeopleSuggestions';
+
 const LIST_MAX_HEIGHT = 260;
 /** Below the field unless fewer than this many pixels are left there and more are above. */
 const LIST_MIN_ROOM = 160;
@@ -50,42 +49,16 @@ export function PersonPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
-  const [found, setFound] = useState<{ query: string; people: PersonMatch[] }>({ query: '', people: [] });
-  // Read when the list opens, so a share made in another dialog shows up.
-  const [recent, setRecent] = useState(() => readRecentPeople(browserStorage()));
-  const request = useRef(0);
   const field = useRef<HTMLInputElement>(null);
   const [place, setPlace] = useState<React.CSSProperties | null>(null);
   const listId = useId();
   const optionId = (i: number) => `${listId}-opt-${i}`;
   const q = value.trim();
+  // Recent people are read again when the list opens, so a share made in another dialog shows up.
+  const { people, refreshRecent } = usePeopleSuggestions(value);
 
-  useEffect(() => {
-    if (q.length < MIN_QUERY) return;
-    const id = ++request.current;
-    const timer = setTimeout(() => {
-      usersApi.search(q)
-        // Only the newest question's answer lands: a slow early reply can't replace a later one.
-        .then(people => { if (request.current === id) setFound({ query: q, people }); })
-        .catch(() => { if (request.current === id) setFound({ query: q, people: [] }); });
-    }, PERSON_SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-  }, [q]);
-
-  const options = useMemo(() => {
-    const seen = new Set<string>();
-    const out: PersonMatch[] = [];
-    const add = (p: PersonMatch) => {
-      const key = p.email.toLowerCase();
-      if (seen.has(key)) return;
-      seen.add(key);
-      out.push(p);
-    };
-    for (const p of recent) if (personMatches(p, q)) add(p);
-    if (q.length >= MIN_QUERY && found.query === q) for (const p of found.people) add(p);
-    // What's typed already is the whole answer: no list of one repeating it.
-    return out.length === 1 && out[0].email.toLowerCase() === q.toLowerCase() ? [] : out;
-  }, [recent, found, q]);
+  // What's typed already is the whole answer: no list of one repeating it.
+  const options = useMemo((): PersonMatch[] => (people.length === 1 && people[0].email.toLowerCase() === q.toLowerCase() ? [] : people), [people, q]);
 
   const showList = open && options.length > 0;
   // Follows the field while the list is up: the dialog's pane scrolls, the window resizes.
@@ -104,7 +77,7 @@ export function PersonPicker({
   }, [showList, active]);
 
   function openList() {
-    setRecent(readRecentPeople(browserStorage()));
+    refreshRecent();
     setOpen(true);
   }
 

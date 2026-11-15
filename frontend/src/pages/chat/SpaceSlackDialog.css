@@ -1,0 +1,83 @@
+/* SpaceSlackDialog.tsx: layout only. Colours come from LaunchPad's tokens,
+   mapped to termag's theme by .lp-theme (launchpad/theme.css); every label,
+   channel names included, is in the UI font; ids only under Advanced, in mono. */
+.space-slack-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-family: var(--font-ui);
+}
+.space-slack-text,
+.space-slack-note,
+.space-slack-error,
+.space-slack-runner,
+.space-slack-preview {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.space-slack-text { color: var(--text-secondary); }
+.space-slack-note { color: var(--text-primary); }
+.space-slack-error { color: var(--danger); }
+.space-slack-runner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-primary);
+}
+.space-slack-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.space-slack-heading { margin: 4px 0 0; font-family: var(--font-ui); }
+.space-slack-list { max-height: 240px; overflow: auto; }
+.space-slack-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+.space-slack-row-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.space-slack-channel-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-ui);
+  font-weight: 500;
+}
+.space-slack-sub {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.space-slack-empty {
+  padding: 8px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.space-slack-combobox,
+.space-slack-select { display: flex; flex-direction: column; gap: 4px; }
+.space-slack-combobox-group { display: flex; align-items: center; }
+.space-slack-combobox-group input { flex: 1; }
+.space-slack-create { display: flex; flex-direction: column; gap: 8px; }
+.space-slack-preview {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.space-slack-preview li { display: flex; gap: 6px; align-items: flex-start; }
+.space-slack-preview li[data-tone='warning'] { color: var(--warning); }
+.space-slack-actions { justify-content: flex-end; }
+.space-slack-ids { list-style: none; padding: 0; margin: 0; font-family: var(--font-ui); font-size: 12px; }
+.space-slack-ids code { font-family: var(--font-mono); }

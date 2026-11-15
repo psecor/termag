@@ -15,10 +15,13 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { spacesApi, type SpaceTree } from '../../services/api';
 import { itemHref } from '../../chat/openItems';
-import { CUE_MS, effectOnFile, holdsOnChange, spaceFileEvents, touchesSpace } from '../../chat/spaceFileLive';
+import { CUE_MS, effectOnFile, holdsOnChange, onFilesRecheck, spaceFileEvents, touchesSpace } from '../../chat/spaceFileLive';
+import { FLAGS, useFlag } from '../../flags';
+import { Button } from '@launchpad-ui/components';
+import { LP_THEME } from '../../launchpad/theme';
 import './fileLive.css';
 
-export type LiveCueState = { kind: 'updated' | 'pending' | 'deleted' | 'moved'; to?: string; n: number } | null;
+export type LiveCueState = { kind: 'updated' | 'pending' | 'deleted' | 'moved' | 'conflict' | 'conflict-gone'; to?: string; n: number } | null;
 
 const errorCode = (err: unknown) => (err as { response?: { data?: { code?: string } } })?.response?.data?.code;
 
@@ -41,13 +44,23 @@ export function useSpaceFileLive<L extends { state: string }>(o: {
   space: string; path: string; loaded: L; setLoaded: (v: L) => void; reload: () => void; gone: L;
   /** Unset is a member, as the file view without file sharing is. */
   reader?: FileReader;
+  /**
+   * Whether the view holds edits not saved yet (an editor on the viewer): a change elsewhere then never replaces
+   * them; the cue says the file changed, with Reload (which drops them, after a confirm) and Keep mine. Unset is none,
+   * as the read-only view has.
+   */
+  dirty?: () => boolean;
 }) {
   const member = (o.reader ?? 'member') === 'member';
+  // Under project-files-enabled the file is also checked when the window or tab comes back and when the open
+  // session's turn ends (chat/spaceFileLive.ts onFilesRecheck), as it is after a missed frame.
+  const fresh = useFlag(FLAGS.projectFiles, false);
   const key = `${o.space}\0${o.path}`;
   const opts = useRef(o);
   opts.current = o;
-  const st = useRef({ key, quiet: false, etag: null as string | null, gone: false, checking: false, refused: false });
-  if (st.current.key !== key) st.current = { key, quiet: false, etag: null, gone: false, checking: false, refused: false };
+  // again: a check asked for while one was in flight (under project-files-enabled), run once that one ends.
+  const st = useRef({ key, quiet: false, etag: null as string | null, gone: false, checking: false, refused: false, again: false });
+  if (st.current.key !== key) st.current = { key, quiet: false, etag: null, gone: false, checking: false, refused: false, again: false };
   const [cue, setCue] = useState<LiveCueState>(null);
   const show = useCallback((kind: NonNullable<LiveCueState>['kind'], to?: string) => {
     setCue(c => ({ kind, ...(to !== undefined ? { to } : {}), n: (c?.n ?? 0) + 1 }));
@@ -68,6 +81,7 @@ export function useSpaceFileLive<L extends { state: string }>(o: {
   }, [show]);
 
   const apply = useCallback(() => {
+    if (opts.current.dirty?.()) { show('conflict'); return; }
     if (holdsOnChange(opts.current.loaded as { state: string })) { show('pending'); return; }
     st.current.quiet = true;
     opts.current.reload();
@@ -77,29 +91,38 @@ export function useSpaceFileLive<L extends { state: string }>(o: {
     const s = st.current;
     s.quiet = false;
     s.gone = true;
+    // Edits not saved stay on screen: the cue says it went, and saving them puts the file back.
+    if (opts.current.dirty?.()) { show('conflict-gone', movedTo); return; }
     opts.current.setLoaded(opts.current.gone);
     show(movedTo !== undefined ? 'moved' : 'deleted', movedTo);
   }, [show]);
 
   const check = useCallback(async () => {
     const s = st.current;
-    if (s.checking || s.refused) return;
+    if (s.refused) return;
+    // One in flight may have asked before this change landed (focus, then a turn's end): ask again once it's done.
+    if (s.checking) { if (fresh) s.again = true; return; }
     s.checking = true;
+    const once = async () => {
+      try {
+        const head = await spacesApi.fileHead(opts.current.space, opts.current.path, s.etag);
+        if (st.current !== s || !head) return;
+        const before = s.etag;
+        s.etag = head.etag;
+        if (s.gone || (before !== null && head.etag !== before)) apply();
+      } catch (err) {
+        if (st.current !== s) return;
+        const code = errorCode(err);
+        if (code === 'not_found') s.refused = true;
+        else if (code === 'file_not_found' && !s.gone) markGone();
+      }
+    };
     try {
-      const head = await spacesApi.fileHead(opts.current.space, opts.current.path, s.etag);
-      if (st.current !== s || !head) return;
-      const before = s.etag;
-      s.etag = head.etag;
-      if (s.gone || (before !== null && head.etag !== before)) apply();
-    } catch (err) {
-      if (st.current !== s) return;
-      const code = errorCode(err);
-      if (code === 'not_found') s.refused = true;
-      else if (code === 'file_not_found' && !s.gone) markGone();
+      do { s.again = false; await once(); } while (s.again && st.current === s && !s.refused);
     } finally {
       s.checking = false;
     }
-  }, [apply, markGone]);
+  }, [apply, markGone, fresh]);
 
   useEffect(() => {
     if (!member) return;
@@ -117,8 +140,12 @@ export function useSpaceFileLive<L extends { state: string }>(o: {
     });
     // The version on screen, for the checks after a missed frame. Once, not a poll.
     void check();
-    return off;
-  }, [member, key, apply, check, markGone]);
+    const again = fresh ? onFilesRecheck(() => { if (!st.current.refused) void check(); }) : () => {};
+    return () => { off(); again(); };
+  }, [member, key, apply, check, markGone, fresh]);
+
+  /** The cue's Keep mine: the edits stay, and their save meets the file's newer version (ifMatch) as any save does. */
+  const keepMine = useCallback(() => { setCue(null); }, []);
 
   /** The cue's Reload, for a view that waits (holdsOnChange). */
   const applyPending = useCallback(() => {
@@ -126,15 +153,22 @@ export function useSpaceFileLive<L extends { state: string }>(o: {
     opts.current.reload();
   }, []);
 
-  return { setLoaded, cue, applyPending };
+  return { setLoaded, cue, applyPending, keepMine };
 }
 
 /** The brief cue at the top of the file view: Updated, Deleted, Moved to …, or Changed · Reload. */
-export function LiveCue({ space, cue, onReload }: { space: string; cue: LiveCueState; onReload: () => void }) {
+export function LiveCue({ space, cue, onReload, name, onKeepMine }: {
+  space: string; cue: LiveCueState; onReload: () => void;
+  /** The file's name, for the conflict's words; and Keep mine (useSpaceFileLive keepMine). */
+  name?: string; onKeepMine?: () => void;
+}) {
   const [shown, setShown] = useState<LiveCueState>(null);
+  // The conflict's Reload drops edits not saved, so it asks first, in place.
+  const [confirming, setConfirming] = useState(false);
   useEffect(() => {
     setShown(cue);
-    if (!cue || cue.kind === 'pending' || cue.kind === 'moved') return;
+    setConfirming(false);
+    if (!cue || cue.kind === 'pending' || cue.kind === 'moved' || cue.kind === 'conflict' || cue.kind === 'conflict-gone') return;
     const t = setTimeout(() => setShown(null), CUE_MS);
     return () => clearTimeout(t);
   }, [cue]);
@@ -147,6 +181,30 @@ export function LiveCue({ space, cue, onReload }: { space: string; cue: LiveCueS
       )}
       {shown?.kind === 'pending' && (
         <>Changed <button type="button" className="btn-tiny" onClick={() => { setShown(null); onReload(); }}>Reload</button></>
+      )}
+      {/* The conflict's controls are LaunchPad's, in its theme (the older Reload above predates the rule). */}
+      {shown?.kind === 'conflict' && (
+        <span className={`${LP_THEME} fv-live-conflict`}>
+          {confirming ? (
+            <>
+              Drop your unsaved changes?
+              <Button size="small" variant="minimal" onPress={() => { setShown(null); onReload(); }}>Reload</Button>
+              <Button size="small" variant="minimal" onPress={() => setConfirming(false)}>Cancel</Button>
+            </>
+          ) : (
+            <>
+              {name ?? 'This file'} changed since you opened it
+              <Button size="small" variant="minimal" onPress={() => setConfirming(true)}>Reload</Button>
+              <Button size="small" variant="minimal" onPress={() => { setShown(null); onKeepMine?.(); }}>Keep mine</Button>
+            </>
+          )}
+        </span>
+      )}
+      {shown?.kind === 'conflict-gone' && (
+        <span className={`${LP_THEME} fv-live-conflict`}>
+          {name ?? 'This file'} was {shown.to !== undefined ? `moved to ${shown.to}` : 'deleted'} since you opened it; your changes are kept
+          <Button size="small" variant="minimal" onPress={() => { setShown(null); onKeepMine?.(); }}>OK</Button>
+        </span>
       )}
     </div>
   );
@@ -181,6 +239,8 @@ async function listAgain(space: string, prefix: string, shown: number): Promise<
 export function useSpaceListingLive(space: string, cache: { listings: Map<string, LiveListing>; index: unknown; gen: number }, rerender: () => void) {
   const latest = useRef({ cache, rerender });
   latest.current = { cache, rerender };
+  // Under project-files-enabled: also when it's shown again and at each moment to look again (onFilesRecheck).
+  const fresh = useFlag(FLAGS.projectFiles, false);
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     /** The newest refetch of each folder. */
@@ -206,11 +266,18 @@ export function useSpaceListingLive(space: string, cache: { listings: Map<string
       }
       draw();
     };
-    const off = spaceFileEvents.subscribe(frame => {
-      if (!touchesSpace(frame, space)) return;
+    const soon = () => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(refetch, 300);
-    });
-    return () => { off(); if (timer) clearTimeout(timer); };
-  }, [space]);
+    };
+    const off = spaceFileEvents.subscribe(frame => { if (touchesSpace(frame, space)) soon(); });
+    // Shown again (the Files tool opened, or switched to Project files or My files): only a shown explorer hears
+    // frames, and its listings are kept for the page, so what it kept may be behind (an agent's file written while
+    // My files wasn't on screen). Refetch them in place, keeping what shows until each lands.
+    // Only listings from an earlier visit count, a listing or a failure to list (which is retried): a first visit's
+    // own loads are placeholders still (no tree, no error).
+    if (fresh && [...latest.current.cache.listings.values()].some(l => l.tree || l.error)) refetch();
+    const again = fresh ? onFilesRecheck(soon) : () => {};
+    return () => { off(); again(); if (timer) clearTimeout(timer); };
+  }, [space, fresh]);
 }

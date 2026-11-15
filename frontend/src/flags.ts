@@ -13,6 +13,11 @@ export const FLAGS = {
   // workstream menus and on the context card. Defaults off; the backend
   // refuses a handoff while the same flag is off for the owner and box.
   agentHandoff: 'agent-handoff-enabled',
+  // Automation alerts ("Alerts and the outbound
+  // webhook"): the keyword, target and health-alert fields in an
+  // automation's Run settings. Defaults off; the backend refuses a keyword,
+  // a non-DM target or a webhook on the same flag for the owner and box.
+  automationAlerts: 'automation-alerts-enabled',
   // Automations: New automation (Shift on New project,
   // the split button, the ⌘K action), the /automations pages and the
   // automation rows' subtitles. Defaults off; the backend refuses create,
@@ -22,14 +27,20 @@ export const FLAGS = {
   // shared Bazel cache on boxes shows while it is on;
   // delivering the cache block to a box is the server's.
   boxBazelCache: 'box-bazel-cache-enabled',
-  // Read here only by What's new, whose entry about running
-  // webapp on your box shows while it is on; the forward itself is the server's.
-  boxPortForward: 'box-port-forward-enabled',
+  // Runs on: Auto in New session: Auto as the default
+  // box with its reason, Send on a parked box, and the Settings default.
+  // Defaults off. The backend answers GET /api/boxes/placement with 404 and
+  // refuses a parked box's create on the same flag.
+  boxPlacement: 'box-placement-enabled',
   // New project shares: the Share item's invite form and accepting an invite.
   // Defaults off. The backend refuses invite and accept on the same flag
   // (services/boxSharingFlag.ts); existing shares, revoke, leave and decline
   // are never behind it.
   boxSharing: 'box-sharing-enabled',
+  // Read here only by What's new, whose entry about Stop
+  // asking again on a box running cloud sessions shows while it is on; the
+  // refusal itself is the server's (routes/instances.ts powerBoxRow).
+  boxStopCloudSessionGuard: 'box-stop-cloud-session-guard-enabled',
   // The lifetime the share dialog preselects.
   previewShareTtlHours: 'browser-pane-preview-share-ttl-hours',
   // Any other file attached to a chat message, kept on the chat's box and named
@@ -54,11 +65,21 @@ export const FLAGS = {
   // its box. Defaults off; off, the pane chat is unchanged. The backend reads it
   // too, for GET …/chat/pane-subagents.
   chatPaneSubagents: 'chat-pane-subagents-enabled',
+  // Phones open the chat:
+  // a phone that loads the workspace URL, and the app installed on a touch
+  // device, land in the chat rather than on /m, and a Lab link to a session in
+  // its chat when it has one. Defaults off; off, phones land on /m as before.
+  chatPhoneHome: 'chat-phone-home-enabled',
+  // New session's worktree pill ("Worktree of termag-22" / "New checkout") and its
+  // permission pill naming the setting and the checkout, not the box.
+  // Defaults off; off, as before.
+  chatSessionPermissions: 'chat-session-permissions-enabled',
   // A session dragged from the sidebar into a composer goes into the message as a
   // reference to it, with the `termag ask` that messages it.
   // Defaults off; off, a drag carries
   // no reference. No server side: an ask checks itself.
   chatSessionReferences: 'chat-session-references-enabled',
+  chatSidebarRecentOrder: 'chat-sidebar-recent-order-enabled',
   // Subagents in the SDK chat: an Agent call is a
   // row that opens the subagent's transcript in the side panel's agent tab,
   // under the chrome refresh. Defaults off; off, the call is a tool card. The
@@ -68,6 +89,12 @@ export const FLAGS = {
   // the sidebar's Notify toggle and the open tab's notifications. Defaults
   // off; the backend sends no push while the same flag is off for a person.
   chatTurnNotifications: 'chat-turn-notifications-enabled',
+  // Lab's nudge toward termag's chat (chatNudge/):
+  // a toast for people who open in Lab, a spotlight
+  // on the switch when they dismiss it, and only a switch (not a visit)
+  // changing where termag opens. Defaults off; the backend leaves
+  // chatNudgeDismissed out of /auth/me while the same flag is off.
+  chatUiNudge: 'chat-ui-nudge-enabled',
   // New session as a worktree of a project already on the chosen box
   // (pages/chat/CheckoutPicker.tsx): the drawer's checkout choice. Defaults
   // off, and off there is no such choice; the backend drops a create body's
@@ -101,8 +128,12 @@ export const FLAGS = {
   // picker. Defaults off; the backend refuses `repos` on a create while the
   // same flag is off for the user.
   multiRepo: 'multi-repo-projects-enabled',
-  // The first-run wizard's MCP servers step ("The MCP
-  // servers step"), shown only while the catalog offers a server too. Defaults off.
+  // The notice banner: its content, a JSON
+  // value, parsed by notice/notice.ts; {} or null is no banner. Browser only.
+  noticeBanner: 'notice-banner',
+  // The MCP servers step in both first-run wizards ("The
+  // MCP servers step" and "The refresh"), shown only while the catalog offers a
+  // server too. Defaults off.
   onboardingMcpStep: 'onboarding-mcp-step-enabled',
   // The redrawn first run. Defaults off.
   // The sign-in page has no user to evaluate it for, so it follows what this
@@ -119,6 +150,11 @@ export const FLAGS = {
   // Preview links' `people` and `link` audiences in the publish dialog.
   // Defaults off; the backend refuses them with 403 audience_disabled.
   previewLinksLinkAudience: 'preview-links-link-audience-enabled',
+  // Project files and My files (part B): the side panel's
+  // Files as Project files | My files with Move between them and Other spaces, Settings → My files, the
+  // project menu's Use an existing space for files… and Slack channels…, and no space pill on New session.
+  // Needs user-projects-enabled too. Defaults off; the server's routes answer project_files_disabled while it's off.
+  projectFiles: 'project-files-enabled',
   // Automations in the simple UI (pages/chat/automations/):
   // an Automations button beside New session, the list at /chat/automations
   // and an automation's page with its run history, Run now, Pause/Enable,
@@ -136,6 +172,10 @@ export const FLAGS = {
   // read from its box. Defaults off; the backend refuses the read (404) while
   // the same flag is off for the user.
   inflightChanges: 'simple-ui-inflight-changes-enabled',
+  // Review with Claude opens a chat: a review
+  // session as claude-chat, opened at once on the review-start page, instead
+  // of the lab's review pane. Defaults off: Claude reviews in a pane.
+  reviewChat: 'simple-ui-review-chat-enabled',
   // Review on a PR whose repository none of your projects has
   // (chat/reviewClone.ts): it clones the repository
   // into a new project on one of your boxes, then starts the review there.
@@ -152,7 +192,8 @@ export const FLAGS = {
   // Space channels: linking Slack channels to a
   // space from termag (the space dialog, M6). Defaults off; the backend's
   // /spaces/:space/slack routes answer 404 space_channels_off while the same
-  // flag is off for the caller. Nothing in the browser reads it yet.
+  // flag is off for the caller. Off, the space menu has no Slack channels item
+  // (pages/chat/SpaceSlackDialog.tsx).
   spaceChannels: 'space-channels-enabled',
   // Terminal tabs: the + / ✕ tab list beside the ctrl
   // pane's tab in the workspace. Defaults off; the backend refuses the add on
@@ -161,6 +202,13 @@ export const FLAGS = {
   // Thanksgiving: the "Thanksgiving turkeys" option in Settings → Appearance,
   // and whether the starfield honours it. Defaults off; a saved choice is kept.
   thanksgivingTurkeys: 'thanksgiving-turkeys-enabled',
+  // The project record: New session
+  // starts from a project, not a repository,
+  // and the chat sidebar groups by project and opens on Projects, with no Group
+  // by Space. Defaults off; off,
+  // New session is the repository picker and the sidebar is milestone 3's. The
+  // backend answers /api/user-projects with 404 user_projects_disabled on the same flag.
+  userProjects: 'user-projects-enabled',
   // What's new: the button in termag's sidebar foot and
   // lab's sidebar head, and the dialog it opens. Defaults off. Client only:
   // the entries are bundled with the frontend, and nothing on the server reads it.

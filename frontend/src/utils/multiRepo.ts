@@ -84,15 +84,24 @@ export function selectionRepos(selection: RepoSelection, typed: readonly ExtraRe
 }
 
 /**
- * The pill's words for more than one repository: the first in full, then
- * each other by its name when the owner is the same, else in full; past three,
- * how many more.
+ * The pill's words for more than one repository, past three with how many
+ * more. When every one has the first's owner, the owner is left out of all of
+ * them (`termag + termag-desktop`), and selectionNames, the pill's tooltip,
+ * has it. Otherwise the first is in full, and each other is by its name when
+ * the owner is the same, else in full.
  */
 export function selectionLabel(first: string, more: readonly ListedPick[]): string {
   if (more.length === 0) return first;
   const owner = first.includes('/') ? first.slice(0, first.indexOf('/')) : null;
-  const short = (fullName: string) => (owner && fullName.startsWith(`${owner}/`) ? fullName.slice(owner.length + 1) : fullName);
+  const sameOwner = (fullName: string) => owner != null && fullName.startsWith(`${owner}/`);
+  const short = (fullName: string) => (sameOwner(fullName) ? fullName.slice(owner!.length + 1) : fullName);
+  const lead = more.every(r => sameOwner(r.fullName)) ? short(first) : first;
   const shown = more.slice(0, 2).map(r => short(r.fullName));
   const rest = more.length - shown.length;
-  return [first, ...shown].join(' + ') + (rest > 0 ? ` + ${rest} more` : '');
+  return [lead, ...shown].join(' + ') + (rest > 0 ? ` + ${rest} more` : '');
+}
+
+/** Every repository the pill names, in full: its tooltip when it names more than one. */
+export function selectionNames(first: string, more: readonly ListedPick[]): string[] {
+  return [first, ...more.map(r => r.fullName)];
 }

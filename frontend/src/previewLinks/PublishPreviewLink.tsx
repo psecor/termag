@@ -13,8 +13,10 @@ import {
   previewLinkError, previewLinksApi, type PreviewLinkAudience, type PreviewLinkRequestView, type PreviewLinkView, type PreviewListener,
   type PublishedPreviewLink,
 } from '../services/previewLinksApi';
-import { MAX_LINK_LIFETIME_DAYS, MAX_TTL_HOURS, MIN_TTL_HOURS, clampTtlHours, nameProblem, parseEmails, suggestName } from './rules';
+import { MAX_LINK_LIFETIME_DAYS, MAX_TTL_HOURS, MIN_TTL_HOURS, clampTtlHours, nameProblem, suggestName } from './rules';
 import { CopyUrl } from './CopyUrl';
+import { TeammatePicker, type PickedPerson } from './TeammatePicker';
+import { browserStorage, rememberPerson } from '../utils/recentPeople';
 
 export const LINK_WARNING = "Anyone you send this to can use the app as you've set it up, including its data.";
 
@@ -44,6 +46,9 @@ function listenerLabel(l: PortItem): string {
   return l.command ? `${l.port} · ${l.command}` : String(l.port);
 }
 
+/** Why a listener can't have a wider audience: the server's not_confined and the agent's tunnel-open refusal say the same. */
+const CONFINE_HINT = 'Only for "Only me": start it with termag preview run to share it more widely';
+
 /** The first port the box would publish, from this checkout before any other. */
 function firstPublishable(list: PreviewListener[]): number | null {
   return (list.find(l => l.verdict.ok && l.inCheckout) ?? list.find(l => l.verdict.ok))?.port ?? null;
@@ -66,7 +71,9 @@ export function PublishPreviewLink({ projectId, projectName, workstream, links, 
   // Typed by the person: a late project name no longer replaces it.
   const [nameTyped, setNameTyped] = useState(false);
   const [audience, setAudience] = useState<PreviewLinkAudience>('owner');
-  const [emails, setEmails] = useState('');
+  const [people, setPeople] = useState<PickedPerson[]>([]);
+  // Full emails still in the picker's field: they count, so Publish can be pressed with one typed and not yet added (Devin, #1758).
+  const [pendingEmails, setPendingEmails] = useState<string[]>([]);
   const [ttl, setTtl] = useState(() => clampTtlHours(ttlHoursDefault));
   const [sendLocalhost, setSendLocalhost] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -103,7 +110,6 @@ export function PublishPreviewLink({ projectId, projectName, workstream, links, 
 
   const problem = name ? nameProblem(name) : 'Give the link a name.';
   const note = problem ? null : nameNote(name, workstream, links);
-  const people = useMemo(() => parseEmails(emails), [emails]);
   // An agent may ask for a port nothing listens on yet, which the server publishes too (it's checked at every tunnel open).
   const items = useMemo((): PortItem[] => {
     const list = listeners ?? [];
@@ -111,12 +117,21 @@ export function PublishPreviewLink({ projectId, projectName, workstream, links, 
       ? [...list, { port: answering.port, pid: null, command: null, verdict: { ok: true }, inCheckout: true, unlistened: true }]
       : list;
   }, [listeners, answering]);
-  const disabledKeys = useMemo(() => items.filter(l => !l.verdict.ok).map(l => l.port), [items]);
+  // People or anyone with the link reach only an app the agent started confined to this checkout (SR9).
+  const wide = audience !== 'owner';
+  const unconfined = (l: PortItem) => wide && !l.unlistened && !l.confined;
+  const disabledKeys = useMemo(() => items.filter(l => !l.verdict.ok || unconfined(l)).map(l => l.port), [items, wide]); // eslint-disable-line react-hooks/exhaustive-deps
+  const picked = items.find(l => l.port === port);
+  const pickedUnconfined = !!picked && picked.verdict.ok && unconfined(picked);
   // An asked port the box refuses can't be published: say why, and don't offer Publish (Bugbot, #1486).
   const askedRefusal = answering ? (listeners ?? []).find(l => l.port === answering.port && !l.verdict.ok)?.verdict : undefined;
   const askedReason = askedRefusal && !askedRefusal.ok ? askedRefusal.reason : null;
   // Not before the box's listing is in: an asked port may be one it refuses (Bugbot, #1486).
-  const ready = listeners !== null && port !== null && !problem && (audience !== 'people' || people.length > 0) && !busy && !askedReason;
+  const recipients = useMemo(
+    () => [...people, ...pendingEmails.filter(e => !people.some(p => p.email === e)).map(email => ({ email, displayName: '' }))],
+    [people, pendingEmails],
+  );
+  const ready = listeners !== null && port !== null && !problem && (audience !== 'people' || recipients.length > 0) && !busy && !askedReason && !pickedUnconfined;
 
   const publish = async () => {
     if (!ready || port === null) return;
@@ -126,10 +141,12 @@ export function PublishPreviewLink({ projectId, projectName, workstream, links, 
     try {
       const res = await previewLinksApi.publish(projectId, {
         workstream, port, name, audience, ttlHours: ttl, hostMode: sendLocalhost ? 'localhost' : 'public',
-        ...(audience === 'people' ? { emails: people } : {}),
+        ...(audience === 'people' ? { emails: recipients.map(p => p.email) } : {}),
         ...(answering ? { requestId: answering.id } : {}),
       });
       setMade(res);
+      // As the other share dialogs do: the people named are offered first next time.
+      if (audience === 'people') for (const p of recipients) rememberPerson(browserStorage(), p);
       onPublished?.(res);
     } catch (err) {
       setError(previewLinkError(err));
@@ -166,12 +183,13 @@ export function PublishPreviewLink({ projectId, projectName, workstream, links, 
             <Icon name="chevron-down" size="medium" />
           </Button>
           <Popover className={`${LP_THEME} preview-links-port-popover`} placement="bottom start">
-            <ListBox items={items}>
+            <ListBox items={items} dependencies={[wide]}>
               {l => (
                 <ListBoxItem id={l.port} textValue={listenerLabel(l)}>
                   <Text slot="label" className="preview-links-mono">{listenerLabel(l)}</Text>
                   {!l.verdict.ok && <Text slot="description" size="small">Can't be published: {l.verdict.reason}</Text>}
-                  {l.verdict.ok && !l.inCheckout && !l.unlistened && <Text slot="description" size="small">Not started from this workstream's checkout</Text>}
+                  {l.verdict.ok && unconfined(l) && <Text slot="description" size="small">{CONFINE_HINT}</Text>}
+                  {l.verdict.ok && !unconfined(l) && !l.inCheckout && !l.unlistened && <Text slot="description" size="small">Not started from this workstream's checkout</Text>}
                 </ListBoxItem>
               )}
             </ListBox>
@@ -179,6 +197,13 @@ export function PublishPreviewLink({ projectId, projectName, workstream, links, 
         </Select>
         <IconButton icon="sync" variant="minimal" size="medium" aria-label="Look again" onPress={loadListeners} />
       </div>
+      {pickedUnconfined && (
+        <Text className="preview-links-hint" elementType="p">
+          Port <code className="preview-links-mono">{port}</code> wasn't started with termag preview run, so only you can have it.
+          To share it more widely, start it on the box with <code className="preview-links-mono">termag preview run -- &lt;command&gt;</code>,
+          then look again.
+        </Text>
+      )}
       {listenError && <Text className="preview-links-error" elementType="p">{listenError}</Text>}
       {/* By what the select offers: an asked port nothing listens on yet is something to publish (Bugbot, #1486). */}
       {listeners !== null && items.length === 0 && !listenError && (
@@ -201,10 +226,7 @@ export function PublishPreviewLink({ projectId, projectName, workstream, links, 
         {audiencesOn && <p className="preview-links-warning">{LINK_WARNING}</p>}
       </RadioGroup>
       {audience === 'people' && (
-        <TextField value={emails} onChange={setEmails} className="preview-links-emails">
-          <Label>Their termag emails</Label>
-          <Input placeholder="name@example.com, another@example.com" />
-        </TextField>
+        <TeammatePicker value={people} onChange={setPeople} onPendingChange={setPendingEmails} />
       )}
 
       <NumberField value={ttl} onChange={v => setTtl(clampTtlHours(v))} minValue={MIN_TTL_HOURS} maxValue={MAX_TTL_HOURS} className="preview-links-ttl">

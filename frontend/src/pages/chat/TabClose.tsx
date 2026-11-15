@@ -7,9 +7,13 @@
 // (OpenItemsState.recent), else the next tab in the open tab's space.
 import React, { startTransition, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { rowKey as inboxRowKey } from '../../mobile/inbox';
+import { rowKey as inboxRowKey, stateSince } from '../../mobile/inbox';
 import { chatHomeSpace } from '../../chat/chatSpaces';
-import { groupOpenItems, itemHref, itemKey, tabAfterClose, type OpenItem, type OpenItemGroup } from '../../chat/openItems';
+import { groupOpenItems, recentOpenItemGroups, itemHref, itemKey, tabAfterClose, type OpenItem, type OpenItemGroup } from '../../chat/openItems';
+import { useProjects } from '../../contexts/ProjectContext';
+import { FLAGS, useFlag } from '../../flags';
+import { statusKey } from '../../utils/statusKey';
+import { sessionName } from '../../utils/sessionName';
 import { useSimpleData, useSimpleDataIfAny } from './simpleData';
 import { useReviewsData } from './reviewsData';
 
@@ -21,6 +25,9 @@ import { useReviewsData } from './reviewsData';
  */
 export function useTabGroups(): OpenItemGroup[] {
   const { items, rows, spaces } = useSimpleData();
+  const recentOrder = useFlag(FLAGS.chatSidebarRecentOrder, false);
+  const { projects, statusMap } = useProjects();
+  const byId = useMemo(() => new Map(projects.map(p => [p.id, p])), [projects]);
   const byKey = useMemo(() => new Map(rows.map(r => [inboxRowKey(r.projectId, r.workstream), r])), [rows]);
   const { sessionKeys: reviewSessions } = useReviewsData();
   const tabs = useMemo(
@@ -33,8 +40,18 @@ export function useTabGroups(): OpenItemGroup[] {
       const row = c.kind === 'chat' ? byKey.get(inboxRowKey(c.projectId, c.workstream)) : undefined;
       return row ? chatHomeSpace(row, spaces.spaces, spaces.index) : undefined;
     };
-    return groupOpenItems(tabs, spaces.spaces.map(s => s.name), spaceOf);
-  }, [tabs, spaces.loaded, spaces.spaces, spaces.index, byKey]);
+    const groups = groupOpenItems(tabs, spaces.spaces.map(s => s.name), spaceOf);
+    return recentOrder ? recentOpenItemGroups(groups, item => {
+      const project = byId.get(item.projectId);
+      const at = project?.workstreams.find(w => w.name === item.workstream)?.lastActiveAt;
+      const row = byKey.get(inboxRowKey(item.projectId, item.workstream));
+      const status = row && project ? statusMap[statusKey(project.instanceId, sessionName(row.owner, project.name, 'agent', item.workstream))] : undefined;
+      const times = [at, status?.updatedAt && row ? stateSince(row) : null].map(value => value ? Date.parse(value) : NaN).filter(Number.isFinite);
+      if (times.length) return Math.max(...times);
+      const fallback = project?.lastActiveAt ? Date.parse(project.lastActiveAt) : NaN;
+      return Number.isFinite(fallback) ? fallback : null;
+    }) : groups;
+  }, [tabs, spaces.loaded, spaces.spaces, spaces.index, byKey, recentOrder, byId, statusMap]);
 }
 
 export type CloseTabs = (ids: readonly string[], opts?: { stay?: OpenItem }) => OpenItem | undefined;

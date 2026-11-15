@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest';
-import { decodeText, formatFileSize, queueJoinRefusal, MAX_CHAT_TEXT, MAX_TEXT_FILE_CHARS, messageTooLong, pastedTextFile, pastesAsFile, PASTE_AS_FILE_BREAKS, PASTE_AS_FILE_CHARS, prepareTextFile, splitTextFiles, textFileKind, withTextFiles } from './chatTextFiles';
+import { decodeText, formatFileSize, queueJoinRefusal, MAX_CHAT_TEXT, MAX_TEXT_FILE_CHARS, messageTooLong, pastedTextFile, pastesAsFile, PASTE_AS_FILE_BREAKS, PASTE_AS_FILE_CHARS, prepareTextFile, heldBoxFiles, splitTextFiles, SPACE_HINT, textFileKind, withTextFiles } from './chatTextFiles';
 
 const bytes = (s: string) => new TextEncoder().encode(s);
 
@@ -24,7 +24,43 @@ describe('withTextFiles and splitTextFiles', () => {
     expect(splitTextFiles(message)).toEqual({ text: '', files: [{ name: 'empty.txt', text: '' }, { name: 'Makefile', text: 'all:\n\techo hi\n' }] });
   });
 
-  // Devin on #1476: a file came back with a newline it never had, or without the one it was.
+  describe('space files', () => {
+  const path = 'attachments/ws1/20261107T101500Z-a1b2c3/logs.zip';
+  const inSpace = { path, size: 52_100, space: 'team-alpha', url: `https://app.example/termag/files/team-alpha/${path}` };
+  const onBox = { path: '.termag-attachments/0123456789abcdef/report.xlsx', size: 52_100 };
+  it('names each one as space:path with its link, after the box files, then how to fetch one, and reads them back', () => {
+    const message = withTextFiles('look', [], [inSpace, onBox]);
+    expect(message).toBe([
+      'look',
+      'Attached file on the box: .termag-attachments/0123456789abcdef/report.xlsx (52.1 KB)',
+      `Attached file in a space: team-alpha:${path} (52.1 KB) https://app.example/termag/files/team-alpha/${path}`,
+      SPACE_HINT,
+    ].join('\n\n'));
+    expect(splitTextFiles(message)).toEqual({
+      text: 'look', files: [],
+      boxFiles: [
+        { name: 'report.xlsx', path: onBox.path, size: '52.1 KB' },
+        { name: 'logs.zip', path, size: '52.1 KB', space: 'team-alpha', url: inSpace.url },
+      ],
+    });
+    // Held again (a message taken back), it goes out the same.
+    const held = heldBoxFiles(splitTextFiles(message).boxFiles!, 'h');
+    expect(withTextFiles('look', [], held.map(f => ({ path: f.path!, size: f.size, space: f.space, url: f.url })))).toBe(message);
+  });
+
+  it('reads no line as a space file unless it names an attachment path', () => {
+    for (const line of [
+      'Attached file in a space: team-alpha:notes/plan.md (1 KB) https://x/termag/files/team-alpha/notes/plan.md',
+      'Attached file in a space: team-alpha:attachments/ws1/20261107T101500Z-a1b2c3/../x (1 KB) https://x',
+      'Attached file in a space: Bad_Space:attachments/ws1/20261107T101500Z-a1b2c3/x (1 KB) https://x',
+      `Attached file in a space: team-alpha:${path} (1 KB) javascript:alert(1)`,
+    ]) {
+      expect(splitTextFiles(`hi\n\n${line}\n\n${SPACE_HINT}`).boxFiles).toBeUndefined();
+    }
+  });
+});
+
+// Devin on #1476: a file came back with a newline it never had, or without the one it was.
   it('gives every file back exactly: no final newline, only a newline, blank lines, CRLF', () => {
     for (const text of ['x=1', '\n', '\n\n', 'a\n\n', '\nlead', 'a\r\nb\r\n', '``', '```']) {
       const message = withTextFiles('q', [{ name: 'f.txt', text }]);

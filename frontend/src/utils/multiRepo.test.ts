@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { selectionLabel, selectionRepos, suggestRepoName, toggleRepo, workspaceReposBody, type ListedPick } from './multiRepo';
+import { selectionLabel, selectionNames, selectionRepos, suggestRepoName, toggleRepo, workspaceReposBody, type ListedPick } from './multiRepo';
 
 describe('suggestRepoName', () => {
   it('takes the repository part of a GitHub URL, without dots', () => {
@@ -101,9 +101,15 @@ describe('the simple UI picker with more than one repository ticked', () => {
     expect(selectionRepos({ pick: api, more: [] }, [{ url: '', name: '' }])).toBeNull();
   });
 
-  it('names the others short when they share the first one\'s owner', () => {
+  it('names the others short when they share the first one\'s owner, and drops the owner when they all do', () => {
     expect(selectionLabel('acme/api', [])).toBe('acme/api');
+    expect(selectionLabel('acme/api', [web])).toBe('api + web');
+    expect(selectionLabel('acme/api', [web, { ...web, fullName: 'acme/cli' }, { ...web, fullName: 'acme/docs' }])).toBe('api + web + cli + 1 more');
     expect(selectionLabel('acme/api', [web, docs])).toBe('acme/api + web + other/docs');
     expect(selectionLabel('acme/api', [web, docs, { ...web, fullName: 'acme/cli' }])).toBe('acme/api + web + other/docs + 1 more');
+  });
+
+  it('lists every repository in full for the pill\'s tooltip', () => {
+    expect(selectionNames('acme/api', [web, docs])).toEqual(['acme/api', 'acme/web', 'other/docs']);
   });
 });

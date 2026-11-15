@@ -8,6 +8,7 @@ import { useProjects } from '../contexts/ProjectContext';
 import { useAuth } from '../contexts/AuthContext';
 import { FLAGS, useFlag } from '../flags';
 import { ensureLaunchPadSprite } from '../launchpad/sprite';
+import { PREVIEW_LINKS_CHANGED_EVENT } from '../utils/workspacePush';
 import { previewLinkError, previewLinksApi, type PreviewLinkRequestView, type PreviewLinkView, type PreviewLinksList as LinksAnswer } from '../services/previewLinksApi';
 import { PublishPreviewLink } from './PublishPreviewLink';
 import { PreviewLinksList } from './PreviewLinksList';
@@ -39,6 +40,11 @@ export function PreviewLinksPanel({ projectId, workstream, onBusyChange }: { pro
     );
   }, [projectId]);
   useEffect(() => { reload(); }, [reload]);
+  // An agent asked for a link (a workspace push): show the new request without a reopen.
+  useEffect(() => {
+    window.addEventListener(PREVIEW_LINKS_CHANGED_EVENT, reload);
+    return () => window.removeEventListener(PREVIEW_LINKS_CHANGED_EVENT, reload);
+  }, [reload]);
   // A request no longer pending (declined here, or answered elsewhere) stops being answered (Bugbot, #1486).
   useEffect(() => {
     if (answering && list && !list.requests.some(r => r.id === answering.id)) setAnswering(null);

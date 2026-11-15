@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { automationsApi, spacesApi, type SchedulePreview, type SpaceView } from '../services/api';
 import { PRESETS, WEEKDAYS, occurrenceShort, type PresetInput } from '../utils/automationSchedule';
 import { draftCron, type AutomationDraft } from '../utils/automationDraft';
+import { FLAGS, useFlag } from '../flags';
 
 /**
  * The fields that make a project an automation: the
@@ -64,8 +65,10 @@ export function useScheduleCheck(draft: AutomationDraft, on = true): ScheduleChe
   return { preview, error: previewError, valid: !!preview && !previewError && preview.tooFrequent === null };
 }
 
-export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix = 'af', onValidity, onFullTierTick, check, showPrompt = true, tierElsewhere = false }: {
+export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix = 'af', onValidity, onFullTierTick, check, showPrompt = true, tierElsewhere = false, webhookHost = null }: {
   draft: AutomationDraft;
+  /** The automation's webhook host, on its page: said beside the alerts, since the webhook is set from the CLI. */
+  webhookHost?: string | null;
   onChange: (next: AutomationDraft) => void;
   /** The create form has no "enabled" switch beside the create button; the page does. */
   showEnabled?: boolean;
@@ -107,6 +110,9 @@ export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix
     return () => { cancelled = true; };
   }, []);
   const id = (s: string) => `${idPrefix}-${s}`;
+  // Alerts and the webhook: the server refuses them with the flag off too.
+  const alertsOn = useFlag(FLAGS.automationAlerts, false);
+  const targetKind = draft.alertTarget === 'dm' || draft.alertTarget === 'project' ? draft.alertTarget : 'channel';
 
   return (
     <>
@@ -207,6 +213,33 @@ export function AutomationFields({ draft, onChange, showEnabled = true, idPrefix
             </select>
             <span className="npf-note usage-dim">The notes file is pulled from the space before each run and pushed after it, so it outlives the box.</span>
           </div>
+          {alertsOn && (
+            <fieldset className="npf-fieldset af-alerts">
+              <legend>Alerts</legend>
+              <span className="npf-note usage-dim">Sent by termag itself, so they arrive whether or not your computer is on.</span>
+              <div className="npf-field">
+                <label htmlFor={id('alert-prefix')}>When a run's result starts with</label>
+                <input id={id('alert-prefix')} value={draft.alertPrefix} onChange={e => set('alertPrefix', e.target.value)} placeholder="BLOCKER:" spellCheck={false} maxLength={200} />
+              </div>
+              <div className="npf-field">
+                <label htmlFor={id('alert-regex')}>or matches the pattern</label>
+                <input id={id('alert-regex')} value={draft.alertRegex} onChange={e => set('alertRegex', e.target.value)} placeholder="/fail(ed|ure)/i" spellCheck={false} maxLength={200} />
+              </div>
+              <label className="npf-check"><input type="checkbox" checked={draft.healthAlerts} onChange={e => set('healthAlerts', e.target.checked)} /> Tell me when it pauses (and why) or its box is unavailable</label>
+              <div className="npf-field">
+                <label htmlFor={id('alert-target')}>Send alerts to</label>
+                <select id={id('alert-target')} value={targetKind} onChange={e => set('alertTarget', e.target.value === 'channel' ? '' : e.target.value)}>
+                  <option value="dm">my Slack DMs</option>
+                  <option value="project">the project's Slack channel</option>
+                  <option value="channel">another Slack channel…</option>
+                </select>
+                {targetKind === 'channel' && (
+                  <input aria-label="Slack channel id" value={draft.alertTarget} onChange={e => set('alertTarget', e.target.value.trim().toUpperCase())} placeholder="C0123ABCD45 (at the bottom of the channel's details)" spellCheck={false} />
+                )}
+              </div>
+              {webhookHost && <span className="npf-note usage-dim">Webhook: run events go to {webhookHost}. Change it with <code>termag automation edit --webhook</code>.</span>}
+            </fieldset>
+          )}
           {showEnabled && (
             <label className="npf-check"><input type="checkbox" checked={draft.enabled} onChange={e => set('enabled', e.target.checked)} /> Enabled</label>
           )}

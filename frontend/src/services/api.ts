@@ -2,7 +2,8 @@ import axios from 'axios';
 import { connectionTracker } from '../utils/connectionTracker';
 import type { ThemeSettings } from '../theme/schema';
 import type { OrgAccess } from '../pages/settings/githubOrgCopy';
-import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, ProjectInvite, ProjectShareInfo, Instance, InstanceKind, BoxLifecycle, AutoTerminatedBox, Workstream, CloudSession, CloudSessionEvent, HandoffMode } from '../types';
+import { Project, BrowserTab, ChromeWindow, WorkflowType, AgentProvider, User, BoxPlacementPolicy, ProjectInvite, ProjectShareInfo, Instance, InstanceKind, BoxLifecycle, AutoTerminatedBox, Workstream, CloudSession, CloudSessionEvent, HandoffMode } from '../types';
+import type { PlacementView } from '../chat/boxPlacement';
 import type { BoxGateState } from '../boxGate';
 import type { WorkspaceRepoInput } from '../utils/multiRepo';
 import type { ProjectRepoView } from '../utils/projectRepos';
@@ -13,12 +14,14 @@ import { chatModelWire, type ChatEffortWire, type ChatModelId } from '../chat/co
 import type { ChatAskThread } from '../chat/asks';
 import type { PaneSubagentsAnswer } from '../chat/paneSubagents';
 import { sendClientHeader } from '../buildInfo';
+import { holdWhileEdgeSignedOut, isEdgeSignedOut, isEdgeSignedOutError } from '../utils/edgeSession';
 
 const api = axios.create({
   baseURL: '/termag',
   withCredentials: true,
 });
 sendClientHeader(api);
+holdWhileEdgeSignedOut(api);
 
 // Every REST round-trip is evidence about reachability. An HTTP response of
 // any status (even 401/500) proves a termag server answered; only a
@@ -28,6 +31,8 @@ sendClientHeader(api);
 api.interceptors.response.use(
   (res) => { connectionTracker.contact('http'); return res; },
   (err) => {
+    // Held unsent while signed out at the edge: no evidence either way.
+    if (isEdgeSignedOutError(err)) return Promise.reject(err);
     if (err?.response) connectionTracker.contact('http');
     else connectionTracker.failure();
     return Promise.reject(err);
@@ -55,6 +60,13 @@ export interface PreferencesPatch {
   boxIdleNotify?: boolean;
   /** Where later visits open; refused while onboarding-refresh-enabled is off. */
   uiMode?: 'simple' | 'full' | null;
+  chatNudgeDismissed?: boolean;
+  /** Settings > Where new sessions run; null follows the org default. Refused while box-placement-enabled is off. */
+  boxPlacement?: BoxPlacementPolicy | null;
+  /** Settings > My files, "Put My files on my boxes" (off removes its box grants). Refused while project-files-enabled is off. */
+  myFilesOnBoxes?: boolean;
+  /** Settings > My files, "Use an existing space as My files…": a space the caller owns. 409 space_in_use, 403 space_not_owned. */
+  myFilesSpace?: string;
 }
 
 export const authApi = {
@@ -63,6 +75,9 @@ export const authApi = {
   logout: () => api.post('/auth/logout').then(r => r.data),
   updatePreferences: (data: PreferencesPatch): Promise<User> =>
     api.put('/auth/me/preferences', data).then(r => r.data),
+  /** Their My files, made now if they have none (the Files tab's My files as it opens). 404 project_files_disabled while it's off. */
+  ensureMyFiles: (): Promise<{ myFilesSpace: string; myFilesOnBoxes: boolean }> =>
+    api.post('/auth/me/my-files').then(r => r.data),
   /** First-run wizard finished/skipped (true) or re-offer it (false). */
   setOnboarded: (done: boolean): Promise<User> =>
     api.put('/auth/me/onboarding', { done }).then(r => r.data),
@@ -98,6 +113,8 @@ export const featureFlagsApi = {
 export interface ProjectTemplateInfo { id: string; label: string; repoUrl: string; blurb: string }
 
 export const projectsApi = {
+  // Runs on: Auto: a session still waiting on a box that won't wake moves to a new box.
+  moveToNewBox: (id: string): Promise<{ instanceId: string; name: string }> => api.post(`/api/projects/${id}/new-box`).then(r => r.data),
   // A space orchestrator's project is never listed (utils/projectKind.ts); the backend leaves it out too.
   list: (): Promise<Project[]> => api.get('/api/projects').then(r => (r.data as Project[]).filter(p => projectKindTraits(p.kind).inProjectLists)),
   create: (data: {
@@ -129,6 +146,12 @@ export const projectsApi = {
     chatSpace?: string | null;
     /** The answer to a refusal for an archived project holding the name on the box (utils/projectStart.ts archivedNameClash). */
     archivedName?: 'unarchive' | 'rename-aside';
+    /**
+     * New session's project (user-projects-enabled): the checkout is one of it,
+     * with exactly its repositories (409 user_project_repos_mismatch otherwise, user_project_archived for an archived
+     * one). A name another checkout holds, archived ones included, answers 409 checkout_name_taken.
+     */
+    userProjectId?: string;
   }): Promise<Project> =>
     api.post('/api/projects', data).then(r => r.data),
   /** Known starter repos for "first project" (webapp, research); "custom" is any GitHub URL. */
@@ -203,7 +226,8 @@ export const workstreamsApi = {
   list: (projectId: string): Promise<Workstream[]> =>
     api.get(`/api/projects/${projectId}/workstreams`).then(r => r.data),
   /** `fetch` starts from a fresh origin/<remoteBranch> on a box that can (backend createWorkstreamBody). */
-  create: (projectId: string, data: { name: string; branch?: string; baseRef?: string; fetch?: { remoteBranch: string; fullAccess?: boolean }; chatSpace?: string | null }): Promise<Workstream> =>
+  // newSession: New session made it, for its start timing (backend services/sessionStartTiming.ts).
+  create: (projectId: string, data: { name: string; branch?: string; baseRef?: string; fetch?: { remoteBranch: string; fullAccess?: boolean }; chatSpace?: string | null; newSession?: boolean }): Promise<Workstream> =>
     api.post(`/api/projects/${projectId}/workstreams`, data).then(r => r.data),
   remove: (projectId: string, workstreamId: string, force = false): Promise<WorkstreamDeleteResult> =>
     api.delete(`/api/projects/${projectId}/workstreams/${workstreamId}`, {
@@ -318,7 +342,10 @@ export const instancesApi = {
   // recording can leave it out (observability.ts NETWORK_URL_BLOCKLIST) while
   // the person-triggered /api/instances calls stay recorded; the server ignores it.
   list: (): Promise<Instance[]> => api.get('/api/instances', { params: { poll: 1 } }).then(r => r.data),
-  get: (id: string): Promise<Instance> => api.get(`/api/instances/${id}`).then(r => r.data),
+  // timeoutMs: bound the call (utils/boxWake's wake passes one, so a hung read
+  // cannot outlast its deadline). Absent, as before: no timeout of its own.
+  get: (id: string, timeoutMs?: number): Promise<Instance> =>
+    api.get(`/api/instances/${id}`, timeoutMs ? { timeout: timeoutMs } : undefined).then(r => r.data),
   // size: one the New box picker chose (utils/boxSize.ts), absent for the
   // default; repo: the repository the box is made for, for its default size.
   // repo: one repository, or a multi-repo project's list, whose largest .termag/environment.json size the box takes.
@@ -344,10 +371,11 @@ export const instancesApi = {
   terminate: (id: string, confirmed = false) =>
     api.delete(`/api/instances/${id}`, { data: { confirmed } }).then(r => r.data),
   // 202 with the transitional status; poll list() until stopped / ready.
-  stop: (id: string): Promise<{ ok: true; status: 'stopping' }> =>
-    api.post(`/api/instances/${id}/stop`).then(r => r.data),
-  start: (id: string): Promise<{ ok: true; status: 'starting' }> =>
-    api.post(`/api/instances/${id}/start`).then(r => r.data),
+  // force: stop it even though it runs Claude Code cloud sessions (a 409 box_busy said so).
+  stop: (id: string, force = false): Promise<{ ok: true; status: 'stopping' }> =>
+    api.post(`/api/instances/${id}/stop`, force ? { force: true } : undefined).then(r => r.data),
+  start: (id: string, timeoutMs?: number): Promise<{ ok: true; status: 'starting' }> =>
+    api.post(`/api/instances/${id}/start`, undefined, timeoutMs ? { timeout: timeoutMs } : undefined).then(r => r.data),
   // 'stopping' when EC2 refused the hibernate and the backend stopped it instead.
   hibernate: (id: string): Promise<{ ok: true; status: 'hibernating' | 'stopping' }> =>
     api.post(`/api/instances/${id}/hibernate`).then(r => r.data),
@@ -543,6 +571,174 @@ export interface WarmPoolStatus {
   specHashes: string[];
 }
 
+/**
+ * Runs on: Auto: where a New session for these
+ * repositories (owner/name or URLs) would run, and every box it could go on.
+ * With a project (user-projects-enabled), a box has what it needs when it has
+ * a checkout of that project, and the repositories are not read.
+ * Read-only; 404 box_placement_disabled while box-placement-enabled is off.
+ */
+export const boxesApi = {
+  placement: (repos: readonly string[], size: string | null, userProjectId: string | null = null): Promise<PlacementView> =>
+    api.get('/api/boxes/placement', { params: { repos: repos.join(','), ...(size ? { size } : {}), ...(userProjectId ? { userProjectId } : {}) } }).then(r => r.data),
+};
+
+/**
+ * A project: a name and its repositories,
+ * with a checkout on each box it runs on. GET /api/user-projects's view.
+ */
+export interface UserProjectView {
+  id: string;
+  name: string;
+  /**
+   * In order: a new checkout clones them in it. `repoKey` is owner/name, lowercased. `iconId`: the
+   * repository's detected icon, drawn while the project's icon is automatic;
+   * `iconSrc` that image inline (a data: URI), for the first two repositories, the ones the icon draws.
+   */
+  repos: Array<{ repoKey: string; name: string; url: string; defaultBranch: string | null; iconId?: string | null; iconSrc?: string | null }>;
+  /** What its icon is: automatic (each repository's detected icon, else its letter), the letters, or an image. */
+  icon?: ProjectIconChoice;
+  archived: boolean;
+  /** Its newest checkout's lastActiveAt, else when it was made. */
+  lastActiveAt: string;
+  /** Its Project files (milestone 8); null until then. */
+  filesSpace: { name: string } | null;
+  checkouts: Array<{
+    projectId: string;
+    instanceId: string | null;
+    boxName: string | null;
+    boxStatus: string | null;
+    sessions: number;
+    archived: boolean;
+  }>;
+}
+
+/** A project's icon (backend services/projectIcons.ts iconChoiceOf): `imageId` only for `image`, and `src` its image inline. */
+export interface ProjectIconChoice {
+  choice: 'auto' | 'letter' | 'image';
+  imageId: string | null;
+  /** The chosen image, a data: URI: no route serves an icon, each travels in the view that names it. */
+  src?: string | null;
+}
+
+/** One image a project's icon can be, as the picker lists it (backend services/projectIconStore.ts). */
+export interface ProjectIconCandidate {
+  id: string;
+  /** Where it was read from in its repository; null for an upload. */
+  path: string | null;
+  mimeType: string;
+  /** The image, a data: URI. */
+  src: string;
+}
+
+/** A repository's icons for the picker: its candidates, and the one automatic shows. */
+export interface RepoIcons {
+  repoKey: string;
+  detectedId: string | null;
+  checkedAt: string | null;
+  candidates: ProjectIconCandidate[];
+}
+
+/** GET /api/user-projects/:id/icons: what the project shows, its upload if it shows one, and each repository's icons. */
+export interface ProjectIconsView extends ProjectIconChoice {
+  upload: ProjectIconCandidate | null;
+  repos: RepoIcons[];
+}
+
+/** What archiving a project would do (GET /api/user-projects/:id/archive-plan, backend routes/userProjectWrites.ts). */
+export interface UserProjectArchivePlan {
+  id: string;
+  name: string;
+  archived: boolean;
+  /** Its live sessions, across its checkouts. */
+  sessions: number;
+  checkouts: Array<{ projectId: string; name: string; kind: 'chat' | 'lab'; sessions: number; boxName: string | null }>;
+  /** Each box: stops (nothing else runs on it), or keeps running and why. */
+  boxes: Array<{ boxId: string; boxName: string; fate: 'stops' | 'keeps'; why: 'nothing-else' | 'other-sessions' | 'lab-session' | 'not-powered'; detail?: string }>;
+}
+
+/** What an archive did: its checkouts archived, any it couldn't (and why), and the boxes the chat archive stopped. */
+export interface UserProjectArchiveReport {
+  archived: Array<{ projectId: string; name: string }>;
+  failed: Array<{ projectId: string; name: string; status: number; error: string }>;
+  boxes: Array<{ boxId: string; boxName: string; action: 'stop'; status?: string | null; error?: string }>;
+}
+
+/** The project record, under user-projects-enabled (404 user_projects_disabled while it's off). Owner only. */
+export const userProjectsApi = {
+  /** The caller's projects, most recently active first, archived ones included. */
+  list: (): Promise<UserProjectView[]> => api.get('/api/user-projects').then(r => r.data.projects),
+  /**
+   * + New project: a name (1–60 characters) and its repositories, or none, with no checkout yet. 409
+   * user_project_name_taken carries the clash's projectId and whether it's archived; 400 user_project_invalid its field.
+   */
+  create: (body: { name: string; repos: Array<{ url: string; defaultBranch?: string }> }): Promise<UserProjectView> =>
+    api.post('/api/user-projects', body).then(r => r.data),
+  /**
+   * Add a repository to one: new checkouts clone it. 409 user_project_repo_exists, user_project_repo_limit (8, or 1
+   * while multi-repo projects are off), user_project_archived; 400 user_project_invalid.
+   */
+  addRepo: (id: string, body: { url: string; defaultBranch?: string }): Promise<UserProjectView> =>
+    api.post(`/api/user-projects/${encodeURIComponent(id)}/repos`, body).then(r => r.data),
+  /**
+   * Rename, archive or unarchive one (PATCH). An archive's
+   * answer carries `archive`, what it did; 409 user_project_name_taken for a taken name; 409
+   * user_project_archive_incomplete (with `archive`) when a checkout wouldn't archive.
+   */
+  update: (id: string, body: { name?: string; archived?: boolean }): Promise<UserProjectView & { archive?: UserProjectArchiveReport }> =>
+    api.patch(`/api/user-projects/${encodeURIComponent(id)}`, body).then(r => r.data),
+  /**
+   * Use an existing space for files…: one of the caller's own
+   * spaces becomes the project's Project files; the one it replaces stays, in Other spaces. Sent on its own. 409
+   * space_in_use when it's already a project's files or someone's My files; 403 space_not_owned; 404
+   * space_not_found, or project_files_disabled while project-files-enabled is off.
+   */
+  setFilesSpace: (id: string, filesSpace: string): Promise<UserProjectView> =>
+    api.patch(`/api/user-projects/${encodeURIComponent(id)}`, { filesSpace }).then(r => r.data),
+  /** Its Project files, made now if it has none (the Files tab's "Project files are being set up"); the view names them. */
+  ensureFiles: (id: string): Promise<UserProjectView> =>
+    api.post(`/api/user-projects/${encodeURIComponent(id)}/files`).then(r => r.data),
+  /** What archiving it would take, and each box's fate, as the archive will work it out. */
+  archivePlan: (id: string): Promise<UserProjectArchivePlan> =>
+    api.get(`/api/user-projects/${encodeURIComponent(id)}/archive-plan`).then(r => r.data),
+  /** Its picker: what it shows and each repository's icons, after a look at the ones due (up to 10 s). */
+  icons: (id: string): Promise<ProjectIconsView> =>
+    api.get(`/api/user-projects/${encodeURIComponent(id)}/icons`).then(r => r.data),
+  /** New project's picker, before the project exists: 1 to 8 repositories' icons. */
+  iconCandidates: (repoKeys: readonly string[]): Promise<{ repos: RepoIcons[] }> =>
+    api.get('/api/user-projects/icon-candidates', { params: { repos: repoKeys.join(',') } }).then(r => r.data),
+  /** What it shows: automatic, the letters, or one of the person's icons. */
+  setIcon: (id: string, body: { choice: 'auto' | 'letter' } | { choice: 'image'; iconId: string }): Promise<{ ok: true }> =>
+    api.put(`/api/user-projects/${encodeURIComponent(id)}/icon`, body).then(r => r.data),
+  /** An upload, sent as its image type (a 128 × 128 PNG from the picker, at most 32 KiB); 400 project_icon_invalid says why not. */
+  uploadIcon: (image: Blob): Promise<{ id: string; mimeType: string }> =>
+    api.post('/api/user-projects/icons', image, { headers: { 'Content-Type': image.type || 'image/png' } }).then(r => r.data),
+};
+
+/** A session the person pinned in the chat sidebar (backend services/sessionPins.ts SessionPinView). */
+export interface SessionPin {
+  workstreamId: string;
+  /** The session's checkout and workstream name as of the read: its sidebar row key is `${projectId}|${workstream}`. */
+  projectId: string;
+  workstream: string;
+  pinnedAt: string;
+}
+
+/**
+ * Session pins, under user-projects-enabled (404 session_pins_disabled while it's off). The caller's own,
+ * on sessions they can see; use chat/sessionPins.ts's useSessionPins rather than these directly.
+ */
+export const sessionPinsApi = {
+  /** Pins on live sessions, oldest first: an archived session's pin is kept but not listed. */
+  list: (): Promise<SessionPin[]> => api.get('/api/session-pins').then(r => r.data.pins),
+  /** Idempotent. 404 session_not_found (gone, or not theirs to see); 409 session_archived. */
+  pin: (workstreamId: string): Promise<SessionPin> =>
+    api.put(`/api/session-pins/${encodeURIComponent(workstreamId)}`).then(r => r.data.pin),
+  /** Idempotent: unpinning one that isn't pinned is a 200 too. */
+  unpin: (workstreamId: string): Promise<void> =>
+    api.delete(`/api/session-pins/${encodeURIComponent(workstreamId)}`).then(() => undefined),
+};
+
 export const warmPoolApi = {
   get: (): Promise<WarmPoolStatus> =>
     // `poll=1`: periodic read, left out of network recording (observability.ts).
@@ -684,6 +880,8 @@ export const visitsApi = {
     sessionTag?: string;
     workstream?: string | null;
   }) => {
+    // Signed out at the edge, a beacon would only reset a login's nonce (utils/edgeSession.ts).
+    if (isEdgeSignedOut()) return;
     const url = '/termag/api/visits';
     const json = JSON.stringify(body);
     const notify = () => {
@@ -898,6 +1096,11 @@ export interface ArchivedChat {
   otherProjects: number;
   /** The box is gone and the orchestrator holds this chat's transcript, so Reopen opens that. */
   storedHistory?: boolean;
+  /** Its main session's title (Workstream.sessionTitle) and who set it; absent from an older orchestrator. */
+  sessionTitle?: string | null;
+  sessionTitleSource?: string | null;
+  /** What its agent ran on, for the redesigned sidebar's model mark; absent from an older orchestrator. */
+  agent?: { provider: string | null; backend: string | null; model: string | null };
 }
 
 /** Where a held message's image is read (routes/chat.ts chatHeldImageFor). */
@@ -910,6 +1113,12 @@ export const chatsApi = {
   archived: (): Promise<ArchivedChat[]> => api.get('/api/chats/archived').then(r => r.data),
   archive: (id: string): Promise<{ archived: true; box: { action: string | null; status?: string | null; reason?: string; error?: string } }> =>
     api.post(`/api/chats/${encodeURIComponent(id)}/archive`).then(r => r.data),
+  /** The archive's dry run: whether archiving would stop the box (user-projects-enabled; 404 chat_actions_disabled off). */
+  archivePlan: (id: string): Promise<{ box: { action: 'stop'; id: string; name: string } | { action: null; reason: string } }> =>
+    api.get(`/api/chats/${encodeURIComponent(id)}/archive-plan`).then(r => r.data),
+  /** A person's name for one of the chat's sessions (`workstream`, main by default); sticks against Claude's titles. */
+  rename: (id: string, workstream: string, title: string): Promise<{ title: string; titleAt: string; titleSource: 'person' }> =>
+    api.post(`/api/chats/${encodeURIComponent(id)}/title`, { workstream, title }).then(r => r.data),
   reopen: (id: string): Promise<{ reopened: boolean; pending?: boolean; stored?: boolean; box: ArchivedChat['box'] }> =>
     api.post(`/api/chats/${encodeURIComponent(id)}/reopen`).then(r => r.data),
   remove: (id: string): Promise<{ deleted: true }> =>
@@ -1342,6 +1551,27 @@ export interface CredentialsStatus {
     connected: { label: string; updatedAt: string; orgs: Record<string, OrgAccess> } | null;
     boxGate: BoxGateState;
   };
+  // The person's own Fireworks API key: absent from an older orchestrator.
+  fireworks?: {
+    available: boolean;
+    // A box is refused without a key of the person's own (fireworks-own-key-required-enabled).
+    required: boolean;
+    key: FireworksKeyStatus | null;
+    // A key is stored but the orchestrator could not read it.
+    unreadable: boolean;
+  };
+}
+
+export interface FireworksKeyStatus {
+  label: string;
+  // The key's first characters, never more of it.
+  hint: string;
+  owner: string | null;
+  account: string | null;
+  expireTime: string | null;
+  expiresSoon: boolean;
+  invalid: { reason: 'rejected' | 'expired'; at: string } | null;
+  updatedAt: string;
 }
 
 export const credentialsApi = {
@@ -1352,6 +1582,9 @@ export const credentialsApi = {
     api.put('/api/credentials/github', { token }).then(r => r.data),
   disconnectGithub: () => api.delete('/api/credentials/github').then(r => r.data),
   recheckGithub: (): Promise<void> => api.post('/api/credentials/github/recheck').then(() => undefined),
+  saveFireworksKey: (key: string): Promise<{ owner: string | null; account: string | null; expireTime: string | null }> =>
+    api.put('/api/credentials/fireworks', { key }).then(r => r.data),
+  removeFireworksKey: (): Promise<void> => api.delete('/api/credentials/fireworks').then(() => undefined),
 };
 
 // MCP connectors through the termag MCP broker (backend routes/mcpConnectors.ts).
@@ -1371,6 +1604,10 @@ export interface McpConnector {
   secretNames: string[] | null;
   missingSecrets: string[];
   brokerUrl: string | null;
+  // Why the owner's mcp-upstream-allowlist refuses it (not on the list, or the
+  // list could not be loaded), or null: the broker refuses its calls, and
+  // Settings shows this instead of Connect. Absent from an older orchestrator.
+  blocked?: string | null;
   updatedAt: string;
   // oauth only: the server is on the user's mcp-oauth-loopback-servers list, so its
   // sign-in ends on a localhost page whose address is pasted into Settings.
@@ -1674,9 +1911,14 @@ export const prsApi = {
   /** Attaches a PR to one of the user's workstreams, until changed by hand. */
   link: (repo: string, number: number, projectId: string, workstream: string): Promise<{ ok: true }> =>
     api.put('/api/prs/links', { repo, number, projectId, workstream }).then(r => r.data),
-  /** A new workstream on the PR's own branch, attached to it (the agent checks out pull/<n>/head, or adopts its worktree). */
-  newWorkstream: (repo: string, number: number, projectId: string, name: string, prompt?: string): Promise<{ id: string; name: string; branch: string; sessionLaunchWarnings?: string[] }> =>
-    api.post(`${prPath(repo, number)}/workstream`, { projectId, name, ...(prompt?.trim() ? { prompt } : {}) }, { timeout: 630_000 }).then(r => r.data),
+  /**
+   * A new workstream on the PR's own branch, attached to it (the agent checks out pull/<n>/head, or adopts its worktree).
+   * `provider`: its agent instead of main's; a review chat's, with simple-ui-review-chat-enabled. `copyOf`: a review
+   * chat beside that session (a workstream of the project), on a branch of its own off the session's branch.
+   */
+  // `copyKeepsLink`: a copy of your own PR's session, which keeps the PR's link (routes/prs.ts prWorkstreamCopy).
+  newWorkstream: (repo: string, number: number, projectId: string, name: string, prompt?: string, provider?: string, copyOf?: string, copyKeepsLink?: boolean): Promise<{ id: string; name: string; branch: string; sessionLaunchWarnings?: string[] }> =>
+    api.post(`${prPath(repo, number)}/workstream`, { projectId, name, ...(prompt?.trim() ? { prompt } : {}), ...(provider ? { provider } : {}), ...(copyOf ? { copyOf, ...(copyKeepsLink ? { copyKeepsLink: true } : {}) } : {}) }, { timeout: 630_000 }).then(r => r.data),
   /** A new review group, its members in review order (each checked against GitHub). */
   createGroup: (name: string, members: PrGroupMemberInput[] = []): Promise<{ id: string }> =>
     api.post('/api/prs/groups', { name, members }).then(r => r.data),
@@ -1855,6 +2097,18 @@ export interface AutomationView {
   keepRuns: number;
   spaceName: string | null;
   notifySlack: boolean;
+  /** Keyword and health alerts; absent from servers before them. */
+  alertPrefix?: string | null;
+  alertRegex?: string | null;
+  /** dm (the owner's Slack DM), project (the project's channel) or a Slack channel id. */
+  alertTarget?: string;
+  healthAlerts?: boolean;
+  /** The outbound webhook's host; set and removed with `termag automation edit --webhook`. */
+  webhook?: { host: string } | null;
+  /** The last alert send (Slack or the webhook) that failed, until one goes; absent from servers before it. */
+  lastAlertError?: { error: string; at: string } | null;
+  /** Each channel's last failed send, until a send on that channel goes; absent from servers before it (read lastAlertError). */
+  lastAlertErrors?: { slack: { error: string; at: string } | null; webhook: { error: string; at: string } | null };
   // The fields below come with the provider and space-folder backends
   //  and are absent on a server without them: read
   // absent as Claude, its default model and effort, and the default folder.
@@ -1882,6 +2136,7 @@ export interface AutomationView {
 export interface AutomationSettings {
   schedule?: string; timezone?: string; prompt?: string; tier?: 'full' | 'read'; enabled?: boolean; prOnChange?: boolean;
   wakeBox?: boolean; notifySlack?: boolean; maxRunMinutes?: number; keepRuns?: number; spaceName?: string | null;
+  alertPrefix?: string | null; alertRegex?: string | null; alertTarget?: string; healthAlerts?: boolean;
   // Sent only to a server that has them (automationsApi.options() is not null). No spaceFolder: the server fixes it.
   provider?: string; model?: string | null; effort?: AutomationEffort | null;
   /** With model: what the next run starts on (utils/automationModel.ts); null is Claude's default backend, whose model is a tier. */
@@ -1949,6 +2204,8 @@ export interface EnvironmentPoolView {
   preparedAt: string | null;
   preparedCommit: Record<string, string> | null;
   lastFailure: { at: string; log: string } | null;
+  /** The newest ready box's on-warm run (the deploy/on-warm.d scripts), run during its prepare. */
+  onWarm?: { state: string; seconds: number | null; log: string | null } | null;
   nextRefreshAt: string | null;
 }
 /** What a create or edit sends: an inline definition (JSON or its text), or a pointer (an empty path is `.termag/environment.json`). */
@@ -1958,7 +2215,7 @@ export type EnvironmentInput =
 
 /**
  * Environments (backend routes/environments.ts): the caller's personal ones (theirs alone), then the shared ones
- * (anyone's to use and edit); only an environment's owner makes it personal or shared.
+ * (anyone's to use, an admin's to change); only an admin makes one shared or a shared one personal.
  */
 export const environmentsApi = {
   list: (): Promise<EnvironmentView[]> => api.get('/api/environments').then(r => r.data.environments),
@@ -2093,6 +2350,55 @@ export type SpaceUploadStart =
 
 const sp = (space: string) => `/api/spaces/${encodeURIComponent(space)}`;
 
+// ---- A space's Slack channels (backend routes/spaceSlack.ts) ----
+
+export interface SpaceSlackPerson { userId: string; email: string | null }
+export interface SpaceSlackChannel {
+  channelId: string; name: string; private: boolean; createdByTermag: boolean;
+  linkedBy: SpaceSlackPerson; linkedVia: string; linkedAt: string; paused: boolean;
+}
+export interface SpaceSlackStatus {
+  space: string;
+  enabled: boolean;
+  status: 'active' | 'paused' | 'suspended' | null;
+  runner: SpaceSlackPerson | null;
+  box: { kind: 'existing'; id: string; name: string } | { kind: 'new'; size: string } | null;
+  pendingRunner: SpaceSlackPerson | null;
+  caps: { channelsPerSpace: number; allowPrivate: boolean };
+  channels: SpaceSlackChannel[];
+  you: { owner: boolean; runner: boolean };
+  /** 'fake': the staging fake workspace answers (SPACE_SLACK_FAKE_WORKSPACE). */
+  slack: 'slack' | 'fake' | 'none';
+}
+export interface SlackPickerChannel {
+  id: string; name: string; private: boolean; termagIn: boolean; members: number | null;
+  linkedTo?: string | null;
+  disabled?: 'channel_linked' | 'channel_workstream' | 'channel_ext_shared' | 'not_in_channel' | 'actor_not_in_slack';
+}
+export interface SpaceSlackPreview {
+  bystanders: number | null; needsInvite: boolean; firstLink: boolean; channelName: string | null; isPrivate: boolean;
+  /** The channel is linked to this space already: nothing to link. */
+  alreadyLinked?: boolean;
+}
+export type SpaceSlackTarget = { channelId: string } | { create: { name: string; private: boolean; inviteMembers: boolean } };
+export type SpaceSlackBox = { existing: string } | { new: { size: 'small' } };
+
+export const spaceSlackApi = {
+  status: (space: string): Promise<SpaceSlackStatus> => api.get(`${sp(space)}/slack`).then(r => r.data),
+  channels: (query: string, cursor?: string): Promise<{ channels: SlackPickerChannel[]; nextCursor: string | null }> =>
+    api.get('/api/spaces/slack/channels', { params: { query, ...(cursor ? { cursor } : {}) } }).then(r => r.data),
+  preview: (space: string, target: SpaceSlackTarget): Promise<SpaceSlackPreview> =>
+    api.post(`${sp(space)}/slack/channels/preview`, target).then(r => r.data),
+  link: (space: string, target: SpaceSlackTarget, box?: SpaceSlackBox): Promise<{ channel: SpaceSlackChannel; already: boolean; failedInvites: Array<{ id: string; error: string }> }> =>
+    api.post(`${sp(space)}/slack/channels`, { ...target, ...(box ? { runner: { box } } : {}) }).then(r => r.data),
+  unlinkPreview: (space: string, channelId: string): Promise<{ channel: SpaceSlackChannel; threads: number | null; canArchive: boolean }> =>
+    api.get(`${sp(space)}/slack/channels/${encodeURIComponent(channelId)}`).then(r => r.data),
+  unlink: (space: string, channelId: string, archive = false): Promise<{ unlinked: string; name: string; archived: boolean }> =>
+    api.delete(`${sp(space)}/slack/channels/${encodeURIComponent(channelId)}`, { params: archive ? { archive: 'true' } : {} }).then(r => r.data),
+  pause: (space: string): Promise<SpaceSlackStatus> => api.post(`${sp(space)}/slack/pause`).then(r => r.data),
+  resume: (space: string): Promise<SpaceSlackStatus> => api.post(`${sp(space)}/slack/resume`).then(r => r.data),
+};
+
 export const spacesApi = {
   list: (): Promise<{ spaces: SpaceView[] }> => api.get('/api/spaces').then(r => r.data),
   create: (name: string, description?: string): Promise<{ space: SpaceView }> =>
@@ -2142,6 +2448,15 @@ export const spacesApi = {
     api.delete(`${sp(space)}/uploads/${encodeURIComponent(uploadId)}`, { params: { path } }).then(r => r.data),
   move: (space: string, from: string, to: string): Promise<{ ok: boolean; moved: number; failed: string[] }> =>
     api.post(`${sp(space)}/files/move`, { from, to }).then(r => r.data),
+  /**
+   * Move one file to another space (Move to My files / Move to Project files),
+   * at the same path unless `toPath`. Editor on both. 409
+   * `exists` (with the target's `space` and `path`) when the target has it: ask, then send `force: true`; 412
+   * `changed` when `ifMatch` is stale; 404 without a role in either; 400 `memory_path` for a space's `.termag/`.
+   * Its share link on the old path goes.
+   */
+  moveTo: (space: string, body: { path: string; toSpace: string; toPath?: string; ifMatch?: string; force?: boolean }): Promise<{ ok: boolean; moved: number; to: { space: string; path: string } }> =>
+    api.post(`${sp(space)}/files/move-to`, body).then(r => r.data),
   removeFiles: (space: string, path: string, recursive = false): Promise<{ ok: boolean; deleted: number; failed: string[] }> =>
     api.delete(`${sp(space)}/files`, { params: { path, ...(recursive ? { recursive: '1' } : {}) } }).then(r => r.data),
   /** The file's version; null (a 304) while it is still `etag`. A removed file rejects with 404 `file_not_found`. */

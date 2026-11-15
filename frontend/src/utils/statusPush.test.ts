@@ -16,6 +16,11 @@ describe('statusFromPush', () => {
   it('turns an absent handoff into null', () => {
     expect(statusFromPush({ status: 'working', updatedAt: 'x' }).handoff).toBeNull();
   });
+
+  it('keeps when the session entered its status, for the sidebar card, and null without one', () => {
+    expect(statusFromPush({ status: 'idle', updatedAt: 'x', statusSince: '2026-11-13T19:00:00.000Z' }).statusSince).toBe('2026-11-13T19:00:00.000Z');
+    expect(statusFromPush({ status: 'idle', updatedAt: 'x' }).statusSince).toBeNull();
+  });
 });
 
 describe('statusFromPush: review panes (docs/parallel-reviews.md)', () => {

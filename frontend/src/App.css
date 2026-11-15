@@ -2483,6 +2483,13 @@ a.ctx-panel:hover { border-color: var(--text-muted); }
   background: rgba(var(--offline-fill-rgb), 0.85);
 }
 
+/* The notice banner (notice/NoticeBanner.tsx), edge to
+   edge over the terminals and above the connection banner, as that one is. */
+.app-notice .notice-alert {
+  border-radius: 0;
+  border-width: 0 0 1px;
+}
+
 /* Status glyphs are stale while offline: grey them so a frozen green dot
    can't pass for a live one. */
 .project-status.stale,
@@ -2613,6 +2620,13 @@ a.ctx-panel:hover { border-color: var(--text-muted); }
    (inline code, key fingerprints, hex colours: .settings-row-mono, .settings-hex). */
 .settings-page { max-width: 760px; font-family: var(--font-ui); }
 .settings-page :where(code, kbd, pre, samp) { font-family: var(--font-mono); }
+/* Settings → Where new sessions run (pages/settings/BoxPlacementSection.tsx): back to the org's default. */
+.settings-placement-actions { display: flex; margin-top: 6px; }
+/* Settings → My files (MyFilesSection.tsx): LaunchPad's Switch, then the space and its Use an existing space… */
+.settings-my-files { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.settings-my-files-space { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.settings-page .settings-my-files-space > button { width: auto; flex: 0 0 auto; }
+.settings-page .settings-placement-actions > .settings-placement-follow { width: auto; flex: 0 0 auto; margin-inline-start: -8px; }
 .settings-hint { margin: 0; font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
 .settings-hint code { font-size: 11px; color: var(--text-primary); }
 .settings-notify-blocked { color: var(--warning); }
@@ -3837,11 +3851,18 @@ button.space-name:hover { color: var(--accent); }
 .admin-sw { font-variant-numeric: tabular-nums; padding: 0 4px; border-radius: 3px; white-space: nowrap; }
 .admin-sw--current { color: var(--success); }
 .admin-sw--behind { color: var(--warning-bright); }
-.admin-sw--outdated { color: var(--text-on-fill); background: var(--danger-fill); }
+/* below-floor (a tool under its policy's security floor) is the only red. */
+.admin-sw--below-floor { color: var(--text-on-fill); background: var(--danger-fill); }
+.admin-sw--outdated { color: var(--warning-bright); text-decoration: underline dotted; }
 .admin-sw--ahead { color: var(--accent); }
+.admin-sw--held { color: var(--text-secondary); }
 .admin-sw--pending { color: var(--warning-bright); }
 .admin-sw--missing { color: var(--text-muted); }
 .admin-sw--unknown { color: var(--text-muted); font-style: italic; }
+/* A tool cell's badges (pages/admin/cellBadges.ts): words, in the UI font, after the version. */
+.admin-sw-badge { margin-left: 4px; font-family: var(--font-ui); font-size: 10px; padding: 0 4px; border: 1px solid var(--border); border-radius: 8px; white-space: nowrap; }
+/* A row older than the fleet update counts, or an offline host's: dimmed. */
+.admin-sw-stale { opacity: 0.55; }
 .admin-sw-matrix th { white-space: nowrap; font-size: 10px; }
 .admin-sw-matrix td { white-space: nowrap; }
 /* The host matrix's cells are versions and commits: code. The reboot row's are words (.admin-sw--words). */
@@ -4080,6 +4101,7 @@ button.space-name:hover { color: var(--accent); }
 .automations-page .auto-table th, .automations-page .auto-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .automations-page .auto-table .auto-summary { max-width: 32em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .automations-page .auto-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.environments-page .auto-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
 .automations-page .auto-memory { white-space: pre-wrap; font-family: var(--font-mono); font-size: 11px; max-height: 24em; overflow: auto; background: var(--bg-elevated); padding: 8px; border-radius: 6px; }
 .automations-page .auto-edit { max-width: 56em; }
 .automations-page .auto-model { font: inherit; font-size: 12px; padding: 2px 6px; background: var(--bg-base); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; }
@@ -4212,6 +4234,15 @@ button.space-name:hover { color: var(--accent); }
 .admin-pill--triaged { color: var(--warning); border-color: var(--warning); }
 .admin-pill--fixed { color: var(--success); border-color: var(--success); }
 .admin-pill--duplicate, .admin-pill--wontfix { color: var(--text-muted); }
+/* /admin/feedback (pages/admin/AdminFeedback.tsx): prose in the UI font; the full UI's body is mono. */
+.admin-feedback { font-family: var(--font-ui); }
+.admin-feedback-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 10px; }
+.admin-feedback-text { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 64ch; line-height: 1.45; }
+.admin-pill--seen { color: var(--text-muted); }
+.admin-pill--fb-praise { color: var(--success); border-color: var(--success); }
+.admin-pill--fb-problem { color: var(--danger); border-color: var(--danger); }
+.admin-pill--fb-idea { color: var(--accent); border-color: var(--accent); }
+.admin-pill--fb-other { color: var(--text-muted); }
 .admin-pill--sev-high { color: var(--danger); border-color: var(--danger); }
 .admin-pill--sev-medium { color: var(--warning); border-color: var(--warning); }
 .admin-bug-filters input[type="search"] { flex: 2; }

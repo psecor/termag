@@ -4,6 +4,7 @@
 import React, { useEffect, useState, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { optOutOfMobile } from '../../mobile/redirect';
+import { recordLabOpened } from '../../chat/labOpened';
 import { currentInstallOption, promptInstall, subscribeInstall } from '../../mobile/install';
 import { reloadApp } from '../../mobile/useMobileRefresh';
 import { pushApi } from '../../services/api';
@@ -30,7 +31,7 @@ export function AppMenu() {
   if (install === 'ios-instructions') actions.push({ label: 'Add to Home Screen…', onClick: () => setOpen('install-ios') });
   actions.push(
     { label: 'Reload app', onClick: reloadApp },
-    { label: 'Lab', onClick: () => { optOutOfMobile(); navigate('/'); } },
+    { label: 'Lab', onClick: () => { recordLabOpened('phone'); optOutOfMobile(); navigate('/'); } },
   );
 
   return (

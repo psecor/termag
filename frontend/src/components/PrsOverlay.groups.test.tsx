@@ -117,6 +117,14 @@ describe('PrsOverlay review groups', () => {
     expect(document.querySelector('.prg-pill')?.textContent).toBe('Desktop bridge 4/4');
     expect(document.querySelectorAll('.prg-card')).toHaveLength(0);
   });
+  it('does the same on Team reviews: a team-requested member leaves the lane for the card (its only lane)', () => {
+    const TEAM = row({ lane: 'team_review', number: 649, title: 'team ask', askedYou: false });
+    mocks.data = { ...RES, lanes: [...(RES as unknown as { lanes: PrLane[] }).lanes, lane('team_review', [TEAM, OTHER])], groups: [{ ...GROUP, members: [...GROUP.members, member(TEAM, { askedYou: false })] }] };
+    render('/?prs=team_review');
+    expect(cardLabels()).toEqual(['termag#646', 'terraform#28576', 'termag#647', 'termag#648', 'termag#649']);
+    expect(listTitles()).toEqual(['unrelated review']);
+    expect(document.querySelectorAll('.prg-pill')).toHaveLength(0);
+  });
   it('j/k walk the card members first, then the list', () => {
     render('/?prs=needs_my_review&pr=example-org%2Ftermag%23646');
     const press = (key: string) => act(() => { document.querySelector<HTMLElement>('.prso')!.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true })); });

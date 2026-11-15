@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { Instance } from '../../types';
 import type { BoxSizeOptions } from '../../utils/boxSize';
-import { boxLine, launchableBoxes, newBoxDetails, newBoxNamed, newBoxSummary, newBoxTitle } from './LaunchDrawer';
+import type { PlacementView } from '../../chat/boxPlacement';
+import { boxLine, boxTipLines, launchableBoxes, newBoxDetails, newBoxNamed, newBoxSummary, newBoxTitle } from './LaunchDrawer';
 
 const box = (status: Instance['status'], projects?: Instance['projects']) =>
   ({ id: status, name: status, kind: 'ec2', ec2InstanceId: `i-${status}`, status, createdAt: '', projects }) as Instance;
@@ -16,6 +17,36 @@ describe('launchableBoxes', () => {
     const external = { ...box('stopped'), id: 'ext', kind: 'external', ec2InstanceId: null } as Instance;
     const noInstance = { ...box('hibernated'), id: 'gone', ec2InstanceId: null } as Instance;
     expect(launchableBoxes([external, noInstance, box('stopped')]).map(b => b.id)).toEqual(['stopped']);
+  });
+});
+
+describe('boxTipLines', () => {
+  const placed: PlacementView = {
+    policy: 'reuse-first', policySource: 'org', boxes: [], newBox: { source: 'pool' },
+    recommended: { kind: 'box', instanceId: 'ready', reason: ['Last used', 'has termag'] },
+  };
+  const dev = { ...box('ready', [{ id: '1', name: 'a' }]), name: 'dev' } as Instance;
+  const details = ['A new box of its own', 'From the warm pool when there is one'];
+
+  it("names the box Auto picked and why, which the pill no longer says, then the box's state", () => {
+    expect(boxTipLines({ auto: true, view: placed, resolvedName: 'dev', chosen: dev, waking: false, details }))
+      .toEqual(['Where this session runs', 'Auto: dev · Last used · has termag', 'dev: Running · 1 session']);
+  });
+
+  it("names New box when Auto picked it, with what it gets", () => {
+    const fresh: PlacementView = { ...placed, recommended: { kind: 'new', source: 'pool', reason: ['a ready box from the pool'] } };
+    expect(boxTipLines({ auto: true, view: fresh, resolvedName: 'New box', chosen: null, waking: false, details }))
+      .toEqual(['Where this session runs', 'Auto: New box · a ready box from the pool', ...details]);
+  });
+
+  it('says Auto is checking while the placement loads, and gives no box yet', () => {
+    expect(boxTipLines({ auto: true, view: null, resolvedName: null, chosen: null, waking: false, details }))
+      .toEqual(['Where this session runs', 'Auto: Checking your boxes…']);
+  });
+
+  it('has no Auto line for a box picked by hand, whose name the pill already says', () => {
+    expect(boxTipLines({ auto: false, view: placed, resolvedName: 'dev', chosen: dev, waking: true, details }))
+      .toEqual(['Where this session runs', 'dev: Waking up…']);
   });
 });
 
@@ -63,7 +94,7 @@ describe('newBoxSummary', () => {
     sizes: [
       { size: 'small', vcpus: 2, memoryGiB: 8, instanceType: 'm8g.large' },
       { size: 'medium', vcpus: 4, memoryGiB: 16, instanceType: 'm8g.xlarge' },
-      { size: 'large', vcpus: 8, memoryGiB: 32, instanceType: 'm8g.2xlarge' },
+      { size: 'large', vcpus: 4, memoryGiB: 32, instanceType: 'r8g.xlarge' },
     ],
   };
   const DISK = { minGiB: 50, maxGiB: 300, defaultGiB: 120, diskGiB: 120 };

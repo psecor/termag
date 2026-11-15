@@ -131,7 +131,8 @@ describe('places and pills', () => {
   it('knows the card views', () => {
     expect(isCardView('needs_you')).toBe(true);
     expect(isCardView('needs_my_review')).toBe(true);
-    expect(isCardView('team_review')).toBe(false);
+    expect(isCardView('team_review')).toBe(true);
+    expect(isCardView('checks')).toBe(false);
   });
 });
 

@@ -45,3 +45,12 @@ export function clampTtlHours(n: number): number {
 export function parseEmails(text: string): string[] {
   return [...new Set(text.split(/[\s,;]+/).map(e => e.trim().toLowerCase()).filter(Boolean))];
 }
+
+/** What the server takes as an email (its PREVIEW_EMAIL_RE); whether it's a termag user is the server's to say. */
+export const PREVIEW_EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
+
+/** Text typed into the people picker as emails to add: every one of them must look like an email, or none is taken. */
+export function typedEmails(text: string): string[] | null {
+  const list = parseEmails(text);
+  return list.length > 0 && list.every(e => PREVIEW_EMAIL_RE.test(e)) ? list : null;
+}

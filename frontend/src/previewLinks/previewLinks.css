@@ -36,3 +36,13 @@
 .preview-links-viewers li { display: flex; align-items: center; gap: 6px; }
 .preview-links-note { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
 .preview-links-note blockquote { margin: 2px 0 0; padding: 4px 8px; border-left: 2px solid var(--border); color: var(--text-primary); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 8em; overflow: auto; }
+/* "People I name" (TeammatePicker): the picked people as tags over the search field. */
+.preview-links-people { display: flex; flex-direction: column; gap: 6px; }
+.preview-links-people-field { display: flex; flex-direction: column; gap: 6px; }
+.preview-links-people-tags [role="row"] { max-width: 100%; }
+.preview-links-person-name { margin-right: 6px; }
+.preview-links-person-email { color: var(--text-secondary); }
+.preview-links-people-popover { min-width: var(--trigger-width); }
+.preview-links-people-empty { display: block; padding: 8px 12px; color: var(--text-secondary); }
+.preview-links-people-group { display: flex; }
+.preview-links-people-group input { flex: 1; min-width: 0; }

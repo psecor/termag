@@ -107,7 +107,7 @@ describe('sidebar rows under the chrome refresh', () => {
     expect(item('c').dataset.state).toBe('off');
     expect(mark('c').childElementCount).toBe(0);
     expect(mark('a').getAttribute('aria-hidden')).toBe('true');
-    expect(item('b').querySelector('.chat-sr')!.textContent).toBe(', Needs approval');
+    expect(item('b').querySelector('.chat-sr')!.textContent).toBe(', Needs you · approval');
     expect(item('a').querySelector('.chat-agent-icon')).toBeNull();
   });
 
@@ -132,10 +132,12 @@ describe('an agent that finished since you looked (docs/unseen-stops.md)', () =>
 
   it('has a blue dot, with the words for it, until you open it', async () => {
     await render(true);
-    expect(item('c').dataset.state).toBe('unread');
+    // Unseen is a dot, not a state: c keeps Idle, and its own group.
+    expect(item('c').dataset.state).toBe('done');
+    expect(item('c').dataset.unseen).toBe('true');
     expect(item('c').querySelector('.chat-status-dot')).not.toBeNull();
-    expect(item('c').querySelector('.chat-sr')!.textContent).toBe(', Ready · unseen');
-    expect(item('c').dataset.tip).toContain('Ready · unseen');
+    expect(item('c').querySelector('.chat-sr')!.textContent).toBe(', Idle · unread');
+    expect(item('c').dataset.tip).toContain('Idle · unread');
     expect(item('a').dataset.state).toBe('done');
 
     await act(async () => { item('c').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 })); });
@@ -280,7 +282,7 @@ describe('the view options under the chrome refresh', () => {
     expect(b.dataset.density).toBe('standard');
     expect(b.querySelector('.chat-item-top .chat-item-age')!.textContent).toBe('2h');
     expect(b.querySelector('.chat-item-sub')!.getAttribute('data-status')).toBe('approval');
-    expect(b.querySelector('.chat-item-state')!.textContent).toBe('Needs approval');
+    expect(b.querySelector('.chat-item-state')!.textContent).toBe('Needs you · approval');
     expect(b.querySelector('.chat-item-state')!.getAttribute('aria-hidden')).toBe('true');
   });
 

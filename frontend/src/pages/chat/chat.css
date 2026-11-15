@@ -41,7 +41,8 @@
 .chat-search { padding: 8px 12px 2px; }
 .chat-search .search-trigger { padding: 6px 10px; font-size: 12px; border-radius: 6px; }
 /* A session result's box pill (⌘K), beside its name and workstream. */
-.recents-box { font-size: 10px; padding: 0 6px; line-height: 15px; flex-shrink: 1; }
+.recents-box { font-size: 10px; padding: 0 6px 0 5px; gap: 4px; line-height: 15px; flex-shrink: 1; }
+.recents-box .chat-box-tag-dot { width: 5px; height: 5px; }
 .chat-brand { color: var(--text-primary); font-weight: 600; font-size: 16px; text-decoration: none; letter-spacing: 0.02em; flex-shrink: 0; }
 /* New session is an icon button, with its shortcut beside it as muted text, outside the button. */
 .chat-new-wrap { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
@@ -295,7 +296,9 @@
   background: var(--bg-elevated); border: 1px solid color-mix(in srgb, var(--danger) 50%, var(--border)); box-shadow: 0 4px 14px rgba(var(--shadow-rgb), calc(0.3 * var(--shadow-strength)));
 }
 .chat-group.drop-denied:not(:has(.chat-item-li)) .chat-drop-note { position: static; transform: none; display: inline-block; margin: 2px 8px 6px; }
-/* Tooltips (Tooltips.tsx): a soft, rounded bubble like the menus, instead of the browser's box. */
+/* Tooltips (Tooltips.tsx): a soft, rounded bubble like the menus, instead of the browser's box. One for a dialog
+   portalled out of .chat-root (data-tips: New session's box picker) goes over its backdrop (z-index 300). */
+.chat-tip[data-over] { z-index: 320; }
 .chat-tip {
   position: fixed; z-index: 60; max-width: 300px; pointer-events: none; white-space: pre-line; overflow-wrap: anywhere;
   padding: 5px 9px; border-radius: 8px; font-size: 12px; line-height: 1.4; color: var(--text-primary);
@@ -305,6 +308,54 @@
 }
 @keyframes chat-tip-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .chat-tip { animation: none; } }
+
+/* The side panel's Files tool under the sidebar redesign (FilesTool.tsx): this browser's open file tabs over the
+   explorer. The Open head's title lines up with the explorer's (14px in), its rows' icons under it; a row's close
+   floats over its right end on hover or focus, taking no width, as the sidebar's hover controls do. */
+.ft { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--bg-surface); font-family: var(--font-ui); }
+.ft > .fx-panel { flex: 1 1 0; }
+.ft-open { flex-shrink: 0; display: flex; flex-direction: column; max-height: 40%; min-height: 0; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.ft-head {
+  display: flex; align-items: center; gap: 6px; width: 100%; height: 36px; box-sizing: border-box; flex-shrink: 0;
+  padding: 0 12px 0 14px; background: none; border: none; color: var(--text-muted); font: inherit; text-align: left; cursor: pointer;
+}
+.ft-head:hover, .ft-head[data-hovered] { color: var(--text-primary); background: none; }
+.lp-theme .ft-head { justify-content: flex-start; border-radius: 0; font-weight: inherit; min-height: 0; }
+.ft-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+.ft-title { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.ft-count { font-size: 11px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.ft-caret { display: inline-flex; margin-left: auto; transition: transform 0.12s ease; }
+.ft-caret[data-open] { transform: rotate(90deg); }
+@media (prefers-reduced-motion: reduce) { .ft-caret { transition: none; } }
+.ft-list { list-style: none; margin: 0; padding: 0 6px; overflow-y: auto; min-height: 0; }
+.ft-item { position: relative; }
+.ft-row { padding: 0 8px; gap: 8px; }
+.ft-text { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1; }
+.ft-text .fx-name { flex-shrink: 0; max-width: 70%; }
+.ft-where { color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ft-close { position: absolute; top: 2px; right: 2px; opacity: 0; pointer-events: none; background: var(--bg-elevated); }
+.ft-item:hover .ft-close, .ft-item:focus-within .ft-close { opacity: 1; pointer-events: auto; }
+.ft-row.active ~ .ft-close { background: var(--bg-active); }
+/* Project files | My files (project-files-enabled): the switch in the explorer's head, where its title was. */
+.ft .fx-panel-head .ft-switch { margin-right: auto; flex-shrink: 0; padding: 2px; }
+.lp-theme .ft-switch.chat-view-segment > * { height: 26px; padding: 0 10px; font-size: 12.5px; }
+.ft .fx-panel-head .ft-switch:has(+ .ft-other-title) { margin-right: 4px; }
+.ft-empty { padding: 24px 12px; text-align: center; }
+.ft-empty p { color: var(--text-muted); font-size: 13px; margin: 6px 0 0; }
+.ft-other { border-bottom: none; border-top: 1px solid var(--border); padding-bottom: 4px; max-height: 30%; }
+.ft-other .ft-row { width: 100%; }
+.fx-note .ft-retry { margin-left: 4px; vertical-align: baseline; }
+/* A move's outcome, under the explorer: "Moved run.png to My files.", or why it stayed. */
+.fx-note.ft-note { flex-shrink: 0; margin: 0; padding: 8px 14px; border-top: 1px solid var(--border); font-size: 12.5px; line-height: 1.4; }
+/* Home has no side panel: its open files are a card under the hint. */
+.ft.ft-home { flex: none; width: min(420px, 100%); box-sizing: border-box; margin: 20px auto 0; text-align: left; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.ft.ft-home .ft-open { max-height: 320px; border-bottom: none; }
+/* Other spaces' rows are LaunchPad's Button, so its centring, radius and fill give way to the row's. */
+.lp-theme .fx-row.ft-pick { justify-content: flex-start; border-radius: 6px; background: none; color: var(--text-primary); font-weight: inherit; }
+.lp-theme .fx-row.ft-pick[data-hovered] { background: var(--bg-elevated); }
+.lp-theme .fx-row.ft-pick.active { background: var(--bg-active); }
+/* A phone has no hover: the close always shows there, and the row leaves it room. */
+@media (hover: none) { .ft-close { opacity: 1; pointer-events: auto; background: none; } .ft-row { padding-right: 32px; } }
 
 /* File explorer (the side panel's Files tab) and file view */
 .fx-panel {
@@ -415,6 +466,8 @@
 .fv-share-main { border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .fv-share-main + .fv-share-link { border-top-left-radius: 0; border-bottom-left-radius: 0; margin-left: -1px; }
 .fv-share-main:focus-visible, .fv-share-link:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--accent); outline-offset: 0; }
+/* Copy link's check, while it says "Link copied" (SpaceFileView.tsx). */
+.fv-share-link[data-copied] svg, .fv-more[data-copied] svg { color: var(--success); }
 .fv-share-main:disabled { opacity: 0.6; cursor: progress; }
 .fv-shared-by { color: var(--text-secondary); font-size: 12px; white-space: nowrap; flex-shrink: 0; }
 .fv-share-error { margin: 0; color: var(--danger); }
@@ -582,6 +635,9 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
 .chat-glyph[data-status="not_running"] { color: var(--text-muted); }
 
 /* ── Main ────────────────────────────────────────────────── */
+/* The main pane: the notice banner (notice/NoticeBanner.tsx), when there is one, over .chat-main. */
+.chat-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.chat-pane-notice { padding: 8px; }
 .chat-main { flex: 1; min-width: 0; display: flex; min-height: 0; }
 .chat-home { margin: auto; text-align: center; color: var(--text-secondary); max-width: 420px; padding: 24px; }
 .chat-home h1 { color: var(--text-primary); font-weight: 600; margin-bottom: 8px; }
@@ -603,6 +659,22 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
 .chat-title-name { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .chat-title-ws { color: var(--text-secondary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-title-repo { color: var(--text-muted); font-size: 12px; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* project ▸ title (user-projects-enabled, SessionHeader.tsx ProjectCrumb): the project shrinks first, so the title stays readable. */
+.chat-title-crumb {
+  flex: 0 1000 auto;
+  min-width: 2.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  text-decoration: none;
+  cursor: pointer;
+}
+.chat-title-crumb[data-hovered] { color: var(--text-primary); text-decoration: underline; }
+.chat-title-crumb[data-focus-visible] { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.chat-crumb-chevron { flex-shrink: 0; color: var(--text-muted); font-size: 12px; }
 .chat-title-space {
   display: inline-flex;
   align-items: center;
@@ -619,11 +691,16 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
 }
 .chat-title-space[data-space="none"] { border: 1px dashed var(--border); background: none; color: var(--text-secondary); }
 .chat-title-space-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-/* Outlined, never filled, so a box's pill doesn't read as a space's chip (.chat-title-space). */
+/* A box's pill (components/BoxPill.tsx): a muted outline, never filled, so it doesn't read as a space's
+   chip (.chat-title-space); the box's colour is only its dot's. A long name is cut, its title in full. */
 .chat-box-tag {
-  color: var(--text-secondary); font-size: 12px; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis;
-  padding: 1px 7px; border-radius: 999px; border: 1px solid var(--chat-box, var(--border));
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; box-sizing: border-box;
+  color: var(--text-secondary); font-size: 12px; white-space: nowrap;
+  padding: 1px 8px 1px 7px; border-radius: 999px; border: 1px solid var(--border);
 }
+.chat-box-tag-dot { flex-shrink: 0; width: 6px; height: 6px; border-radius: 50%; background: var(--chat-box); }
+.chat-box-tag-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chat-header-actions .chat-box-tag { align-self: center; max-width: 200px; }
 .chat-ws-select { background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; }
 .chat-header-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .chat-header-actions .btn-ghost { text-decoration: none; }
@@ -706,9 +783,13 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
 /* The status line and the notes under the composer start where the text does, past the
    composer's rounded corner, in line with the transcript. Cards stay full width. */
 .chat-bottom > .chat-status, .chat-composer-notes > .chat-composer-note { padding-left: 16px; padding-right: 16px; }
+/* The status line's row (SdkComposer, ChatView): the line, and at its end a multi-repo session's repo
+   pill (SessionRepoPill.tsx), centred on one another. The line keeps its height and its 16px inset. */
+.chat-status-row { display: flex; align-items: center; gap: 12px; min-width: 0; padding-bottom: 4px; }
+.chat-status-row > .chat-status { flex: 1; min-width: 0; padding: 2px 0 2px 16px; }
 /* One line is always kept for those notes (11px at 1.45, plus the note's 4px top padding). */
 .chat-composer-notes { min-height: 20px; }
-/* Working (thinking, running a tool, writing) keeps the base grey, the same as "Done · your turn":
+/* Working (thinking, running a tool, writing) keeps the base grey, the same as "Idle · your turn":
    green read as too bright. The spinner in front of it (.sdk-spinner, currentColor) takes the same grey. */
 .chat-status[data-tone="waiting"] { color: var(--warning); }
 .chat-status[data-tone="offline"] { color: var(--warning); }
@@ -884,6 +965,26 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
 .chat-composer-bar { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 2px 8px 8px; }
 .chat-composer-bar .chat-composer-note { padding-top: 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-composer-bar .chat-compose-actions { margin-left: auto; }
+/* The composer is a query container, so its bar fits the room it has: a phone, or the file
+   viewer's narrow chat. Below 480px, where the model, the note that a change applies from the
+   next message and the actions no longer share a line, the note takes a line of its own above
+   the controls rather than an ellipsis between them, and the model takes what the actions
+   leave, from a basis of 0, so the actions never wrap. */
+.chat-composer { container: composer / inline-size; }
+@container composer (max-width: 479px) {
+  .chat-composer-bar { flex-wrap: wrap; row-gap: 0; }
+  .chat-composer-bar > .chat-composer-note { order: -1; flex: 1 0 100%; padding: 0 10px 2px; }
+  .chat-composer-bar > .chat-compose-model { flex: 1 1 0; }
+}
+/* A 320 or 360px phone: the round buttons keep their size, without the gaps between them. */
+@container composer (max-width: 359px) {
+  .chat-composer-bar { gap: 4px; }
+  .chat-composer-bar :is(.chat-compose-actions, .chat-compose-end) { gap: 0; }
+}
+/* The narrowest: the model's name alone; its effort is in the menu. */
+@container composer (max-width: 319px) {
+  .chat-composer-bar .chat-model-effort { display: none; }
+}
 .chat-hold { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin-top: 6px; padding: 8px 10px; border: 1px solid var(--warning); border-radius: 8px; font-size: 12px; color: var(--text-secondary); }
 .chat-hold-actions { display: flex; gap: 6px; flex-shrink: 0; }
 
@@ -938,8 +1039,6 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
   font-size: 14px;
 }
 .chat-new-field input:disabled { opacity: 0.6; }
-.chat-launch-ask .chat-compose-repo-name { min-width: 0; }
-.chat-launch-ask > .chat-launch-q { margin-left: -7px; }
 .chat-new-space {
   display: flex;
   flex-direction: column;
@@ -1170,6 +1269,11 @@ button.chat-foot-link { background: none; border: none; padding: 0; font: inheri
 .chat-compose-input::placeholder { color: var(--text-muted); }
 .chat-compose-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .chat-compose-model-btn { color: var(--text-secondary); font-size: 13px; padding: 5px 9px 5px 10px; border-radius: 999px; }
+/* A pill's words stay on one line and give way with an ellipsis; wrapped, two pills' words ran
+   into each other on a phone. Its icon, caret and switch keep their size. */
+.chat-compose-model-btn { white-space: nowrap; min-width: 0; }
+.chat-compose-model-btn > svg { flex-shrink: 0; }
+.chat-compose-pill-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chat-compose-model-btn:hover:not(:disabled), .chat-compose-model-btn[aria-expanded="true"] { background: var(--bg-elevated); color: var(--text-primary); }
 .chat-compose-send {
   width: 36px;
@@ -1528,6 +1632,22 @@ a.sdk-image { cursor: zoom-in; }
 /* Phone label for the header link. Desktop keeps "Open in Lab". */
 .chat-full-ui-short { display: none; }
 .chat-history-btn { display: none; }
+/* The Sessions button's Needs you count (chatChrome.tsx ChatHistoryButton): a label, not a control. */
+.chat-history-count {
+  margin-left: 6px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--bg-base);
+  background: var(--warning);
+}
 
 /* Phone layout. The breakpoint is CHAT_NARROW_QUERY in chat/chatLayout.ts:
    below it the list is the page or a drawer (data-pane), never a 280px column
@@ -1541,7 +1661,16 @@ a.sdk-image { cursor: zoom-in; }
     flex: 1;
     border-right: none;
   }
-  .chat-root[data-pane="page"] .chat-main { display: none; }
+  .chat-root[data-pane="page"] .chat-pane { display: none; }
+  /* Under a notch the banner takes the safe area's inset, and the page below it, which
+     pads its own top by that inset, slides up under the banner by as much. */
+  .chat-pane-notice {
+    position: relative;
+    z-index: 1;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) max(8px, env(safe-area-inset-right, 0px)) 8px max(8px, env(safe-area-inset-left, 0px));
+    background: var(--bg-base);
+  }
+  .chat-pane-notice + .chat-main { margin-top: calc(-1 * env(safe-area-inset-top, 0px)); }
 
   /* Stack Chats above the composer. The composer itself is unchanged.
      Clear the notch / home indicator: the 720px rule only pads 16px, and
@@ -1744,6 +1873,13 @@ a.sdk-image { cursor: zoom-in; }
 /* Four tabs and the close button don't fit a 320 px phone: the tabs scroll, the close stays. */
 .chat-side-tabs { display: flex; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
 .chat-side-tabs::-webkit-scrollbar { display: none; }
+/* A phone's file tab (project-files-enabled): its name, then its close (SidePanel.tsx). With file tabs the strip
+   scrolls rather than squeezing every tab's name. */
+.chat-root .chat-side-tabs:not([data-fit]):has(.chat-side-file-tab) { overflow-x: auto; }
+.chat-root .chat-side-tabs:not([data-fit]):has(.chat-side-file-tab) > .chat-side-tab { flex-shrink: 0; }
+.chat-side-file-tab { display: inline-flex; align-items: center; gap: 2px; }
+.chat-side-file-tab-main { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: none; border: none; padding: 0; color: inherit; font: inherit; cursor: pointer; }
+.chat-side-file-tab-close { flex-shrink: 0; }
 .chat-side-tab {
   flex-shrink: 0;
   white-space: nowrap;
@@ -1802,6 +1938,10 @@ a.sdk-image { cursor: zoom-in; }
    on a narrow phone, the keyboard button stays at the start. */
 .chat-term-phone { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .chat-term-phone-pane { position: relative; flex: 1 1 0; min-height: 0; }
+/* A vertical drag is useTouchScroll's (it scrolls the history); telling the
+   browser up front keeps it from starting a pan of its own before the drag
+   leaves the slop, when the touchmove could no longer be cancelled. */
+.chat-term-phone-pane[data-touch-scroll] { touch-action: pan-x; }
 .chat-term-keys {
   display: flex;
   align-items: center;
@@ -1836,21 +1976,34 @@ a.sdk-image { cursor: zoom-in; }
   .chat-new-kbd { display: none; }
 }
 /* ── New session: the question, the pills, the drawer (pages/chat/NewChat.tsx) ── */
-/* "What are we doing in <repository>?": the repository is the menu's trigger. */
+/* "What are we doing in <repository>?": the repository is the menu's trigger. A
+   sentence, so it wraps as text, balanced, flush with the composer's left edge.
+   The repository and its "?" are one piece that never breaks, so the "?" is
+   never left on a line of its own; a name too long for the line is cut short. */
 .chat-launch-ask {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 8px;
-  margin: 0 0 4px 4px;
+  margin: 0 0 4px;
   font-size: 22px;
   font-weight: 600;
+  line-height: 1.35;
   letter-spacing: -0.01em;
   color: var(--text-primary);
+  text-wrap: balance;
 }
+.chat-launch-subject {
+  display: inline-flex;
+  align-items: baseline;
+  max-width: 100%;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+.chat-launch-subject .chat-compose-repo { min-width: 0; }
+.chat-launch-subject .chat-compose-repo-name { min-width: 0; }
+/* An environment's name (up to 40 characters, hyphens and all) is cut the same way; its title has it in full. */
+.chat-launch-subject .chat-launch-environment { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chat-launch-q { flex-shrink: 0; }
 /* No fill and no caret: the repository is underlined, as a link in the sentence (Codex, t3code). */
 .chat-launch-ask .chat-compose-repo-btn {
-  padding: 0 2px;
+  padding: 0;
   border-radius: 4px;
   font-weight: 600;
 }
@@ -1864,11 +2017,83 @@ a.sdk-image { cursor: zoom-in; }
 .chat-launch-ask .chat-compose-repo-btn:hover .chat-compose-repo-name,
 .chat-launch-ask .chat-compose-repo-btn[aria-expanded="true"] .chat-compose-repo-name { text-decoration-color: var(--text-primary); }
 .chat-launch-ask .chat-compose-repo-btn[data-empty] { color: var(--text-secondary); font-weight: 500; }
-.chat-launch-ask .chat-compose-menu { right: auto; width: min(440px, 90vw); font-size: 14px; font-weight: 400; letter-spacing: normal; }
+.chat-launch-ask .chat-compose-menu { right: auto; width: min(440px, 90vw); font-size: 14px; font-weight: 400; line-height: normal; letter-spacing: normal; white-space: normal; text-wrap: wrap; }
 /* Ticking more repositories widens the pill: the menu keeps its own width, so its rows stay where they were. */
 .chat-launch-ask .chat-compose-menu[aria-multiselectable="true"] { max-width: none; width: min(360px, 90vw); }
+/* With projects (ProjectPicker.tsx): the note when they couldn't load. */
+.chat-launch-project-note { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; color: var(--text-secondary); font-size: 13px; font-family: var(--font-ui); }
+/* Its menu: LaunchPad's ListBox in a popover, built to pick fast. One line per project, its repositories
+   muted at the right; the picked one tinted with an accent bar (and LaunchPad's check); From a repository and
+   + New project pinned under the list, always in view. */
+/* React Aria caps the popover's height to the room it has. The menu fits it by shrinking its list, so the pinned
+   actions stay in view however short the window; only a form that can't shrink (New project) scrolls the popover. */
+.lp-theme.chat-project-popover { width: min(380px, 90vw); overflow-y: auto; display: flex; flex-direction: column; }
+.chat-project-dialog { display: flex; flex-direction: column; gap: 4px; outline: none; flex: 1 1 auto; min-height: 0; padding: 0; }
+.chat-project-picker-menu { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+/* LaunchPad's Dialog pads itself for a modal; in this popover the popover's own padding is the edge. */
+.lp-theme.chat-project-popover .chat-project-dialog { padding: 0; }
+.chat-project-search { margin: 4px 4px 2px; }
+.chat-project-list { flex: 1 1 auto; min-height: 60px; max-height: min(340px, 50vh); overflow-y: auto; outline: none; padding: 2px 0; }
+.chat-project-search, .chat-project-actions { flex-shrink: 0; }
+.lp-theme.chat-project-popover .chat-project-option {
+  position: relative; display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 0 8px 0 10px; border-radius: 6px; cursor: pointer; text-align: start;
+}
+.lp-theme.chat-project-popover .chat-project-option > span { display: flex; align-items: baseline; gap: 12px; flex: 1; min-width: 0; }
+.lp-theme.chat-project-popover .chat-project-option [slot='label'] {
+  font-weight: 500; line-height: 20px; color: var(--text-primary); min-width: 0; flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lp-theme.chat-project-popover .chat-project-option [slot='description'] {
+  margin-left: auto; color: var(--text-muted); font-size: 12px; min-width: 0; flex-shrink: 100; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lp-theme.chat-project-popover .chat-project-option > svg { flex-shrink: 0; fill: var(--accent); }
+.lp-theme.chat-project-popover .chat-project-option[data-selected] { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.lp-theme.chat-project-popover .chat-project-option[data-selected]::before {
+  content: ''; position: absolute; left: 0; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: var(--accent);
+}
+.lp-theme.chat-project-popover .chat-project-create [slot='label'] { color: var(--accent); }
+.lp-theme.chat-project-popover .chat-project-add-repo [slot='label'] { color: var(--text-secondary); font-weight: 400; }
+.chat-project-actions { display: flex; gap: 6px; border-top: 1px solid var(--border); margin-top: 4px; padding: 6px 2px 2px; }
+.chat-project-key { margin-left: 6px; color: var(--text-muted); font-size: 11px; }
+/* A row whose create, unarchive or add was refused or failed says so in its description (↵ retries). */
+.lp-theme.chat-project-popover .chat-project-option[data-failed] [slot='description'] { color: var(--danger); }
+.lp-theme.chat-project-popover .chat-project-unarchive [slot='label'] { color: var(--warning, #f5c26b); }
+.chat-project-section-head { padding: 8px 10px 2px; color: var(--text-muted); font-size: 11.5px; font-weight: 500; }
+/* The repositories step (RepoStep.tsx): the whole popover, one scroll (the list), its action pinned at the foot. */
+.chat-repo-step { display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-height: 0; font-family: var(--font-ui); }
+.chat-repo-step-head { display: flex; align-items: center; gap: 8px; padding: 2px 2px 4px; flex-shrink: 0; }
+.chat-repo-step-title { font-weight: 600; font-size: 13.5px; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-repo-step-search { margin: 0 4px; flex-shrink: 0; }
+.chat-repo-step-chips { padding: 2px 4px; flex-shrink: 0; }
+.chat-repo-step-list { flex: 1 1 auto; min-height: 60px; max-height: min(300px, 45vh); overflow-y: auto; outline: none; padding: 2px 0; }
+.lp-theme.chat-project-popover .chat-repo-step-option { min-height: 30px; border-radius: 6px; padding: 0 8px 0 10px; display: flex; align-items: center; gap: 8px; }
+.chat-repo-step-empty { padding: 10px; color: var(--text-secondary); font-size: 13px; }
+.chat-repo-step-error { color: var(--danger); font-size: 12px; padding: 2px 6px; flex-shrink: 0; }
+.chat-repo-step-actions { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--border); margin-top: 2px; padding: 6px 2px 2px; flex-shrink: 0; }
+.chat-repo-step-note { margin-left: auto; color: var(--text-muted); font-size: 11.5px; white-space: nowrap; }
+/* The repository menu's way back to the projects (RepoPicker's back). */
+.chat-compose-back { align-self: flex-start; margin: 2px 0 4px; }
 
 .chat-compose-pills { display: flex; align-items: center; gap: 2px; min-width: 0; }
+/* New session's bar (NewChat.tsx): the pills take what the actions leave, from a basis of 0 so
+   they shrink rather than push the actions onto a line of their own. Where one row can't hold
+   the model, Permissions and the orchestrator beside the actions (a phone; it needs about
+   500px), the two go on a row of their own above, and the model shares the actions' row. */
+.chat-compose-bar { container: compose-bar / inline-size; flex-wrap: wrap; row-gap: 2px; }
+.chat-compose-bar > .chat-compose-pills { flex: 1 1 0; }
+.chat-compose-extras { display: flex; align-items: center; gap: 2px; min-width: 0; }
+.chat-compose-extras:empty { display: none; }
+@container compose-bar (max-width: 520px) {
+  .chat-compose-bar > .chat-compose-pills { display: contents; }
+  .chat-compose-pills > .chat-compose-extras { order: -1; flex: 1 0 100%; }
+  .chat-compose-pills > .chat-compose-model { flex: 1 1 0; }
+}
+/* With the worktree pill (chat-session-permissions-enabled) the extras have longer names (the worktree,
+   "Full access · from termag-22"): they take their own row sooner, rather than all being cut short. */
+@container compose-bar (max-width: 780px) {
+  .chat-compose-bar[data-extras='wide'] > .chat-compose-pills { display: contents; }
+  .chat-compose-bar[data-extras='wide'] .chat-compose-pills > .chat-compose-extras { order: -1; flex: 1 0 100%; }
+  .chat-compose-bar[data-extras='wide'] .chat-compose-pills > .chat-compose-model { flex: 1 1 0; }
+}
 .chat-menu-heading { padding: 4px 10px 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted); }
 
 /* Permissions: the choice's icon and name. */
@@ -1915,7 +2140,8 @@ a.sdk-image { cursor: zoom-in; }
 .chat-permission-text small { font-size: 11.5px; color: var(--text-secondary); line-height: 1.35; }
 
 /* The drawer: a strip that slides out from under the composer's bottom edge,
-   its settings as triggers on the left. */
+   its settings as triggers on the left. A tray, inset 18px from each of the
+   composer's sides, with its own smaller corners. */
 .chat-launch-composer { display: flex; flex-direction: column; min-width: 0; }
 .chat-compose-box { position: relative; z-index: 1; }
 .chat-launch-drawer {
@@ -1924,6 +2150,8 @@ a.sdk-image { cursor: zoom-in; }
   padding: 16px 8px 0;
   border-radius: 0 0 16px 16px;
   background: color-mix(in srgb, var(--bg-surface) 55%, var(--bg-base));
+  /* What New box's "+" is ringed in, so it reads as over the box (LaunchDrawer.tsx NewBoxMark). */
+  --chat-launch-mark-ring: color-mix(in srgb, var(--bg-surface) 55%, var(--bg-base));
 }
 /* The visible strip, below the composer: its triggers sit in its middle. */
 .chat-launch-strip { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; min-height: 40px; padding: 4px 0; }
@@ -1945,13 +2173,18 @@ a.sdk-image { cursor: zoom-in; }
 .chat-launch-trigger:hover:not(:disabled), .chat-launch-trigger[aria-expanded="true"] {
   background: var(--bg-elevated);
   color: var(--text-primary);
+  --chat-launch-mark-ring: var(--bg-elevated);
 }
 .chat-launch-trigger:disabled { opacity: 0.6; cursor: default; }
 .chat-launch-trigger-label { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-/* New box's mark (pages/chat/LaunchDrawer.tsx): LaunchPad's sparkle, in the text's own colour beside the name. */
-.chat-launch-new-mark { flex-shrink: 0; --lp-color-fill-ui-primary: currentColor; }
+/* New box's mark (pages/chat/LaunchDrawer.tsx NewBoxMark): the box with a small "+" on its corner, in the
+   text's own muted colour, the "+" ringed in what is behind it. */
+.chat-launch-new-mark { flex-shrink: 0; display: block; }
+.chat-launch-new-mark .chat-launch-mark-ring { stroke: var(--chat-launch-mark-ring, var(--bg-base)); }
 /* New box's tooltips and the box trigger's: a line each, the first in bold. */
 .chat-launch-tip { display: flex; flex-direction: column; gap: 2px; font-family: var(--font-ui); text-align: start; }
+/* The repo pill's tooltip (RepoPicker.tsx): every repository it names, in full, one a line. */
+.chat-repo-tip { display: flex; flex-direction: column; gap: 2px; font-family: var(--font-ui); font-size: 12px; font-weight: 400; letter-spacing: normal; text-align: start; }
 .chat-launch-strip .chat-new-space { display: flex; flex-direction: row; align-items: center; gap: 6px; min-width: 0; }
 .chat-space-trigger[aria-invalid="true"] .chat-launch-trigger-label { color: var(--danger); }
 
@@ -1981,6 +2214,10 @@ a.sdk-image { cursor: zoom-in; }
 }
 .chat-launch-box:hover { background: var(--bg-elevated); }
 .chat-launch-box[aria-checked="true"] { background: var(--bg-active); }
+/* New box's "+" ring in the box dialog: the dialog's surface, or the row's own fill under it. */
+.chat-launch-dialog { --chat-launch-mark-ring: var(--bg-surface); }
+.chat-launch-box:hover { --chat-launch-mark-ring: var(--bg-elevated); }
+.chat-launch-new[data-checked], .chat-launch-box[aria-checked="true"] { --chat-launch-mark-ring: var(--bg-active); }
 /* The box is settled (launched for a refused start): only the names change. */
 .chat-launch-box:disabled { cursor: default; }
 .chat-launch-box:disabled:not([aria-checked="true"]) { opacity: 0.5; }
@@ -2016,6 +2253,67 @@ a.sdk-image { cursor: zoom-in; }
   background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border); border-radius: 8px;
 }
 .box-disk-input .box-disk-input-hint, .box-disk-input .box-disk-input-note { color: var(--text-secondary); font-size: 12px; }
+
+/* Runs on: Auto's picker (pages/chat/PlacementPicker.tsx): LaunchPad's ListBox in
+   the box dialog, one row per choice: its name, a line under it and, for a box, its load meter. In the
+   UI font and termag's colours (LP_THEME on its container); only the tokens the rows read are mapped here. */
+.chat-placement {
+  --lp-text-label-1-medium: var(--lp-font-weight-medium) var(--lp-font-size-200)/var(--lp-line-height-200) var(--font-ui);
+  --lp-text-label-1-regular: var(--lp-font-weight-regular) var(--lp-font-size-200)/var(--lp-line-height-200) var(--font-ui);
+  --lp-text-label-2-medium: var(--lp-font-weight-medium) var(--lp-font-size-100)/var(--lp-line-height-100) var(--font-ui);
+  --lp-text-body-2-regular: var(--lp-font-weight-regular) var(--lp-font-size-100)/var(--lp-line-height-100) var(--font-ui);
+  --lp-color-bg-interactive-secondary-hover: var(--bg-elevated);
+  --lp-color-bg-interactive-secondary-active: var(--bg-active);
+  --lp-color-bg-interactive-selected: var(--bg-active);
+  --lp-color-border-ui-secondary: var(--border);
+  gap: 8px;
+}
+.chat-placement-list { min-width: 0; max-height: none; }
+.chat-placement-list .chat-placement-option { padding: 7px 10px; border-radius: 8px; }
+/* LaunchPad's item holds its children in one content span (and its check after it): the name and the
+   line in the first column of that span, the meter in a fixed second one, so every row's meter lines up. */
+.chat-placement-list .chat-placement-option > [class*="_content"] {
+  flex: 1; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 64px; grid-template-areas: none;
+  align-items: center; column-gap: 12px; row-gap: 1px;
+}
+.chat-placement-list .chat-placement-option .chat-placement-name, .chat-placement-list .chat-placement-option .chat-placement-line { grid-area: auto; grid-column: 1; }
+/* A row with no meter (Auto, New box, a box with no recent reading) takes the whole width. */
+.chat-placement-list .chat-placement-option:not(:has(.chat-placement-meter)) > [class*="_content"] { grid-template-columns: minmax(0, 1fr); }
+.chat-placement-option[aria-selected="true"] { background: var(--bg-active); }
+.chat-placement-name { grid-column: 1; font-weight: 600; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-placement-recommended { font-weight: 400; color: var(--text-secondary); }
+.chat-placement-line { grid-column: 1; display: block; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+/* The load meter: a short bar on the row's right, the tightest of memory, disk and load against the hot threshold. */
+.chat-placement-list .chat-placement-meter { grid-column: 2; grid-row: 1 / span 2; width: 64px; }
+.chat-placement-meter { --fill-color: var(--success); }
+/* Its number is for a screen reader ("85% of running hot"): on screen the bar says it, and a percent beside a box reads as its memory. */
+.chat-placement-meter [class*="_value"] { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.chat-placement-meter[data-tone="warning"] { --fill-color: var(--warning); }
+.chat-placement-meter[data-tone="danger"] { --fill-color: var(--danger); }
+.chat-placement-option[data-heat="hot"] .chat-placement-line { color: var(--danger); }
+.chat-placement-alert { font-size: 12.5px; }
+/* A session started on a hot box (pages/chat/TranscriptNotices.tsx HotBoxNotice): a note at the transcript's end, never a gate. */
+.sdk-hot-box {
+  display: flex; align-items: center; gap: 10px; margin: 8px 0; padding: 8px 12px; border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border)); background: color-mix(in srgb, var(--warning) 8%, var(--bg-surface));
+  color: var(--text-secondary); font-family: var(--font-ui); font-size: 13px;
+}
+.sdk-hot-box span { flex: 1; min-width: 0; }
+.chat-setup-actions .chat-setup-error { color: var(--danger); font-size: 12px; font-family: var(--font-ui); }
+.chat-placement-alert p { margin: 0 0 6px; }
+.chat-placement-default { color: var(--text-secondary); font-size: 12px; padding: 0 10px; }
+.chat-placement-default a { color: var(--accent); }
+/* Options: New box's name, size and disk, the checkout and the environment. */
+.chat-placement-options { font-family: var(--font-ui); }
+.chat-placement-options-head { margin: 0; font: inherit; }
+.chat-placement-options-head button { font: inherit; font-size: 13px; color: var(--text-secondary); gap: 4px; padding-inline: 4px; }
+.chat-placement-options-body { display: flex; flex-direction: column; gap: 10px; padding: 6px 10px 2px; }
+.chat-placement-pickers { display: flex; flex-wrap: wrap; gap: 6px; }
+.chat-placement-none { color: var(--text-secondary); font-size: 12px; }
+@media (max-width: 360px) {
+  .chat-placement-list .chat-placement-option > [class*="_content"] { grid-template-columns: minmax(0, 1fr) 44px; }
+  .chat-placement-list .chat-placement-meter { width: 44px; }
+}
 .box-disk-input .box-disk-input-error { color: var(--danger); font-size: 12px; }
 .box-disk-input .box-disk-input-error, .box-disk-input .box-disk-input-note { flex-basis: 100%; }
 .chat-launch-new-field { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 8px; }
@@ -2189,18 +2487,24 @@ a.sdk-image { cursor: zoom-in; }
 .chat-launch-checkouts { margin: -4px 0 8px; font-family: var(--font-ui); font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
 .chat-launch-checkouts code { font-family: var(--font-mono); font-size: 11px; }
 
-/* The repo pill over a started session's composer (SessionRepoPill.tsx): New
-   session's RepoPicker as a small outlined pill, its menu opening upward,
-   each Selected row's clone status under its name. */
-.chat-session-repos { display: flex; padding: 0 2px 6px; font-size: 13px; }
+/* The repo pill at the end of a started session's status line (SessionRepoPill.tsx): New
+   session's RepoPicker as a quiet chip, in the status line's size, its right edge in from the
+   composer's as the line's text is from its left; cut short with an ellipsis (its tooltip has
+   every name), its menu opening upward from its right edge, each Selected row's clone status
+   under its name. */
+.chat-session-repos { display: flex; flex: 0 1 auto; min-width: 0; max-width: 60%; padding-right: 10px; font-size: 12px; }
 .chat-session-repos .chat-compose-repo-btn {
-  padding: 2px 10px;
+  gap: 5px;
+  padding: 2px 8px 2px 10px;
   border: 1px solid var(--border);
   border-radius: 999px;
   color: var(--text-secondary);
+  line-height: 16px;
 }
 .chat-session-repos .chat-compose-repo-btn:hover,
-.chat-session-repos .chat-compose-repo-btn[aria-expanded="true"] { color: var(--text-primary); background: var(--bg-active); }
+.chat-session-repos .chat-compose-repo-btn[aria-expanded="true"] { color: var(--text-primary); background: var(--bg-elevated); }
+.chat-session-repos .chat-compose-caret { border-top-color: currentColor; opacity: 0.7; }
+.chat-session-repos .chat-compose-menu[data-above] { left: auto; right: 0; max-width: none; width: min(400px, calc(100vw - 32px)); font-size: 13px; }
 .chat-compose-repo-state { color: var(--text-muted); }
 .chat-compose-repo-state[data-state="failed"] { color: var(--danger); }
 .chat-compose-menu[data-above] { top: auto; bottom: calc(100% + 6px); right: auto; width: min(400px, 90vw); max-height: min(60vh, 420px); }

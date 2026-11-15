@@ -55,12 +55,16 @@ export function plainPreview(text: string): string {
   return text.replace(/\*\*|__|`/g, '').replace(/\s+/g, ' ').trim().replace(/^(#{1,6}|[-*+]|>)\s+/, '');
 }
 
-/** What the notification says; the same words as the push (backend buildChatTurnPayload). */
-export function turnNotificationText(projectName: string, workstream: string, preview: string | null): { title: string; body: string } {
+/**
+ * What the notification says; the same words as the push (backend
+ * buildChatTurnPayload). `title` is the session's one title
+ * (chat/sessionTitle.ts), the sidebar row's.
+ */
+export function turnNotificationText(title: string, preview: string | null): { title: string; body: string } {
   const text = plainPreview(preview ?? '');
   return {
-    title: workstream === 'main' ? projectName : `${projectName} · ${workstream}`,
-    body: text ? `Your turn · ${text.length > MAX_BODY ? `${text.slice(0, MAX_BODY - 1)}…` : text}` : 'Done · your turn',
+    title,
+    body: text ? `Idle · ${text.length > MAX_BODY ? `${text.slice(0, MAX_BODY - 1)}…` : text}` : 'Idle · your turn',
   };
 }
 

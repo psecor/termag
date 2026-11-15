@@ -147,6 +147,9 @@ export function ContextRing({ usage = emptyUsage, costUsd, sinceClearedUsd = nul
             {ctx ? `${formatTokens(ctx.used)} of ${formatTokens(ctx.window)} tokens · ${ctx.percent}%`
               : compactedFrom != null ? `Compacted from ${formatTokens(compactedFrom)} tokens` : "Fills in with Claude's next reply"}
           </div>
+          {ctx && ctx.window < ctx.modelWindow && (
+            <div className="chat-ring-note">{`Compacts at ${formatTokens(ctx.window)} · the model's window is ${formatTokens(ctx.modelWindow)}`}</div>
+          )}
           <Meter kind="context" percent={ctx?.percent ?? 0} tone={ringTone(ctx?.percent ?? null)} />
           {costUsd != null && (
             <div className="chat-ring-row">

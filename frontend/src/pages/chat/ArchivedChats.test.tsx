@@ -17,10 +17,22 @@ const api = vi.hoisted(() => ({
   reopen: vi.fn(),
   remove: vi.fn(),
 }));
+const up = vi.hoisted(() => ({
+  on: false,
+  list: null as null | Array<{ id: string; name: string; archived: boolean }>,
+  settled: true,
+  update: vi.fn(async () => ({})),
+  reload: vi.fn(async () => {}),
+}));
 vi.mock('../../services/api', async () => {
   const actual = await vi.importActual<typeof import('../../services/api')>('../../services/api');
-  return { ...actual, chatsApi: { ...actual.chatsApi, ...api } };
+  return { ...actual, chatsApi: { ...actual.chatsApi, ...api }, userProjectsApi: { ...actual.userProjectsApi, update: up.update } };
 });
+vi.mock('../../flags', async () => {
+  const actual = await vi.importActual<typeof import('../../flags')>('../../flags');
+  return { ...actual, useFlag: <T,>(key: string, fallback: T) => (key === 'user-projects-enabled' ? up.on as T : fallback) };
+});
+vi.mock('./simpleData', () => ({ useSimpleDataIfAny: () => ({ userProjects: { list: up.list, failed: false, settled: up.settled, reload: up.reload } }) }));
 vi.mock('../../contexts/ProjectContext', () => ({ useProjects: () => ({ reloadProjects: async () => {} }) }));
 vi.mock('../../services/boxFeed', () => ({
   boxFeed: { reload: async () => {}, getSnapshot: () => [], upsert: () => {}, subscribe: () => () => {} },
@@ -46,6 +58,11 @@ beforeEach(() => {
   localStorage.clear();
   resetSidebarViewForTests();
   api.archived.mockReset();
+  up.on = false;
+  up.list = null;
+  up.settled = true;
+  up.update.mockClear();
+  up.reload.mockClear();
   api.reopen.mockReset();
   api.remove.mockReset();
 });
@@ -221,6 +238,59 @@ describe('ArchivedChats under the chrome refresh', () => {
   });
 });
 
+describe("ArchivedChats: the person's archived projects", () => {
+  it('lists them first under the flag, each with Unarchive, which brings the project back', async () => {
+    up.on = true;
+    up.list = [{ id: 'up-1', name: 'Termag web', archived: true }, { id: 'up-2', name: 'Live one', archived: false }];
+    api.archived.mockResolvedValue([chat('webapp', 'stopped')]);
+    await show({ refresh: true });
+    const fold = host.querySelector('.chat-archived-group .chat-group-toggle')!;
+    expect(fold.querySelector('.chat-group-count')?.textContent).toBe('2');
+    expect(fold.textContent).toContain('1 project, 1 session');
+    await press(fold);
+    const project = host.querySelector('[data-archived="project"] .chat-archived-item')!;
+    expect(project.querySelector('.chat-item-name')?.textContent).toBe('Termag web');
+    expect(project.querySelector('.chat-item-age')?.textContent).toBe('Project');
+    expect(rows().map(r => r.querySelector('.chat-item-name')?.textContent)).toEqual(['Termag web', 'webapp']);
+    await press(project);
+    expect(menuLabels()).toEqual(['Unarchive']);
+    await press(menuItem('Unarchive'));
+    expect(up.update).toHaveBeenCalledWith('up-1', { archived: false });
+    expect(up.reload).toHaveBeenCalled();
+  });
+
+  it("waits for the archived sessions before showing archived projects, so the count isn't short", async () => {
+    up.on = true;
+    up.list = [{ id: 'up-1', name: 'Termag web', archived: true }];
+    api.archived.mockReturnValue(new Promise(() => {}));
+    await show({ refresh: true });
+    expect(host.querySelector('.chat-archived-group')).toBeNull();
+  });
+
+  it("waits for the person's projects too under the flag, so archived ones don't pop in after the sessions", async () => {
+    up.on = true;
+    up.settled = false;
+    api.archived.mockResolvedValue([chat('webapp', 'stopped')]);
+    await show({ refresh: true });
+    expect(host.querySelector('.chat-archived-group')).toBeNull();
+    up.settled = true;
+    up.list = [{ id: 'up-1', name: 'Termag web', archived: true }];
+    await show({ refresh: true });
+    expect(host.querySelector('.chat-archived-group .chat-group-count')?.textContent).toBe('2');
+  });
+
+  it('shows the section for an archived project with no archived session, and nothing of it with the flag off', async () => {
+    up.on = true;
+    up.list = [{ id: 'up-1', name: 'Termag web', archived: true }];
+    api.archived.mockResolvedValue([]);
+    await show({ refresh: true });
+    expect(host.querySelector('.chat-archived-group .chat-group-count')?.textContent).toBe('1');
+    up.on = false;
+    await show({ refresh: true });
+    expect(host.querySelector('.chat-archived-group')).toBeNull();
+  });
+});
+
 describe('ArchivedChats when the list fails to load', () => {
   it('asks again after a failure the orchestrator caused, so the section comes back', async () => {
     vi.useFakeTimers();
@@ -251,5 +321,84 @@ describe('ArchivedChats when the list fails to load', () => {
     root = createRoot(host);
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(api.archived).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ArchivedChats as a section of the bottom row (the sidebar redesign)', () => {
+  async function showDocked(open: boolean, onCount: (n: number) => void, sessions?: React.ReactNode[]) {
+    const value: ChatChrome = { mode: 'docked', historyOpen: false, openHistory: () => {}, closeHistory: () => {}, refresh: true };
+    await act(async () => {
+      root.render(<ChatChromeProvider value={value}><MemoryRouter initialEntries={['/chat']}><div className="chat-root"><ArchivedChats dock={{ open, onCount, sessions }} /></div></MemoryRouter></ChatChromeProvider>);
+    });
+  }
+  // The redesign's cards: each one's title.
+  const cardTitles = () => [...host.querySelectorAll('.chat-archived-li .sc-title, .chat-archived-li .session-stub')].map(n => n.textContent);
+
+  it('counts every archived session and project for its button, and draws nothing until it is open', async () => {
+    up.on = true;
+    up.list = [{ id: 'up-1', name: 'Old project', archived: true }, { id: 'up-2', name: 'Live', archived: false }];
+    api.archived.mockResolvedValue([chat('webapp', 'stopped'), chat('js-core', 'terminated')]);
+    const onCount = vi.fn();
+    await showDocked(false, onCount);
+    expect(onCount).toHaveBeenLastCalledWith(3);
+    expect(host.querySelector('.chat-archived-group')).toBeNull();
+    await showDocked(true, onCount);
+    // Open: the list alone, under the head the sidebar draws, with no fold of its own.
+    expect(host.querySelector('.chat-archived-group')?.hasAttribute('data-bare')).toBe(true);
+    expect(host.querySelector('.chat-archived-fold')).toBeNull();
+    expect(cardTitles()).toEqual(['Old project', 'webapp', 'js-core']);
+  });
+
+  it("draws each as a session card: its session's title, a ring and how long ago it was archived, the box's state in its tooltip", async () => {
+    api.archived.mockResolvedValue([chat('webapp', 'stopped', { sessionTitle: 'Flag health endpoint', sessionTitleSource: 'claude' })]);
+    await showDocked(true, vi.fn());
+    const card = host.querySelector<HTMLElement>('[data-archived="chat"] .sc')!;
+    expect(card.querySelector('.sc-title')?.textContent).toBe('Flag health endpoint');
+    expect(card.querySelector('.sc-chip')?.getAttribute('data-kind')).toBe('off');
+    expect(card.querySelector('.sc-chip-time')?.textContent).toBe('2h');
+    expect(card.dataset.tip).toBe('Flag health endpoint\nwebapp\nexample-org/webapp\nArchived 2h ago\nBox stopped');
+    // The model's mark, Claude unless the chat ran elsewhere.
+    expect(card.querySelector('.sc-mark')?.getAttribute('data-tip')).toBe('Claude');
+  });
+
+  it('reopens from the Reopen floating over the card', async () => {
+    api.archived.mockResolvedValue([chat('webapp', 'stopped')]);
+    api.reopen.mockResolvedValue({ reopened: false, pending: true, box: null });
+    await showDocked(true, vi.fn());
+    const reopen = host.querySelector<HTMLButtonElement>('[data-archived="chat"] .sc-over [aria-label="Reopen webapp"]')!;
+    await act(async () => { reopen.click(); });
+    expect(api.reopen).toHaveBeenCalledWith('webapp');
+  });
+
+  it("shows the archived sessions it's handed even while the archived chats can't be read, and counts what it draws", async () => {
+    up.on = true;
+    up.list = [{ id: 'up-1', name: 'Old project', archived: true }];
+    api.archived.mockRejectedValue({ response: { status: 403 } });
+    const onCount = vi.fn();
+    await showDocked(true, onCount, [<li key="s" className="chat-archived-li"><span className="session-stub">⌘K on phones</span></li>]);
+    expect(cardTitles()).toEqual(['Old project', '⌘K on phones']);
+    // The project it draws; ProjectsList adds the sessions.
+    expect(onCount).toHaveBeenLastCalledWith(1);
+  });
+
+  it('shows the archived projects it has read even when the archived chats fail and it has no sessions', async () => {
+    up.on = true;
+    up.list = [{ id: 'up-1', name: 'Old project', archived: true }];
+    api.archived.mockRejectedValue({ response: { status: 403 } });
+    const onCount = vi.fn();
+    await showDocked(true, onCount);
+    expect(cardTitles()).toEqual(['Old project']);
+    expect(onCount).toHaveBeenLastCalledWith(1);
+  });
+
+  it("lists the person's archived sessions after the projects, and shows with only those", async () => {
+    up.on = true;
+    up.list = [{ id: 'up-1', name: 'Old project', archived: true }];
+    api.archived.mockResolvedValue([]);
+    await showDocked(true, vi.fn(), [<li key="s" className="chat-archived-li"><span className="session-stub">⌘K on phones</span></li>]);
+    expect(cardTitles()).toEqual(['Old project', '⌘K on phones']);
+    up.list = [];
+    await showDocked(true, vi.fn(), [<li key="s" className="chat-archived-li"><span className="session-stub">⌘K on phones</span></li>]);
+    expect(cardTitles()).toEqual(['⌘K on phones']);
   });
 });

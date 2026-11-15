@@ -10,6 +10,10 @@
 // and a message sent to an agent; pickItem, noteSent). Dragging (or
 // Alt+Up/Down) moves a tab anywhere in its space, never to another, and it stays there until
 // its next access. Going to a tab from the sidebar or a route moves nothing.
+// A file may be open in the side panel instead (project-files-enabled): those file tabs are
+// kept beside the tabs, in `panel`, each with the side panel's place it's open beside
+// (chat/sidePanel.ts sidePanelPlace), so nothing that lists the tabs (the sidebar, recents, closing
+// a tab) ever sees one. The panel's file tabs and the Files tool's Open list there are that list.
 // There's no cap on how many tabs a person keeps: none closes for being old or
 // far down. A long space shows its first rows and hides the rest behind Show
 // more (chat/incrementalList.ts); only the person closes a tab, or its session
@@ -25,7 +29,7 @@ import { parseSpaceFileLink, parseSpaceFolderLink } from '../utils/spaces';
  */
 export type OpenItemRef =
   | { kind: 'chat'; projectId: string; workstream: string }
-  | { kind: 'file'; space: string; path: string }
+  | { kind: 'file'; space: string; path: string; /** Set only on a file tab of the side panel's (OpenItemsState.panel): its place. */ panel?: string }
   | { kind: 'explorer'; space: string };
 
 export type OpenItem = OpenItemRef & {
@@ -61,7 +65,12 @@ export interface OpenItemsState {
    * (tabAfterClose). Unset until a tab is first shown.
    */
   recent?: readonly string[];
+  /** The files open in side panels (project-files-enabled), each beside its place, in order: no tab of the list above. */
+  panel?: readonly PanelFileItem[];
 }
+
+/** A file open in the side panel beside `panel`, a place (chat/sidePanel.ts sidePanelPlace). */
+export type PanelFileItem = { kind: 'file'; space: string; path: string; panel: string; id: string; openedAt: number };
 
 /** How many tabs `recent` keeps. */
 export const RECENT_TABS_MAX = 50;
@@ -206,11 +215,45 @@ export function duplicateItem(state: OpenItemsState, id: string, copyId: string,
   return { ...state, items };
 }
 
-/** Closes tab `id`, or every tab in `id`: off the list only, the session or file itself stays. */
+/** Closes tab `id`, or every tab in `id`, a side panel's file tabs too: off the list only, the session or file itself stays. */
 export function dismissItem(state: OpenItemsState, id: string | readonly string[]): OpenItemsState {
   const ids = new Set(typeof id === 'string' ? [id] : id);
   const items = state.items.filter(i => !ids.has(i.id));
-  return items.length === state.items.length ? state : keepTabs(state, items);
+  const panel = state.panel?.filter(i => !ids.has(i.id));
+  const next = items.length === state.items.length ? state : keepTabs(state, items);
+  return panel && panel.length !== state.panel!.length ? { ...next, panel } : next;
+}
+
+/** The files open in the side panel beside `place`, in order. */
+export function panelFileItems(state: OpenItemsState, place: string | null | undefined): PanelFileItem[] {
+  return place ? (state.panel ?? []).filter(i => i.panel === place) : [];
+}
+
+/**
+ * Puts `place`'s files open in the side panel in `order` (their ids, rearranged), in the places they hold: the
+ * panel's tab order (chat/panelTabs.ts orderPanelTabs), which the Files tool's Open list follows. Anything else is ignored.
+ */
+export function arrangePanel(state: OpenItemsState, place: string, order: readonly string[]): OpenItemsState {
+  const panel = state.panel ?? [];
+  const group = panel.filter(i => i.panel === place).map(i => i.id);
+  if (order.length !== group.length || order.some(id => !group.includes(id)) || order.every((id, i) => id === group[i])) return state;
+  const byId = new Map(panel.map(i => [i.id, i]));
+  let n = 0;
+  return { ...state, panel: panel.map(i => (i.panel === place ? byId.get(order[n++])! : i)) };
+}
+
+/**
+ * File `ref` opened in the side panel beside `place`: the file tab already showing it there, else a new one, last,
+ * so a new file tab is the last of the place's. Returns the state and that tab.
+ */
+export function openInPanel(
+  state: OpenItemsState, ref: { space: string; path: string }, place: string, now: number, makeId: () => string = newTabId,
+): { state: OpenItemsState; id: string } {
+  const panel = state.panel ?? [];
+  const have = panel.find(i => i.panel === place && i.space === ref.space && i.path === ref.path);
+  if (have) return { state, id: have.id };
+  const id = makeId();
+  return { state: { ...state, panel: [...panel, { kind: 'file', space: ref.space, path: ref.path, panel: place, id, openedAt: now }] }, id };
 }
 
 /** `state` with only `items` (a subset of its tabs) left, and `recent` holding only their ids. */
@@ -299,10 +342,16 @@ export function seedItems(
 /** A session opened this recently stays even when the project list doesn't have it yet (New session just made it). */
 export const RECONCILE_GRACE_MS = 2 * 60_000;
 
-/** Tabs on sessions that no longer exist (deleted or archived) close, and leave `recent`. Files and explorers stay. */
+/**
+ * Tabs on sessions that no longer exist (deleted or archived) close, and leave `recent`, and so do the files open in
+ * such a session's side panel. Other files and explorers stay.
+ */
 export function reconcileItems(state: OpenItemsState, liveChats: ReadonlySet<string>, now: number): OpenItemsState {
   const items = state.items.filter(i => i.kind !== 'chat' || liveChats.has(itemKey(i)) || now - i.openedAt < RECONCILE_GRACE_MS);
-  return items.length === state.items.length ? state : keepTabs(state, items);
+  const panel = state.panel?.filter(i => !i.panel.startsWith('session:') || now - i.openedAt < RECONCILE_GRACE_MS
+    || liveChats.has(`chat:${i.panel.slice('session:'.length)}`));
+  const next = items.length === state.items.length ? state : keepTabs(state, items);
+  return panel && panel.length !== state.panel!.length ? { ...next, panel } : next;
 }
 
 /** Where a chat tab's session is: its own space, and the spaces whose explorers list it (its box reaches them). */
@@ -367,17 +416,35 @@ export function parseOpenItems(raw: string | null): OpenItemsState {
       seen.add(k);
       return true;
     });
-    if (!Array.isArray(data.recent)) return { seeded: data.seeded === true, items: unique };
+    const panel = parsePanel((data as { panel?: unknown }).panel, new Set(unique.map(i => i.id)));
+    const withPanel = panel.length ? { panel } : {};
+    if (!Array.isArray(data.recent)) return { seeded: data.seeded === true, items: unique, ...withPanel };
     const tabs = new Set(unique.map(i => i.id));
     const recent = [...new Set(data.recent.filter((r): r is string => typeof r === 'string' && tabs.has(r)))].slice(0, RECENT_TABS_MAX);
-    return { seeded: data.seeded === true, items: unique, recent };
+    return { seeded: data.seeded === true, items: unique, recent, ...withPanel };
   } catch {
     return EMPTY_OPEN_ITEMS;
   }
 }
 
 export function serializeOpenItems(state: OpenItemsState): string {
-  return JSON.stringify({ v: 2, seeded: state.seeded, items: state.items, ...(state.recent ? { recent: state.recent } : {}) });
+  return JSON.stringify({ v: 2, seeded: state.seeded, items: state.items, ...(state.recent ? { recent: state.recent } : {}), ...(state.panel?.length ? { panel: state.panel } : {}) });
+}
+
+/** The side panels' files as kept: valid ones only, each id once and none a tab's id (`taken`). */
+function parsePanel(raw: unknown, taken: ReadonlySet<string>): PanelFileItem[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set(taken);
+  const out: PanelFileItem[] = [];
+  for (const r of raw) {
+    if (!r || typeof r !== 'object') continue;
+    const { space, path, panel, id, openedAt } = r as Record<string, unknown>;
+    if (typeof space !== 'string' || !space || typeof path !== 'string' || !path || typeof panel !== 'string' || !panel || panel.length > 400) continue;
+    if (typeof id !== 'string' || !TAB_ID.test(id) || seen.has(id) || typeof openedAt !== 'number' || !Number.isFinite(openedAt)) continue;
+    seen.add(id);
+    out.push({ kind: 'file', space, path, panel, id, openedAt });
+  }
+  return out;
 }
 
 /** A path segment decoded, or as-is when it isn't valid percent-encoding (a hand-typed lone `%`). */
@@ -447,6 +514,26 @@ export function spaceLinkTarget(href: string, origin: string, base: string): { r
 }
 
 export interface OpenItemGroup { space: string | null; items: OpenItem[] }
+
+/** Recent sessions first, then files and explorers; No space stays last. */
+export function recentOpenItemGroups(
+  groups: readonly OpenItemGroup[],
+  activeAt: (item: Extract<OpenItem, { kind: 'chat' }>) => number | null,
+): OpenItemGroup[] {
+  const at = (item: OpenItem): number => {
+    const value = item.kind === 'chat' ? activeAt(item) : null;
+    return value !== null && Number.isFinite(value) ? value : -Infinity;
+  };
+  const newest = (group: OpenItemGroup) => group.items.reduce((max, item) => Math.max(max, at(item)), -Infinity);
+  return groups.map(g => ({ ...g, items: [...g.items].sort((a, b) => {
+    if (a.kind !== 'chat' || b.kind !== 'chat') return Number(b.kind === 'chat') - Number(a.kind === 'chat');
+    return at(a) === at(b) ? 0 : at(a) > at(b) ? -1 : 1;
+  }) })).sort((a, b) => {
+    if (a.space === null || b.space === null) return Number(a.space === null) - Number(b.space === null);
+    const aa = newest(a), bb = newest(b);
+    return aa === bb ? a.space.localeCompare(b.space) : aa > bb ? -1 : 1;
+  });
+}
 
 /**
  * The sidebar's groups: one per space the user has, by name, each with its

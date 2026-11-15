@@ -130,7 +130,7 @@ export const CHAT_COMMANDS: ReadonlySet<string> = new Set([
   'plugin', 'plugins', 'reload-plugins', 'resume', 'review', 'rewind', 'security-review', 'simplify', 'status', 'statusline',
   'terminal-setup', 'todos', 'upgrade', 'usage', 'vim', 'code-review',
   // termag's skills
-  'agent-ask', 'agent-orchestrator', 'metaterm', 'termag-bug-report', 'termag-handoff', 'termag-overlap', 'termag-pr', 'termag-spaces',
+  'agent-ask', 'agent-orchestrator', 'metaterm', 'termag-bug-report', 'termag-feedback', 'termag-handoff', 'termag-overlap', 'termag-pr', 'termag-spaces',
 ]);
 
 /** The command a message sent in the chat is, as chat.command names it, or null when it is no slash command. Pure. */

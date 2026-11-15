@@ -9,6 +9,11 @@ import { automation, run } from '../../../chat/automationsView.fixtures';
 import { setFlagValues } from '../../../flags';
 
 vi.mock('../../../launchpad/sprite', () => ({ ensureLaunchPadSprite: () => Promise.resolve() }));
+const recorded = vi.hoisted(() => [] as Array<{ name: string; attributes: unknown }>);
+vi.mock('../../../observability', async importOriginal => ({
+  ...(await importOriginal<typeof import('../../../observability')>()),
+  recordProductEvent: (name: string, attributes: unknown) => { recorded.push({ name, attributes }); },
+}));
 
 const api = vi.hoisted(() => ({
   list: vi.fn(), get: vi.fn(), update: vi.fn(), runNow: vi.fn(), stopRun: vi.fn(), retireRun: vi.fn(), remove: vi.fn(),
@@ -147,6 +152,17 @@ describe('AutomationDetail', () => {
     await act(async () => button('Run now')!.click());
     expect(api.runNow).toHaveBeenCalledWith('a1');
     expect(host.querySelector('.chat-auto-card [role="alert"]')?.textContent).toContain('Not started: box_asleep');
+  });
+
+  it('Open in Lab goes to the automation in Lab and records lab.opened from automation', async () => {
+    api.get.mockResolvedValue(detail(a, []));
+    await mount('/chat/automations/p1');
+    recorded.length = 0;
+    await act(async () => (host.querySelector('.chat-more-btn') as HTMLButtonElement).click());
+    const lab = [...document.querySelectorAll('[role="menuitem"]')].find(el => el.textContent?.startsWith('Open in Lab')) as HTMLElement;
+    await act(async () => lab.click());
+    expect(host.querySelector('.elsewhere')).not.toBeNull();
+    expect(recorded.filter(r => r.name === 'lab.opened')).toEqual([{ name: 'lab.opened', attributes: { 'termag.from': 'automation' } }]);
   });
 
   it('Archive asks first, then archives and goes Home: there is no list of automations to go back to', async () => {

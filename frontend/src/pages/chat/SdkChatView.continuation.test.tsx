@@ -99,14 +99,14 @@ describe('SdkChatView: a chat whose box is gone carries on when its owner sends 
   it('while the new box comes up and restores, the status line says so and the history stays readable', async () => {
     mocks.history.mockResolvedValue({ ...storedChat, continuation: { phase: 'starting-box', held: [{ id: 'm1', text: 'pick up where we left off', error: null }] } });
     await render();
-    expect(statusText()).toContain('Starting a new box for this chat…');
+    expect(statusText()).toContain('Working · starting a new box for this chat…');
     expect(document.body.textContent).toContain('earlier question');
     expect(document.body.textContent).toContain('pick up where we left off');
     expect(composer()?.disabled).toBe(false);
     unmount();
     mocks.history.mockResolvedValue({ ...storedChat, continuation: { phase: 'restoring' } });
     await render();
-    expect(statusText()).toContain('Restoring this conversation…');
+    expect(statusText()).toContain('Working · restoring this conversation…');
   });
 
   it('someone other than the owner reads it, with the composer off and who can continue it', async () => {
@@ -135,7 +135,7 @@ describe('SdkChatView: a chat whose box is gone carries on when its owner sends 
   it('a switch to another chat drops the last one\'s phase and refusal before its own history comes', async () => {
     mocks.history.mockResolvedValue({ ...storedChat, continuation: { phase: 'starting-box', sendRefusal: { code: 'owner-only', reason: 'Only Pat can continue this chat' } } });
     await render();
-    expect(statusText()).toContain('Starting a new box for this chat…');
+    expect(statusText()).toContain('Working · starting a new box for this chat…');
     expect(composer()?.placeholder).toBe('Only Pat can continue this chat');
     mocks.history.mockReturnValue(new Promise(() => {}));
     // The same view, not remounted: the hook keeps per-chat state itself (ChatRoute's key is not the only guard).
@@ -143,7 +143,7 @@ describe('SdkChatView: a chat whose box is gone carries on when its owner sends 
       root.render(<MemoryRouter><SdkChatView project={project} workstream="docs" /></MemoryRouter>);
     });
     await flush();
-    expect(statusText()).not.toContain('Starting a new box for this chat…');
+    expect(statusText()).not.toContain('Working · starting a new box for this chat…');
     expect(composer()?.placeholder).not.toBe('Only Pat can continue this chat');
   });
 });

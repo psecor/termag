@@ -128,12 +128,12 @@ afterEach(() => {
 });
 
 describe('a stored chat whose box is down', () => {
-  it('shows the stored transcript and "Box is stopped · sending a message starts it", with no Start box, and starts nothing', async () => {
+  it('shows the stored transcript and "Not running · box is stopped, sending a message starts it", with no Start box, and starts nothing', async () => {
     mocks.history.mockResolvedValue(storedHistory);
     await render();
     expect(transcript()).toContain('what is in the readme?');
     expect(transcript()).toContain('It explains how to run the stack.');
-    expect(statusLine()).toBe('Box is stopped · sending a message starts it');
+    expect(statusLine()).toBe('Not running · box is stopped, sending a message starts it');
     expect(startButton()).toBeNull();
     expect(mocks.start).not.toHaveBeenCalled();
     // The open-start hook's answer (hooks/useStartParkedBoxOnOpen.ts): leave the box alone.
@@ -144,7 +144,7 @@ describe('a stored chat whose box is down', () => {
     mocks.boxes = [box('hibernated')];
     mocks.history.mockResolvedValue(storedHistory);
     await render();
-    expect(statusLine()).toBe('Box is hibernated · sending a message starts it');
+    expect(statusLine()).toBe('Not running · box is hibernated, sending a message starts it');
     expect(mocks.start).not.toHaveBeenCalled();
   });
 
@@ -157,7 +157,7 @@ describe('a stored chat whose box is down', () => {
     await send();
     expect(mocks.start).toHaveBeenCalledTimes(1);
     expect(mocks.start).toHaveBeenCalledWith('b1');
-    expect(statusLine()).toBe('Starting the box…');
+    expect(statusLine()).toBe('Working · starting the box…');
     // Not sent to a box that is not there: queued in this browser, shown as waiting.
     expect(mocks.send).not.toHaveBeenCalled();
     expect(readQueued(localStorage, 'p1')).toBe('and the tests?');
@@ -177,10 +177,10 @@ describe('a stored chat whose box is down', () => {
     mocks.boxes = [box('stopping')];
     mocks.history.mockResolvedValue(storedHistory);
     await render();
-    expect(statusLine()).toBe('Box is stopping · sending a message starts it');
+    expect(statusLine()).toBe('Not running · box is stopping, sending a message starts it');
     await send();
     expect(mocks.start).not.toHaveBeenCalled();
-    expect(statusLine()).toBe('Box is stopping · it starts once it has stopped');
+    expect(statusLine()).toBe('Working · box is stopping, it starts once it has stopped');
     setBox('stopped');
     await flush();
     expect(mocks.start).toHaveBeenCalledTimes(1);
@@ -192,7 +192,7 @@ describe('a stored chat whose box is down', () => {
     await render();
     await send();
     expect(transcript()).toContain('Box is not stopped');
-    expect(statusLine()).toBe('Box is stopped · sending a message starts it');
+    expect(statusLine()).toBe('Not running · box is stopped, sending a message starts it');
     await send('once more');
     expect(mocks.start).toHaveBeenCalledTimes(2);
   });
@@ -203,7 +203,7 @@ describe('a stored chat whose box is down', () => {
     await send();
     expect(mocks.start).toHaveBeenCalledTimes(1);
     // The reload after the 202 still says stopped: the box did not come up.
-    expect(statusLine()).toBe('Box is stopped · sending a message starts it');
+    expect(statusLine()).toBe('Not running · box is stopped, sending a message starts it');
     expect(transcript()).toContain('did not come up');
     await send('once more');
     expect(mocks.start).toHaveBeenCalledTimes(2);
@@ -214,10 +214,10 @@ describe('a stored chat whose box is down', () => {
     mocks.reload.mockImplementation(async () => { mocks.boxes = [box('starting')]; mocks.listeners.forEach(l => l()); });
     await render();
     await send();
-    expect(statusLine()).toBe('Starting the box…');
+    expect(statusLine()).toBe('Working · starting the box…');
     setBox('stopped');
     await flush();
-    expect(statusLine()).toBe('Box is stopped · sending a message starts it');
+    expect(statusLine()).toBe('Not running · box is stopped, sending a message starts it');
     expect(transcript()).toContain('did not come up');
     await send('once more');
     expect(mocks.start).toHaveBeenCalledTimes(2);
@@ -229,10 +229,10 @@ describe('a stored chat whose box is down', () => {
     mocks.history.mockResolvedValue(storedHistory);
     await render();
     await send();
-    expect(statusLine()).toBe('Starting the box…');
+    expect(statusLine()).toBe('Working · starting the box…');
     await act(async () => { vi.advanceTimersByTime(31_000); });
     await flush();
-    expect(statusLine()).toBe('Box is stopped · sending a message starts it');
+    expect(statusLine()).toBe('Not running · box is stopped, sending a message starts it');
     expect(transcript()).toContain('no answer');
   });
 

@@ -1,0 +1,22 @@
+/* Fog, then sun: clear-sky blue accents in both UIs and both palettes. Contrast:
+   dark: #86c5ec on #0d1117 10.10:1, #161b22 9.24:1, #21262d 8.13:1, simple UI #181a1f 9.29:1,
+   #23252a 8.19:1; white on #357aa8 4.67:1; #357aa8 as a border or outline on #21262d 3.26:1,
+   #23252a 3.29:1.
+   light: #1f6392 on #ffffff 6.45:1, #f6f8fa 6.05:1, #eaeef2 5.53:1, simple UI #f7f9fb 6.11:1;
+   white on #1a5680 7.82:1. */
+
+html[data-daily-theme="2026-11-10"],
+html[data-daily-theme="2026-11-10"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-10"] .lp-theme {
+  --accent: #86c5ec;
+  --accent-dim: #357aa8;
+  --accent-rgb: 134, 197, 236;
+}
+
+html[data-daily-theme="2026-11-10"][data-palette="light"],
+html[data-daily-theme="2026-11-10"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-10"][data-palette="light"] .lp-theme {
+  --accent: #1f6392;
+  --accent-dim: #1a5680;
+  --accent-rgb: 31, 99, 146;
+}

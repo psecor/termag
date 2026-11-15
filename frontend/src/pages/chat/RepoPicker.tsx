@@ -12,10 +12,11 @@
 // clone's status, and the menu opens upward from over the composer.
 import React, { useEffect, useRef, useState } from 'react';
 import '@launchpad-ui/tokens/index.css';
-import { Header, ListBox, ListBoxItem, ListBoxSection, Text, type ListBoxProps } from '@launchpad-ui/components';
+import { Button, Focusable, Header, ListBox, ListBoxItem, ListBoxSection, Text, Tooltip, TooltipTrigger, type ListBoxProps } from '@launchpad-ui/components';
+import { LP_THEME } from '../../launchpad/theme';
 import { githubReposApi } from '../../services/api';
 import { catalogFromWire, degradedCatalog, type CatalogGroup, type RepoCatalog, type RepoPick } from '../../utils/repoPick';
-import { selectionLabel, type ListedPick } from '../../utils/multiRepo';
+import { selectionLabel, selectionNames, type ListedPick } from '../../utils/multiRepo';
 import { REPO_EMPTY, REPO_EMPTY_NO_PASTE, repoListView, repoTriggerLabel } from '../../chat/composer';
 
 type Selection = Parameters<NonNullable<ListBoxProps<object>['onSelectionChange']>>[0];
@@ -34,7 +35,7 @@ export interface SessionRepos {
   state: 'cloning' | 'failed' | null;
 }
 
-export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, onOpenChange, more = [], onToggle, session }: {
+export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, onOpenChange, more = [], onToggle, session, back }: {
   pick: RepoPick;
   /** A listed repository (the menu then closes), or a pasted URL as it is typed ('empty' once cleared). */
   onPick: (pick: RepoPick) => void;
@@ -48,6 +49,8 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
   onToggle?: (repo: ListedPick) => void;
   /** With onToggle: the pill over a started session's composer. */
   session?: SessionRepos;
+  /** New session's From a repository…: a way back to the project menu, atop this one. */
+  back?: { label: string; onBack: () => void };
 }) {
   const [paste, setPaste] = useState(pick.kind === 'pasted' ? pick.url : '');
   const [query, setQuery] = useState('');
@@ -174,21 +177,31 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
     );
   }
 
+  // More than one repository: the pill names them short (utils/multiRepo.ts selectionLabel), and its tooltip in full.
+  const names = more.length > 0 ? selectionNames(repoTriggerLabel(pick), more) : [];
   return (
     <div className="chat-compose-repo">
-      <button
-        ref={triggerRef}
-        type="button"
-        className="chat-compose-repo-btn"
-        data-empty={empty ? '' : undefined}
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        onClick={() => onOpenChange(!open)}
-      >
-        <span className="chat-compose-repo-name">{selectionLabel(repoTriggerLabel(pick), more)}</span>
-        {session?.state && <span className="chat-compose-repo-state" data-state={session.state}>{session.state === 'cloning' ? 'cloning…' : 'failed'}</span>}
-        {session && <span className="chat-compose-caret" aria-hidden="true" />}
-      </button>
+      {/* LaunchPad's Tooltip on termag's own trigger (Focusable), as New box's (LaunchDrawer.tsx); not while the menu is open. */}
+      <TooltipTrigger delay={500} isDisabled={open || names.length === 0}>
+        <Focusable>
+          <button
+            ref={triggerRef}
+            type="button"
+            className="chat-compose-repo-btn"
+            data-empty={empty ? '' : undefined}
+            aria-expanded={open}
+            aria-haspopup="listbox"
+            onClick={() => onOpenChange(!open)}
+          >
+            <span className="chat-compose-repo-name">{selectionLabel(repoTriggerLabel(pick), more)}</span>
+            {session?.state && <span className="chat-compose-repo-state" data-state={session.state}>{session.state === 'cloning' ? 'cloning…' : 'failed'}</span>}
+            {session && <span className="chat-compose-caret" aria-hidden="true" />}
+          </button>
+        </Focusable>
+        <Tooltip placement="top" className={`${LP_THEME} chat-repo-tip`}>
+          {names.map(n => <span key={n}>{n}</span>)}
+        </Tooltip>
+      </TooltipTrigger>
       {open && (
         <div
           className="chat-compose-menu"
@@ -197,6 +210,11 @@ export function RepoPicker({ pick, onPick, empty = pick.kind === 'empty', open, 
           aria-label={onToggle ? undefined : 'Repositories'}
           onKeyDown={onToggle ? onMenuKeyDown : undefined}
         >
+          {back && (
+            <Button variant="minimal" size="small" className={`${LP_THEME} chat-compose-back`} onPress={back.onBack}>
+              ← {back.label}
+            </Button>
+          )}
           <input
             ref={searchRef}
             className="chat-compose-search"

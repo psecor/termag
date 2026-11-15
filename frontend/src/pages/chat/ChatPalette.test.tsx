@@ -99,7 +99,7 @@ describe('ChatPalette', () => {
     type('flaky');
     expect(heads()).toContain('Sessions');
     expect(titles()).toEqual(['Fix the flaky retry']);
-    expect(document.querySelector('.chat-palette-sub')?.textContent).toBe('webapp · Running');
+    expect(document.querySelector('.chat-palette-sub')?.textContent).toBe('webapp · Working');
     expect(document.querySelector('.chat-palette-item[data-status="working"] [role="progressbar"]')).not.toBeNull();
     expect(highlighted()).toBe('r:webapp|main');
     press('Enter');
@@ -137,8 +137,10 @@ describe('ChatPalette', () => {
     await open();
     type('js-core');
     const item = document.querySelector('[data-key="r:js-core|main"]');
-    expect(item?.getAttribute('data-status')).toBe('unread');
-    expect(item?.querySelector('.chat-palette-sub')?.textContent).toContain('unseen');
+    // Unseen is a dot, not a state: the row keeps Idle, with the blue dot and " · unread".
+    expect(item?.getAttribute('data-status')).toBe('done');
+    expect(item?.querySelector('.chat-status-dot')).not.toBeNull();
+    expect(item?.querySelector('.chat-palette-sub')?.textContent).toContain('Idle · unread');
   });
 
   it('lists recent searches when empty, with the first highlighted, and Shift+Delete forgets one', async () => {

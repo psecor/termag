@@ -5,6 +5,7 @@ import { Project, StatusMap, AgentStatusValue } from '../types';
 import { projectsApi, visitsApi } from '../services/api';
 import { useAuth } from './AuthContext';
 import { connectionTracker } from '../utils/connectionTracker';
+import { edgeDialGate } from '../utils/edgeSession';
 import { statusReconnectDelayMs } from '../utils/connection';
 import { statusKey } from '../utils/statusKey';
 import { statusFromPush } from '../utils/statusPush';
@@ -12,7 +13,7 @@ import { cloudSessionFeed } from '../services/cloudSessionFeed';
 import { boxFeed } from '../services/boxFeed';
 import { chatEvents, type ChatFrame } from '../chat/chatEvents';
 import { spaceFileEvents, type SpaceFileFrame } from '../chat/spaceFileLive';
-import { workspaceChangeFromPush } from '../utils/workspacePush';
+import { PINS_PUSH_EVENT, PREVIEW_LINKS_CHANGED_EVENT, PROJECTS_PUSH_EVENT, workspaceChangeFromPush } from '../utils/workspacePush';
 import { PRS_CHANGED_EVENT } from '../utils/prPipeline';
 import { FLAGS, useFlag } from '../flags';
 import { cloneInFlight } from '../utils/cloneTile';
@@ -26,6 +27,11 @@ interface ProjectContextValue {
   projectsLoaded: boolean;
   /** The latest read of the project list failed before any had been read: none is known, not "none". */
   projectsLoadFailed?: boolean;
+  /**
+   * The latest read failed after a list had been read: the list on screen is
+   * the last one that loaded (the sidebar's Projects view says it couldn't refresh).
+   */
+  projectsRefreshFailed?: boolean;
   activeProjectId: string | null;
   statusMap: StatusMap;
   setActiveProject: (id: string | null) => void;
@@ -62,6 +68,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [projectsLoadFailed, setProjectsLoadFailed] = useState(false);
+  const [projectsRefreshFailed, setProjectsRefreshFailed] = useState(false);
   const projectsRef = useRef<Project[]>([]);
   const listClock = useRef<CloneListState<Project>>({ generation: 0, projects: [] });
   // Initialize from the URL so a refresh restores immediately. The URL is the
@@ -221,12 +228,17 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       listClock.current = next;
       if (next.projects !== projectsRef.current) rememberList(next.projects);
       // A read that finished before a newer one is held, not shown: the list on screen is still the old one.
-      if (next.applied != null) { setProjectsLoaded(true); setProjectsLoadFailed(false); }
+      if (next.applied != null) { setProjectsLoaded(true); setProjectsLoadFailed(false); setProjectsRefreshFailed(false); }
     } catch (err) {
+      // Only the latest read's failure says anything: an older one's list was never going to show.
+      const latest = listClock.current.generation === generation;
       const next = releaseListRead(listClock.current, generation);
       listClock.current = next;
       if (next.projects !== projectsRef.current) rememberList(next.projects);
-      if (next.applied != null) setProjectsLoaded(true); else setProjectsLoadFailed(true);
+      if (next.applied != null) {
+        setProjectsLoaded(true);
+        if (latest) setProjectsRefreshFailed(true);
+      } else setProjectsLoadFailed(true);
       throw err;
     }
   }, [rememberList]);
@@ -242,7 +254,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       request: () => action === 'retry' ? projectsApi.retryClone(projectId) : projectsApi.startEmpty(projectId),
       reload: () => projectsApi.list(),
     });
-    if (result.list) rememberList(result.list);
+    if (result.list) { rememberList(result.list); setProjectsRefreshFailed(false); }
     // A retry on a project whose box failed launches a new box, which the
     // feed only learns about from a reload.
     if (action === 'retry') void boxFeed.reload();
@@ -251,7 +263,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!user) return;
-    reloadProjects();
+    // A failed first read is projectsLoadFailed, which the gates and pages read; not an unhandled rejection.
+    reloadProjects().catch(() => {});
   }, [user, reloadProjects]);
 
   // An environment's steps report as they go (setup, the run, each port turning healthy): poll while they do.
@@ -266,12 +279,18 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!user) return;
     let disposed = false;
+    // Set at the first open: a later one is a reconnect, which may have missed pushes.
+    let opened = false;
 
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // Signed out at the edge, a dial only resets a login's nonce: wait for the
+    // sign-in instead, and keep a socket that is still up (utils/edgeSession.ts).
+    const edge = edgeDialGate();
 
     function connect() {
       if (disposed) return;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (!edge.allows(connect)) return;
       // Retire any prior socket with its handlers detached, so its eventual
       // onclose can't schedule a second reconnect on top of this one.
       const prev = wsRef.current;
@@ -303,6 +322,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         // chat view refetches its history so a finished turn stops showing busy.
         chatEvents.notifyReconnect();
         spaceFileEvents.notifyReconnect();
+        // So may the pins (chat/sessionPins.ts), which re-read only on a push.
+        if (opened) window.dispatchEvent(new Event(PINS_PUSH_EVENT));
+        opened = true;
       };
 
       ws.onmessage = (event) => {
@@ -335,10 +357,18 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
           if (msg.type === 'space-file') { spaceFileEvents.publish(msg as unknown as SpaceFileFrame); return; }
           // A project or box changed outside this tab (the CLI, a spawn, a sweep, another tab).
           const change = workspaceChangeFromPush(msg);
-          if (change === 'projects') { reloadProjectsRef.current().catch(() => {}); return; }
+          if (change === 'projects') {
+            reloadProjectsRef.current().catch(() => {});
+            window.dispatchEvent(new Event(PROJECTS_PUSH_EVENT));
+            return;
+          }
           if (change === 'boxes') { void boxFeed.reload(); return; }
           // A session opened or changed a PR (backend services/prLiveUpdates.ts): every PR view re-reads.
           if (change === 'prs') { window.dispatchEvent(new Event(PRS_CHANGED_EVENT)); return; }
+          // An agent asked for a preview link: an open links list shows it.
+          if (change === 'preview-links') { window.dispatchEvent(new Event(PREVIEW_LINKS_CHANGED_EVENT)); return; }
+          // A session was pinned or unpinned in another tab: the pins re-read (chat/sessionPins.ts).
+          if (change === 'pins') { window.dispatchEvent(new Event(PINS_PUSH_EVENT)); return; }
           // A share revoked or left took this session out of the viewer's
           // scope (backend services/statusAudience.ts, shareChangeFrames).
           if (msg.type === 'status-gone') {
@@ -370,6 +400,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     connect();
     return () => {
       disposed = true;
+      edge.cancel();
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       connectionTracker.closeSocket = null;
       connectionTracker.reconnectSocket = null;
@@ -379,7 +410,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
 
   return (
     <ProjectContext.Provider value={{
-      projects, projectsLoaded, projectsLoadFailed, activeProjectId, statusMap, setActiveProject, reloadProjects, settleProjectClone,
+      projects, projectsLoaded, projectsLoadFailed, projectsRefreshFailed, activeProjectId, statusMap, setActiveProject, reloadProjects, settleProjectClone,
       getActiveWorkstream, setActiveWorkstream,
     }}>
       {children}

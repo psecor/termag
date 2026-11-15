@@ -36,6 +36,19 @@ export function guardViewportAfterDispose(term: Terminal): void {
 }
 
 /**
+ * Call just before term.dispose(). While mouse tracking is on, a press makes
+ * xterm (5.x and 6.0) add mousemove and mouseup listeners on the document,
+ * and dispose() leaves them attached. A pane disposed mid-press then throws
+ * "Cannot read properties of undefined (reading 'dimensions')" on every later
+ * drag move and release, before the line that would remove them. xterm removes
+ * them when mouse tracking goes off; reset() turns it off and sends no input.
+ * Upstream: xtermjs/xterm.js#6070, fixed for 7.0.0.
+ */
+export function endMouseTracking(term: Pick<Terminal, 'reset'>): void {
+  term.reset();
+}
+
+/**
  * FitAddon.fit() on a zero-sized container (a collapsed dock, a pane laid out
  * before its column has a width) shrinks the terminal to its 2x1 minimum,
  * which the resize message then pushes to tmux. Skip the fit instead; the

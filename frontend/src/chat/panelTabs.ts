@@ -5,17 +5,28 @@
 // (docs/agents/gotchas.md, the side panel's ctrl shell), and a second Browser
 // the same browser. An agent tab is one subagent's transcript:
 // one per subagent, shown only beside its own
-// chat. Kept per browser; pure, for the tests.
+// chat. Kept per browser; pure, for the tests. Under project-files-enabled the tabs can be dragged (or moved
+// from a tab's menu) into any order, one order per browser that every place shows its own tabs in; a file
+// tab has a place in it once it has been moved (orderPanelTabs), and is last until then.
 import type { SidePanelTab } from './sidePanel';
 
-export type PanelTabKind = SidePanelTab | 'launcher' | 'agent';
+export type PanelTabKind = SidePanelTab | 'launcher' | 'agent' | 'file';
 /** The subagent an agent tab shows: its chat (`${projectId}|${workstream}`), its Agent call's id, and what the tab says. */
 export interface AgentTabRef { chat: string; id: string; title: string }
-export interface PanelTab { id: string; kind: PanelTabKind; agent?: AgentTabRef }
+/**
+ * A file tab (project-files-enabled) is a file open in the panel beside the place, an OpenItem of chat/openItems.ts
+ * (openInPanel) whose id it has: the Files tool's Open list is the same tabs. Only its place in the order is kept
+ * here, as `{ id, kind: 'file' }`.
+ */
+export interface PanelTab { id: string; kind: PanelTabKind; agent?: AgentTabRef; file?: { space: string; path: string } }
 export interface PanelTabs { tabs: PanelTab[]; active: string }
 
 export const PANEL_TABS_KEY = 'termag.chat.panelTabs';
-/** The agent tab on screen, if one is: the panel opens on it again, as it does on the tool it last showed. */
+/**
+ * The subagent tab each chat last had on screen, at most one per chat (agentTabsOnScreen): beside that chat the
+ * panel shows it again, as it shows the tool the place last showed. A JSON list of tab ids; before chats had their
+ * own it was one bare id, still read.
+ */
 export const PANEL_AGENT_TAB_KEY = 'termag.chat.panelTabs.agent';
 const TOOLS: readonly SidePanelTab[] = ['files', 'terminal', 'browser', 'share', 'pr', 'review'];
 
@@ -26,6 +37,8 @@ export function panelTabId(): string {
 }
 
 const launcher = (): PanelTab => ({ id: panelTabId(), kind: 'launcher' });
+/** A file tab's id, an OpenItem's (chat/openItems.ts). */
+const FILE_TAB_ID = /^[a-z0-9]{1,16}$/;
 
 /** The kept tabs: known kinds only, one tab per tool (the first), and none at all is null. */
 export function parsePanelTabs(raw: string | null): PanelTab[] | null {
@@ -39,6 +52,12 @@ export function parsePanelTabs(raw: string | null): PanelTab[] | null {
     if (!t || typeof t !== 'object') continue;
     const { id, kind } = t as { id?: unknown; kind?: unknown };
     if (typeof id !== 'string' || !id || ids.has(id)) continue;
+    if (kind === 'file') {
+      if (!FILE_TAB_ID.test(id)) continue;
+      ids.add(id);
+      tabs.push({ id, kind });
+      continue;
+    }
     if (kind === 'agent') {
       const agent = agentRef((t as { agent?: unknown }).agent);
       if (!agent || tabs.some(x => x.agent && sameAgent(x.agent, agent))) continue;
@@ -53,6 +72,39 @@ export function parsePanelTabs(raw: string | null): PanelTab[] | null {
     tabs.push({ id, kind: kind as PanelTabKind });
   }
   return tabs.length > 0 ? tabs : null;
+}
+
+/** PANEL_AGENT_TAB_KEY's ids: a list of strings, or a bare id as it was kept before each chat had its own. */
+export function parseAgentTabs(raw: string | null): string[] {
+  if (!raw) return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return raw.length <= 200 ? [raw] : []; }
+  if (!Array.isArray(parsed)) return [];
+  return [...new Set(parsed.filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 200))];
+}
+
+/**
+ * The subagent tab each chat last had on screen, given `kept` and the panel now: `tabs`, with `active` on screen
+ * beside `chat`. That chat's entry becomes `active` if it is one of its subagents' tabs, else goes; another chat's
+ * is left alone, so picking a tool beside one chat doesn't lose the subagent another left on screen. A tab
+ * closed goes, so there is at most one per chat and only for tabs kept.
+ */
+export function agentTabsOnScreen(kept: readonly string[], tabs: readonly PanelTab[], active: string | undefined, chat: string | null): string[] {
+  const chatOf = (id: string) => tabs.find(t => t.id === id && t.kind === 'agent')?.agent?.chat ?? null;
+  const seen = new Set<string>();
+  const rest = kept.filter(id => {
+    const c = chatOf(id);
+    if (c == null || c === chat || seen.has(c)) return false;
+    seen.add(c);
+    return true;
+  });
+  return active && chat != null && chatOf(active) === chat ? [active, ...rest] : rest;
+}
+
+/** The subagent tab `chat` last had on screen, if it is still among `tabs`. */
+export function agentTabOf(kept: readonly string[], tabs: readonly PanelTab[] | null, chat: string | null): string | null {
+  if (!chat || !tabs) return null;
+  return kept.find(id => tabs.some(t => t.id === id && t.kind === 'agent' && t.agent?.chat === chat)) ?? null;
 }
 
 const short = (v: unknown, max: number) => (typeof v === 'string' && v && v.length <= max ? v : null);
@@ -117,6 +169,39 @@ export function openTool(state: PanelTabs, tool: SidePanelTab, from?: string): P
   }
   const t = { id: panelTabId(), kind: tool };
   return { tabs: [...state.tabs, t], active: t.id };
+}
+
+/**
+ * Puts `shown`, the tabs this place shows in order, in `order` (their ids, rearranged), in the places they hold in the
+ * list. The tabs it hides (another chat's subagents, another place's files, a tool not offered here) keep their
+ * places, so each place's tabs keep the order they had. A file tab shown that has no place in the list yet gets one,
+ * kept as its id alone. Returns `tabs` itself when nothing moves.
+ */
+export function orderPanelTabs(tabs: readonly PanelTab[], shown: readonly PanelTab[], order: readonly string[]): readonly PanelTab[] {
+  const ids = shown.map(t => t.id);
+  if (order.length !== ids.length || order.some(x => !ids.includes(x)) || new Set(order).size !== order.length || order.every((x, i) => x === ids[i])) return tabs;
+  const kept = (t: PanelTab): PanelTab => (t.kind === 'file' ? { id: t.id, kind: 'file' } : t);
+  const have = new Set(tabs.map(t => t.id));
+  const all = [...tabs, ...shown.filter(t => !have.has(t.id))].map(kept);
+  const members = new Set(ids);
+  const byId = new Map(all.map(t => [t.id, t]));
+  let n = 0;
+  return all.map(t => (members.has(t.id) ? byId.get(order[n++])! : t));
+}
+
+/**
+ * The tabs in the order this place shows them: the kept ones it offers (`offered`, which says for each tool,
+ * launcher or subagent tab), its file tabs (`files`, this place's, in the Open list's order) where the list has
+ * them, and the rest of its file tabs last, so a new one opens at the end.
+ */
+export function placeTabs(tabs: readonly PanelTab[], offered: (t: PanelTab) => boolean, files: readonly PanelTab[]): PanelTab[] {
+  const byId = new Map(files.map(t => [t.id, t]));
+  const out: PanelTab[] = [];
+  for (const t of tabs) {
+    if (t.kind === 'file') { const f = byId.get(t.id); if (f) out.push(f); } else if (offered(t)) out.push(t);
+  }
+  const placed = new Set(out.map(t => t.id));
+  return [...out, ...files.filter(t => !placed.has(t.id))];
 }
 
 /** + : a new launcher, shown. */

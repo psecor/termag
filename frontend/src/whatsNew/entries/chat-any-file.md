@@ -5,4 +5,4 @@ category: new
 date: 2026-11-06
 flag: chat-file-attachments-enabled
 ---
-Drop, paste or pick any file, such as a zip, a spreadsheet or a big log, and it's copied to your session's box for Claude to open. Files can be up to 20 MB.
+Drop, paste or pick any file, such as a zip, a spreadsheet or a big log, and it's copied to your session's box for Claude to open, or, in a session that belongs to a space, into that space, with a link in your message. Files can be up to 20 MB.

@@ -12,10 +12,10 @@ describe('chatLiveStatus', () => {
     const root = createRoot(document.createElement('div'));
     act(() => root.render(<Reader />));
     const key = chatLiveKey('p1', 'main');
-    act(() => publishChatStatus(key, { tone: 'working', text: 'Thinking…', preview: null }));
-    expect(seen[seen.length - 1].get(key)).toEqual({ tone: 'working', text: 'Thinking…', preview: null });
+    act(() => publishChatStatus(key, { tone: 'working', text: 'Working · thinking…', preview: null }));
+    expect(seen[seen.length - 1].get(key)).toEqual({ tone: 'working', text: 'Working · thinking…', preview: null });
     const renders = seen.length;
-    act(() => publishChatStatus(key, { tone: 'working', text: 'Thinking…', preview: null }));
+    act(() => publishChatStatus(key, { tone: 'working', text: 'Working · thinking…', preview: null }));
     expect(seen.length).toBe(renders);
     act(() => publishChatStatus(key, null));
     expect(seen[seen.length - 1].has(key)).toBe(false);

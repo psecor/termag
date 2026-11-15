@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { credentialsApi, CredentialsStatus } from '../../services/api';
 import { GithubCredential } from './GithubCredential';
+import { FireworksCredential } from './FireworksCredential';
 import { DocsLink } from './DocsLink';
 
 function apiError(err: unknown, fallback: string): string {
@@ -58,6 +59,7 @@ export function CredentialsSection() {
           </div>
 
           <GithubCredential status={status.github} onChanged={load} onError={setError} />
+          {status.fireworks?.available && <FireworksCredential status={status.fireworks} onChanged={load} />}
         </>
       )}
       {error && <div className="credentials-error">{error}</div>}

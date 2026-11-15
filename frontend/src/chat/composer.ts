@@ -164,6 +164,19 @@ export function newChatCreateFields(pick: RepoPick, model: ChatModelId): NewChat
   };
 }
 
+/**
+ * A project with no repository's create fields: the model's, and
+ * no repoUrl, so its checkout clones nothing and its session's steps skip the clone.
+ */
+export function noRepoCreateFields(model: ChatModelId): Omit<NewChatCreateFields, 'repoUrl'> & { repoUrl: null } {
+  return {
+    repoUrl: null,
+    defaultBranch: null,
+    claudeModel: claudeModelForCreate(model),
+    ...(chatModelWire(model).backend ? chatModelWire(model) : {}),
+  };
+}
+
 export function repoTriggerLabel(pick: RepoPick): string {
   if (pick.kind === 'listed') return pick.fullName;
   if (pick.kind === 'pasted') return repoKey(pick.url) ?? (pick.url.trim() || 'Choose a repository');

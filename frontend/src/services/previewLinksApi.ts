@@ -9,9 +9,11 @@
  */
 import axios from 'axios';
 import { sendClientHeader } from '../buildInfo';
+import { holdWhileEdgeSignedOut } from '../utils/edgeSession';
 
 const api = axios.create({ baseURL: '/termag', withCredentials: true });
 sendClientHeader(api);
+holdWhileEdgeSignedOut(api);
 
 export type PreviewLinkAudience = 'owner' | 'people' | 'link';
 export type PreviewLinkHostMode = 'localhost' | 'public';
@@ -24,6 +26,8 @@ export interface PreviewListener {
   verdict: { ok: true } | { ok: false; code: string; reason: string };
   /** The process runs from the workstream's checkout. */
   inCheckout: boolean;
+  /** Started with `termag preview run` for this checkout: only then can a wider audience have it (SR9). Absent from an older server. */
+  confined?: boolean;
 }
 
 export interface PreviewLinkPerson { id: string; email: string; displayName: string }

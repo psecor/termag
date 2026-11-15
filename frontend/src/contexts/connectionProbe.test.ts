@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PROBE_PATH, isEdgeSignedOut, probeBackend, reauthenticate, retryConnection } from './ConnectionContext';
+import { PROBE_PATH, isEdgeSignedOut, markEdgeSignedOut, probeBackend, reauthenticate, retryConnection } from './ConnectionContext';
 import { connectionTracker } from '../utils/connectionTracker';
 
 function fetchMock(impl: (input: RequestInfo | URL, init?: RequestInit) => Promise<unknown>) {
@@ -91,6 +91,18 @@ describe('probeBackend on an expired edge session', () => {
     fetchMock(async () => ({ type: 'basic', status: 200 }));
     await expect(probeBackend()).resolves.toBe(true);
     expect(isEdgeSignedOut()).toBe(false);
+  });
+
+  it('keeps the mark when the session expired while it was in flight', async () => {
+    // Its 200 left the edge before the expiry; clearing the mark on it would
+    // wake every tab in the middle of a sign-in.
+    let answer!: (r: unknown) => void;
+    fetchMock(() => new Promise(r => { answer = r; }));
+    const probe = probeBackend();
+    markEdgeSignedOut();
+    answer({ type: 'basic', status: 200 });
+    await probe;
+    expect(isEdgeSignedOut()).toBe(true);
   });
 
   it('leaves a healthy response alone', async () => {

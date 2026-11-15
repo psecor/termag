@@ -306,7 +306,7 @@ describe('the one line above the box (fileLine)', () => {
 
   it('says each strip state in one line, with only the actions that apply', () => {
     expect(line({ kind: 'hidden' })).toMatchObject({ text: 'orchestrator · Done · your turn', tone: 'idle', spinner: false, dismiss: false, retry: false });
-    expect(line({ kind: 'hidden' }, { status: { tone: 'working', text: 'Writing…' }, running: true })).toMatchObject({ text: 'orchestrator · Writing…', spinner: true });
+    expect(line({ kind: 'hidden' }, { status: { tone: 'working', text: 'Working · writing…' }, running: true })).toMatchObject({ text: 'orchestrator · Working · writing…', spinner: true });
     expect(line({ kind: 'sending' })).toMatchObject({ text: 'orchestrator · sending…', spinner: true, dismiss: true });
     expect(line({ kind: 'queued', where: 'browser', count: 2 })).toMatchObject({ text: 'orchestrator · 2 messages · sent as soon as Claude is ready' });
     expect(line({ kind: 'working', text: '# Big heading\n\nlots of text' })).toMatchObject({ text: 'orchestrator · working…', spinner: true });

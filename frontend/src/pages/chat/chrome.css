@@ -134,6 +134,8 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
   padding: var(--chrome-gap) var(--chrome-gap) var(--chrome-gap) 0;
   gap: var(--chrome-gap);
 }
+/* The notice banner sits on the window above both cards, the same gap from each. */
+.chat-root[data-chrome='refresh'][data-pane='docked'] .chat-pane-notice { padding: var(--chrome-gap) var(--chrome-gap) 0 0; }
 .chat-root[data-chrome='refresh'][data-pane='docked'] .chat-main > :not(.chat-side-panel) {
   flex: 1 1 0;
   min-width: 0;
@@ -341,7 +343,7 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
 .chat-root[data-chrome='refresh'] .chat-item.active { background: var(--chrome-row-active); }
 /* Needing you is the dot's to say; the name stays readable, a little heavier. */
 .chat-root[data-chrome='refresh'] .chat-item[data-band='attention'] .chat-item-name { color: var(--text-primary); font-weight: 500; }
-.chat-root[data-chrome='refresh'] .chat-item:is([data-state='approval'], [data-state='unread'], [data-state='error']) .chat-item-name { font-weight: 500; }
+.chat-root[data-chrome='refresh'] .chat-item:is([data-state='approval'], [data-state='unread'], [data-state='error'], [data-unseen]) .chat-item-name { font-weight: 500; }
 .chat-root[data-chrome='refresh'] .chat-item[data-state='off'] .chat-item-name { color: var(--text-secondary); }
 .chat-root[data-chrome='refresh'] .chat-item-age {
   flex-shrink: 0;
@@ -502,6 +504,70 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
   .lp-theme.chat-palette-layer .chat-status-dot { animation: none; }
 }
 
+/* ── The Projects view (ProjectsList.tsx, View options → Show: Projects): the tabs' groups and rows,
+   plus a Lab tag, a refresh alert, and the empty and filtered states. */
+/* "Lab": a label, not a control, in the UI font and a muted colour. Compact rows put it before the age;
+   Standard rows first in the meta line. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-item-tag {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 16px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
+}
+.chat-root[data-chrome='refresh'] .chat-items .chat-item > .chat-item-tag { margin-left: 6px; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-item-sub > .chat-item-tag { line-height: 18px; align-self: center; }
+/* The twisty is LaunchPad's Button (ProjectsList.tsx): its own padding, size, border and fill go, so the tabs' twisty rules above place and draw it. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li > .chat-projects-twisty {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-secondary);
+  font: inherit;
+}
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li > .chat-projects-twisty:is([data-hovered], [data-pressed]) { background: var(--chrome-row-active); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-items .chat-tree-li > .chat-projects-twisty[data-focus-visible] { outline: 2px solid var(--accent); outline-offset: -2px; }
+.chat-root[data-chrome='refresh'] .chat-projects-alert { flex-shrink: 0; margin: 4px 8px 6px; font-family: var(--font-ui); }
+.chat-root[data-chrome='refresh'] .chat-projects-alert p { margin: 0; }
+.chat-root[data-chrome='refresh'] .chat-projects-empty { list-style: none; padding: 16px 8px; font-family: var(--font-ui); }
+.chat-root[data-chrome='refresh'] .chat-projects-empty h5 { margin: 0 0 4px; color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-projects-filtered { font-family: var(--font-ui); line-height: 20px; }
+/* A project's head (user-projects-enabled): its open PRs, a LaunchPad Button after the fold
+   toggle, in the head's muted colour until hovered; and a project with no session yet. */
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-prs {
+  order: 5;
+  flex-shrink: 0;
+  min-height: 22px;
+  padding: 0 6px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-prs:is([data-hovered], [data-pressed]) { background: var(--chrome-row-active); color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-prs[data-focus-visible] { outline: 2px solid var(--accent); outline-offset: -2px; }
+.chat-root[data-chrome='refresh'] .chat-items .chat-group-head .chat-project-menu { order: 6; flex-shrink: 0; }
+@media (pointer: coarse) {
+  .chat-root[data-chrome='refresh'] .chat-items .chat-group-prs { min-height: 36px; }
+}
+.chat-root[data-chrome='refresh'] .chat-project-none {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 2px 8px 8px 38px;
+  font-family: var(--font-ui);
+}
+.chat-root[data-chrome='refresh'] .chat-project-none-text { color: var(--text-secondary); font-size: 13px; }
+
 /* ── Archived (ArchivedRows.tsx): a head like a status group's, rows like the sessions', the border under it ──
    The head's toggle and each row are LaunchPad Buttons wearing the space head's and the session
    row's classes. LaunchPad's button sets its own font, layout, padding and fills, so these rules
@@ -522,7 +588,7 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
 .chat-root[data-chrome='refresh'] .chat-archived-group .chat-group-head .chat-group-caret { order: 3; opacity: 0; transition: opacity 0.12s ease, transform 0.12s ease; }
 .chat-root[data-chrome='refresh'] .chat-archived-group .chat-group-head:is(:hover, :focus-within) .chat-group-caret,
 .chat-root[data-chrome='refresh'] .chat-archived-group[data-folded] .chat-group-head .chat-group-caret { opacity: 1; }
-.chat-root[data-chrome='refresh'] .chat-archived-fold {
+.chat-root[data-chrome='refresh'] :is(.chat-archived-fold, .chat-projects-fold) {
   display: flex;
   flex: 1;
   min-width: 0;
@@ -536,8 +602,8 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
   text-align: left;
   cursor: pointer;
 }
-.chat-root[data-chrome='refresh'] .chat-archived-fold:is(:hover, [data-hovered], [data-pressed]) { background: none; color: var(--text-primary); }
-.chat-root[data-chrome='refresh'] .chat-archived-fold[data-focus-visible] { background: none; outline: 2px solid var(--accent); outline-offset: -2px; }
+.chat-root[data-chrome='refresh'] :is(.chat-archived-fold, .chat-projects-fold):is(:hover, [data-hovered], [data-pressed]) { background: none; color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] :is(.chat-archived-fold, .chat-projects-fold)[data-focus-visible] { background: none; outline: 2px solid var(--accent); outline-offset: -2px; }
 /* No rail and no indent: rows line up under the head, as the spaces' do. */
 .chat-root[data-chrome='refresh'] .chat-archived-rows { margin: 0; padding: 0; border-left: none; }
 .chat-root[data-chrome='refresh'] .chat-archived-item {
@@ -587,6 +653,18 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
 .lp-theme .chat-archived-confirm-dialog { display: flex; flex-direction: column; gap: 10px; padding: 20px; outline: none; }
 .lp-theme .chat-archived-confirm-dialog p { margin: 0; color: var(--text-secondary); }
 .lp-theme .chat-archived-confirm-buttons { justify-content: flex-end; margin-top: 6px; }
+/* A project's Rename and Archive dialogs (ProjectMenu.tsx, user-projects-enabled): LaunchPad's
+   Modal and Dialog in the theme's elevated surface, as Archived's delete confirm is. */
+.lp-theme .chat-project-modal { font-family: var(--font-ui); color: var(--text-primary); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 12px; }
+.lp-theme .chat-project-dialog { padding: 20px; outline: none; font-size: 13px; }
+.lp-theme .chat-project-dialog, .lp-theme .chat-project-dialog form { display: flex; flex-direction: column; gap: 12px; }
+.lp-theme .chat-project-dialog p { margin: 0; }
+.lp-theme .chat-project-dialog-note { color: var(--text-secondary); }
+.lp-theme .chat-project-name-field { display: flex; flex-direction: column; gap: 4px; }
+.lp-theme .chat-project-field-error { color: var(--danger); font-size: 12px; }
+.lp-theme .chat-project-boxes { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; color: var(--text-primary); }
+.lp-theme .chat-project-boxes li[data-fate='keeps'] { color: var(--text-secondary); }
+.lp-theme .chat-project-dialog-buttons { justify-content: flex-end; margin-top: 4px; }
 
 /* ── A session's header (SessionHeader.tsx), on a desktop width ──
    space / title, the project chip, a Working pill; then the box, ⋯ and the panel toggle.
@@ -610,6 +688,20 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
   color: var(--text-secondary);
   font-size: 13px;
 }
+/* project ▸ title (user-projects-enabled, SessionHeader.tsx ProjectCrumb): the project's name, a
+   LaunchPad Link in the title's colour, muted, truncating before the title does. */
+.chat-root[data-chrome='refresh'] .chat-header .chat-title-crumb { font-size: 14px; font-weight: 500; }
+.chat-root[data-chrome='refresh'] .chat-header .chat-title-pr {
+  min-height: 0;
+  height: auto;
+  padding: 2px 8px;
+  line-height: inherit;
+  font-family: var(--font-ui);
+  font-weight: 400;
+  cursor: pointer;
+}
+.chat-root[data-chrome='refresh'] .chat-header .chat-title-pr:is([data-hovered], [data-pressed]) { color: var(--text-primary); }
+.chat-root[data-chrome='refresh'] .chat-header .chat-title-pr[data-focus-visible] { outline: 2px solid var(--accent); outline-offset: 1px; }
 /* The breadcrumb's slash only follows a space. */
 .chat-root[data-chrome='refresh'] .chat-crumb-sep { display: none; color: var(--text-secondary); }
 .chat-root[data-chrome='refresh'] .chat-title-space + .chat-crumb-sep { display: inline; }
@@ -731,6 +823,40 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
    shown has it quieter, full strength on hover or focus. */
 .chat-root[data-chrome='refresh'] .chat-side-tab:not([data-selected]) .chat-side-tab-close [data-icon] { opacity: 0.55; }
 .chat-root[data-chrome='refresh'] .chat-side-tab:is(:hover, :focus-within) .chat-side-tab-close [data-icon] { opacity: 1; }
+/* A file tab (project-files-enabled): its mark is where the file lives, and its × floats over its right end
+   on hover or focus, on the tab's own colour over the panel's, so the name has the tab's whole width until then. */
+.chat-root[data-chrome='refresh'] .chat-side-tab-mark { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; flex-shrink: 0; }
+.chat-root[data-chrome='refresh'] .chat-side-tab-mark [data-icon] { fill: currentColor; }
+.chat-root[data-chrome='refresh'] .chat-side-tab[data-file] .chat-side-tab-main { padding-right: 8px; }
+.chat-root[data-chrome='refresh'] .chat-side-tab[data-file] .chat-side-tab-close {
+  position: absolute;
+  top: 5px;
+  right: 4px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+  background: linear-gradient(var(--chrome-row-hover), var(--chrome-row-hover)), var(--chrome-card);
+}
+.chat-root[data-chrome='refresh'] .chat-side-tab[data-file][data-selected] .chat-side-tab-close {
+  background: linear-gradient(var(--chrome-row-active), var(--chrome-row-active)), var(--chrome-card);
+}
+.chat-root[data-chrome='refresh'] .chat-side-tab[data-file]:is(:hover, :focus-within) .chat-side-tab-close { opacity: 1; pointer-events: auto; }
+@media (hover: none) {
+  .chat-root[data-chrome='refresh'] .chat-side-tab[data-file] .chat-side-tab-close { opacity: 1; pointer-events: auto; }
+}
+/* Dragging a tab (project-files-enabled, PanelTabStrip): a line where it will land, and the tab dragged faded. */
+.chat-root[data-chrome='refresh'] .chat-side-tabs[data-fit] { position: relative; }
+.chat-root[data-chrome='refresh'] .chat-side-drop {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--accent);
+  pointer-events: none;
+}
+.chat-root[data-chrome='refresh'] .chat-side-tab[data-dragged] { opacity: 0.45; }
 .chat-root[data-chrome='refresh'] .chat-side-add { width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0; }
 .chat-root[data-chrome='refresh'] .chat-side-add [data-icon] { fill: var(--text-secondary); }
 /* "N more": the tabs that don't fit, in a menu. */
@@ -812,6 +938,14 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
 .chat-root[data-chrome='refresh'] .pr-panel { display: flex; flex-direction: column; gap: 12px; padding: 16px; overflow-y: auto; font-size: 13px; }
 .chat-root[data-chrome='refresh'] .pr-panel-empty { align-items: center; justify-content: center; text-align: center; gap: 8px; padding: 32px 24px; }
 .chat-root[data-chrome='refresh'] .pr-panel-label { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .pr-panel-picker { display: flex; flex-direction: column; gap: 4px; }
+.chat-root[data-chrome='refresh'] .pr-panel-choice { display: flex; align-items: center; gap: 8px; width: 100%; height: auto; padding: 8px; text-align: left; white-space: normal; }
+.chat-root[data-chrome='refresh'] .pr-panel-choice[aria-pressed='true'] { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.chat-root[data-chrome='refresh'] .pr-panel-choice [data-icon] { flex-shrink: 0; fill: var(--text-secondary); }
+.chat-root[data-chrome='refresh'] .pr-panel-choice-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.chat-root[data-chrome='refresh'] .pr-panel-choice-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-root[data-chrome='refresh'] :is(.pr-panel-choice-sub, .pr-panel-source) { color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.chat-root[data-chrome='refresh'] .pr-panel-source { margin: 0; }
 .chat-root[data-chrome='refresh'] .chat-launcher-icon[data-kind='pr'] { --tile: var(--accent); }
 .chat-root[data-chrome='refresh'] .pr-panel-gates {
   padding: 10px 12px;
@@ -1244,6 +1378,14 @@ html[data-palette='light'] .chat-root[data-chrome='refresh'] { --chrome-window: 
 .chat-root[data-chrome='refresh'] .chat-composer-notes[data-above]:empty { display: none; }
 .chat-root[data-chrome='refresh'] .chat-composer-notes[data-above] > .chat-composer-note { padding: 0; }
 .chat-root[data-chrome='refresh'] .chat-composer-notes[data-above] > .chat-hold { margin-top: 0; padding: 8px 8px 8px 12px; font-size: 13px; color: var(--text-primary); }
+/* With nothing under it, a session's composer sits 22px over the bottom on desktop and wider (6px
+   before), so the gap reads close to the 16px side gutters. A phone keeps .chat-bottom's 6px and its
+   safe-area inset; the file viewer's docked chat (.fv-chat) is left alone. */
+@media (min-width: 768px) {
+  .chat-root[data-chrome='refresh'] .chat-bottom:not(.fv-chat):has(> .chat-composer:last-child) {
+    padding-bottom: calc(22px + env(safe-area-inset-bottom, 0px));
+  }
+}
 /* Stop and Send hold no room while neither shows. */
 .chat-root[data-chrome='refresh'] .chat-compose-end { min-width: 0; }
 .chat-root[data-chrome='refresh'] .chat-compose-end:empty { display: none; }

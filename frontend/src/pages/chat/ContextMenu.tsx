@@ -72,11 +72,11 @@ export function MenuButton({ label, open, expanded, className = '', tip = 'Optio
   );
 }
 
-const LONG_PRESS_MS = 500;
+export const LONG_PRESS_MS = 500;
 /** How far a held finger may move, in px, before it is a scroll rather than a press. */
 const LONG_PRESS_SLOP = 10;
 
-type PressHandlers = Required<Pick<React.DOMAttributes<HTMLElement>, 'onPointerDown' | 'onPointerMove' | 'onPointerUp' | 'onPointerCancel'>>;
+export type PressHandlers = Required<Pick<React.DOMAttributes<HTMLElement>, 'onPointerDown' | 'onPointerMove' | 'onPointerUp' | 'onPointerCancel'>>;
 
 /** How long after a long press's lift a click on the pressed element is still the lift's. */
 const LIFT_CLICK_MS = 400;

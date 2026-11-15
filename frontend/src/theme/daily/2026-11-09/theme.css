@@ -1,0 +1,22 @@
+/* Checkmate, 1985: boxwood-gold accents in both UIs and both palettes. Contrast:
+   dark: #e3b56b on #0d1117 9.99:1, #161b22 9.13:1, #21262d 8.04:1, simple UI #181a1f 9.19:1,
+   #23252a 8.10:1; white on #9a6822 4.80:1; #9a6822 as a border or outline on #21262d 3.17:1,
+   #23252a 3.20:1.
+   light: #8a5418 on #ffffff 6.25:1, #f6f8fa 5.87:1, #eaeef2 5.36:1, simple UI #f7f9fb 5.92:1;
+   white on #7a4a14 7.45:1. */
+
+html[data-daily-theme="2026-11-09"],
+html[data-daily-theme="2026-11-09"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-09"] .lp-theme {
+  --accent: #e3b56b;
+  --accent-dim: #9a6822;
+  --accent-rgb: 227, 181, 107;
+}
+
+html[data-daily-theme="2026-11-09"][data-palette="light"],
+html[data-daily-theme="2026-11-09"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-09"][data-palette="light"] .lp-theme {
+  --accent: #8a5418;
+  --accent-dim: #7a4a14;
+  --accent-rgb: 138, 84, 24;
+}

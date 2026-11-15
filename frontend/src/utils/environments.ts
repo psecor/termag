@@ -142,8 +142,32 @@ export const VISIBILITY_LABEL: Record<EnvironmentVisibility, string> = { persona
 /** Who can use it, as the New environment form and an environment's page say. */
 export const VISIBILITY_HINT: Record<EnvironmentVisibility, string> = {
   personal: 'Only you see it and use it, on your own boxes',
-  shared: "Everyone signed in sees it and uses it. It runs from a file on its repository's default branch",
+  shared: "Everyone signed in sees it and uses it, and admins change it. It runs from a file on its repository's default branch",
 };
+
+/** The server's refusal of a non-admin's change to a shared environment (backend services/environments.ts SHARED_ADMIN_ONLY). */
+export const SHARED_ADMIN_ONLY = 'Only admins can change shared environments; make a personal one';
+
+/**
+ * What `user` may do with an environment, as the server decides it: a
+ * personal one is wholly its owner's, and nobody else's at all, an admin included (the server answers them 404); a
+ * shared one only an admin edits, makes personal or deletes, and only an admin shares their own. `reason` is why the
+ * controls are off, for a non-admin on a shared one.
+ */
+export function environmentRights(env: { visibility: EnvironmentVisibility; owner: { id: string } | null }, user: { id?: string; role?: string } | null | undefined): {
+  edit: boolean; remove: boolean; share: boolean; unshare: boolean; reason: string | null;
+} {
+  const admin = user?.role === 'admin';
+  if (env.visibility === 'shared') return { edit: admin, remove: admin, share: false, unshare: admin, reason: admin ? null : SHARED_ADMIN_ONLY };
+  const own = !!user?.id && env.owner?.id === user.id;
+  return { edit: own, remove: own, share: own && admin, unshare: false, reason: null };
+}
+
+/** Whether `user` may make a new environment shared: admins only. */
+export const canCreateShared = (user: { role?: string } | null | undefined): boolean => user?.role === 'admin';
+
+/** Why the New environment form's Shared choice is off for a non-admin. */
+export const SHARED_CREATE_ADMIN_ONLY = 'Only admins make shared environments; yours is personal';
 
 /**
  * Why a draft can't be shared as it stands, the rule as the server words it, else null. Only what the form knows

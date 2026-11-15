@@ -22,14 +22,30 @@ export interface TextFile { id: string; name: string; text: string }
  * chat-files.js): `path` (under the checkout) once it is there; until then it
  * is uploading, or waiting for the box to wake.
  */
-export interface BoxFile { id: string; name: string; size: number | string; path: string | null; status: 'uploading' | 'waking' | 'kept' }
+export interface BoxFile {
+  id: string; name: string; size: number | string; path: string | null; status: 'uploading' | 'waking' | 'kept';
+  /** The chat's space it is in, or (uploading) going to (chat/chatSpaceFiles.ts); absent: the box. */
+  space?: string;
+  /** Its browser link, once in a space. */
+  url?: string;
+  /** Bytes sent so far, while uploading to a space. */
+  sent?: number;
+  /** Why the box keeps it although the chat has a space. */
+  fellBack?: string;
+}
 
-/** A box file as a message names it, and as a bubble reads it back. */
-export interface SentBoxFile { name: string; path: string; size: string }
+/** A box or space file as a message names it, and as a bubble reads it back; `space` and `url` for one in a space. */
+export interface SentBoxFile { name: string; path: string; size: string; space?: string; url?: string }
 
 const HEAD = 'Attached file: ';
 const BOX_HEAD = 'Attached file on the box: ';
 const BOX_LINE = /^Attached file on the box: (\.termag-attachments\/[0-9a-f]{16}\/([A-Za-z0-9._-]+)) \(([^()\n]+)\)$/;
+const SPACE_HEAD = 'Attached file in a space: ';
+/** The space path's shape a message may name (chat/chatSpaceFiles.ts spaceAttachmentPath): nothing else reads back as one. */
+export const SPACE_ATTACHMENT_PATH_RE = /^attachments\/[A-Za-z0-9_-]{1,64}\/\d{8}T\d{6}Z-[0-9a-z]{6}\/([A-Za-z0-9._-]{1,120})$/;
+const SPACE_LINE = /^Attached file in a space: ([a-z0-9-]{2,40}):(\S+) \(([^()\n]+)\) (https?:\/\/\S+)$/;
+/** After a message's space files, once: how the agent fetches one. */
+export const SPACE_HINT = '(`termag space get <space>:<path>` fetches a file in a space; the link opens it in the browser.)';
 
 /** A file name fit for the block's heading line: no control characters, bounded. */
 function headingName(raw: string): string {
@@ -68,15 +84,22 @@ function block(file: Pick<TextFile, 'name' | 'text'>): string {
  * block headed with its name, then a line naming where the box keeps each
  * other file (its path relative to the checkout, Claude's working directory).
  */
-export function withTextFiles(typed: string, files: ReadonlyArray<Pick<TextFile, 'name' | 'text'>>, boxFiles: ReadonlyArray<{ path: string; size: number | string }> = []): string {
+export function withTextFiles(typed: string, files: ReadonlyArray<Pick<TextFile, 'name' | 'text'>>, boxFiles: ReadonlyArray<{ path: string; size: number | string; space?: string; url?: string }> = []): string {
   if (!files.length && !boxFiles.length) return typed;
-  const lines = boxFiles.map(f => `${BOX_HEAD}${f.path} (${typeof f.size === 'number' ? formatFileSize(f.size) : f.size})`);
+  const size = (f: { size: number | string }) => (typeof f.size === 'number' ? formatFileSize(f.size) : f.size);
+  const inSpace = boxFiles.filter(f => f.space && f.url);
+  const lines = [
+    ...boxFiles.filter(f => !(f.space && f.url)).map(f => `${BOX_HEAD}${f.path} (${size(f)})`),
+    // In a space: `space:path` for the agent, then the link for people; one hint after them all.
+    ...inSpace.map(f => `${SPACE_HEAD}${f.space}:${f.path} (${size(f)}) ${f.url}`),
+    ...(inSpace.length ? [SPACE_HINT] : []),
+  ];
   return [typed, ...files.map(block), ...lines].filter(Boolean).join('\n\n');
 }
 
 /** Box files read back from a message, held again (a draft handed over, a message taken back). */
 export function heldBoxFiles(files: ReadonlyArray<SentBoxFile>, prefix: string): BoxFile[] {
-  return files.map((f, n) => ({ id: `${prefix}-box${n}`, name: f.name, size: f.size, path: f.path, status: 'kept' as const }));
+  return files.map((f, n) => ({ id: `${prefix}-box${n}`, name: f.name, size: f.size, path: f.path, status: 'kept' as const, ...(f.space && f.url ? { space: f.space, url: f.url } : {}) }));
 }
 
 type Attached = { files: Array<{ name: string; text: string }>; boxFiles: SentBoxFile[] };
@@ -86,7 +109,25 @@ function blocksFrom(text: string, at: number): Attached | null {
   const files: Array<{ name: string; text: string }> = [];
   const boxFiles: SentBoxFile[] = [];
   let p = at;
+  // The line from p to its end (or the text's), and where it ends.
+  const lineAt = (from: number) => { const end = text.indexOf('\n', from); return { line: text.slice(from, end < 0 ? text.length : end), end: end < 0 ? text.length : end }; };
+  // Past a line: done at the text's end, on after the blank line, or not attachments at all.
+  const past = (end: number): 'done' | 'on' | null => (end === text.length ? 'done' : text.startsWith('\n\n', end) ? 'on' : null);
   for (;;) {
+    if (text.startsWith(SPACE_HEAD, p) || text.startsWith(SPACE_HINT, p)) {
+      const { line, end } = lineAt(p);
+      if (line !== SPACE_HINT) {
+        const m = SPACE_LINE.exec(line);
+        const name = m ? SPACE_ATTACHMENT_PATH_RE.exec(m[2])?.[1] : undefined;
+        if (!m || !name) return null;
+        boxFiles.push({ path: m[2], name, size: m[3], space: m[1], url: m[4] });
+      }
+      const next = past(end);
+      if (next === 'done') return { files, boxFiles };
+      if (!next) return null;
+      p = end + 2;
+      continue;
+    }
     if (text.startsWith(BOX_HEAD, p)) {
       const end = text.indexOf('\n', p);
       const line = BOX_LINE.exec(text.slice(p, end < 0 ? text.length : end));

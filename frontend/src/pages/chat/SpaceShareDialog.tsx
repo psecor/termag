@@ -20,8 +20,10 @@ import { SpaceSwatch } from './SpaceSwatch';
 
 type Confirm = { message: React.ReactNode; confirmLabel: string; onConfirm: () => void };
 
-export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: {
+export function SpaceShareDialog({ space, label, userId, onClose, onChanged, onLeft }: {
   space: SpaceView;
+  /** What the space is called in the words, when it isn't its name: a project's files ("termag's files"). */
+  label?: string;
   userId: string | undefined;
   onClose: () => void;
   /** Someone or a box was added or removed: the sidebar's spaces should load again. */
@@ -30,6 +32,7 @@ export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: 
   onLeft: () => void;
 }) {
   const m = useSpaceMembers(space.name);
+  const shown = label ?? space.name;
   const can = shareAbilities(space.role, Boolean(space.readOnly));
   const myBoxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
   const [email, setEmail] = useState('');
@@ -54,7 +57,7 @@ export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: 
       rememberPerson(browserStorage(), { email: who, displayName: pickedName });
       m.setNote(r.invite
         ? `${who} gets access when they first sign in to termag.`
-        : `${r.member?.displayName || who} ${role === 'owner' ? 'is now an owner' : role === 'editor' ? 'can now edit' : 'can now view'} ${space.name}.`);
+        : `${r.member?.displayName || who} ${role === 'owner' ? 'is now an owner' : role === 'editor' ? 'can now edit' : 'can now view'} ${shown}.`);
     }, 'Could not add them', () => { setEmail(''); setPickedName(undefined); changed(); });
   };
 
@@ -69,24 +72,26 @@ export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: 
   return createPortal(
     <Dialog
       className="chat-launch-dialog chat-share-dialog"
-      title={<span className="chat-share-title"><SpaceSwatch space={space.name} />Share {space.name}</span>}
+      title={<span className="chat-share-title"><SpaceSwatch space={space.name} />Share {shown}</span>}
       onClose={onClose}
     >
       <p className="chat-launch-dialog-note">
         {can.manage
-          ? <>People you add see {space.name} in their sidebar and can open its files. Each person keeps their own agents.</>
-          : <>Who can open {space.name}, and the boxes whose agents reach it.</>}
+          ? label
+            ? <>People you add can open {label}. Each person keeps their own agents.</>
+            : <>People you add see {space.name} in their sidebar and can open its files. Each person keeps their own agents.</>
+          : <>Who can open {shown}, and the boxes whose agents reach it.</>}
       </p>
       {/* The space's link, the one way to copy it: near the top, where it's seen first. */}
       <div className="chat-share-link">
-        <input readOnly value={link} aria-label={`Link to ${space.name}`} onFocus={e => e.currentTarget.select()} />
+        <input readOnly value={link} aria-label={`Link to ${shown}`} onFocus={e => e.currentTarget.select()} />
         <button type="button" className="chat-share-secondary chat-share-copy" onClick={copyLink}>
           <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
             <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M6.5 9.5l3-3M7 4.5l1-1a2.8 2.8 0 0 1 4 4l-1 1M9 11.5l-1 1a2.8 2.8 0 0 1-4-4l1-1" />
           </svg>
           {copied ? 'Link copied' : 'Copy link'}
         </button>
-        <span className="chat-share-sub chat-share-link-hint">Only people in {space.name} can open it</span>
+        <span className="chat-share-sub chat-share-link-hint">Only people in {shown} can open it</span>
       </div>
       {space.readOnly && <div className="chat-share-gate" role="status">This space has no owner, so it is read-only. An admin can make someone its owner.</div>}
       {m.error && (
@@ -98,7 +103,7 @@ export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: 
       {m.note && <div className="chat-share-note" role="status">{m.note}</div>}
 
       {can.addPeople === 'yes' && (
-        <form className="chat-share-add" onSubmit={add} aria-label={`Add people to ${space.name}`}>
+        <form className="chat-share-add" onSubmit={add} aria-label={`Add people to ${shown}`}>
           <div className="chat-share-who">
             <PersonPicker required value={email} placeholder="Add people by name or email" ariaLabel="Email"
               onChange={(next, name) => { setEmail(next); setPickedName(name); }} />
@@ -139,7 +144,7 @@ export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: 
                 ) : <span className="chat-share-role">{SHARE_ROLE_LABEL[p.role]}</span>}
                 {can.manage && !self && (
                   <button type="button" className="chat-share-action" aria-label={`Remove ${p.email}`} onClick={() => setConfirm({
-                    message: <>Remove {p.email} from <b>{space.name}</b>? The boxes they added lose access too.</>,
+                    message: <>Remove {p.email} from <b>{shown}</b>? The boxes they added lose access too.</>,
                     confirmLabel: 'Remove',
                     onConfirm: () => void m.act(() => spacesApi.removeMember(space.name, p.userId), 'Could not remove them', changed),
                   })}>Remove</button>
@@ -148,7 +153,7 @@ export function SpaceShareDialog({ space, userId, onClose, onChanged, onLeft }: 
                   <button type="button" className="chat-share-action" disabled={lastOwner}
                     title={lastOwner ? 'Make someone else an owner first' : undefined}
                     onClick={() => setConfirm({
-                      message: <>Leave <b>{space.name}</b>? The boxes you added lose access too.</>,
+                      message: <>Leave <b>{shown}</b>? The boxes you added lose access too.</>,
                       confirmLabel: 'Leave',
                       onConfirm: () => void m.act(() => spacesApi.removeMember(space.name, p.userId), 'Could not leave', onLeft),
                     })}>Leave</button>

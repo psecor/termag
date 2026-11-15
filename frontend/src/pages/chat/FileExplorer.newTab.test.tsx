@@ -73,7 +73,7 @@ describe('a new tab', () => {
     expect([...host.querySelectorAll('.nt-name')].map(n => n.textContent)).toEqual(['plan.md', 'review-notes']);
     // An agent's state is its icon's dot, and words for a screen reader only.
     expect([...host.querySelectorAll('.nt-where')].map(n => n.textContent)).toEqual(['docs', 'Agent']);
-    expect(host.querySelectorAll('.nt-row')[1].querySelector('.chat-sr')!.textContent).toBe(', Ready');
+    expect(host.querySelectorAll('.nt-row')[1].querySelector('.chat-sr')!.textContent).toBe(', Idle');
     expect(host.querySelector('.chat-side-toggle')).not.toBeNull();
   });
 

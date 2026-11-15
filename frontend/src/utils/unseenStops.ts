@@ -82,6 +82,24 @@ export function markSeen(store: SeenStops, key: string, now: number, stoppedAt?:
   return { ...store, seen: { ...store.seen, [key]: at } };
 }
 
+/**
+ * Mark a session unseen again (the sidebar card's Mark as unread): its seen time goes back to just before its
+ * stop, so the stop reads as unseen until the session is next looked at. Only a stop unseenStopAge would still
+ * show (canMarkUnseen) can be marked.
+ */
+export function markUnseen(store: SeenStops, key: string, stoppedAt: string | null | undefined): SeenStops {
+  const stop = stoppedAt ? Date.parse(stoppedAt) : NaN;
+  if (!Number.isFinite(stop)) return store;
+  return { ...store, seen: { ...store.seen, [key]: stop - 1 } };
+}
+
+/** Whether Mark as unread can show a blue dot for it: it came to rest, and not so long ago that the dot has expired. */
+export function canMarkUnseen(status: string | undefined, stoppedAt: string | null | undefined, now: number): boolean {
+  if (status !== 'idle' && status !== 'not_running') return false;
+  const stop = stoppedAt ? Date.parse(stoppedAt) : NaN;
+  return Number.isFinite(stop) && now - stop < UNSEEN_MAX_AGE_MS;
+}
+
 /** How long ago the session stopped unseen, or null when there's nothing to mark. */
 export function unseenStopAge(
   store: SeenStops,

@@ -13,6 +13,9 @@ vi.mock('../../flags', async () => {
   const actual = await vi.importActual<typeof import('../../flags')>('../../flags');
   return { ...actual, useFlag: (key: string, fallback: unknown) => (key in mocks.flags ? mocks.flags[key] : fallback) };
 });
+const links = vi.hoisted(() => ({ list: vi.fn(), listeners: vi.fn(), publish: vi.fn() }));
+vi.mock('../../services/previewLinksApi', () => ({ previewLinksApi: links, previewLinkError: () => 'refused' }));
+vi.mock('../../launchpad/sprite', () => ({ ensureLaunchPadSprite: () => Promise.resolve() }));
 vi.mock('../../services/api', () => ({
   previewSharesApi: mocks.shares,
   prsApi: mocks.prs,
@@ -132,5 +135,38 @@ describe('the side panel\'s Share tab', () => {
     expect(mocks.shares.revoke).toHaveBeenCalledWith('p1', 'l1');
     expect(el.textContent).toContain('Not shared with anyone yet.');
     expect(button('Share preview')).toBeDefined();
+  });
+});
+
+describe('the Share tab\'s delivery choice (preview links)', () => {
+  beforeEach(() => {
+    links.list.mockReset().mockResolvedValue({ links: [], requests: [], ttlHoursDefault: 24, previewDomain: 'preview.test' });
+    links.listeners.mockReset().mockResolvedValue([]);
+  });
+  const choices = () => [...el.querySelectorAll('.share-delivery input[type=radio]')] as HTMLInputElement[];
+  const label = (r: HTMLInputElement) => r.closest('label')?.textContent?.trim();
+  const shown = (sel: string) => { const e = el.querySelector(sel); return !!e && !e.closest('[hidden]'); };
+
+  it('with preview-links-enabled on, lists "In your browser" first and opens on it, "In termag" second', async () => {
+    mocks.flags = { 'preview-links-enabled': true };
+    act(() => root.render(<ShareTab projectId="p1" workstream="main" />));
+    await flush();
+    expect(el.textContent).toContain('Share the preview of main');
+    expect(choices().map(label)).toEqual(['In your browser', 'In termag']);
+    expect(choices()[0].checked).toBe(true);
+    expect(shown('.preview-links-publish')).toBe(true);
+    expect(shown('.share-dialog-form')).toBe(false);
+    act(() => { choices()[1].click(); });
+    expect(shown('.share-dialog-form')).toBe(true);
+    expect(shown('.preview-links-publish')).toBe(false);
+  });
+
+  it('with it off, offers no choice: the preview share alone, as before', async () => {
+    act(() => root.render(<ShareTab projectId="p1" workstream="main" />));
+    await flush();
+    expect(el.querySelector('.share-delivery')).toBeNull();
+    expect(el.querySelector('.preview-links')).toBeNull();
+    expect(shown('.share-dialog-form')).toBe(true);
+    expect(links.list).not.toHaveBeenCalled();
   });
 });

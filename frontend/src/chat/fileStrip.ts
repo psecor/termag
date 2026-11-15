@@ -255,7 +255,7 @@ export function fileLine(strip: StripState, ctx: {
   const named = (l: Omit<FileLine, 'name' | 'text'>): FileLine => ({ ...l, name: ctx.name, text: `${ctx.name}${l.status}` });
   switch (strip.kind) {
     case 'hidden': {
-      const tone = ctx.status.tone === 'error' ? 'error' : ctx.status.tone === 'idle' ? 'idle' : 'working';
+      const tone = ctx.status.tone === 'error' ? 'error' : ctx.status.tone === 'idle' || ctx.status.tone === 'off' ? 'idle' : 'working';
       return named({ ...base, status: at(ctx.status.text), tone, spinner: ctx.running && ctx.status.tone === 'working', retry: false, dismiss: false });
     }
     case 'sending': return named({ ...base, status: at('sending…'), tone: 'working', spinner: true, retry: false, dismiss: true });

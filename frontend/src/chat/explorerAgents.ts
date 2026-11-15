@@ -3,6 +3,8 @@
 // agent started nested under it the way files nest in
 // folders. Agents whose box doesn't reach the space aren't listed.
 
+import { sessionTitle } from './sessionTitle';
+
 /** One agent started by another: the child session and the session that started it. */
 export interface SpawnLink { projectId: string; workstream: string; parentProjectId: string; parentWorkstream: string }
 
@@ -10,6 +12,8 @@ export interface AgentRowLike {
   projectId: string; workstream: string; projectName: string; instanceId: string | null;
   /** An ask thread's chat: the thread's title and id (mobile/inbox.ts InboxRow). */
   askTitle?: string | null; askThreadId?: string | null;
+  /** The session's stored title and who set it (mobile/inbox.ts InboxRow), for its one title (chat/sessionTitle.ts). */
+  sessionTitle?: string | null; sessionTitleSource?: string | null;
 }
 
 export interface AgentNode<R> { row: R; children: Array<AgentNode<R>> }
@@ -37,15 +41,14 @@ export function workstreamTip(r: Named & { projectName?: string }): string | nul
 }
 
 /**
- * A session's name in a list: the project, with the workstream when it is not
- * main. An ask thread is called by its title alone, else by its thread id
- * (ask-<thread id>, the workstream's name): callers name their threads and
- * nothing is derived. The project and box it runs in are the ask's plumbing
- * (both in the tooltip), and in the tree it sits under the session that sent it.
+ * A session's name in a list: its one title (chat/sessionTitle.ts), the
+ * sidebar row's and the header's, never "project · workstream". An ask thread
+ * is called by its title, else by its thread id (ask-<thread id>): callers
+ * name their threads and nothing is derived. In the tree an ask sits under the
+ * session that sent it; the project and box are in the tooltip.
  */
-export function agentLabel(r: Pick<AgentRowLike, 'projectName'> & Named): string {
-  if (r.askThreadId) return workstreamLabel(r);
-  return r.workstream === 'main' ? r.projectName : `${r.projectName} · ${workstreamLabel(r)}`;
+export function agentLabel(r: Pick<AgentRowLike, 'projectName' | 'sessionTitle' | 'sessionTitleSource'> & Named): string {
+  return sessionTitle(r);
 }
 
 const byLabel = <R extends AgentRowLike>(a: R, b: R) => agentLabel(a).localeCompare(agentLabel(b));
@@ -97,7 +100,8 @@ export function searchAgents<R extends AgentRowLike>(nodes: ReadonlyArray<AgentN
   const out: R[] = [];
   const walk = (list: ReadonlyArray<AgentNode<R>>) => {
     for (const n of list) {
-      const name = agentLabel(n.row).toLowerCase();
+      // Its title, and the project and workstream it was called by before it had one.
+      const name = `${agentLabel(n.row)}\n${n.row.projectName}\n${n.row.workstream}`.toLowerCase();
       if (words.every(w => name.includes(w))) out.push(n.row);
       walk(n.children);
     }

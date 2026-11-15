@@ -18,10 +18,15 @@ function Check() {
 }
 
 /** The pill's words: the model, and the effort unless it is Default (or not offered). */
+export function modelPickerParts(model: ChatModelId | null, options: ChatModelOption[], effort: ChatEffortId | null): { name: string; effort: string | null } {
+  if (!model) return { name: '…', effort: null };
+  return { name: chatModelLabel(model, options), effort: effort && effort !== 'default' && chatModelTakesEffort(model) ? chatEffortLabel(effort) : null };
+}
+
+/** The same words as one string. */
 export function modelPickerLabel(model: ChatModelId | null, options: ChatModelOption[], effort: ChatEffortId | null): string {
-  if (!model) return '…';
-  const name = chatModelLabel(model, options);
-  return effort && effort !== 'default' && chatModelTakesEffort(model) ? `${name} · ${chatEffortLabel(effort)}` : name;
+  const { name, effort: shown } = modelPickerParts(model, options, effort);
+  return shown ? `${name} · ${shown}` : name;
 }
 
 /** Room above and below the pill, in px, less the menu's gap and a margin from the window's edge. */
@@ -71,6 +76,8 @@ export function ModelPicker({ model, options = CLAUDE_ONLY, onChange, open, onOp
   // Fireworks' models run at their own effort, so the section goes with them.
   const showEffort = effort != null && onEffortChange != null && chatModelTakesEffort(model);
 
+  const label = modelPickerParts(model, options, showEffort ? effort : null);
+
   const menuRef = useRef<HTMLDivElement>(null);
   const [placement, setPlacement] = useState<{ below: boolean; maxHeight: number } | null>(null);
   useLayoutEffect(() => {
@@ -90,7 +97,8 @@ export function ModelPicker({ model, options = CLAUDE_ONLY, onChange, open, onOp
         disabled={disabled}
         onClick={() => { if (!disabled) onOpenChange(!open); }}
       >
-        <span>{modelPickerLabel(model, options, showEffort ? effort : null)}</span>
+        {/* The effort in a span of its own: the narrowest composer leaves it to the menu (chat.css). */}
+        <span className="chat-compose-pill-label">{label.name}{label.effort && <span className="chat-model-effort"> · {label.effort}</span>}</span>
         <span className="chat-compose-caret" aria-hidden="true" />
       </button>
       {open && (

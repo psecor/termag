@@ -12,6 +12,7 @@ import {
   browserSocketParams, isBlankUrl, isFinalClose, reconnectDelayMs, suggestionLabel, suggestionToOpen,
   type BrowserPaneTarget, type BrowserShareHandoff, type Suggestion,
 } from '../utils/browserPaneConnection';
+import { edgeDialGate } from '../utils/edgeSession';
 
 /** The workstream checkout a guest pane shows (agent browser-checkout). */
 export interface PaneCheckout { branch: string; head: string; dirty: number | null }
@@ -220,9 +221,14 @@ export function BrowserPane({ projectId = '', workstream = 'main', share, url, o
       return { width: Math.max(MIN_WIDTH, Math.round(rect.width)), height: Math.max(MIN_HEIGHT, Math.round(rect.height)) };
     };
 
+    // Signed out at the edge, a dial only resets a login's nonce: wait for the
+    // sign-in instead (utils/edgeSession.ts).
+    const edge = edgeDialGate();
+
     const connect = () => {
       if (disposed) return;
       redial = null;
+      if (!edge.allows(connect)) return;
       const size = measure();
       frameRef.current = size;
       if (canvas.width !== size.width || canvas.height !== size.height) {
@@ -399,6 +405,7 @@ export function BrowserPane({ projectId = '', workstream = 'main', share, url, o
 
     return () => {
       disposed = true;
+      edge.cancel();
       clearTimeout(dial);
       if (redial) clearTimeout(redial);
       if (resizeTimer) clearTimeout(resizeTimer);

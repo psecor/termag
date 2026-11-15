@@ -10,7 +10,10 @@ import { conversationHref, InboxRow, opensReview, stateSince, STATUS_GLYPH, stat
 import { optOutOfMobile } from '../../mobile/redirect';
 import { openInChatHref, opensInChat } from '../../mobile/chatLinks';
 import { projectsApi } from '../../services/api';
-import { workstreamLabel, workstreamTip } from '../../chat/explorerAgents';
+import { workstreamTip } from '../../chat/explorerAgents';
+import { sessionTitle } from '../../chat/sessionTitle';
+import { fullUiHref } from '../../chat/simpleChat';
+import { recordLabOpened } from '../../chat/labOpened';
 import { ActionSheet, ConfirmSheet, apiError } from './Sheet';
 
 function ctxLabel(tokens: number): string {
@@ -39,6 +42,7 @@ export function SessionRow({ row, now, recent, onMore, onOpen, href }: {
     : since ? fmtAge(Math.max(0, now - Date.parse(since))) : '';
   const ctx = row.contextTokens != null ? contextLevel(row.contextTokens) : 'ok';
   const label = statusLabel(row);
+  const title = sessionTitle(row);
   const body = (
     <>
         <span className="m-glyph" data-status={row.status} data-ring={reviewLed ? row.ring ?? undefined : undefined} aria-hidden>
@@ -49,8 +53,9 @@ export function SessionRow({ row, now, recent, onMore, onOpen, href }: {
             {row.kind === 'metaterm' && <span className="m-metaterm" aria-hidden>⚡ </span>}
             {row.kind === 'automation' && <span className="m-automation" aria-label="automation run">⏱ </span>}
             {row.kind === 'cloud' && <span className="m-cloud" aria-label="cloud session">☁ </span>}
-            {row.projectName}
-            {row.workstream !== 'main' && <span className="m-ws" title={workstreamTip(row) ?? undefined}> · {workstreamLabel(row)}</span>}
+            {/* The session's one title (chat/sessionTitle.ts), with its project beside it when they differ: no " · <workstream>". */}
+            <span title={workstreamTip(row) ?? undefined}>{title}</span>
+            {title !== row.projectName && <span className="m-row-project">{row.projectName}</span>}
             {row.shared && <span className="m-owner"> ({row.owner})</span>}
           </span>
           {row.message && <span className="m-row-preview">{row.message}</span>}
@@ -107,8 +112,9 @@ export function useRowActions(): { open: (row: InboxRow) => void; sheets: React.
     catch (err) { setError(apiError(err, 'Could not archive the project')); }
   };
   const openFull = (row: InboxRow) => {
+    recordLabOpened('phone');
     optOutOfMobile();
-    navigate(`/?project=${encodeURIComponent(row.projectId)}${row.workstream !== 'main' ? `&ws=${encodeURIComponent(row.workstream)}` : ''}`);
+    navigate(fullUiHref(row.projectId, row.workstream));
   };
   const sheets = (
     <>

@@ -6,7 +6,8 @@
 import { useSyncExternalStore } from 'react';
 
 export interface ChatLiveStatus {
-  tone: 'idle' | 'working' | 'error' | 'setup';
+  /** `off`: no agent runs for it (its box is down), so its row is Not running too. */
+  tone: 'idle' | 'working' | 'error' | 'setup' | 'off';
   text: string;
   /** The last assistant text, one line; null before Claude has said anything. */
   preview: string | null;

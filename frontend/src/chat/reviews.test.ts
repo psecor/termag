@@ -408,3 +408,68 @@ describe('review filters', () => {
     expect(matchesFilters(it0, f({ draft: 'ready' }))).toBe(false);
   });
 });
+
+describe('the sidebar redesign\'s reviews', () => {
+  const item = (o: Partial<import('./reviews').QueueItem>) => ({
+    key: 'a/b#1', repo: 'a/b', number: 1, title: 't', author: 'peter-secor', url: null, section: 'to-review', why: [], at: null,
+    row: null, session: null, agent: null, round: null, deferredUntil: null, ...o,
+  }) as import('./reviews').QueueItem;
+
+  it('counts only asks you haven\'t started, with each requester once', async () => {
+    const { reviewAsks } = await import('./reviews');
+    const items = [
+      item({ key: '1', author: 'peter-secor' }),
+      item({ key: '2', author: 'henry' }),
+      item({ key: '3', author: 'peter-secor' }),
+      item({ key: '4', author: 'zane', session: { projectId: 'p', workstream: 'review-4' } as never }),
+      item({ key: '5', author: 'ann', section: 'team' }),
+      item({ key: '6', author: 'bo', section: 'your-call' }),
+    ];
+    expect(reviewAsks({ items, grouped: [] })).toEqual({ count: 3, requesters: ['peter-secor', 'henry'] });
+    expect(reviewAsks({ items: [], grouped: [] })).toEqual({ count: 0, requesters: [] });
+  });
+
+  it('counts a request folded into a group, and not one an agent review (read or not) has started', async () => {
+    const { reviewAsks } = await import('./reviews');
+    const grouped = [item({ key: 'g', number: 7, author: 'cy' })];
+    const items = [item({ key: '1', number: 1, url: 'https://github.com/a/b/pull/1' }), item({ key: '2', number: 2, author: 'henry' })];
+    expect(reviewAsks({ items, grouped }).count).toBe(3);
+    expect(reviewAsks({ items, grouped }, [{ repo: 'A/B', number: 1 }])).toEqual({ count: 2, requesters: ['henry', 'cy'] });
+    // Another repository's #1, or one whose repository isn't known, started nothing here.
+    expect(reviewAsks({ items, grouped }, [{ repo: 'other/repo', number: 1 }, { repo: null, number: 2 }]).count).toBe(3);
+  });
+
+  it('finds an agent review\'s repository from its URL, else its one-repository checkout', async () => {
+    const { agentReviewRepo } = await import('./reviews');
+    expect(agentReviewRepo('https://github.com/Example-Org/termag/pull/4242', ['x/y'])).toBe('example-org/termag');
+    expect(agentReviewRepo(null, ['example-org/termag'])).toBe('example-org/termag');
+    expect(agentReviewRepo(null, ['a/b', 'c/d'])).toBeNull();
+    expect(agentReviewRepo(null, undefined)).toBeNull();
+  });
+
+  it('puts a review session that is your call in Needs you, by its row key', async () => {
+    const { yourCallSessions } = await import('./reviews');
+    const items = [
+      item({ section: 'your-call', session: { projectId: 'p', workstream: 'review-1' } as never }),
+      item({ section: 'pushed', session: { projectId: 'p', workstream: 'review-2' } as never }),
+      item({ section: 'reviewing', session: { projectId: 'p', workstream: 'review-3' } as never }),
+      item({ section: 'your-call' }),
+    ];
+    expect([...yourCallSessions({ items }, (p, w) => `${p}|${w}`)]).toEqual(['p|review-1', 'p|review-2']);
+  });
+
+  it('gives a your-call review session Needs you\'s mark, unless it already needs you', async () => {
+    const { reviewCallKind } = await import('./reviews');
+    expect(reviewCallKind('done', true)).toBe('approval');
+    expect(reviewCallKind('off', true)).toBe('approval');
+    expect(reviewCallKind('error', true)).toBe('error');
+    expect(reviewCallKind('done', false)).toBe('done');
+  });
+
+  it('draws two initials for a requester', async () => {
+    const { loginInitials } = await import('./reviews');
+    expect(loginInitials('peter-secor')).toBe('PS');
+    expect(loginInitials('henry')).toBe('HE');
+    expect(loginInitials('a')).toBe('A');
+  });
+});

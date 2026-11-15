@@ -12,6 +12,11 @@ import { accountInitials } from './SidebarChrome';
 import { setFlagValues } from '../../flags';
 import { MOBILE_OPT_OUT_KEY } from '../../mobile/redirect';
 
+const recorded = vi.hoisted(() => [] as Array<{ name: string; attributes: unknown }>);
+vi.mock('../../observability', async importOriginal => ({
+  ...(await importOriginal<typeof import('../../observability')>()),
+  recordProductEvent: (name: string, attributes: unknown) => { recorded.push({ name, attributes }); },
+}));
 vi.mock('../../contexts/AuthContext', () => ({
   useAuth: () => ({ user: { unixUsername: 'ada', displayName: 'Ada Lovelace', email: 'ada@example.com' } }),
 }));
@@ -41,6 +46,7 @@ beforeEach(() => {
   root = createRoot(host);
   localStorage.clear();
   where = '';
+  recorded.length = 0;
   // React Aria escapes ids with CSS.escape, which jsdom lacks.
   const css = (globalThis as { CSS?: { escape?: (s: string) => string } }).CSS;
   if (!css?.escape) (globalThis as { CSS?: unknown }).CSS = { ...css, escape: (v: string) => v.replace(/[^\w-]/g, c => `\\${c}`) };
@@ -128,7 +134,23 @@ describe('the sidebar chrome under the refresh', () => {
 
     await press(account);
     await press(document.querySelectorAll('[role="menuitem"]')[0]);
-    expect(where).toBe('/?project=p1&ws=feat');
+    expect(where).toBe('/?project=p1&ws=feat&lab=1');
+  });
+
+  it('records lab.opened from the account menu\'s Open Lab (chat/labOpened.ts)', async () => {
+    show({ refresh: true }, '/chat/p/p1');
+    await press(host.querySelector('.chat-account')!);
+    await press(document.querySelectorAll('[role="menuitem"]')[0]);
+    expect(where).toBe('/?project=p1&lab=1');
+    expect(recorded.filter(r => r.name === 'lab.opened')).toEqual([{ name: 'lab.opened', attributes: { 'termag.from': 'account-menu' } }]);
+  });
+
+  it('records lab.opened as account-menu from the old foot\'s Lab link', async () => {
+    show({}, '/chat/p/p1');
+    const lab = [...host.querySelectorAll('.chat-foot-link')].find(l => l.textContent === 'Lab')!;
+    await press(lab);
+    expect(where).toBe('/?project=p1&lab=1');
+    expect(recorded.filter(r => r.name === 'lab.opened')).toEqual([{ name: 'lab.opened', attributes: { 'termag.from': 'account-menu' } }]);
   });
 
   it('goes to Settings from the menu', async () => {

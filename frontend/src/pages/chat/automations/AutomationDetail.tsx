@@ -25,6 +25,7 @@ import { automationState, errorText, isLiveRun, shownAutomation } from '../../..
 import { useAutomation } from '../../../chat/useAutomation';
 import { useAutomations, useAutomationsEnabled } from '../../../chat/useAutomations';
 import { repoSlug } from '../../../chat/simpleChat';
+import { recordLabOpened } from '../../../chat/labOpened';
 import { agoLabel, boxStartFailuresLabel, describeSchedule, occurrenceShort, RUN_STATE_LABEL, untilLabel } from '../../../utils/automationSchedule';
 import { runNowRefusal } from '../../../utils/automationRunNow';
 import { ConfirmDialog } from '../../../components/ConfirmDialog';
@@ -134,7 +135,7 @@ export function AutomationDetail({ id }: { id: string }) {
       : { label: 'Enable schedule', onSelect: () => { void act(() => automationsApi.update(view.id, { enabled: true }), 'Schedule on'); }, disabled: busy });
     if (view.pausedReason) menu.push({ label: 'Resume', hint: "Clear the scheduler's pause", onSelect: () => { void act(() => automationsApi.update(view.id, {}), 'Resumed'); }, disabled: busy });
   }
-  menu.push({ label: 'Open in Lab', hint: 'Edit the schedule and prompt, read the notes', onSelect: () => navigate(`/automations/${encodeURIComponent(view.projectId)}`) });
+  menu.push({ label: 'Open in Lab', hint: 'Edit the schedule and prompt, read the notes', onSelect: () => { recordLabOpened('automation'); navigate(`/automations/${encodeURIComponent(view.projectId)}`); } });
   if (owner) menu.push({ label: 'Archive…', onSelect: () => setConfirmArchive(true), disabled: busy });
 
   return (

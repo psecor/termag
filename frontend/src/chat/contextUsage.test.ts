@@ -78,7 +78,7 @@ describe('the numbers the ring shows', () => {
     expect(assumedWindow('claude-sonnet-4-6')).toBe(200_000);
     expect(assumedWindow('claude-haiku-4-5')).toBe(200_000);
     expect(assumedWindow(null)).toBe(200_000);
-    expect(contextView({ ...emptyUsage, contextTokens: 50_000 })).toEqual({ used: 50_000, window: 200_000, percent: 25 });
+    expect(contextView({ ...emptyUsage, contextTokens: 50_000 })).toEqual({ used: 50_000, window: 200_000, modelWindow: 200_000, percent: 25 });
     expect(contextView({ ...emptyUsage, contextTokens: 50_000, contextWindow: 1_000_000 })?.percent).toBe(5);
     expect(contextView(emptyUsage)).toBeNull();
   });
@@ -297,5 +297,58 @@ describe("a seat's monthly spend", () => {
     expect(formatMoney(81822, 2, 'USD', 'en-US')).toBe('$818');
     expect(formatMoney(700000, 2, 'EUR', 'en-US')).toBe('€7,000');
     expect(formatMoney(5000, 2, 'not a currency', 'en-US')).toBe('50 not a currency');
+  });
+
+  describe('the compact window (claude-context-tokens on the Bedrock gateway)', () => {
+    const opus = (tokens: number) => ({ type: 'assistant', message: { ...call(6, tokens, 0), model: 'claude-opus-5-5', content: [] }, parent_tool_use_id: null });
+    const result = { type: 'result', subtype: 'success', modelUsage: { 'claude-opus-5-5': { contextWindow: 1_000_000 } } };
+
+    it("fills the ring against where Claude Code compacts, not the model's 1M", () => {
+      let s = applyEvent(emptyChat, { type: 'turn-start', text: 'hi', resumed: false, live: false, compactWindow: 200_000 });
+      s = applyEvent(applyEvent(s, opus(100_000)), result);
+      expect(contextView(s.usage!)).toEqual({ used: 100_006, window: 200_000, modelWindow: 1_000_000, percent: 50 });
+      expect(ringLabel(s.usage!)).toMatch(/^Context 50% used/);
+    });
+
+    it("is the model's window when a turn-start names none, or names more than the model has", () => {
+      let s = applyEvent(emptyChat, { type: 'turn-start', text: 'hi', resumed: false, live: false, compactWindow: 200_000 });
+      s = applyEvent(s, { type: 'turn-start', text: 'again', resumed: true, live: false });
+      s = applyEvent(applyEvent(s, opus(100_000)), result);
+      expect(contextView(s.usage!)?.window).toBe(1_000_000);
+      const small = { ...emptyUsage, contextTokens: 50_000, contextWindow: 200_000, compactWindow: 500_000 };
+      expect(contextView(small)?.window).toBe(200_000);
+    });
+
+    it("takes a running turn's window from its turn-start, even when the replay is capped and the newest record is the turn before", () => {
+      const entries = [{ type: 'assistant', uuid: 'a1', message: { id: 'm1', role: 'assistant', model: 'claude-opus-5-5', content: [], usage: { input_tokens: 6, cache_read_input_tokens: 150_000 } } }];
+      const records = [{ turnId: 't1', prompt: 'a', costUsd: null, durationMs: null, compactWindow: 200_000 }];
+      const start = { type: 'turn-start', text: 'b', resumed: true, live: false, compactWindow: 400_000 };
+      const tail = { type: 'system', subtype: 'background_tasks_changed', tasks: [] };
+      // A capped replay starts mid-turn (seq > 1) and carries the turn-start in `head`.
+      const capped = fromHistory(entries, null, { turnId: 't2', events: [{ seq: 5, event: tail }], head: [start] }, records);
+      expect(contextView(capped.usage!)?.window).toBe(400_000);
+      // An uncapped replay carries it in its events.
+      const whole = fromHistory(entries, null, { turnId: 't2', events: [{ seq: 1, event: start }, { seq: 2, event: tail }] }, records);
+      expect(contextView(whole.usage!)?.window).toBe(400_000);
+      // A running turn that named none is the model's window, whatever the turn before compacted at.
+      const none = fromHistory(entries, null, { turnId: 't2', events: [{ seq: 5, event: tail }], head: [{ ...start, compactWindow: undefined }] }, records);
+      expect(contextView(none.usage!)?.window).toBe(1_000_000);
+    });
+
+    it("reads a reopened chat's window from its newest turn record, and keeps the ring's numbers", () => {
+      const entries = [{ type: 'assistant', uuid: 'a1', message: { id: 'm1', role: 'assistant', model: 'claude-opus-5-5', content: [], usage: { input_tokens: 6, cache_read_input_tokens: 150_000 } } }];
+      const records = [
+        { turnId: 't1', prompt: 'a', costUsd: null, durationMs: null, compactWindow: null },
+        { turnId: 't2', prompt: 'b', costUsd: null, durationMs: null, compactWindow: 200_000 },
+      ];
+      const s = fromHistory(entries, null, null, records);
+      expect(contextView(s.usage!)).toMatchObject({ window: 200_000, percent: 75 });
+      // An older box's records say nothing: the model's window.
+      expect(contextView(fromHistory(entries, null, null, [{ turnId: 't1', prompt: 'a', costUsd: null, durationMs: null }]).usage!)?.window).toBe(1_000_000);
+      // A history with no sizes still names the window, over what the tab remembered.
+      const remembered = { contextTokens: 90_000, model: 'claude-opus-5-5', contextWindow: 1_000_000, limits: {} };
+      const kept = withKeptUsage(emptyChat, fromHistory([], null, null, records), remembered).usage!;
+      expect(kept).toMatchObject({ contextTokens: 90_000, compactWindow: 200_000 });
+    });
   });
 });

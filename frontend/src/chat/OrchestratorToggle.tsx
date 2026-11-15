@@ -29,7 +29,8 @@ const ABOUT = 'Claude starts with the agent-orchestrator skill: it splits the wo
 export function orchestratorLead(on: boolean, state: OrchestratorState): string {
   if (state === 'needs-trust') return 'Needs Full access: a read-only session cannot run commands';
   if (state === 'setup-off') return SETUP_OFF_TOOLTIP;
-  return on ? 'On for this session' : 'Act as an orchestrator';
+  // Stored on the project (Project.chatOrchestrator), so sessions branched off this one inherit it.
+  return on ? 'On for this session, and for sessions you branch off it later' : 'Act as an orchestrator';
 }
 
 export const ORCHESTRATOR_ABOUT = ABOUT;
@@ -55,7 +56,7 @@ export function OrchestratorToggle({ on, onChange, state, disabled }: {
       onClick={() => { if (!unavailable) onChange(!on); }}
     >
       <HubIcon />
-      <span>Orchestrator</span>
+      <span className="chat-compose-pill-label">Orchestrator</span>
       <span className="chat-switch" aria-hidden="true"><i /></span>
     </button>
     </Tooltip>

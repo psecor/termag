@@ -24,24 +24,24 @@ import {
 } from '@launchpad-ui/components';
 import { Icon } from '@launchpad-ui/icons';
 import { LP_THEME } from '../../launchpad/theme';
-import { instancesApi, projectsApi, prsApi, reviewApi, type PrReviewGroup, type PrRow, type PrWorkstreamLink, type ReviewGuessResponse } from '../../services/api';
+import { instancesApi, projectsApi, prsApi, reviewApi, type PrGroupMember, type PrReviewGroup, type PrRow, type PrWorkstreamLink, type ReviewGuessResponse } from '../../services/api';
 import { boxFeed } from '../../services/boxFeed';
 import { FLAGS, useFlag } from '../../flags';
 import { CHAT_PROVIDER_ID } from '../../providers/registry';
 import {
   cloneFor, cloneOutcomeFor, cloneProgressText, cloneReady, cloneStartHref, noteCloneOutcome, useCloneOutcome, noteCloneStep, repoOfCloneUrl, reviewCloneBox, unreadyCloneOf,
-  untilCheckedOut, useReviewClone, type ClonedProject, type CloneDeps,
+  untilCheckedOut, useReviewClone, wakeProjectBox, type ClonedProject, type CloneDeps,
 } from '../../chat/reviewClone';
 import { suggestPrPrompt, suggestWorkstreamName } from '../../utils/workstreamChoices';
 import { queueKey, uniqueName, writeQueued } from '../../chat/newChat';
-import { reviewFormatInstruction } from '../../chat/reviewCard';
-import { groupReviewBody, groupReviewPlan } from '../../utils/prReviewGroups';
+import { REVIEW_SEND_MAX, reviewDiffBlock, reviewFormatInstruction } from '../../chat/reviewCard';
+import { groupReviewBody, groupReviewPlan, toReview } from '../../utils/prReviewGroups';
 import { renderReviewTemplate, reviewPromptHeader, templateForRepo } from '../../utils/review';
 import { apiErrorText } from '../../utils/prPipeline';
 import { chatHref } from '../../chat/simpleChat';
 import { prShort } from '../../chat/reviews';
 import { useProjects } from '../../contexts/ProjectContext';
-import type { Project } from '../../types';
+import type { Instance, Project } from '../../types';
 import { markReviewSession, useReviewsData } from './reviewsData';
 
 export type ReviewerId = 'devin' | 'claude' | 'cursor';
@@ -66,6 +66,49 @@ function writeKind(k: ReviewKind) {
 /** What a review session's agent starts on: the lab's own first prompt for a PR's workstream. */
 export function reviewSessionPrompt(repo: string, number: number): string {
   return `${suggestPrPrompt(repo, number)}${reviewFormatInstruction(prShort(repo, number))}`;
+}
+
+/**
+ * A review chat's first message from Edit the prompt (simple-ui-review-chat-enabled): the lab's fixed line naming
+ * the PR, the body as the dialog shows it, then the review card's format, which asks it to post nothing (you post
+ * from the card), in place of the pane's sign-off line.
+ */
+export function reviewChatPrompt(repo: string, number: number, body: string): string {
+  const header = reviewPromptHeader(number, `https://github.com/${repo}/pull/${number}`);
+  // A body cleared in the dialog is sent as it showed: the fixed line and the card's format alone.
+  return `${header}${body.trim() ? `\n\n${body.trim()}` : ''}${reviewFormatInstruction(prShort(repo, number))}`;
+}
+
+/** A reviewer's line in the reviewer menus while its review is a chat (simple-ui-review-chat-enabled). */
+export const CHAT_REVIEW_NOTE = 'A chat on a checkout of the PR: you talk it through and post';
+
+/**
+ * The reviewers whose review is a chat with review chats on (simple-ui-review-chat-enabled), and the chat-runner
+ * provider each one's session is made as (backend routes/prs.ts REVIEW_CHAT_PROVIDERS).
+ */
+export const REVIEW_CHAT_PROVIDERS: Readonly<Partial<Record<ReviewerId, string>>> = { claude: CHAT_PROVIDER_ID, cursor: 'cursor-chat', devin: 'devin-chat' };
+
+/**
+ * The reviewers whose chat needs every box it runs on to say its agent can run their engine (the box list's
+ * `chatEngines`, backend chatEnginesOf). Devin's engine is new on boxes (agent chat-devin-v1, after a bake and an agent
+ * restart), so Devin's review is a chat only there; anywhere else, a box whose agent isn't connected (asleep, waking)
+ * included, it keeps its review pane, as with review chats off.
+ */
+export const REVIEW_CHAT_ENGINES: Readonly<Partial<Record<ReviewerId, string>>> = { devin: 'devin' };
+
+/** A reviewer's line in the page-wide picker while its review is a chat only on a box that can run it (REVIEW_CHAT_ENGINES). */
+export const CHAT_REVIEW_NOTE_WHERE_IT_RUNS = 'A chat on a checkout of the PR, on a box that can run it; else its review pane';
+
+/**
+ * Whether `who`'s review can be a chat on the boxes it would run on: always for a reviewer whose engine every
+ * box's runner has; for one in REVIEW_CHAT_ENGINES, only when there is a box and each one says it runs that engine.
+ */
+export function reviewChatOnBoxes(
+  who: ReviewerId, boxIds: ReadonlyArray<string | null | undefined>, boxes: ReadonlyArray<Pick<Instance, 'id' | 'chatEngines'>>,
+): boolean {
+  const engine = REVIEW_CHAT_ENGINES[who];
+  if (!engine) return true;
+  return boxIds.length > 0 && boxIds.every(id => !!id && !!boxes.find(b => b.id === id)?.chatEngines?.includes(engine));
 }
 
 const browserStore = () => (typeof localStorage !== 'undefined' ? localStorage : null);
@@ -270,6 +313,8 @@ export function ReviewMenu({ repo, number, row, group, defaults, here, agentOnly
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const cloneOn = useFlag(FLAGS.reviewClone, false);
+  // Review with Claude opens a chat: its review is the review session, made as the chat runner's Claude.
+  const reviewChatOn = useFlag(FLAGS.reviewChat, false);
   const boxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
   // Read as stores of their own: a failed fetch keeps the same list, so the list alone re-renders nothing.
   const boxesRead = useSyncExternalStore(boxFeed.subscribe, () => boxFeed.hasLoaded() || boxFeed.isFailing());
@@ -285,22 +330,27 @@ export function ReviewMenu({ repo, number, row, group, defaults, here, agentOnly
   const pickSession = () => { writeKind('session'); };
 
   if (defaults) {
+    // With review chats on, a review session is Claude's review: one choice, Claude.
+    const chosen = kind === 'session' ? (reviewChatOn ? 'claude' : 'session') : reviewer;
+    const chosenName = chosen === 'session' ? 'A session' : nameOf(chosen);
     return (
       <span className="rv-default">
         <span className="rv-default-label" aria-hidden="true">Reviewer</span>
         <MenuTrigger>
-          <Button variant="minimal" size="small" aria-label={`Review starts: ${kind === 'session' ? 'a session' : nameOf(reviewer)}`}>{kind === 'session' ? 'A session' : nameOf(reviewer)}<Icon name="chevron-down" size="small" aria-hidden="true" /></Button>
+          <Button variant="minimal" size="small" aria-label={`Review starts: ${chosen === 'session' ? 'a session' : chosenName}`}>{chosenName}<Icon name="chevron-down" size="small" aria-hidden="true" /></Button>
           <Popover placement="bottom end" className={`${LP_THEME} chat-menu-popover`}>
-            <Menu aria-label="Reviewer" selectionMode="single" selectedKeys={new Set([kind === 'session' ? 'session' : reviewer])}
+            <Menu aria-label="Reviewer" selectionMode="single" selectedKeys={new Set([chosen])}
               onSelectionChange={keys => { const k = [...(keys as Set<string>)][0]; if (k === 'session') pickSession(); else if (k) pick(k as ReviewerId); }}>
-              <MenuItem id="session" textValue="A review session">
-                <Text slot="label">A review session</Text>
-                <Text slot="description">Claude on a checkout of the PR, in a chat; you post</Text>
-              </MenuItem>
+              {!reviewChatOn && (
+                <MenuItem id="session" textValue="A review session">
+                  <Text slot="label">A review session</Text>
+                  <Text slot="description">Claude on a checkout of the PR, in a chat; you post</Text>
+                </MenuItem>
+              )}
               {REVIEWERS.map(r => (
                 <MenuItem key={r.id} id={r.id} textValue={r.name}>
                   <Text slot="label">{r.name}</Text>
-                  <Text slot="description">{r.note}</Text>
+                  <Text slot="description">{reviewChatOn && REVIEW_CHAT_PROVIDERS[r.id] ? (REVIEW_CHAT_ENGINES[r.id] ? CHAT_REVIEW_NOTE_WHERE_IT_RUNS : CHAT_REVIEW_NOTE) : r.note}</Text>
                 </MenuItem>
               ))}
             </Menu>
@@ -340,6 +390,25 @@ export function ReviewMenu({ repo, number, row, group, defaults, here, agentOnly
   // A review session needs a project whose checkout is the PR's repository (the lab's PR workstream route).
   const sessionProject = !group && repo ? (row?.reviewTarget ?? cloneOf(repo, projects, cloneOn)) : null;
   const prUrl = group && plan && 'members' in plan ? plan.members[0].url : repo && number != null ? `https://github.com/${repo}/pull/${number}` : null;
+  // Where each review chat goes (chatPlaces): one PR's, or each open member's of a group.
+  const places = reviewChatOn ? chatPlaces({ here, group, members: group ? reviewChatMembers(group, queue.viewer) : null, repo, number, row, sessionProject, projects }) : [];
+  // Review with Claude or Cursor is a chat (the review session, as that reviewer's chat-runner provider,
+  // REVIEW_CHAT_PROVIDERS), wherever Review is: a PR's, beside a session on its own PR (`here`, the Review tab too),
+  // and each member of a group, one chat each, since a review card posts to its own session's PR (chatPlaces). Where
+  // no chat can go but a pane can (a multi-repo project's session, whose branch-off spans its repositories), the
+  // pane, as with review chats off (Bugbot).
+  const reviewChats = reviewChatsHere(reviewChatOn, places.length, clonePick, !!target);
+  // The boxes the chats would run on: each place's project's, else the clone's (the project still cloning, or the box
+  // picked for one). Devin's review is a chat only where each one's agent says it runs Devin (REVIEW_CHAT_ENGINES).
+  const chatBoxes = places.length > 0
+    ? places.map(p => projects.find(x => x.id === p.at?.projectId)?.instanceId)
+    : clonePick ? [unready?.instanceId ?? boxPick?.box.id] : [];
+  const chats = (id: ReviewerId) => reviewChats && !!REVIEW_CHAT_PROVIDERS[id] && reviewChatOnBoxes(id, chatBoxes, boxes);
+  // A chat with nowhere to check the PR out: its button and menu items are off, never a click that does nothing.
+  const chatNowhere = reviewChats && places.length === 0 && !clonePick;
+  // The reviewer Review starts: a stored "A review session" is Claude while review chats are on, everywhere (as the
+  // page-wide picker shows it): its chat where Claude's review is one, else Claude's pane (beside a session on its PR).
+  const chosen: ReviewerId = reviewChatOn && kind === 'session' ? 'claude' : reviewer;
 
   // The project cloned for this PR's repository, listed before the review starts in it (and after a failure, so
   // the next Review finds the project this one made rather than making another).
@@ -394,6 +463,8 @@ export function ReviewMenu({ repo, number, row, group, defaults, here, agentOnly
   const failText = (err: unknown, fallback: string) => (err instanceof Error && !(err as { response?: unknown }).response ? err.message : apiErrorText(err, fallback));
 
   const start = async (id: ReviewerId, prompt?: string) => {
+    // A chat reviewer's review: `prompt` is then Edit the prompt's body as it showed it.
+    if (chats(id)) { if (!chatNowhere) await startSession(prompt, id); return; }
     if ((!target && !clonePick) || prNumber == null) return;
     // Before any other path: a clone this tab started for the PR may already list its project (a pane clone says
     // it's done before its checkout lands), and a second Review then belongs to that clone's wait page.
@@ -411,91 +482,178 @@ export function ReviewMenu({ repo, number, row, group, defaults, here, agentOnly
     }
   };
 
-  const startSession = async () => {
-    if ((!sessionProject && !clonePick) || !repo || number == null) return;
+  // `body`: Edit the prompt's, for a review chat (reviewChatPrompt); else the lab's PR prompt. `who`: whose chat it
+  // is, with review chats on (Claude, as a stored "A review session" is). With review chats on, each place
+  // (chatPlaces) gets its chat: one PR's, or each open member's of a group, opened one after another on the
+  // review-start page of the first, which then hands over to the first's chat.
+  const startSession = async (body?: string, who: ReviewerId = 'claude') => {
+    const provider = reviewChats ? REVIEW_CHAT_PROVIDERS[who] ?? CHAT_PROVIDER_ID : undefined;
+    const todo: ChatPlace[] = reviewChats ? places : sessionProject && repo && number != null ? [{ repo, number, row: row ?? null, at: sessionProject, copyOf: null }] : [];
+    const first = todo[0] ?? (repo && number != null ? { repo, number, row: row ?? null, at: null, copyOf: null } : null);
+    if (!first || (todo.length === 0 && !clonePick)) return;
+    const { repo: r, number: n } = first;
     // A clone this tab started for the PR, its project listed or not: its wait page (above).
-    if (cloneUnderWay(repo, number)) return;
-    // A clone first: the wait page shows it; a project that's there: this button, for the branch it makes.
-    const cloning = !sessionProject;
-    if (cloning) waitForClone(repo, number); else setBusy(true);
-    setError(null); pickSession();
+    if (cloneUnderWay(r, n)) return;
+    // A clone first: the wait page shows it; a project that's there: this button, for the branch it makes. A review
+    // chat opens the wait page either way, so the button never waits: its box waking and the checkout show there,
+    // then the chat.
+    const cloning = todo.length === 0;
+    const waitPage = cloning || reviewChats;
+    if (waitPage) waitForClone(r, n); else setBusy(true);
+    setError(null);
+    if (reviewChats) pick(REVIEW_CHAT_PROVIDERS[who] ? who : 'claude'); else pickSession();
+    let stepShown = false;
+    let fresh: ClonedProject | null = null;
     try {
-      const fresh = sessionProject ? null : await cloned();
-      const at = sessionProject ?? linkOf(fresh!);
-      // Read from GitHub when the pipeline hasn't listed it (a pasted or ⌘K PR): its branch, which names the session
-      // as the lab does, and its title and author, which the mark keeps so a session on your own PR isn't a review.
-      const read = row?.headRefName && row.author ? null : await prsApi.overview(repo, number).catch(() => null);
-      const branch = row?.headRefName || read?.headRefName || '';
-      // The next free name in the project: a second session on the PR, or one after an archived one, would hit the
-      // create route's conflict (names stay taken while archived).
-      const taken = projects.find(p => p.id === at.projectId)?.workstreams?.map(w => w.name) ?? [];
-      const name = uniqueName(suggestWorkstreamName(repo, number, branch || `pr${number}`), taken);
-      // A box that types the clone into its pane says it's done before the checkout lands: the branch off it waits.
-      const created = await untilCheckedOut(() => prsApi.newWorkstream(repo, number, at.projectId, name), fresh?.pane ?? false, CLONE_DEPS,
-        () => noteCloneStep(repo, { repo, box: '', phase: 'checkout', projectName: at.projectName }))
-        .finally(() => { if (fresh?.pane) noteCloneStep(repo, null); });
-      // The chat runner drops a workstream's first prompt (it has no promptLaunch). It waits in the chat's own
-      // first-message queue, as New session's does (chat/newChat.ts): the session's view sends it once, when
-      // its runner is up, after a reload or from another tab too. Storage refusing it leaves it as the draft.
-      const prompt = reviewSessionPrompt(repo, number);
-      const held = writeQueued(browserStore(), queueKey(at.projectId, created.name), prompt);
-      // Listed before the page moves, and marked a review session until the pipeline reads its link back, so it
-      // opens as a review (useReviewOf) on its first paint.
+      fresh = cloning ? await cloned() : null;
+      const made = fresh;
+      const jobs: ChatPlace[] = made ? [{ ...first, at: linkOf(made) }] : todo;
+      let opened: { link: PrWorkstreamLink; state: Record<string, unknown> } | null = null;
+      const woken = new Set<string>();
+      const wakeFailed = new Map<string, unknown>();
+      // A group's members one after another: one that fails doesn't stop the rest, and says so after (failed).
+      const failed: string[] = [];
+      const madeNow: string[] = [];
+      for (const [i, job] of jobs.entries()) {
+        const at = job.at!;
+        const of = jobs.length > 1 ? ` (${i + 1} of ${jobs.length})` : '';
+        // Only a group's start keeps what it made for its next Review all (madeReviewChats); a PR's start is one chat.
+        const key = group && jobs.length > 1 ? madeKey(group.id, at.projectId, job.repo, job.number) : null;
+        const before = key ? madeReviewChats.get(key) : undefined;
+        if (key && before) { madeNow.push(key); if (!opened) opened = { link: before, state: { panelTool: 'pr' } }; continue; }
+        try {
+          if (reviewChats && !fresh) {
+            // A project that's there, on a box that may be asleep: woken first (the create route refuses a parked box).
+            const boxId = projects.find(p => p.id === at.projectId)?.instanceId;
+            if (boxId && !woken.has(boxId)) {
+              woken.add(boxId);
+              try {
+                await wakeProjectBox(boxId, CLONE_DEPS, box => { stepShown = true; noteCloneStep(r, { repo: r, box, phase: 'box', number: n }); });
+              } catch (err) { wakeFailed.set(boxId, err); }
+            }
+            // A box that wouldn't wake: every member on it fails for that reason, not the create route's parked box.
+            if (boxId && wakeFailed.has(boxId)) throw wakeFailed.get(boxId);
+          }
+          if (reviewChats) { stepShown = true; noteCloneStep(r, { repo: job.repo, box: '', phase: 'session', number: job.number, projectName: `${at.projectName}${of}` }); }
+          // Read from GitHub when the pipeline hasn't listed it (a pasted or ⌘K PR): its branch, which names the session
+          // as the lab does, and its title and author, which the mark keeps so a session on your own PR isn't a review.
+          const read = job.row?.headRefName && job.row.author ? null : await prsApi.overview(job.repo, job.number).catch(() => null);
+          const branch = job.row?.headRefName || read?.headRefName || '';
+          // Where the PR's branch is checked out in the project already, the chat gets a branch of its own (copyOf), since
+          // git allows a branch in one worktree only: known only now for a PR the pipeline lists no branch for (pasted,
+          // ⌘K), whose place chatPlaces chose before GitHub said.
+          const inProject = projects.find(p => p.id === at.projectId)?.workstreams ?? [];
+          const copyOf = copyOfAt(job.copyOf, branch, inProject);
+          // The next free name in the project: a second session on the PR, or one after an archived one, would hit the
+          // create route's conflict (names stay taken while archived). A branch of its own off a session's says so.
+          const taken = inProject.map(w => w.name);
+          const base = suggestWorkstreamName(job.repo, job.number, branch || `pr${job.number}`);
+          const name = uniqueName(copyOf ? `${base}-review` : base, taken);
+          // A copy of your own PR's session leaves the PR's link on that session (its PR tab, merge panel and Review tab
+          // are the PR's), as a review of your own PR is never a review session. Someone else's moves to this review.
+          const author = job.row?.author ?? read?.author ?? null;
+          const yours = !!author && !!queue.viewer && author.toLowerCase() === queue.viewer.toLowerCase();
+          // A box that types the clone into its pane says it's done before the checkout lands: the branch off it waits.
+          const created = await untilCheckedOut(
+            () => prsApi.newWorkstream(job.repo, job.number, at.projectId, name, undefined, provider, copyOf ?? undefined, !!copyOf && yours), fresh?.pane ?? false, CLONE_DEPS,
+            () => noteCloneStep(r, { repo: r, box: '', phase: 'checkout', projectName: at.projectName }));
+          // The chat runner drops a workstream's first prompt (it has no promptLaunch). It waits in the chat's own
+          // first-message queue, as New session's does (chat/newChat.ts): the session's view sends it once, when
+          // its runner is up, after a reload or from another tab too. Storage refusing it leaves it as the draft.
+          // A review chat's reviewer is read-only on the PR's checkout (every engine): it gets the PR's diff with its prompt,
+          // since it can't ask git or gh what changed (reviewDiffBlock). Each place its own PR's; without one (GitHub
+          // couldn't say), the prompt alone.
+          const asked = reviewChats && body !== undefined && jobs.length === 1 ? reviewChatPrompt(job.repo, job.number, body) : reviewSessionPrompt(job.repo, job.number);
+          const diff = reviewChats ? await prsApi.files(job.repo, job.number).then(d => reviewDiffBlock(prShort(job.repo, job.number), d), () => null) : null;
+          // Never past what a send takes (REVIEW_SEND_MAX): a prompt that long goes without the diff rather than not at all.
+          const prompt = diff && asked.length + diff.length <= REVIEW_SEND_MAX ? `${asked}${diff}` : asked;
+          const held = writeQueued(browserStore(), queueKey(at.projectId, created.name), prompt);
+          markReviewSession(
+            { projectId: at.projectId, projectName: at.projectName, workstream: created.name },
+            {
+              repo: job.repo, number: job.number,
+              title: (job.row?.title && job.row.title !== prShort(job.repo, job.number) ? job.row.title : null) ?? read?.title ?? prShort(job.repo, job.number),
+              author: job.row?.author ?? read?.author ?? null, url: job.row?.url ?? `https://github.com/${job.repo}/pull/${job.number}`,
+            },
+          );
+          const link = { projectId: at.projectId, projectName: at.projectName, workstream: created.name };
+          if (key) { madeReviewChats.set(key, link); madeNow.push(key); }
+          if (!opened) opened = { link, state: { panelTool: 'pr', ...(held ? {} : { draft: prompt }) } };
+        } catch (err) {
+          // One member's chat only: the others go on. Alone, it's the start's own failure.
+          if (jobs.length === 1) throw err;
+          failed.push(`${prShort(job.repo, job.number)}: ${failText(err, 'its chat could not start')}`);
+        }
+      }
+      if (stepShown || fresh?.pane) noteCloneStep(r, null);
+      // Listed before the page moves, and marked review sessions until the pipeline reads their links back, so they
+      // open as reviews (useReviewOf) on their first paint; after a failed member too, so the ones made show.
       await reloadProjects().catch(() => {});
-      markReviewSession(
-        { projectId: at.projectId, projectName: at.projectName, workstream: created.name },
-        {
-          repo, number,
-          title: (row?.title && row.title !== prShort(repo, number) ? row.title : null) ?? read?.title ?? prShort(repo, number),
-          author: row?.author ?? read?.author ?? null, url: row?.url ?? `https://github.com/${repo}/pull/${number}`,
-        },
-      );
       refresh();
-      const state = { panelTool: 'pr', ...(held ? {} : { draft: prompt }) };
-      if (cloning) noteCloneOutcome(repo, number, { to: { projectId: at.projectId, workstream: created.name, state } });
-      else if (live.current) startTransition(() => navigate(chatHref(at.projectId, created.name), { state }));
+      if (failed.length) {
+        throw new Error(`${failed.join('; ')}${opened ? '. The other chats are open in the sidebar: Review all again opens them and tries the rest.' : ''}`);
+      }
+      for (const k of madeNow) madeReviewChats.delete(k);
+      if (!opened) throw new Error('Nowhere to check the PR out');
+      const { link, state } = opened;
+      if (waitPage) noteCloneOutcome(r, n, { to: { projectId: link.projectId, workstream: link.workstream, state } });
+      else if (live.current) startTransition(() => navigate(chatHref(link.projectId, link.workstream), { state }));
     } catch (err) {
+      if (stepShown || fresh?.pane) noteCloneStep(r, null);
       const text = failText(err, 'The review session could not start');
-      if (cloning) noteCloneOutcome(repo, number, { error: text }); else setError(text);
+      if (waitPage) noteCloneOutcome(r, n, { error: text }); else setError(text);
     } finally {
-      if (!cloning) setBusy(false);
+      if (!waitPage) setBusy(false);
     }
   };
 
   // A review session is a new checkout, so not for a group, nor from the Review tab, which fills its own pane (agentOnly).
   const sessionOk = !group && !agentOnly;
-  const asSession = kind === 'session' && sessionOk && (sessionProject != null || clonePick);
-  const primary = label ?? (group ? `Review all with ${nameOf(reviewer)}` : asSession ? 'Review in a session' : `Review with ${nameOf(reviewer)}`);
+  // With review chats off, a stored "A review session" is the session, as before; on, Claude's and Cursor's reviews
+  // are, wherever a place is (chatPlaces), and a stored session is Claude's (chosen).
+  const asSession = (kind === 'session' && !reviewChatOn && sessionOk && (sessionProject != null || clonePick))
+    || (chats(chosen) && (places.length > 0 || clonePick));
+  const primary = label ?? (group ? `Review all with ${nameOf(chosen)}` : asSession ? (reviewChats ? `Review with ${nameOf(chosen)}` : 'Review in a session') : `Review with ${nameOf(chosen)}`);
   // A clone this tab started leaves Review pressable: it opens that clone's wait page again (cloneUnderWay).
   const working = busy || (cloning != null && !cloneUnderWayHere);
   const cloneLead = unready
     ? (unready.setupStatus === 'failed' ? `${unready.name}'s clone of ${repo} failed: termag clones it again` : `${unready.name} is still cloning ${repo}: termag waits for it`)
     : `No project on ${repo} yet: termag clones it into ${cloneWhere}`;
-  const mainOff = (asSession ? !sessionProject && !clonePick : !target && !clonePick) || working;
+  const mainOff = (asSession ? false : (!target && !clonePick) || (chats(chosen) && chatNowhere)) || working;
+  // Where the chat goes, for the tooltip and the menu: off a session's branch, or a project's new checkout.
+  const placeWhere = places.length > 1 ? `${places.length} chats, one per PR`
+    : places[0]?.at ? (places[0].copyOf ? `a branch off ${places[0].at.workstream === 'main' ? places[0].at.projectName : `${places[0].at.projectName} · ${places[0].at.workstream}`}` : places[0].at.projectName) : null;
   const tip = asSession
-    ? (sessionProject ? `A new session on the PR's branch, in ${sessionProject.projectName}. Claude reads it; you post.`
-      : `${cloneLead}, then opens a session on the PR's branch there. Claude reads it; you post.`)
-    : why ?? (target ? `In ${where}. ${REVIEWERS.find(r => r.id === reviewer)!.note}.`
-      : `${cloneLead}, then ${nameOf(reviewer)} reviews it there.`);
+    ? (reviewChats && placeWhere ? `A chat with ${nameOf(chosen)}, in ${placeWhere}. ${nameOf(chosen)} reads it; you post.`
+      : sessionProject ? `${reviewChats ? `A chat with ${nameOf(chosen)}` : 'A new session'} on the PR's branch, in ${sessionProject.projectName}. ${reviewChats ? nameOf(chosen) : 'Claude'} reads it; you post.`
+        : `${cloneLead}, then opens ${reviewChats ? `a chat with ${nameOf(chosen)}` : 'a session'} on the PR's branch there. ${reviewChats ? nameOf(chosen) : 'Claude'} reads it; you post.`)
+    : why ?? (target ? `In ${where}. ${REVIEWERS.find(r => r.id === chosen)!.note}.`
+      : `${cloneLead}, then ${nameOf(chosen)} reviews it there.`);
   return (
     <span className="rv-menu">
       <ButtonGroup className="rv-split" aria-label={`Review ${repo && number != null ? prShort(repo, number) : group?.name ?? ''}`}>
         <TooltipTrigger delay={400}>
-          <Button size={size} variant="default" isDisabled={mainOff} onPress={() => { void (asSession ? startSession() : start(reviewer)); }} className="rv-split-main">
+          <Button size={size} variant="default" isDisabled={mainOff} onPress={() => { void (asSession ? startSession(undefined, chosen) : start(chosen)); }} className="rv-split-main">
             <Icon name="preview" size="small" aria-hidden="true" />{cloning ? 'Cloning…' : busy ? 'Starting…' : primary}
           </Button>
           <Tooltip placement="bottom" className={LP_THEME}>{tip}</Tooltip>
         </TooltipTrigger>
         <MenuTrigger>
-          <IconButton icon="chevron-down" size={size} variant="default" aria-label="More ways to review" isDisabled={(!target && !sessionProject && !clonePick) || working} className="rv-split-more" />
+          <IconButton icon="chevron-down" size={size} variant="default" aria-label="More ways to review" isDisabled={(!target && !sessionProject && !clonePick && places.length === 0) || working} className="rv-split-more" />
           <Popover placement="bottom end" className={`${LP_THEME} chat-menu-popover`}>
             <Menu aria-label="Review" onAction={key => {
               const k = String(key);
               if (k === 'edit') setEditing(true);
               else if (k === 'session') void startSession();
               else if (k === 'devin' || k === 'claude' || k === 'cursor') void start(k);
-            }} disabledKeys={[...(!sessionProject && !clonePick ? ['session'] : []), ...(!target && !clonePick ? ['devin', 'claude', 'cursor'] : []), ...(!target ? ['edit'] : [])]}>
-              {sessionOk && (
+            }} disabledKeys={[
+              ...(!sessionProject && !clonePick ? ['session'] : []),
+              // No pane: only the reviewers whose chat has somewhere to go (chatPlaces), a group's without a pane too.
+              ...(!target && !clonePick ? REVIEWERS.filter(r => !(chats(r.id) && places.length > 0)).map(r => r.id)
+                : chatNowhere ? REVIEWERS.filter(r => chats(r.id)).map(r => r.id) : []),
+              ...(!target ? ['edit'] : []),
+            ]}>
+              {sessionOk && !reviewChats && (
                 <MenuItem id="session" textValue="Review in a new session">
                   <Icon name="chat-bubble-outline" size="medium" aria-hidden="true" />
                   <Text slot="label">Review in a new session</Text>
@@ -503,12 +661,13 @@ export function ReviewMenu({ repo, number, row, group, defaults, here, agentOnly
                     : clonePick ? `Claude on the PR's branch, in ${cloneWhere}. You talk it through and post.` : `No project on ${repo} to check it out in`}</Text>
                 </MenuItem>
               )}
-              {sessionOk && <Separator />}
+              {sessionOk && !reviewChats && <Separator />}
               {REVIEWERS.map(r => (
                 <MenuItem key={r.id} id={r.id} textValue={`Review with ${r.name}`}>
-                  <Icon name="robot" size="medium" aria-hidden="true" />
+                  <Icon name={chats(r.id) ? 'chat-bubble-outline' : 'robot'} size="medium" aria-hidden="true" />
                   <Text slot="label">{group ? `Review all with ${r.name}` : `Review with ${r.name}`}</Text>
-                  <Text slot="description">{where ? `In ${where}. ` : cloneWhere ? `In ${cloneWhere}. ` : ''}{r.note}</Text>
+                  <Text slot="description">{chats(r.id) ? reviewChatWhere(placeWhere, cloneWhere, repo ?? group?.name)
+                    : <>{where ? `In ${where}. ` : cloneWhere ? `In ${cloneWhere}. ` : ''}{r.note}</>}</Text>
                 </MenuItem>
               ))}
               {!group && <Separator />}
@@ -527,17 +686,111 @@ export function ReviewMenu({ repo, number, row, group, defaults, here, agentOnly
       {!working && mainOff && listed && <span className="rv-menu-note">{group && why ? why : noRunReason(repo, cloneOn, boxesFailing && boxes.length === 0, !projectsLoaded && !!projectsLoadFailed)}</span>}
       {error && <span className="rv-menu-error" role="alert">{error}</span>}
       {editing && target && repo && number != null && (
-        <PromptDialog target={target} repo={repo} number={number} reviewer={reviewer} onPrBranch={onPrBranch} onClose={() => setEditing(false)}
+        <PromptDialog target={target} repo={repo} number={number} reviewer={chosen} onPrBranch={onPrBranch} chats={id => places.length > 0 && chats(id)} onClose={() => setEditing(false)}
           onStart={(id, prompt) => { setEditing(false); void start(id, prompt); }} />
       )}
     </span>
   );
 }
 
-function PromptDialog({ target, repo, number, reviewer, onPrBranch, onClose, onStart }: {
+/**
+ * Review chats a group's start made while another of its members failed (startSession), by group, project and PR:
+ * that group's Review all again opens those instead of making them twice, and makes only the rest. Dropped once its
+ * start makes every one; a single PR's Review never reads or writes them, so it makes a session of its own as before.
+ */
+const madeReviewChats = new Map<string, PrWorkstreamLink>();
+const madeKey = (groupId: string, projectId: string, repo: string, number: number) => `${groupId}|${projectId}|${repo.toLowerCase()}#${number}`;
+
+/**
+ * The members of a group a review chat goes to: the open ones left to review (the card's count), whether or not one
+ * has a pane, since each chat checks its PR out on its own (chatPlaces), unlike the pane review, which needs one.
+ */
+export function reviewChatMembers(group: PrReviewGroup, viewer: string | null): PrGroupMember[] {
+  return toReview(group, viewer).filter(m => m.state === 'open');
+}
+
+/**
+ * One review chat to open: the PR, and where it goes. `at` holds a checkout of the PR's branch already (`copyOf`, its
+ * workstream: the chat gets a branch of its own off it, with that session's access, since git allows a branch in one
+ * worktree only), or is a project on the PR's repository (a new checkout of the PR's branch).
+ */
+export interface ChatPlace { repo: string; number: number; row: PrRow | null; at: PrWorkstreamLink | null; copyOf: string | null }
+
+/**
+ * Where review chats go with review chats on. Beside a session on its own PR (`here`): a branch off that session's.
+ * A group: each open member's own chat, so each card posts to its own PR (a card posts to its session's PR, not the
+ * one its fence names): off the checkout that member's pane or review target has when it is on the member's branch,
+ * else a new checkout in a project on its repository. A PR: off its review target when that is on the PR's branch,
+ * else a new checkout there. A member, or a PR, with nowhere is left out. A multi-repo project's branch-off spans its
+ * repositories, so it's never a copy's source.
+ */
+export function chatPlaces(o: {
+  here?: { projectId: string; workstream: string }; group?: PrReviewGroup; members?: readonly PrGroupMember[] | null;
+  repo?: string; number?: number; row?: PrRow | null; sessionProject: PrWorkstreamLink | null; projects: readonly Project[];
+}): ChatPlace[] {
+  const projectOf = (id: string) => o.projects.find(p => p.id === id);
+  const copyable = (link: PrWorkstreamLink | null | undefined, branch?: string | null): link is PrWorkstreamLink => {
+    if (!link || projectOf(link.projectId)?.layout === 'workspace') return false;
+    if (branch === undefined) return true;
+    return !!branch && projectOf(link.projectId)?.workstreams?.find(w => w.name === link.workstream)?.branch === branch;
+  };
+  const named = (link: PrWorkstreamLink): PrWorkstreamLink => ({ ...link, projectName: link.projectName || projectOf(link.projectId)?.name || '' });
+  if (o.group) {
+    return (o.members ?? []).flatMap((m): ChatPlace[] => {
+      const own = m.pane ?? m.row?.reviewTarget ?? null;
+      // Off the member's pane or review target when that is on its branch; else a checkout in that session's project
+      // (startSession copies there too once the branch shows checked out, for a member the pipeline lists no branch for).
+      if (copyable(own, m.row?.headRefName ?? null)) return [{ repo: m.repo, number: m.number, row: m.row ?? null, at: named(own), copyOf: own.workstream }];
+      if (copyable(own)) return [{ repo: m.repo, number: m.number, row: m.row ?? null, at: named(own), copyOf: null }];
+      const project = cloneOf(m.repo, o.projects, true);
+      return project ? [{ repo: m.repo, number: m.number, row: m.row ?? null, at: project, copyOf: null }] : [];
+    });
+  }
+  if (!o.repo || o.number == null) return [];
+  const row = o.row ?? null;
+  if (o.here) {
+    const at = named({ ...o.here, projectName: '' });
+    return copyable(at) ? [{ repo: o.repo, number: o.number, row, at, copyOf: at.workstream }] : [];
+  }
+  if (!o.sessionProject) return [];
+  const copy = copyable(o.sessionProject, row?.headRefName ?? null);
+  return [{ repo: o.repo, number: o.number, row, at: o.sessionProject, copyOf: copy ? o.sessionProject.workstream : null }];
+}
+
+/**
+ * Whether Review with Claude or Cursor is a chat here (simple-ui-review-chat-enabled): wherever a chat can go
+ * (chatPlaces) or a clone can make one, and where there's no pane either. Where no chat can go but a pane can (a
+ * multi-repo project's session, whose branch-off spans its repositories), the pane, as with review chats off.
+ */
+export function reviewChatsHere(on: boolean, places: number, clonePick: boolean, paneTarget: boolean): boolean {
+  return on && (places > 0 || clonePick || !paneTarget);
+}
+
+/**
+ * The workstream a review chat's checkout copies (`copyOf`, a branch of its own) once the PR's branch is known: the
+ * one chatPlaces chose, else the project's workstream on that branch already (git allows a branch in one worktree
+ * only), else none (a checkout of the PR's branch).
+ */
+export function copyOfAt(chosen: string | null, branch: string, workstreams: ReadonlyArray<{ name: string; branch?: string | null }>): string | null {
+  if (chosen) return chosen;
+  return branch ? workstreams.find(w => w.branch === branch)?.name ?? null : null;
+}
+
+/** A review chat in the menu: where its checkout goes, and that you post. `where`: a project, or a branch off a session's. */
+export function reviewChatWhere(where: string | null, cloneWhere: string | null, repo: string | undefined): string {
+  if (where?.startsWith('a branch off ') || where?.endsWith('one per PR')) return `In ${where}. You talk it through and post.`;
+  if (where) return `A chat on the PR's branch, in ${where}. You talk it through and post.`;
+  if (cloneWhere) return `A chat on the PR's branch, in ${cloneWhere}. You talk it through and post.`;
+  return `No project on ${repo ?? 'this repository'} to check it out in`;
+}
+
+function PromptDialog({ target, repo, number, reviewer, onPrBranch, chats, onClose, onStart }: {
   target: PrWorkstreamLink; repo: string; number: number; reviewer: ReviewerId;
   /** The review runs in a checkout of the PR's own branch, where a repo template is the author's to change. */
   onPrBranch: boolean;
+  /** Whether a reviewer's review is a chat here (simple-ui-review-chat-enabled, and its box runs its engine): a chat
+   *  reviewer gets the body as shown, and no sign-off line. */
+  chats: (id: ReviewerId) => boolean;
   onClose: () => void; onStart: (id: ReviewerId, prompt: string | undefined) => void;
 }) {
   const url = `https://github.com/${repo}/pull/${number}`;
@@ -556,6 +809,7 @@ function PromptDialog({ target, repo, number, reviewer, onPrBranch, onClose, onS
   const sourceLabel = repoTemplate?.label ?? guess?.promptSourceLabel ?? null;
   const shown = body ?? renderReviewTemplate(template, number, url);
   const footer = guess?.reviewers?.find(r => r.id === who)?.footer ?? guess?.promptFooter ?? '';
+  const chat = chats(who);
   return (
     <ModalOverlay isOpen isDismissable onOpenChange={open => { if (!open) onClose(); }} className={LP_THEME}>
       <Modal size="large" className="rv-confirm">
@@ -570,7 +824,9 @@ function PromptDialog({ target, repo, number, reviewer, onPrBranch, onClose, onS
           <TextField aria-label="Review prompt" value={guess ? shown : ''} onChange={setBody} isDisabled={!guess} className="rv-prompt-field">
             <TextArea className="rv-prompt-body" rows={7} />
           </TextField>
-          <pre className="rv-prompt-fixed">{footer}</pre>
+          {chat
+            ? <p className="rv-prompt-source">Then termag asks {nameOf(who)} for its findings as a review card, and to post nothing: you post from the card, in the chat.</p>
+            : <pre className="rv-prompt-fixed">{footer}</pre>}
           <p className="rv-prompt-source">
             {failed ?? (!guess ? 'Reading the prompt template…'
               : source === 'repo' && onPrBranch ? <><Icon name="warning" size="small" aria-hidden="true" /> From {sourceLabel ?? '.termag/review-prompt.md'}, on the PR's own branch: its author can change it. Read it before it runs.</>
@@ -581,7 +837,7 @@ function PromptDialog({ target, repo, number, reviewer, onPrBranch, onClose, onS
           <ButtonGroup className="rv-confirm-buttons">
             {body !== null && <Button variant="minimal" onPress={() => setBody(null)}>Reset</Button>}
             <Button variant="minimal" onPress={onClose}>Cancel</Button>
-            <Button variant="primary" isDisabled={!guess} onPress={() => onStart(who, body !== null && body !== renderReviewTemplate(template, number, url) ? body : undefined)}>
+            <Button variant="primary" isDisabled={!guess} onPress={() => onStart(who, chat ? shown : body !== null && body !== renderReviewTemplate(template, number, url) ? body : undefined)}>
               Review with {nameOf(who)}
             </Button>
           </ButtonGroup>

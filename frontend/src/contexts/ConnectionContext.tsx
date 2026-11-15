@@ -7,8 +7,10 @@ import {
   shouldReconnectOnForeground,
 } from '../utils/connection';
 import { connectionTracker, TrackerSnapshot } from '../utils/connectionTracker';
+import { edgeCheckpoint, isEdgeSignedOut, markEdgeSignedIn, markEdgeSignedOut, onEdgeSessionChange } from '../utils/edgeSession';
 
 export { connectionTracker } from '../utils/connectionTracker';
+export { isEdgeSignedOut, markEdgeSignedOut } from '../utils/edgeSession';
 
 /** Health endpoint the probe hits. Must sit under the app's base path. */
 export const PROBE_PATH = '/termag/health';
@@ -19,12 +21,12 @@ export const PROBE_PATH = '/termag/health';
  * seconds.
  *
  * Credentials are included because every `/termag/*` path is behind the edge's
- * OIDC gate on the hosted deployment: a cookie-less request is answered with a
- * redirect to the identity provider, which the browser reports as a network
- * failure cross-origin. Sending the cookie is what makes the probe able to
- * succeed there at all. Once that session expires the edge redirects or
- * answers 401 even with the cookie; the probe then marks the tab signed out
- * (see `markEdgeSignedOut`) rather than following the redirect.
+ * OIDC gate on the hosted deployment: a cookie-less request never reaches
+ * termag. Sending the cookie is what makes the probe able to succeed there at
+ * all. Once that session expires the edge redirects (the
+ * browser still holds the expired ALB cookie) or answers 401 (it holds none);
+ * the probe then marks every tab signed out (`markEdgeSignedOut`,
+ * utils/edgeSession.ts) rather than following the redirect.
  *
  * A successful probe is evidence about HTTP only. It is recorded as such, so it
  * cannot vouch for the status socket — see `ConnectionSample.lastSocketContactAt`.
@@ -32,6 +34,7 @@ export const PROBE_PATH = '/termag/health';
 export async function probeBackend(): Promise<boolean> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), T.probeTimeoutMs);
+  const sent = edgeCheckpoint();
   try {
     // Any HTTP response at all counts: the point is "did the request reach a
     // termag server", not "is it healthy". `cache: no-store` defeats the
@@ -41,7 +44,7 @@ export async function probeBackend(): Promise<boolean> {
       markEdgeSignedOut();
       return false;
     }
-    setEdgeSignedOut(false);
+    markEdgeSignedIn(sent);
     connectionTracker.contact('http');
     return true;
   } catch {
@@ -60,38 +63,14 @@ export function isEdgeSessionExpired(res: Pick<Response, 'type' | 'status'>): bo
   return res.type === 'opaqueredirect' || res.status === 401;
 }
 
-let edgeSignedOut = false;
-const signedOutListeners = new Set<() => void>();
-
-function setEdgeSignedOut(value: boolean): void {
-  if (edgeSignedOut === value) return;
-  edgeSignedOut = value;
-  signedOutListeners.forEach(fn => fn());
-}
-
-/** True while the edge session is expired and nobody has asked to sign in yet. */
-export function isEdgeSignedOut(): boolean {
-  return edgeSignedOut;
-}
-
 /**
- * Note the expired session and wait for the person at this tab. A tab never
- * starts the Okta login by itself: the ALB's AWSALBAuthNonce cookie lives
- * 15 minutes, so a login started while nobody was looking (a probe in a
- * background tab, or a screen waking at night) parks on the Okta page, and
- * signing in there hours later fails the callback with a 401 that no reload
- * fixes. The provider shows the signed-out notice and calls `reauthenticate`
- * on the next click or key press.
- */
-export function markEdgeSignedOut(): void {
-  setEdgeSignedOut(true);
-}
-
-/**
- * Reload so the page navigation, not a background request, runs the Okta
- * login (background requests get a 401 from the ALB rather than a redirect,
- * and must not start logins of their own: each overwrites the nonce cookie).
- * Only call this for the person at the tab; see `markEdgeSignedOut`.
+ * Reload so the page navigation runs the Okta login. Only call this for the
+ * person at the tab. A tab never starts the login by itself: the ALB's
+ * AWSALBAuthNonce cookie lives 15 minutes, so a login started while nobody was
+ * looking (a probe in a background tab, a screen waking at night) parks on the
+ * Okta page, and signing in there later fails the callback with a 401 that no
+ * reload fixes. Every other tab stays quiet meanwhile (utils/edgeSession.ts),
+ * because each request they sent would overwrite this login's nonce.
  */
 export function reauthenticate(): void {
   edgeLogin.start();
@@ -141,14 +120,22 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   useEffect(() => connectionTracker.subscribe(() => setSnap(connectionTracker.snapshot)), []);
 
   // Signed out: the next click, tap or key press is the person at this tab,
-  // so it starts the login (see markEdgeSignedOut for why nothing else may).
-  const [signedOut, setSignedOut] = useState(edgeSignedOut);
+  // so it starts the login (see reauthenticate for why nothing else may).
+  // Another tab's finding counts too: it arrives through utils/edgeSession.ts.
+  const [signedOut, setSignedOut] = useState(isEdgeSignedOut);
   useEffect(() => {
-    const sync = () => setSignedOut(edgeSignedOut);
-    signedOutListeners.add(sync);
+    const sync = () => setSignedOut(isEdgeSignedOut());
+    const off = onEdgeSessionChange(sync);
     sync();
-    return () => { signedOutListeners.delete(sync); };
+    return off;
   }, []);
+  // Back from signed out (this tab's login, or another tab's): check in once.
+  // The sockets redial on their own (edgeDialGate).
+  const wasSignedOut = useRef(signedOut);
+  useEffect(() => {
+    if (wasSignedOut.current && !signedOut) void probeBackend();
+    wasSignedOut.current = signedOut;
+  }, [signedOut]);
   useEffect(() => {
     if (!signedOut) return;
     const onInteract = () => reauthenticate();
@@ -182,14 +169,17 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
   // answering the server's pings, so the socket is usually gone — or about to
   // be — by the time the user looks at it again. Waiting for the reconnect
   // timer is what left the "connection lost" notice up until someone clicked.
+  // Neither while signed out: each probe would reset the nonce of a login in
+  // progress in another tab (utils/edgeSession.ts).
   const lastForegroundReconnectAt = useRef<number | null>(null);
   useEffect(() => {
     let id: ReturnType<typeof setInterval> | null = null;
-    if (state !== 'online') {
-      id = setInterval(() => { void probeBackend(); }, T.probeIntervalMs);
+    if (state !== 'online' && !signedOut) {
+      // Checked as it fires too: another tab's mark can land before this re-renders.
+      id = setInterval(() => { if (!isEdgeSignedOut()) void probeBackend(); }, T.probeIntervalMs);
     }
     const onForeground = () => {
-      if (document.visibilityState !== 'visible') return;
+      if (document.visibilityState !== 'visible' || isEdgeSignedOut()) return;
       const at = Date.now();
       const s = connectionTracker.snapshot;
       if (shouldReconnectOnForeground({
@@ -210,7 +200,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       document.removeEventListener('visibilitychange', onForeground);
       window.removeEventListener('focus', onForeground);
     };
-  }, [state]);
+  }, [state, signedOut]);
 
   // Make it visible in the tab strip too.
   useEffect(() => {

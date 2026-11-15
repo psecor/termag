@@ -8,6 +8,7 @@ import type { AgentStatus, Project } from '../../types';
 import { spaceColor } from '../../chat/spaceColors';
 import { ChatSidebar } from './ChatSidebar';
 import { ChatChromeProvider, type ChatChrome } from './chatChrome';
+import { setFlagValues } from '../../flags';
 
 function space(name: string, role: SpaceView['role'], readOnly = false): SpaceView {
   return { id: `id-${name}`, name, description: null, createdAt: '', usedBytes: 0, quotaBytes: 1, role, readOnly };
@@ -96,5 +97,19 @@ describe('ChatSidebar', () => {
     ));
     expect(nav().hasAttribute('inert')).toBe(false);
     expect(nav().getAttribute('aria-hidden')).toBeNull();
+  });
+
+  it('says on the Lab link where termag opens: the UI used last, or Lab from now on under chat-ui-nudge-enabled', () => {
+    mocks.projects = [];
+    mocks.spaces = [];
+    mocks.index = new Map();
+    const lab = () => [...host.querySelectorAll('.chat-foot-link')].find(e => e.textContent === 'Lab');
+    act(() => root.render(<MemoryRouter><ChatSidebar /></MemoryRouter>));
+    expect(lab()?.getAttribute('title')).toBe('Switch to Lab. termag opens in the UI you used last.');
+    setFlagValues({ 'chat-ui-nudge-enabled': true });
+    try {
+      act(() => root.render(<MemoryRouter key="on"><ChatSidebar /></MemoryRouter>));
+      expect(lab()?.getAttribute('title')).toBe('Switch to Lab. termag opens in Lab from now on.');
+    } finally { setFlagValues({}); }
   });
 });

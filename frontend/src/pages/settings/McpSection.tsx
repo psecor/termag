@@ -7,7 +7,7 @@ import { apiError, ConnectorNameLine, McpCatalogList, ServerName, useMcpSignIn, 
 import { McpCallbackUrl } from './McpCallbackUrl';
 import { McpPermissions } from './McpPermissions';
 import { DocsLink } from './DocsLink';
-import { connectorStatus, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
+import { connectAction, connectorStatus, linkResult, mcpAgentNames, parseHeaderLines, referencedSecretNames, serverParam, suggestName } from './mcpForm';
 
 const DEFAULT_HEADERS = 'Authorization: Bearer {{secret.token}}';
 
@@ -36,6 +36,22 @@ function SecretInputs({ names, stored, values, onChange }: {
       ))}
     </div>
   );
+}
+
+/**
+ * Starts a connector's sign-in from its row's Connect (connectAction), in
+ * Settings and in the setup wizard: the row is busy until the page leaves
+ * for the server, and free again when it stays (the scope checklist, a
+ * localhost sign-in in a new tab) or the start fails.
+ */
+export async function startLink(c: McpConnector, onLink: BeginLink, setBusy: (busy: boolean) => void, onError: (failure: Failure) => void): Promise<void> {
+  setBusy(true);
+  try {
+    if (await onLink(c)) setBusy(false);
+  } catch (err) {
+    onError(apiError(err, 'Could not start signing in to the server'));
+    setBusy(false);
+  }
 }
 
 /** One of the user's servers, in Settings and in the setup wizard's MCP step. */
@@ -81,17 +97,7 @@ export function ConnectorRow({ c, focused, signIn, returnTo, onLink, onChanged, 
     }
   }
 
-  async function link() {
-    setBusy(true);
-    try {
-      // Settings stays when the checklist or a new sign-in tab opens: the row is free again.
-      if (await onLink(c)) setBusy(false);
-    } catch (err) {
-      onError(apiError(err, 'Could not start signing in to the server'));
-      setBusy(false);
-    }
-  }
-  const choosable = !!c.oauth?.scopeChoice;
+  const link = () => startLink(c, onLink, setBusy, onError);
   // What the server granted at the last sign-in, or what it was asked for when it didn't say.
   const permissions = linked ? (c.oauth?.grantedScopes ?? c.oauth?.requestedScopes ?? null) : null;
 
@@ -132,8 +138,9 @@ export function ConnectorRow({ c, focused, signIn, returnTo, onLink, onChanged, 
         {permissions && permissions.length > 0 && (
           <McpPermissions granted={!!c.oauth?.grantedScopes} labels={permissions.map(s => s.label)} />
         )}
-        {c.authType === 'oauth' && !linked && c.linkError && <span className="credentials-error">{c.linkError}</span>}
-        {c.authType === 'oauth' && c.pasteLink && <McpPasteLink c={c} signIn={signIn} returnTo={returnTo} />}
+        {c.blocked && <span className="credentials-error">{c.blocked}</span>}
+        {!c.blocked && c.authType === 'oauth' && !linked && c.linkError && <span className="credentials-error">{c.linkError}</span>}
+        {!c.blocked && <McpPasteLink c={c} signIn={signIn} returnTo={returnTo} />}
         {editing && (
           <>
             <SecretInputs names={names} stored={c.secretNames ?? []} values={values}
@@ -146,9 +153,9 @@ export function ConnectorRow({ c, focused, signIn, returnTo, onLink, onChanged, 
         )}
       </div>
       <div className="mcp-row-actions">
-        {!editing && names.length > 0 && <button className="btn-ghost" disabled={busy} onClick={() => setEditing(true)}>Secrets</button>}
-        {c.authType === 'oauth' && (
-          <button className="btn-ghost" disabled={busy} onClick={link}>{!linked ? 'Link' : choosable ? 'Change permissions' : 'Re-link'}</button>
+        {!c.blocked && !editing && names.length > 0 && <button className="btn-ghost" disabled={busy} onClick={() => setEditing(true)}>Secrets</button>}
+        {!c.blocked && c.authType === 'oauth' && (
+          <button className="btn-ghost" disabled={busy} onClick={() => void link()}>{connectAction(c)}</button>
         )}
         {c.authType === 'oauth' && linked && <button className="btn-ghost" disabled={busy} onClick={unlink}>Unlink</button>}
         <button className="btn-ghost" disabled={busy} onClick={() => setConfirming(true)}>Delete</button>
@@ -266,7 +273,7 @@ function AddForm({ initialUpstream, storeAvailable, onLink, onAdded, onReload, o
       )}
       <div className="inline-form settings-form mcp-submit">
         <button type="submit" disabled={busy || !upstream.trim() || !name.trim()}>
-          {mode === 'oauth' ? 'Add and sign in' : 'Add server'}
+          {mode === 'oauth' ? 'Add and connect' : 'Add server'}
         </button>
       </div>
     </form>
@@ -306,7 +313,7 @@ export function McpSection({ focus, search }: { focus: boolean; search: string }
           {agents} on every box you own get these servers through the termag broker, which adds your
           credentials to each call. Boxes never hold them.
         </p>
-        {result.linked && <div className="settings-notice" role="status">Linked. Your agents can use this MCP now.</div>}
+        {result.linked && <div className="settings-notice" role="status">Connected. Your agents can use it now.</div>}
         {result.error && <div className="error-banner" role="alert">{result.error}</div>}
         {error && (
           <div className="error-banner" role="alert">

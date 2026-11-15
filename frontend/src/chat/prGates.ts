@@ -4,6 +4,7 @@
 // its checks, termag's three Cursor agents, its review and its conflicts. Pure.
 import type { PrOverview, PrPipelineResponse, PrRow } from '../services/api';
 import { lanesOf } from '../utils/prPipeline';
+import { rowKey } from '../mobile/inbox';
 
 export type GateStatus = 'pass' | 'fail' | 'running' | 'waiting';
 export interface Gate { key: string; name: string; status: GateStatus; detail: string }
@@ -20,6 +21,18 @@ export function sessionPr(res: PrPipelineResponse | null | undefined, projectId:
   const rank = (r: PrRow) => (r.mergedAt ? 1 : 0);
   const at = (r: PrRow) => (r.at ? Date.parse(r.at) : 0);
   return [...rows].sort((a, b) => rank(a) - rank(b) || at(b) - at(a))[0];
+}
+
+/**
+ * Every open PR linked to a session, as sessionPr links one (its row's
+ * project and workstream), with the session's row key: the Projects view's
+ * PR counts (chat/sidebarGroups.ts projectGroups). A merged PR, or a branch
+ * with no PR, isn't one.
+ */
+export function sessionOpenPrs(res: PrPipelineResponse | null | undefined): Array<{ key: string; pr: string }> {
+  return lanesOf(res).flatMap(l => l.rows).flatMap(r => (r.kind === 'pr' && r.repo && r.number != null && !r.mergedAt && r.workstream
+    ? [{ key: rowKey(r.workstream.projectId, r.workstream.workstream), pr: `${r.repo}#${r.number}` }]
+    : []));
 }
 
 /** termag's agents, by the check name each posts as. */

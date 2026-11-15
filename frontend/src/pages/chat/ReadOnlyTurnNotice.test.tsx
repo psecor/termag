@@ -33,6 +33,14 @@ describe('ReadOnlyTurnNotice', () => {
     expect(el.querySelector('.lp-theme')).not.toBeNull();
   });
 
+  it("names the chat's own agent and its read tier: Claude's by default, Cursor's plan mode for a Cursor chat", () => {
+    expect(show(<ReadOnlyTurnNotice reason="x" />).textContent).toContain('Claude has only Read, Grep and Glob this turn');
+    act(() => root?.unmount()); host?.remove();
+    const el = show(<ReadOnlyTurnNotice reason="x" agent={{ name: 'Cursor', readTier: 'only its plan mode this turn: it reads the code' }} />);
+    expect(el.textContent).toContain('Cursor has only its plan mode this turn');
+    expect(el.textContent).not.toContain('Claude');
+  });
+
   it('says a refusal with no fix is on purpose', () => {
     const el = show(<ReadOnlyTurnNotice reason="branch main was checked out from a pull request" />);
     expect(el.querySelector('[role="alert"]')!.textContent).toContain('That is on purpose for this checkout');

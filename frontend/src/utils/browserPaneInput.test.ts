@@ -65,7 +65,8 @@ describe('browser pane input mapping', () => {
 
   it('explains each close code', () => {
     expect(browserPaneCloseMessage(BROWSER_PANE_CLOSE.DISABLED, 'guests off')).toMatch(/switched off/);
-    expect(browserPaneCloseMessage(BROWSER_PANE_CLOSE.UNSUPPORTED, '')).toMatch(/needs an update/);
+    expect(browserPaneCloseMessage(BROWSER_PANE_CLOSE.UNSUPPORTED, 'browser pane unsupported')).toMatch(/needs an update/);
+    expect(browserPaneCloseMessage(BROWSER_PANE_CLOSE.UNSUPPORTED, 'no chromium')).toMatch(/^This box has no Chromium.*sudo snap install chromium/);
     expect(browserPaneCloseMessage(BROWSER_PANE_CLOSE.PARKED, 'box hibernated')).toBe('The box is hibernated.');
     expect(browserPaneCloseMessage(1008, 'project forbidden')).toBe('Not allowed: project forbidden.');
     expect(browserPaneCloseMessage(1011, 'agent error')).toMatch(/Could not start/);

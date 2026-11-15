@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { prsApi, projectsApi, type PrCheckout, type PrRow } from '../services/api';
+import { prsApi, projectsApi, instancesApi, type PrCheckout, type PrRow } from '../services/api';
 import type { Project } from '../types';
+import { boxFeed } from '../services/boxFeed';
 import { apiErrorText } from '../utils/prPipeline';
+import { WAKE_READ_TIMEOUT_MS, WAKE_START_TIMEOUT_MS, wakeBox, wakeNote, wakeStep, type WakeResult } from '../utils/boxWake';
 import { useProjects } from '../contexts/ProjectContext';
 import { projectHref } from '../pages/dashboard/AttentionSection';
 import { filterChoices, isWorkstreamName, scopedProjects, suggestPrPrompt, suggestWorkstreamName, workstreamChoices } from '../utils/workstreamChoices';
@@ -23,13 +25,17 @@ import { filterChoices, isWorkstreamName, scopedProjects, suggestPrPrompt, sugge
  * the PR's repository. The agent starts on a prompt about the PR, which the
  * form shows and the user can change or clear. With no checkout of the
  * repository known, the form warns: the box refuses a project whose origin is
- * another repository.
+ * another repository. A stopped or hibernated box is started first and waited
+ * for (utils/boxWake): the checkout runs on the box, so it has to be up before
+ * the workstream is asked for.
  */
 export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
   row: PrRow; checkouts?: PrCheckout[]; onChanged: () => void; onError: (msg: string) => void;
 }) {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [busy, setBusy] = useState(false);
+  // What the box the workstream will be made on is doing, while the picker waits for it.
+  const [waiting, setWaiting] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [hi, setHi] = useState(0);
   // The "New workstream" form: where, under what name, and what its agent is asked first.
@@ -37,7 +43,17 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
   const navigate = useNavigate();
   // A no-op outside the workspace (the dashboard): the workspace loads afresh when the link opens it.
   const { reloadProjects, setActiveWorkstream } = useProjects();
+  // The caller's own boxes, to find the one the chosen project lives on and start it if it is down.
+  const boxes = useSyncExternalStore(boxFeed.subscribe, boxFeed.getSnapshot);
   const list = useRef<HTMLUListElement | null>(null);
+  // Whether this picker is still on screen. A box can take minutes to come up,
+  // and the overlay can be closed while it does: the workstream is still made,
+  // but the user who left is not pulled to it when it lands.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   // Keep the highlighted row in view as the arrow keys move it, as a native select would.
   useEffect(() => {
     list.current?.querySelector('li.active')?.scrollIntoView({ block: 'nearest' });
@@ -45,9 +61,11 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
   if (row.kind !== 'pr' || !row.repo || row.number == null) return null;
   const { repo, number } = row;
 
-  const close = () => { setProjects(null); setQuery(''); setHi(0); setCreating(null); };
+  const close = () => { setProjects(null); setQuery(''); setHi(0); setCreating(null); setWaiting(null); };
   const open = async () => {
     setBusy(true);
+    // Fresh box states too: the projects list only says which box each one is on.
+    void boxFeed.reload();
     try { setProjects(await projectsApi.list()); } catch (err) { onError(apiErrorText(err, 'Could not list your workstreams.')); }
     finally { setBusy(false); }
   };
@@ -77,16 +95,74 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
     if (targets.length === 0) { onError('No project of yours to make it in.'); return; }
     setCreating({ projectId: targets[0].id, name: suggestWorkstreamName(repo, number, row.headRefName), prompt: suggestPrPrompt(repo, number) });
   };
-  const createNew = () => {
+  const createNew = async () => {
     if (!creating || busy || !isWorkstreamName(creating.name)) return;
     const { projectId, name, prompt } = creating;
-    void run(async () => {
+    setBusy(true);
+    try {
+      // The checkout runs on the project's box, so a parked box is started and
+      // waited for rather than answered with "start it from the Boxes list".
+      const project = projects?.find(p => p.id === projectId);
+      let box = (project?.instanceId ? boxes.find(b => b.id === project.instanceId) : undefined) ?? null;
+      // The box list may not have loaded yet (the overlay also opens on the dashboard).
+      if (project?.instanceId && !box) {
+        await boxFeed.reload();
+        box = boxFeed.getSnapshot().find(b => b.id === project.instanceId) ?? null;
+      }
+      // Decide on a read taken now, not on the feed's snapshot: it stops
+      // polling once every box settles, so a box started (or stopped) from
+      // another tab still reads as it did when the list last loaded. A stale
+      // "stopped" would ask to start a box that is already up, and a stale
+      // "ready" would skip the wake and hit the parked-box refusal.
+      if (box) {
+        const known = box;
+        box = await instancesApi.get(known.id, WAKE_READ_TIMEOUT_MS).catch(() => known);
+      }
+      // Only an EC2 box can be started from here; an external box's agent
+      // comes back with its machine, so its own error stands.
+      if (box && box.kind === 'ec2' && wakeStep(box.status) !== 'ready') {
+        setWaiting(wakeNote(box.name, box.status));
+        // Show the box going up in the sidebar's Boxes list at once, then once
+        // per status change.
+        void boxFeed.reload();
+        // Reflect the box's progress in the sidebar's Boxes list once per
+        // change: the feed polls through a transitional status by itself, so
+        // a reload every 3 s would only repeat its own requests.
+        let shown = box.status;
+        let woken: WakeResult;
+        try {
+          woken = await wakeBox(box, {
+            get: id => instancesApi.get(id, WAKE_READ_TIMEOUT_MS),
+            start: id => instancesApi.start(id, WAKE_START_TIMEOUT_MS),
+            onWait: b => {
+              setWaiting(wakeNote(b.name, b.status));
+              if (b.status !== shown) { shown = b.status; void boxFeed.reload(); }
+            },
+          });
+        } catch (err) {
+          // A start the backend refused: its message, not the checkout one.
+          onError(apiErrorText(err, `Could not start ${box.name}. Start it from the Boxes list and try again.`));
+          return;
+        }
+        if (!woken.ok) { onError(woken.error); return; }
+        void boxFeed.reload();
+      }
       const ws = await prsApi.newWorkstream(repo, number, projectId, name, prompt);
+      // Still on screen? A closed overlay keeps the workstream it asked for
+      // (its checkout is in flight, like any slow one), but does not navigate.
+      if (!mounted.current) return;
+      close();
       await reloadProjects().catch(() => undefined);
       setActiveWorkstream(projectId, ws.name);
       navigate(projectHref(projectId, ws.name));
-    // A gateway timeout has no JSON error: the box may still be checking a big repository out.
-    }, 'No answer in time: if the box was slow, the workstream still appears in the sidebar when its checkout finishes.');
+      onChanged();
+    } catch (err) {
+      // A gateway timeout has no JSON error: the box may still be checking a big repository out.
+      onError(apiErrorText(err, 'No answer in time: if the box was slow, the workstream still appears in the sidebar when its checkout finishes.'));
+    } finally {
+      setBusy(false);
+      setWaiting(null);
+    }
   };
   if (creating) {
     const valid = isWorkstreamName(creating.name);
@@ -117,7 +193,7 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
             onChange={e => setCreating({ ...creating, name: e.target.value.trim() })}
             onKeyDown={e => {
               if (e.key === 'Escape') { e.stopPropagation(); setCreating(null); }
-              else if (e.key === 'Enter') { e.preventDefault(); createNew(); }
+              else if (e.key === 'Enter') { e.preventDefault(); void createNew(); }
             }}
           />
           {!valid && <div className="error-text prs-ws-scope">Letters, digits, dashes and underscores; not "main".</div>}
@@ -131,14 +207,18 @@ export function PrWorkstreamPicker({ row, checkouts, onChanged, onError }: {
             onChange={e => setCreating({ ...creating, prompt: e.target.value })}
             onKeyDown={e => {
               if (e.key === 'Escape') { e.stopPropagation(); setCreating(null); }
-              else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); createNew(); }
+              else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void createNew(); }
             }}
           />
           <div className="usage-dim prs-ws-scope">
-            {busy ? 'Checking the branch out on the box…' : 'Checks out the PR\'s branch (or adopts a worktree already on it), attaches the PR and opens the workstream; its agent starts on the prompt.'}
+            {waiting
+              ? waiting
+              : busy
+                ? 'Checking the branch out on the box…'
+                : 'Checks out the PR\'s branch (or adopts a worktree already on it), attaches the PR and opens the workstream; its agent starts on the prompt. A stopped box is started first.'}
           </div>
           <div className="prs-ws-actions">
-            <button type="button" className="btn-primary btn-tiny" disabled={busy || !valid} onClick={createNew}>Create</button>
+            <button type="button" className="btn-primary btn-tiny" disabled={busy || !valid} onClick={() => { void createNew(); }}>Create</button>
             <button type="button" className="btn-ghost btn-tiny" disabled={busy} onClick={() => setCreating(null)}>Back</button>
           </div>
         </div>

@@ -5,21 +5,23 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Project } from '../../types';
 
-const mocks = vi.hoisted(() => ({ rows: [] as unknown[], overview: null as unknown, merge: null as null | (() => unknown) }));
+const mocks = vi.hoisted(() => ({ rows: [] as unknown[], list: vi.fn(), overview: null as unknown, overviews: {} as Record<string, unknown>, reads: vi.fn(), merge: null as null | (() => unknown) }));
 vi.mock('../../services/api', async importOriginal => {
   const actual = await importOriginal<typeof import('../../services/api')>();
   return {
     ...actual,
     prsApi: {
       ...actual.prsApi,
-      list: async () => ({ connected: true, lanes: [{ id: 'mine', label: 'Mine', rows: mocks.rows }] }),
-      overview: async () => { if (overviewFails) throw new Error('502'); return mocks.overview; },
+      list: mocks.list,
+      overview: async (repo: string, number: number) => { mocks.reads(repo, number); if (overviewFails) throw new Error('502'); return mocks.overviews[`${repo}#${number}`] ?? mocks.overview; },
       merge: async () => { mocks.merge?.(); return { merged: true, sha: 'abc', autoMerge: false, message: null }; },
     },
   };
 });
 
 import { PrTab } from './PrTab';
+import { askStore } from '../../chat/askStore';
+import type { AskView } from '../../chat/asks';
 
 const project = { id: 'p1', name: 'webapp' } as unknown as Project;
 const row = {
@@ -37,6 +39,11 @@ const overview = {
   failedSuites: { runs: [], other: [] }, requestedUsers: [], requestedTeams: [],
 };
 
+const ask = (thread: string, number: number, repo = 'example-org/webapp') => ({
+  thread, title: `Ask ${thread}`, prs: [{ key: `${repo}#${number}`, url: `https://github.com/${repo}/pull/${number}`, number, branch: null }],
+} as AskView);
+const publish = (...asks: AskView[]) => askStore.publish('p1|main', new Map(asks.map(a => [a.thread, a])));
+
 let root: Root;
 let host: HTMLDivElement;
 let overviewFails = false;
@@ -50,13 +57,17 @@ beforeEach(() => {
   document.body.appendChild(host);
   root = createRoot(host);
   mocks.rows = [];
+  mocks.list.mockReset().mockImplementation(async () => ({ connected: true, lanes: [{ id: 'mine', label: 'Mine', rows: mocks.rows }] }));
   mocks.overview = overview;
+  mocks.overviews = {};
+  mocks.reads.mockClear();
   overviewFails = false;
 });
 
 afterEach(() => {
   act(() => root.unmount());
   host.remove();
+  askStore.publish('p1|main', null);
 });
 
 async function render() {
@@ -65,6 +76,71 @@ async function render() {
 }
 
 describe('PrTab', () => {
+  it('waits for the initial pipeline read so an ask PR does not flash before the parent PR', async () => {
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    mocks.list.mockImplementationOnce(async () => {
+      await pending;
+      return { connected: true, lanes: [{ id: 'mine', label: 'Mine', rows: [row] }] };
+    });
+    publish(ask('one', 43));
+    await render();
+    expect(host.textContent).toContain('Looking for its pull request');
+    expect(host.querySelector('.pro-title')).toBeNull();
+    expect(mocks.reads).not.toHaveBeenCalled();
+    await act(async () => { finish(); await pending; });
+    expect(host.querySelector('.pro-title')?.textContent).toContain('Fix the flaky retry');
+    expect(host.querySelector('[aria-pressed="true"]')?.textContent).toContain('This session');
+    expect(mocks.reads).not.toHaveBeenCalledWith('example-org/webapp', 43);
+  });
+
+  it('still reads an ask PR when the initial pipeline request fails', async () => {
+    mocks.list.mockRejectedValueOnce(new Error('502'));
+    publish(ask('one', 42));
+    await render();
+    expect(host.querySelector('.pr-panel-empty')).toBeNull();
+    expect(host.querySelector('.pro-title')?.textContent).toContain('Fix the flaky retry');
+    expect(mocks.reads).toHaveBeenCalledWith('example-org/webapp', 42);
+  });
+
+  it('reads an ask PR directly even when the parent and pipeline have no PR', async () => {
+    publish(ask('one', 42));
+    await render();
+    expect(host.querySelector('.pr-panel-empty')).toBeNull();
+    expect(host.querySelector('.pr-panel-source')?.textContent).toBe('From ask: Ask one');
+    expect(host.querySelector('.pro-title')?.textContent).toContain('Fix the flaky retry');
+    expect(mocks.reads).toHaveBeenCalledWith('example-org/webapp', 42);
+    expect(gateDetail('Bugbot')).toBe('Running');
+  });
+
+  it('switches among the parent PR and ask PRs, preserving the selected PR when more asks arrive', async () => {
+    mocks.rows = [row, { ...row, number: 43, title: 'Second PR', workstream: { projectId: 'ask-project', workstream: 'main' } }];
+    mocks.overviews['example-org/webapp#43'] = { ...overview, number: 43, title: 'Second PR', body: 'The other change.', checks: [] };
+    publish(ask('one', 43));
+    await render();
+    const picker = () => host.querySelector('[aria-label="Pull requests for this session"]')!;
+    expect(picker().querySelectorAll('button')).toHaveLength(2);
+    expect(host.querySelector('.pro-title')?.textContent).toContain('Fix the flaky retry');
+    await act(async () => (picker().querySelectorAll('button')[1] as HTMLButtonElement).click());
+    expect(host.querySelector('.pro-title')?.textContent).toContain('Second PR');
+    expect(host.querySelector('.pro-body')?.textContent).toBe('The other change.');
+    expect(gateDetail('Bugbot')).toBeUndefined();
+    await act(async () => publish(ask('one', 43), ask('two', 44)));
+    expect(picker().querySelectorAll('button')).toHaveLength(3);
+    expect(host.querySelector('.pro-title')?.textContent).toContain('Second PR');
+    expect(picker().querySelector('[aria-pressed="true"]')?.textContent).toContain('Ask one');
+  });
+
+  it('updates when an ask publishes a PR and never carries it into another workstream', async () => {
+    await render();
+    expect(host.querySelector('.pr-panel-empty')).not.toBeNull();
+    await act(async () => publish(ask('one', 42)));
+    expect(host.querySelector('.pro-title')?.textContent).toContain('Fix the flaky retry');
+    await act(async () => root.render(<PrTab project={project} workstream="other" />));
+    expect(host.querySelector('.pr-panel-empty')).not.toBeNull();
+    expect(host.querySelector('.pro-title')).toBeNull();
+  });
+
   it('says there is no pull request when the session has none', async () => {
     await render();
     expect(host.querySelector('.pr-panel-empty')?.textContent).toContain('No pull request yet');

@@ -9,6 +9,8 @@
 // one typed on the keyboard (Terminal's transformInput), then lets go. The
 // keyboard button focuses xterm's textarea inside the tap, which is what
 // raises a phone's keyboard (iOS raises it only for a focus in a gesture).
+// On a touch screen a one-finger vertical drag on the pane scrolls its
+// history (useTouchScroll.ts).
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, IconButton, ToggleButton } from '@launchpad-ui/components';
 import { Icon, type IconName } from '@launchpad-ui/icons';
@@ -16,6 +18,10 @@ import { Terminal, type TerminalHandle } from '../../components/Terminal';
 import { LP_THEME } from '../../launchpad/theme';
 import { ensureLaunchPadSprite } from '../../launchpad/sprite';
 import { barKeyBytes, TERMINAL_BAR_KEYS, withStickyCtrl, type BarKeyId } from '../../utils/terminalKeyBar';
+import { COARSE_POINTER_QUERY } from '../../utils/terminalKeys';
+import { useTouchScroll } from './useTouchScroll';
+
+const coarsePointer = () => typeof window.matchMedia === 'function' && window.matchMedia(COARSE_POINTER_QUERY).matches;
 
 // The arrows are LaunchPad's icons: the UI font's ← and → are drawn much
 // smaller than its ↑ and ↓. The key's label stays its accessible name's source.
@@ -107,9 +113,15 @@ export function PhoneTerminal({ sessionName, projectId, workstream, instanceId }
     return withStickyCtrl(data);
   }, [setCtrl]);
   const onReady = useCallback((h: TerminalHandle | null) => { handle.current = h; }, []);
+  const getHandle = useCallback(() => handle.current, []);
+  const paneRef = useRef<HTMLDivElement>(null);
+  // Coarse pointer only: a mouse never sends touch events anyway, but a
+  // desktop at a phone width keeps exactly what it had.
+  const [touch] = useState(coarsePointer);
+  useTouchScroll(paneRef, getHandle, touch);
   return (
     <div className="chat-term-phone">
-      <div className="chat-term-phone-pane">
+      <div className="chat-term-phone-pane" ref={paneRef} data-touch-scroll={touch || undefined}>
         <Terminal
           sessionName={sessionName}
           projectId={projectId}
@@ -120,7 +132,7 @@ export function PhoneTerminal({ sessionName, projectId, workstream, instanceId }
           transformInput={transformInput}
         />
       </div>
-      <TerminalKeyBar terminal={() => handle.current} ctrl={ctrl} onCtrlChange={setCtrl} />
+      <TerminalKeyBar terminal={getHandle} ctrl={ctrl} onCtrlChange={setCtrl} />
     </div>
   );
 }

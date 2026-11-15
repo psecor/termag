@@ -137,6 +137,32 @@ export function agoLabel(iso: string, now: Date = new Date()): string {
  * start its box 6 times, first 2h ago (Insufficient capacity.)". Null while
  * its starts take.
  */
+/**
+ * "Last Slack send failed 2h ago: not_in_channel · Last webhook send failed 5m ago: answered 503",
+ * one per failing channel, or null while sends go. A server from before per-channel errors sends only `legacy`.
+ */
+export function lastAlertErrorsLabel(
+  errors: { slack: { error: string; at: string } | null; webhook: { error: string; at: string } | null } | null | undefined,
+  legacy: { error: string; at: string } | null | undefined,
+  now: Date = new Date(),
+): string | null {
+  if (!errors) return lastAlertErrorLabel(legacy, now);
+  const one = (name: string, e: { error: string; at: string } | null) => {
+    if (!e) return null;
+    const when = agoLabel(e.at, now);
+    return `Last ${name} send failed${when ? ` ${when}` : ''}: ${e.error}`;
+  };
+  const parts = [one('Slack', errors.slack), one('webhook', errors.webhook)].filter(Boolean);
+  return parts.length ? parts.join(' · ') : null;
+}
+
+/** "Last send failed 2h ago: Slack: not_in_channel", or null while sends go. */
+export function lastAlertErrorLabel(e: { error: string; at: string } | null | undefined, now: Date = new Date()): string | null {
+  if (!e) return null;
+  const when = agoLabel(e.at, now);
+  return `Last send failed${when ? ` ${when}` : ''}: ${e.error}`;
+}
+
 export function boxStartFailuresLabel(f: { count: number; since: string | null; lastError: string | null } | null | undefined, now: Date = new Date()): string | null {
   if (!f || f.count <= 0) return null;
   const times = f.count === 1 ? 'once' : `${f.count} times`;

@@ -71,11 +71,24 @@ export function connectorStatus(c: {
   missingSecrets: string[];
   secretNames: string[] | null;
   linkStatus?: 'linked' | 'needs_link';
+  blocked?: string | null;
 }): { label: string; tone: ConnectorTone } {
-  if (c.authType === 'oauth') return c.linkStatus === 'linked' ? { label: 'authed', tone: 'good' } : { label: 'not authed', tone: 'warn' };
+  if (c.blocked) return { label: 'blocked', tone: 'bad' };
+  if (c.authType === 'oauth') return c.linkStatus === 'linked' ? { label: 'connected', tone: 'good' } : { label: 'not connected', tone: 'warn' };
   if (c.secretNames === null) return { label: 'secrets unreadable', tone: 'bad' };
   if (c.missingSecrets.length > 0) return { label: `missing ${c.missingSecrets.map(n => `secret.${n}`).join(', ')}`, tone: 'warn' };
   return { label: 'ready', tone: 'good' };
+}
+
+/**
+ * The sign-in button on an OAuth server's row, in Settings and in the setup
+ * wizard: Connect until it is linked, then Change permissions when the server
+ * offers a choice of scopes, else Reconnect. A catalog server's button is
+ * Connect too, so one verb starts every sign-in.
+ */
+export function connectAction(c: { linkStatus?: 'linked' | 'needs_link'; oauth?: { scopeChoice?: unknown } | null }): string {
+  if (c.linkStatus !== 'linked') return 'Connect';
+  return c.oauth?.scopeChoice ? 'Change permissions' : 'Reconnect';
 }
 
 /**

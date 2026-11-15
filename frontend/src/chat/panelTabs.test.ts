@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { addLauncher, closePanelTab, fitPanelTabs, initialPanelTabs, openAgentTab, openTool, parsePanelTabs, type PanelTabs } from './panelTabs';
+import {
+  addLauncher, agentTabOf, agentTabsOnScreen, closePanelTab, fitPanelTabs, initialPanelTabs, openAgentTab, openTool, parseAgentTabs, parsePanelTabs,
+  type PanelTab, type PanelTabs,
+  orderPanelTabs, placeTabs,
+} from './panelTabs';
 
 const kinds = (s: PanelTabs) => s.tabs.map(t => t.kind);
 const activeKind = (s: PanelTabs) => s.tabs.find(t => t.id === s.active)?.kind;
@@ -108,6 +112,46 @@ describe('agent tabs (docs/simple-ui-subagents.md)', () => {
   });
 });
 
+describe('the subagent tab each chat had on screen', () => {
+  const a: PanelTab = { id: 'a', kind: 'agent', agent: { chat: 'p1|main', id: 'toolu_1', title: 'One' } };
+  const a2: PanelTab = { id: 'a2', kind: 'agent', agent: { chat: 'p1|main', id: 'toolu_3', title: 'Three' } };
+  const b: PanelTab = { id: 'b', kind: 'agent', agent: { chat: 'p2|main', id: 'toolu_2', title: 'Two' } };
+  const t: PanelTab = { id: 't', kind: 'terminal' };
+  const tabs = [t, a, a2, b];
+
+  it("keeps one per chat: the one on screen beside it, leaving another chat's alone", () => {
+    expect(agentTabsOnScreen([], tabs, 'a', 'p1|main')).toEqual(['a']);
+    expect(agentTabsOnScreen(['a'], tabs, 'b', 'p2|main')).toEqual(['b', 'a']);
+    // A tool shown beside p2 drops p2's, not p1's.
+    expect(agentTabsOnScreen(['b', 'a'], tabs, 't', 'p2|main')).toEqual(['a']);
+    // Another of p1's subagents replaces its first.
+    expect(agentTabsOnScreen(['b', 'a'], tabs, 'a2', 'p1|main')).toEqual(['a2', 'b']);
+    // Beside no chat (a space, subagents off), nothing changes.
+    expect(agentTabsOnScreen(['b', 'a'], tabs, 't', null)).toEqual(['b', 'a']);
+  });
+
+  it('forgets a closed tab, a tab that is no subagent, and a second for one chat', () => {
+    expect(agentTabsOnScreen(['gone', 't', 'a', 'a2'], tabs, 't', 'p2|main')).toEqual(['a']);
+  });
+
+  it("finds a chat's among the tabs kept, and none for a chat with none or no tabs", () => {
+    expect(agentTabOf(['b', 'a'], tabs, 'p1|main')).toBe('a');
+    expect(agentTabOf(['b', 'a'], tabs, 'p2|main')).toBe('b');
+    expect(agentTabOf(['b', 'a'], tabs, 'p3|main')).toBeNull();
+    expect(agentTabOf(['b', 'a'], [t], 'p1|main')).toBeNull();
+    expect(agentTabOf(['a'], null, 'p1|main')).toBeNull();
+    expect(agentTabOf(['a'], tabs, null)).toBeNull();
+  });
+
+  it('reads a list of ids, or the bare id kept before, and nothing from a damaged record', () => {
+    expect(parseAgentTabs(null)).toEqual([]);
+    expect(parseAgentTabs(JSON.stringify(['a', 'b', 'a', 3, '']))).toEqual(['a', 'b']);
+    expect(parseAgentTabs('tmwe8qgqu1')).toEqual(['tmwe8qgqu1']);
+    expect(parseAgentTabs(JSON.stringify({ a: 1 }))).toEqual([]);
+    expect(parseAgentTabs('x'.repeat(201))).toEqual([]);
+  });
+});
+
 describe('fitPanelTabs', () => {
   const ids = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
   // + and its gap, and the tab on screen (150 px) and its gap: 182 px before the other tabs.
@@ -127,5 +171,38 @@ describe('fitPanelTabs', () => {
 
   it('labels every tab before the strip is measured', () => {
     expect(fitPanelTabs(ids, 'a', 0, 0)).toEqual({ compact: false, hidden: [] });
+  });
+});
+
+describe('one tab order for every place (project-files-enabled)', () => {
+  const T: PanelTab = { id: 'tt', kind: 'terminal' };
+  const B: PanelTab = { id: 'bb', kind: 'browser' };
+  const A: PanelTab = { id: 'aa', kind: 'agent', agent: { chat: 'p2|main', id: 'x', title: 'Other chat' } };
+  const F1: PanelTab = { id: 'f1', kind: 'file', file: { space: 'notes', path: 'a.md' } };
+  const F2: PanelTab = { id: 'f2', kind: 'file', file: { space: 'notes', path: 'b.md' } };
+  const here = (t: PanelTab) => t.kind !== 'agent';
+
+  it("shows a place's tabs in the kept order, its file tabs where they were put and new ones last", () => {
+    expect(placeTabs([T, A, B], here, [F1, F2]).map(t => t.id)).toEqual(['tt', 'bb', 'f1', 'f2']);
+    expect(placeTabs([{ id: 'f2', kind: 'file' }, T, { id: 'gone', kind: 'file' }, B], here, [F1, F2]).map(t => t.id)).toEqual(['f2', 'tt', 'bb', 'f1']);
+    expect(placeTabs([{ id: 'f2', kind: 'file' }, T], here, [F2])[0]).toBe(F2);
+  });
+
+  it('puts the tabs shown in a new order, leaving the hidden where they are, and keeps a file tab as its id', () => {
+    const shown = placeTabs([T, A, B], here, [F1]);
+    const moved = orderPanelTabs([T, A, B], shown, ['f1', 'tt', 'bb']);
+    expect(moved).toEqual([{ id: 'f1', kind: 'file' }, A, T, B]);
+    expect(placeTabs(moved, here, [F1]).map(t => t.id)).toEqual(['f1', 'tt', 'bb']);
+    // Back.
+    expect(placeTabs(orderPanelTabs(moved, placeTabs(moved, here, [F1]), ['tt', 'bb', 'f1']), here, [F1]).map(t => t.id)).toEqual(['tt', 'bb', 'f1']);
+    // Nothing moves, or no order of exactly those tabs: the same list.
+    expect(orderPanelTabs(moved, placeTabs(moved, here, [F1]), ['f1', 'tt', 'bb'])).toBe(moved);
+    expect(orderPanelTabs(moved, placeTabs(moved, here, [F1]), ['f1', 'tt'])).toBe(moved);
+    expect(orderPanelTabs(moved, placeTabs(moved, here, [F1]), ['f1', 'f1', 'bb'])).toBe(moved);
+  });
+
+  it('keeps file tabs in the stored order, ids only', () => {
+    expect(parsePanelTabs(JSON.stringify([{ id: 'f1', kind: 'file' }, { id: 'tt', kind: 'terminal' }, { id: 'Bad/Id', kind: 'file' }, { id: 'f1', kind: 'file' }])))
+      .toEqual([{ id: 'f1', kind: 'file' }, { id: 'tt', kind: 'terminal' }]);
   });
 });

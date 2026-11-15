@@ -46,7 +46,7 @@ export interface ProviderConfig {
   /** Runs in the simple UI's chat runner, not the agent pane (backend chatRunner). */
   chatRunner?: boolean;
   /** The headless agent the chat runner drives for it (backend chatEngine). */
-  chatEngine?: 'claude' | 'pi';
+  chatEngine?: 'claude' | 'pi' | 'cursor' | 'devin';
   /** The chatRunner provider its automations run as (backend automationChatProvider). */
   automationChatProvider?: string;
 }
@@ -112,6 +112,21 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     mcpConnectors: true,
   },
 
+  // cursor-agent driven headless by the chat runner (backend registry).
+  'cursor-chat': {
+    id: 'cursor-chat',
+    displayName: 'Cursor (chat)',
+    selectable: false,
+    chatRunner: true,
+    chatEngine: 'cursor',
+    badge: 'CR',
+    color: { base: 'rgba(160, 80, 220, 0.6)', bright: 'rgba(200, 140, 255, 0.9)' },
+    lightColor: { base: 'rgba(130, 80, 223, 0.6)', bright: 'rgba(102, 57, 186, 0.9)' },
+    usagePrecision: 'estimated',
+    statusSources: ['chat-runner'],
+    mcpConnectors: true,
+  },
+
   gemini: {
     id: 'gemini',
     displayName: 'Gemini',
@@ -157,6 +172,21 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     lightColor: { base: 'rgba(191, 57, 137, 0.6)', bright: 'rgba(153, 40, 110, 0.9)' },
     usagePrecision: 'estimated',
     statusSources: ['devin-hooks', 'tmux-poller:devin'],
+    mcpConnectors: true,
+  },
+
+  // The Devin CLI's ACP server driven by the chat runner (backend registry).
+  'devin-chat': {
+    id: 'devin-chat',
+    displayName: 'Devin (chat)',
+    selectable: false,
+    chatRunner: true,
+    chatEngine: 'devin',
+    badge: 'DV',
+    color: { base: 'rgba(236, 72, 153, 0.6)', bright: 'rgba(244, 114, 182, 0.9)' },
+    lightColor: { base: 'rgba(191, 57, 137, 0.6)', bright: 'rgba(153, 40, 110, 0.9)' },
+    usagePrecision: 'estimated',
+    statusSources: ['chat-runner'],
     mcpConnectors: true,
   },
 

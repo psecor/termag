@@ -8,13 +8,17 @@
 import type React from 'react';
 import { useCallback, useRef, useState } from 'react';
 import { admitImages, dragHasFiles, filesOf, isChatImageType, isPdfFile, MAX_CHAT_IMAGES, prepareAttachment, type PreparedImage } from './chatImageData';
+import type { KeptChatFile, UploadProgress } from './chatSpaceFiles';
 import { formatFileSize, MAX_TEXT_FILE_CHARS, noRoom, pastedTextFile, pastesAsFile, prepareTextFile, TextFileRefusal, textFilesChars, type BoxFile, type TextFile } from './chatTextFiles';
 
 /** The largest file the box keeps (backend services/chatFiles.ts MAX_CHAT_FILE_BYTES). */
 export const MAX_BOX_FILE_BYTES = 20 * 1000 * 1000;
 
-/** Uploads one file to the chat's box, saying meanwhile when it is waiting for the box to wake; answers where it was kept. */
-export type BoxFileUpload = (file: File, waiting: () => void) => Promise<{ path: string; name: string; size: number }>;
+/**
+ * Uploads one file to the chat's box, or its space (chat/chatSpaceFiles.ts keepChatFile), saying meanwhile when it is
+ * waiting for the box to wake and how much has gone where; answers where it was kept.
+ */
+export type BoxFileUpload = (file: File, waiting: () => void, progress?: (p: UploadProgress) => void) => Promise<KeptChatFile>;
 
 export interface ComposerAttachments {
   images: PreparedImage[];
@@ -24,7 +28,7 @@ export interface ComposerAttachments {
   setFiles: React.Dispatch<React.SetStateAction<TextFile[]>>;
   /** The text files held now, for a callback that must not wait for a render. */
   filesRef: React.MutableRefObject<TextFile[]>;
-  /** Other files, kept on the box: the message names their paths (chat/chatTextFiles.ts withTextFiles). */
+  /** Other files, kept on the box or in the chat's space: the message names their paths (chat/chatTextFiles.ts withTextFiles). */
   boxFiles: BoxFile[];
   setBoxFiles: React.Dispatch<React.SetStateAction<BoxFile[]>>;
   /** A file is still on its way to the box: the message can't name it yet. */
@@ -55,7 +59,7 @@ export interface ComposerAttachmentOptions {
   pdfs?: boolean;
   /** Images on their way into the composer from elsewhere, whose room counts as taken (useSdkChat's take-backs). */
   coming?: React.MutableRefObject<number>;
-  /** Any other file goes to the box this way (chat-file-attachments-enabled, chat-files-v1); absent, it is refused. */
+  /** Any other file goes to the box, or the chat's space, this way (chat-file-attachments-enabled, chat-files-v1); absent, it is refused. */
   upload?: BoxFileUpload;
   /** Why this chat's box can't take other files, said of one it refuses (GET …/chat fileRefusal). */
   uploadRefusal?: string;
@@ -94,11 +98,18 @@ export function useComposerAttachments({ pdfs = false, coming, upload, uploadRef
     const id = `box${++boxId}`;
     setBoxFiles(held => [...held, { id, name, size: f.size, path: null, status: 'uploading' }]);
     try {
-      const kept = await upload!(f, () => setBoxFiles(held => held.map(b => (b.id === id ? { ...b, status: 'waking' } : b))));
-      setBoxFiles(held => held.map(b => (b.id === id ? { ...b, name: kept.name, size: kept.size, path: kept.path, status: 'kept' } : b)));
+      const kept = await upload!(f,
+        () => setBoxFiles(held => held.map(b => (b.id === id ? { ...b, status: 'waking' } : b))),
+        // To the chat's space, with how much has gone; to the box (space: null), once the space didn't take it.
+        ({ sent, space }) => setBoxFiles(held => held.map(b => (b.id !== id ? b : space ? { ...b, space, sent } : { id: b.id, name: b.name, size: b.size, path: null, status: b.status }))));
+      setBoxFiles(held => held.map(b => (b.id === id ? {
+        id, name: kept.name, size: kept.size, path: kept.path, status: 'kept',
+        ...(kept.space && kept.url ? { space: kept.space, url: kept.url } : {}),
+        ...(kept.fellBack ? { fellBack: kept.fellBack } : {}),
+      } : b)));
     } catch (err) {
       setBoxFiles(held => held.filter(b => b.id !== id));
-      setNote(`${name} didn't reach the box: ${(err as Error).message}`);
+      setNote(`${name} wasn't attached: ${(err as Error).message}`);
     }
   }, [upload]);
   // Dropped, pasted or picked files: the images (and, where taken, PDFs) among them, made small enough

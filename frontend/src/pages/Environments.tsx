@@ -5,11 +5,11 @@ import { environmentsApi, type EnvironmentEventView, type EnvironmentResolvedVie
 import { useAuth } from '../contexts/AuthContext';
 import { useDefinitionCheck } from '../hooks/useDefinitionCheck';
 import { useEnvironmentPool } from '../hooks/useEnvironmentPool';
-import { poolFailureLine, poolLine, refreshLine } from '../utils/environmentPool';
+import { onWarmLine, poolFailureLine, poolLine, refreshLine } from '../utils/environmentPool';
 import {
-  ACTION_LABEL, DEFAULT_ENVIRONMENT_FILE, ENVIRONMENTS_DOCS_URL, describeEvent, draftFromEnvironment, draftInput,
-  emptyEnvironmentDraft, environmentCommands, environmentError, personLabel, pointerLabel, repoLabel, shareBlocker, visibilityGroups,
-  whenLabel, VISIBILITY_HINT, VISIBILITY_LABEL, type EnvironmentDraft,
+  ACTION_LABEL, DEFAULT_ENVIRONMENT_FILE, ENVIRONMENTS_DOCS_URL, canCreateShared, describeEvent, draftFromEnvironment, draftInput,
+  emptyEnvironmentDraft, environmentCommands, environmentError, environmentRights, personLabel, pointerLabel, repoLabel, shareBlocker, visibilityGroups,
+  whenLabel, SHARED_CREATE_ADMIN_ONLY, VISIBILITY_HINT, VISIBILITY_LABEL, type EnvironmentDraft,
 } from '../utils/environments';
 
 /**
@@ -19,11 +19,13 @@ import {
  * environment, editable in place, and `/environments/:id/history` is that
  * environment's history. An environment is an inline definition (checked on
  * blur and on save, never while typing) or a pointer to a file (repo : branch
- * : path), personal (its owner's alone) or shared (anyone's to see, use, edit
- * and delete, from a file on its repository's default branch): the list has
- * the caller's personal ones first, a new one is personal unless the form says
- * shared, and its owner switches it, the server's refusal saying the rule
- * when it can't be shared. Mounted
+ * : path), personal (its owner's alone) or shared (anyone's to see and use,
+ * only an admin's to change, from a file on its repository's default branch):
+ * the list has the caller's personal ones first, a new one is personal unless
+ * an admin's form says shared, and an admin switches it, the server's refusal
+ * saying the rule when it can't be shared. A non-admin sees a shared one's
+ * Edit, Make personal and Delete off, with why (utils/environments.ts
+ * environmentRights). Mounted
  * like Automations (no status socket, no heartbeat). The simple UI's section
  * is pages/chat/EnvironmentsPage.tsx, on the same API.
  */
@@ -88,6 +90,8 @@ function EnvironmentIndex() {
 
 function EnvironmentNew() {
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const mayShare = canCreateShared(user);
   const [draft, setDraft] = useState<EnvironmentDraft>(emptyEnvironmentDraft);
   const [visibility, setVisibility] = useState<EnvironmentVisibility>('personal');
   const [busy, setBusy] = useState(false);
@@ -116,9 +120,10 @@ function EnvironmentNew() {
         <label>Who can use it</label>
         {(['personal', 'shared'] as const).map(v => (
           <label key={v} className="npf-check">
-            <input type="radio" name="env-visibility" checked={visibility === v} onChange={() => setVisibility(v)} /> {VISIBILITY_LABEL[v]}: {VISIBILITY_HINT[v]}
+            <input type="radio" name="env-visibility" checked={visibility === v} disabled={v === 'shared' && !mayShare} onChange={() => setVisibility(v)} /> {VISIBILITY_LABEL[v]}: {VISIBILITY_HINT[v]}
           </label>
         ))}
+        {!mayShare && <div className="usage-dim">{SHARED_CREATE_ADMIN_ONLY}</div>}
         {blocked && <div className="error-text">{blocked}</div>}
       </div>
       {error && error !== blocked && <p className="error-text">{error}</p>}
@@ -185,11 +190,14 @@ function EnvironmentDetail({ id }: { id: string }) {
     }
   };
 
-  // The owner's switch. Sharing asks the server, whose refusal says the rule (a file on the repository's default branch).
+  // An admin's switch. Sharing asks the server, whose refusal says the rule (a file on the repository's default branch).
   const switchTo = async (to: EnvironmentVisibility) => {
     setBusy(true); setError(null);
     try {
-      setEnv(await environmentsApi.setVisibility(env.id, to, env.updatedAt));
+      const switched = await environmentsApi.setVisibility(env.id, to, env.updatedAt);
+      // Someone else's environment made personal is theirs alone: this page can no longer show it.
+      if (switched.visibility === 'personal' && switched.owner?.id !== user?.id) { navigate('/environments'); return; }
+      setEnv(switched);
     } catch (err) {
       setError(environmentError(err, to === 'shared' ? 'Could not share the environment' : 'Could not make the environment personal'));
     } finally {
@@ -197,6 +205,7 @@ function EnvironmentDetail({ id }: { id: string }) {
     }
   };
   const isOwner = !!user && env.owner?.id === user.id;
+  const may = environmentRights(env, user);
 
   return (
     <section className="dash-card">
@@ -215,13 +224,13 @@ function EnvironmentDetail({ id }: { id: string }) {
       ) : (
         <>
           <div className="auto-actions">
-            <button type="button" className="btn-primary" onClick={() => setDraft(draftFromEnvironment(env))}>Edit</button>
+            <button type="button" className="btn-primary" disabled={!may.edit} title={may.reason ?? undefined} onClick={() => setDraft(draftFromEnvironment(env))}>Edit</button>
             <Link className="btn-ghost" to={`/environments/${encodeURIComponent(env.id)}/history`}>History</Link>
-            {isOwner && (env.visibility === 'personal'
-              ? <button type="button" className="btn-ghost" disabled={busy} title="Runs from a file on its repository's default branch" onClick={() => void switchTo('shared')}>Share with everyone</button>
-              : <button type="button" className="btn-ghost" disabled={busy} title="Only you see it and use it" onClick={() => void switchTo('personal')}>Make personal</button>)}
-            <button type="button" className="btn-ghost menu-danger" disabled={busy} onClick={() => void remove()}>Delete</button>
+            {may.share && <button type="button" className="btn-ghost" disabled={busy} title="Runs from a file on its repository's default branch" onClick={() => void switchTo('shared')}>Share with everyone</button>}
+            {may.unshare && <button type="button" className="btn-ghost" disabled={busy} title={isOwner ? 'Only you see it and use it' : `Only ${personLabel(env.owner)} sees it and uses it`} onClick={() => void switchTo('personal')}>Make personal</button>}
+            <button type="button" className="btn-ghost menu-danger" disabled={busy || !may.remove} title={may.reason ?? undefined} onClick={() => void remove()}>Delete</button>
           </div>
+          {may.reason && <p className="usage-dim">{may.reason}.</p>}
           <dl className="auto-facts usage-dim">
             {env.kind === 'pointer'
               ? <div><dt>File</dt><dd><code>{pointerLabel(env.file)}</code></dd></div>
@@ -234,6 +243,8 @@ function EnvironmentDetail({ id }: { id: string }) {
               <div><dt>Pool</dt><dd>
                 {poolLine(pool).text}{poolLine(pool).commit && <> <code>{poolLine(pool).commit}</code></>}
                 {refreshLine(pool) && <div className="usage-dim">{refreshLine(pool)}</div>}
+                {onWarmLine(pool) && <div className={onWarmLine(pool)!.failed ? 'error-text' : ''}>{onWarmLine(pool)!.text}</div>}
+                {pool.onWarm?.state === 'failed' && pool.onWarm.log && <pre className="auto-memory">{pool.onWarm.log}</pre>}
                 {pool.lastFailure && <div className="error-text">{poolFailureLine(pool.lastFailure.at)}</div>}
                 {pool.lastFailure?.log && <pre className="auto-memory">{pool.lastFailure.log}</pre>}
               </dd></div>

@@ -13,8 +13,9 @@ const mocks = vi.hoisted(() => ({
   list: vi.fn(), get: vi.fn(), resolved: vi.fn(), events: vi.fn(), validate: vi.fn(), create: vi.fn(), update: vi.fn(), remove: vi.fn(), setVisibility: vi.fn(),
 }));
 vi.mock('../services/api', () => ({ environmentsApi: mocks }));
-// Signed in as Pat (u1), who owns full-stack.
-vi.mock('../contexts/AuthContext', () => ({ useAuth: () => ({ user: { id: 'u1' } }) }));
+// Signed in as Pat (u1), who owns full-stack, and is an admin unless a test says not.
+const auth = vi.hoisted(() => ({ user: { id: 'u1', role: 'admin' } as { id: string; role?: string } }));
+vi.mock('../contexts/AuthContext', () => ({ useAuth: () => auth }));
 
 const { default: Environments } = await import('./Environments');
 const { setFlagValues } = await import('../flags');
@@ -58,6 +59,7 @@ async function type(selector: string, value: string) {
 }
 
 beforeEach(() => {
+  auth.user = { id: 'u1', role: 'admin' };
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   for (const m of Object.values(mocks)) m.mockReset();
   mocks.list.mockResolvedValue([FULL_STACK]);
@@ -200,11 +202,45 @@ describe('Environments (full UI)', () => {
     expect(button('Make personal')).toBeTruthy();
   });
 
-  it("offers no switch on someone else's shared environment", async () => {
+  it("goes back to the list once an admin has made someone else's shared environment personal: it is theirs now", async () => {
+    const sams = { ...FULL_STACK, visibility: 'shared', owner: { id: 'u2', email: 'sam@example.com', name: 'Sam' } };
+    mocks.get.mockResolvedValue(sams);
+    mocks.setVisibility.mockResolvedValueOnce({ ...sams, visibility: 'personal' });
+    await show('/environments/e1');
+    await click(button('Make personal'));
+    expect(mocks.setVisibility).toHaveBeenCalledWith('e1', 'personal', FULL_STACK.updatedAt);
+    expect(button('Edit')).toBeUndefined();
+    expect(button('Share with everyone')).toBeUndefined();
+    expect(button('New environment') ?? container.querySelector('a.btn-primary')).toBeTruthy();
+  });
+
+  it("lets an admin make someone else's shared environment personal", async () => {
     mocks.get.mockResolvedValue({ ...FULL_STACK, visibility: 'shared', owner: { id: 'u2', email: 'sam@example.com', name: 'Sam' } });
     await show('/environments/e1');
     expect(container.textContent).toContain("shared, Sam's");
+    expect(button('Make personal')).toBeTruthy();
+  });
+
+  it("shows a non-admin a shared environment's Edit and Delete disabled, no switch, and says why", async () => {
+    auth.user = { id: 'u1', role: 'member' };
+    mocks.get.mockResolvedValue({ ...FULL_STACK, visibility: 'shared', owner: { id: 'u2', email: 'sam@example.com', name: 'Sam' } });
+    await show('/environments/e1');
+    expect(container.textContent).toContain('Only admins can change shared environments; make a personal one.');
+    expect(button('Edit').disabled).toBe(true);
+    expect(button('Delete').disabled).toBe(true);
     expect(button('Make personal')).toBeUndefined();
+  });
+
+  it('offers a non-admin no Shared choice on New environment, and no share on their own', async () => {
+    auth.user = { id: 'u1', role: 'member' };
+    await show('/environments/new');
+    expect(container.querySelectorAll<HTMLInputElement>('input[name="env-visibility"]')[1].disabled).toBe(true);
+    expect(container.textContent).toContain('Only admins make shared environments; yours is personal');
+    act(() => root.unmount());
+    root = createRoot(container);
+    await show('/environments/e1');
+    expect(button('Share with everyone')).toBeUndefined();
+    expect(button('Edit').disabled).toBe(false);
   });
 
   it('deletes after a confirm', async () => {

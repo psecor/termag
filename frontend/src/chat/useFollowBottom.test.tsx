@@ -69,4 +69,32 @@ describe('useFollowBottom', () => {
     expect(el.scrollTop).toBe(1000);
     expect(latest.current!.unseen).toBe(false);
   });
+
+  it('stays at the bottom when the scroller shrinks, and leaves a reader who scrolled up where they were', () => {
+    const observers: Array<() => void> = [];
+    const saved = (globalThis as { ResizeObserver?: unknown }).ResizeObserver;
+    (globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
+      constructor(cb: () => void) { observers.push(cb); }
+      observe() {}
+      disconnect() {}
+    };
+    try {
+      act(() => root.render(<Harness content="a1" chat="A" />));
+      const el = scroller();
+      expect(observers).toHaveLength(1);
+      // A banner appears above the pane: the browser keeps scrollTop, so the bottom slides out of view.
+      el.scrollTop = 900;
+      act(() => { el.dispatchEvent(new Event('scroll')); });
+      el.scrollTop = 820;
+      act(() => observers[0]());
+      expect(el.scrollTop).toBe(1000);
+
+      el.scrollTop = 0;
+      act(() => { el.dispatchEvent(new Event('scroll')); });
+      act(() => observers[0]());
+      expect(el.scrollTop).toBe(0);
+    } finally {
+      (globalThis as { ResizeObserver?: unknown }).ResizeObserver = saved;
+    }
+  });
 });

@@ -4,8 +4,15 @@
    and monospace only for code. Text is --text-primary or --text-secondary,
    which meet WCAG AA on both surfaces; --text-muted is kept for marks. */
 
+/* html/body are position:fixed + overflow:hidden, so the page owns its scroll.
+   The scroll padding keeps a field scrolled to (focus, Tab) clear of the
+   sticky .wel-top. */
 .wel-root {
-  min-height: 100vh;
+  position: fixed;
+  inset: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-padding-top: 56px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -42,8 +49,17 @@
 
 /* First-run setup. */
 .wel-top {
-  width: 100%;
-  max-width: 1080px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  flex-shrink: 0;
+  background: var(--bg-surface);
+  /* Across .wel-root's side padding too, or at phone widths it is only as
+     wide as the card, whose edge and shadow then show beside it. */
+  width: calc(100% + 32px);
+  max-width: 1112px;
+  margin-inline: -16px;
+  padding-inline: 16px;
   height: 56px;
   display: flex;
   align-items: center;
@@ -149,6 +165,32 @@
 .wel-next li svg { color: var(--accent); fill: currentColor; }
 
 .wel-form .npf { font-family: var(--font-ui); }
+
+/* The MCP servers step: one row per server. */
+.wel-tools { display: flex; flex-direction: column; gap: 14px; }
+.wel-tool-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.wel-tool {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-surface);
+}
+.wel-tool-main { display: flex; align-items: center; gap: 12px; }
+.wel-tool-main > button { flex-shrink: 0; }
+.wel-tool-error { font-size: 13px; color: var(--danger); }
+/* A localhost sign-in's paste box, and the checklist's scopes. */
+.wel-paste { display: flex; flex-direction: column; gap: 8px; }
+.wel-callback { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: 4px; }
+.wel-scopes { display: flex; flex-direction: column; gap: 8px; max-height: 50vh; overflow-y: auto; padding: 4px 0; }
+.wel-tool-mark {
+  width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.wel-tool-mark svg { color: var(--accent); fill: currentColor; }
+.wel-tool-name { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 600; color: var(--text-primary); }
+.wel-tool-status { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; font-size: 13px; color: var(--text-secondary); }
+.wel-tool-status svg { fill: currentColor; }
 
 .wel-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
 .wel-foot-note { font-size: 13px; color: var(--text-secondary); }

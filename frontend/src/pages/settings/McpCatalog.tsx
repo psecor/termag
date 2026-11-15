@@ -47,7 +47,7 @@ export type BeginLink = (c: McpConnector) => Promise<boolean>;
 export type SignIn = (connectorId: string, authorizeUrl: string) => boolean;
 
 // Asks the server for a connector's sign-in URL, for `scopes` (all when undefined).
-type StartOAuth = (connectorId: string, scopes: string[] | undefined) => Promise<string>;
+export type StartOAuth = (connectorId: string, scopes: string[] | undefined) => Promise<string>;
 
 /** One page's sign-ins: the scope checklist, and the localhost sign-in open in another tab. */
 export interface McpSignIn {
@@ -57,8 +57,13 @@ export interface McpSignIn {
   choose: (c: McpConnector) => void;
   // The localhost sign-in open in another tab, for its connector's paste box.
   pending: PendingSignIn | null;
-  // The open scope checklist, for the page to render.
+  // The open scope checklist, drawn as Settings draws it, for the page to render.
   scopeDialog: ReactNode;
+  // The connector whose checklist is open, and what a page that draws its own
+  // checklist (useScopeChecklist) passes it.
+  choosing: McpConnector | null;
+  start: StartOAuth;
+  closeChoice: () => void;
   returnTo: McpReturnTo | undefined;
 }
 
@@ -98,7 +103,7 @@ export function useMcpSignIn(onError: (failure: Failure) => void, returnTo?: Mcp
   const scopeDialog = choosing
     ? <ScopeDialog c={choosing} start={start} onSignIn={signIn} onCancel={() => setChoosing(null)} onError={onError} />
     : null;
-  return { signIn, beginLink, choose: setChoosing, pending, scopeDialog, returnTo };
+  return { signIn, beginLink, choose: setChoosing, pending, scopeDialog, returnTo, choosing, start, closeChoice: () => setChoosing(null) };
 }
 
 /**
@@ -106,13 +111,19 @@ export function useMcpSignIn(onError: (failure: Failure) => void, returnTo?: Mcp
  * consent screens (Slack's) grant everything asked for or nothing. Built from
  * the settings page's own Dialog, buttons and checkboxes.
  */
-function ScopeDialog({ c, start, onSignIn, onCancel, onError }: {
+export interface ScopeChecklistProps {
   c: McpConnector;
   start: StartOAuth;
   onSignIn: SignIn;
   onCancel: () => void;
   onError: (failure: Failure) => void;
-}) {
+}
+
+/**
+ * The scope checklist's state and its Continue, shared by Settings' dialog
+ * below and the setup wizard's (pages/welcome/McpStepRefresh.tsx).
+ */
+export function useScopeChecklist({ c, start, onSignIn, onCancel, onError }: ScopeChecklistProps) {
   const oauth = c.oauth!;
   const options = oauth.scopeChoice?.options ?? [];
   const [selected, setSelected] = useState<string[]>(() => initialScopes(oauth, c.linkStatus === 'linked'));
@@ -130,6 +141,12 @@ function ScopeDialog({ c, start, onSignIn, onCancel, onError }: {
       onCancel();
     }
   }
+  return { options, selected, setSelected, toggle, busy, signIn };
+}
+
+function ScopeDialog(props: ScopeChecklistProps) {
+  const { c, onCancel } = props;
+  const { options, selected, setSelected, toggle, busy, signIn } = useScopeChecklist(props);
 
   return (
     <Dialog title={`What may agents do in ${c.displayName ?? c.name}?`} onClose={onCancel} closeDisabled={busy} className="np-dialog mcp-scope-dialog">
@@ -160,6 +177,46 @@ function ScopeDialog({ c, start, onSignIn, onCancel, onError }: {
 }
 
 /**
+ * Connect on a catalog server: creates the user's connector for it and starts
+ * its sign-in, or opens the scope checklist when the server offers a choice.
+ * Answers true when the browser is leaving for the server's sign-in page, so
+ * the caller keeps its button busy; false when the page stays (a sign-in in a
+ * new tab, the checklist, or an error).
+ */
+export async function connectCatalogServer(
+  server: McpCatalogServer,
+  returnTo: McpReturnTo | undefined,
+  onSignIn: SignIn,
+  onChoose: (c: McpConnector) => void,
+  onReload: () => void,
+  onError: (failure: Failure) => void,
+): Promise<boolean> {
+  try {
+    const { authorizeUrl, connector } = await mcpConnectorsApi.connectCatalog(server.name, { chooseScopes: true, ...(returnTo ? { returnTo } : {}) });
+    if (authorizeUrl) {
+      // A sign-in in a new tab leaves the page here; the reload moves the
+      // server to Your servers, where its paste box is.
+      if (!onSignIn(connector.id, authorizeUrl)) return true;
+      onReload();
+      return false;
+    }
+    // The server offers a choice of scopes. Connect made the connector, so
+    // the reload lists it under Your servers while the checklist is open.
+    // Connect is enabled again, for when that reload fails and this row stays.
+    onReload();
+    onChoose(connector);
+    return false;
+  } catch (err) {
+    onError(apiError(err, 'Could not connect the server'));
+    // Connect can create the connector and then fail to start sign-in; the
+    // reload moves the server to Your servers (not connected, with Connect) rather
+    // than leaving it offered here.
+    onReload();
+    return false;
+  }
+}
+
+/**
  * A server the orchestrator offers that the user hasn't connected yet.
  * Connect creates their connector for it and sends them to the server's
  * sign-in page; after that it shows under their own servers instead.
@@ -179,31 +236,7 @@ function CatalogRow({ server, storeAvailable, returnTo, onSignIn, onChoose, onRe
 
   async function connect() {
     setBusy(true);
-    try {
-      const { authorizeUrl, connector } = await mcpConnectorsApi.connectCatalog(server.name, { chooseScopes: true, ...(returnTo ? { returnTo } : {}) });
-      if (authorizeUrl) {
-        // A sign-in in a new tab leaves the page here; the reload moves the
-        // server to Your servers, where its paste box is.
-        if (onSignIn(connector.id, authorizeUrl)) {
-          onReload();
-          setBusy(false);
-        }
-        return;
-      }
-      // The server offers a choice of scopes. Connect made the connector, so
-      // the reload lists it under Your servers while the checklist is open.
-      // Connect is enabled again, for when that reload fails and this row stays.
-      onReload();
-      onChoose(connector);
-      setBusy(false);
-    } catch (err) {
-      onError(apiError(err, 'Could not connect the server'));
-      // Connect can create the connector and then fail to start sign-in; the
-      // reload moves the server to Your servers (not authed, with Link) rather
-      // than leaving it offered here.
-      onReload();
-      setBusy(false);
-    }
+    if (!await connectCatalogServer(server, returnTo, onSignIn, onChoose, onReload, onError)) setBusy(false);
   }
 
   return (

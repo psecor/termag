@@ -35,6 +35,48 @@ export const spaceFileEvents = {
   },
 };
 
+/**
+ * The other moments to look again at the files on screen (under project-files-enabled):
+ * the window regains focus, the tab becomes visible, or the open session's turn ends (recheckFiles). A
+ * frame can be missed (the socket down, a write nobody confirmed), and an agent's turn is when its files land, so
+ * these are when a missed one would show. Events, not a timer: nothing runs while nothing changes. Focus and
+ * visibility usually come together, so they count once a second; a turn's end always counts. The window's
+ * listeners are attached only while something on screen listens.
+ */
+type Recheck = () => void;
+const rechecks = new Set<Recheck>();
+const WINDOW_RECHECK_MS = 1000;
+let lastWindowRecheck = -Infinity;
+const runRechecks = () => { for (const fn of [...rechecks]) fn(); };
+const onWindowBack = () => {
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+  const now = Date.now();
+  if (now - lastWindowRecheck < WINDOW_RECHECK_MS) return;
+  lastWindowRecheck = now;
+  runRechecks();
+};
+
+/** Calls `fn` on each moment to look again; returns the unsubscribe. */
+export function onFilesRecheck(fn: Recheck): () => void {
+  if (rechecks.size === 0 && typeof window !== 'undefined') {
+    window.addEventListener('focus', onWindowBack);
+    document.addEventListener('visibilitychange', onWindowBack);
+  }
+  rechecks.add(fn);
+  return () => {
+    rechecks.delete(fn);
+    if (rechecks.size === 0 && typeof window !== 'undefined') {
+      window.removeEventListener('focus', onWindowBack);
+      document.removeEventListener('visibilitychange', onWindowBack);
+    }
+  };
+}
+
+/** The open session's turn ended: its agent may have written files, so look again at the ones on screen. */
+export function recheckFiles(): void {
+  runRechecks();
+}
+
 /** How long the "Updated" cue shows. */
 export const CUE_MS = 2500;
 

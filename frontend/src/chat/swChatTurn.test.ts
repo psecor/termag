@@ -47,7 +47,7 @@ const CHAT_URL = `${ORIGIN}/termag/chat/p/p1`;
 const chatPush = (navigate = CHAT_URL) => ({
   web_push: 8030,
   mutable: true,
-  notification: { title: 'orchestrator', body: 'Your turn · done', navigate, tag: 'chat-turn:p1:main', data: { key: 'chat-turn:p1:main', kind: 'chat-turn' } },
+  notification: { title: 'orchestrator', body: 'Idle · done', navigate, tag: 'chat-turn:p1:main', data: { key: 'chat-turn:p1:main', kind: 'chat-turn' } },
 });
 const win = (path: string, focused = true, visibilityState = 'visible'): FakeWindow => ({ url: `${ORIGIN}${path}`, focused, visibilityState, messages: [] });
 
@@ -57,7 +57,7 @@ describe('sw.js chat-turn push', () => {
     await w.push(chatPush());
     expect(w.shown).toHaveLength(1);
     expect(w.shown[0].title).toBe('orchestrator');
-    expect(w.shown[0].options).toMatchObject({ tag: 'chat-turn:p1:main', renotify: true, body: 'Your turn · done', data: { url: CHAT_URL } });
+    expect(w.shown[0].options).toMatchObject({ tag: 'chat-turn:p1:main', renotify: true, body: 'Idle · done', data: { url: CHAT_URL } });
     // A Chrome that honours `navigate` would handle the click itself, never routing the open window.
     expect(w.shown[0].options).not.toHaveProperty('navigate');
   });
@@ -76,7 +76,7 @@ describe('sw.js chat-turn push', () => {
 
   it('always shows it on Safari, which revokes a push that shows nothing', async () => {
     const w = worker([win('/termag/chat/p/p1')]);
-    await w.pushSafari({ title: 'orchestrator', body: 'Done · your turn', navigate: CHAT_URL, data: { key: 'chat-turn:p1:main', kind: 'chat-turn' } });
+    await w.pushSafari({ title: 'orchestrator', body: 'Idle · your turn', navigate: CHAT_URL, data: { key: 'chat-turn:p1:main', kind: 'chat-turn' } });
     expect(w.shown).toHaveLength(1);
     // One notification per chat: not the per-push tag the phone's waiting pushes use.
     expect(w.shown[0].options.tag).toBe('chat-turn:p1:main');

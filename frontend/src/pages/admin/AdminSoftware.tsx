@@ -4,28 +4,51 @@ import { ChartCard } from '../dashboard/ChartCard';
 import { FollowedRunText, useFollowedRun } from './FollowedRun';
 import { OrchestratorClaudeUpdate } from './OrchestratorClaudeUpdate';
 import { DataTable, KeyValues, fmtAgo, pendingText, useAdminPolled, errorText, type Column } from './shared';
-import { fleetCountHosts, softwareCounts, tableHosts, type HostKindFilter } from './softwareCounts';
+import { fleetCountHosts, headerText, softwareCounts, tableHosts, type HostKindFilter, type HostNeedFilter } from './softwareCounts';
+import { cellBadges, isStale, runBadge } from './cellBadges';
 import {
   SCOPE_CHOICES, defaultRestart, hostButtonLabel, UPDATE_TOOLS, conflictText, fleetButtonLabel, fleetConfirmText, fleetResultLines, hostConfirmText, hostUpdateAction,
-  isUpdateOff, latestRunByHost, restartChoices, restartLabel, runAt, runClass, runSessionsText, runStateText, runVersions, scopeCount,
+  cellPolicyText, isUpdateOff, latestRunByHost, scopeCountWhy, restartChoices, restartLabel, runAt, runClass, runSessionsText, runStateText, runVersions, scopeCount, toolForInventory,
   type UpdateTool,
 } from '../../utils/toolUpdate';
 import { triggerText } from '../../utils/runTrigger';
 import { kernelParts, rebootCellText, rebootPanelText } from './rebootPending';
 
-const STATE_LABEL: Record<SoftwareState, string> = { current: 'current', behind: 'behind', outdated: 'outdated', ahead: 'ahead', pending: 'reboot pending', missing: 'missing', unknown: 'unknown' };
-const STATES: SoftwareState[] = ['current', 'behind', 'outdated', 'ahead', 'pending', 'missing', 'unknown'];
+const STATE_LABEL: Record<SoftwareState, string> = { current: 'current', 'below-floor': 'below floor', behind: 'behind', outdated: 'outdated', ahead: 'ahead', held: 'held', pending: 'reboot pending', missing: 'missing', unknown: 'unknown' };
+const STATES: SoftwareState[] = ['current', 'below-floor', 'behind', 'outdated', 'ahead', 'held', 'pending', 'missing', 'unknown'];
 const COMMITS = new Set(['termag', 'termag-checkout', 'image']);
 const LABEL: Record<string, string> = { 'termag-checkout': 'checkout', 'cursor-agent': 'cursor', claude: 'claude code', 'kernel-installed': 'kernel installed', reboot: 'reboot pending' };
 const isOffline = (h: SoftwareHost) => !h.connected && h.kind !== 'orchestrator';
 const show = (component: string, v: string | null) => (v ? (COMMITS.has(component) ? v.slice(0, 7) : v) : '—');
 
-function StateCell({ component, cell, now }: { component: string; cell: SoftwareHost['cells'][string] | undefined; now: number }) {
-  if (!cell) return <span className="usage-dim">·</span>;
-  const title = [cell.raw, cell.path, `${STATE_LABEL[cell.state]} · seen ${fmtAgo(cell.observedAt, now)}`].filter(Boolean).join('\n');
+/** A host's newest run of a tool, for its cell's hover: trigger, restart, result, versions and when. */
+function runLine(run: SoftwareUpdateRun, now: number): string {
+  const versions = runVersions(run);
+  return [`last update: ${runStateText(run)}${versions ? ` · ${versions}` : ''} · ${fmtAgo(runAt(run), now)}`, `${triggerText(run)} · ${restartLabel(run.restart)}`, run.reason, runSessionsText(run), run.detail].filter(Boolean).join('\n');
+}
+
+/**
+ * One cell of the host matrix: the version, coloured by state, and for a tool termag updates its
+ * badges (cellBadges: updating, failed and why, the sweep blocked, held, stale), which replace the
+ * "last <tool> update" columns. A stale row is dimmed. The hover has the full version line, the policy
+ * it was graded against and the newest run.
+ */
+function StateCell({ component, cell, run, offline, orchestrator = false, now }: { component: string; cell: SoftwareHost['cells'][string] | undefined; run?: SoftwareUpdateRun; offline: boolean; orchestrator?: boolean; now: number }) {
+  // No inventory row for the tool (a box that never reported it): its newest run still shows, as in Recent updates.
+  if (!cell) {
+    const b = run ? runBadge(run, false) : null;
+    return run ? <span className="usage-dim" title={runLine(run, now)}>·{b && <span className={`admin-sw-badge ${b.className}`}>{b.text}</span>}{!b && <span className="admin-sw-badge usage-dim">last update: {runStateText(run)}</span>}</span> : <span className="usage-dim">·</span>;
+  }
+  const title = [cell.raw, cell.path, `${STATE_LABEL[cell.state]} · seen ${fmtAgo(cell.observedAt, now)}`, cellPolicyText(cell, orchestrator), run ? runLine(run, now) : null].filter(Boolean).join('\n');
   const text = cell.state === 'missing' ? '—' : component === 'reboot' ? rebootCellText(cell, now) : show(component, cell.version);
-  // The reboot row's cell is words ("pending · 3 d"), not a version, so it stays in the UI font.
-  return <span className={`admin-sw admin-sw--${cell.state}${component === 'reboot' ? ' admin-sw--words' : ''}`} title={title}>{text}</span>;
+  const badges = toolForInventory(component) ? cellBadges(cell, run, offline, now) : [];
+  // The reboot row's cell is words ("pending · 3 d"), not a version, so it stays in the UI font; so do the badges.
+  return (
+    <span title={title} className={isStale(cell, offline, now) ? 'admin-sw-stale' : undefined}>
+      <span className={`admin-sw admin-sw--${cell.state}${component === 'reboot' ? ' admin-sw--words' : ''}`}>{text}</span>
+      {badges.map(b => <span key={b.text} className={`admin-sw-badge ${b.className}`}>{b.text}</span>)}
+    </span>
+  );
 }
 
 // What "refresh inventories" waits before reading the matrix again; an update request waits the same.
@@ -44,14 +67,6 @@ function RestartSelect({ tool, value, onChange }: { tool: UpdateTool; value: Too
       {choices.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
     </select>
   );
-}
-
-/** A host's newest run of one tool, in the matrix's "last update" column for that tool. */
-function RunCell({ run, now }: { run: SoftwareUpdateRun | undefined; now: number }) {
-  if (!run) return <span className="usage-dim">—</span>;
-  const versions = runVersions(run);
-  const title = [`${triggerText(run)} · ${restartLabel(run.restart)}`, run.reason, runSessionsText(run), run.detail].filter(Boolean).join('\n');
-  return <span className={runClass(run)} title={title}>{runStateText(run)}{versions ? <> · <span className="admin-mono">{versions}</span></> : null} · {fmtAgo(runAt(run), now)}</span>;
 }
 
 /**
@@ -98,7 +113,7 @@ export function HostToolUpdate({ tool, host, preview, runs, onRequested, onPoll,
  * which hides every action of it), the floor and target (from that preview, else a probe of the first
  * connected box that has the tool), and its fleet action. Called once per tool, in UPDATE_TOOLS' order.
  */
-function useToolUpdates(tool: UpdateTool, m: SoftwareMatrix | null, countHosts: SoftwareHost[], selected: string | null, setErr: (e: string | null) => void) {
+function useToolUpdates(tool: UpdateTool, m: SoftwareMatrix | null, countHosts: SoftwareHost[], selected: string | null, setErr: (e: string | null) => void, now: number) {
   const { component } = tool;
   const preview = useAdminPolled(useCallback(() => (selected ? offOr(adminApi.toolUpdatePreview(component, selected)).then(p => ({ hostKey: selected, p })) : Promise.resolve(null)), [component, selected]), 60_000, { deps: [selected] });
   const runs = useAdminPolled(useCallback(() => offOr(adminApi.softwareUpdates(component, RUNS_LIMIT)), [component]), 60_000);
@@ -116,7 +131,8 @@ function useToolUpdates(tool: UpdateTool, m: SoftwareMatrix | null, countHosts: 
   // The fleet's floor and target: a box's preview, never the orchestrator host's, whose target is its own pin
   // (orchestrator-claude-update-policy) while the fleet's runs take each box's policy (Bugbot on #1165).
   const ref: Ref | null = hostPreview && hostPreview !== 'off' && hostPreview.kind !== 'orchestrator' ? hostPreview : probe.data && probe.data !== 'off' ? probe.data : null;
-  const fleetN = m ? scopeCount(tool, countHosts, scope, ref, m.hosts) : null;
+  const fleetN = m ? scopeCount(tool, countHosts, scope) : null;
+  const fleetWhy = m ? scopeCountWhy(tool, countHosts, scope) : null;
   const reread = () => { runs.refresh(); preview.refresh(); };
   // A host panel's run ended: its preview's current version, live and busy counts and in-flight have moved.
   const rereadPreview = () => { preview.refresh(); };
@@ -127,13 +143,13 @@ function useToolUpdates(tool: UpdateTool, m: SoftwareMatrix | null, countHosts: 
     catch (e) { setErr(conflictText(e, tool) ?? errorText(e)); }
     finally { setFleetBusy(false); }
   };
-  return { tool, runs, runList, lastRun, hostPreview, rereadPreview, ref, fleetN, scope, setScope, fleetRestart, setFleetRestart, fleet, fleetBusy, fleetOpen, setFleetOpen, updateFleet, reread };
+  return { tool, runs, runList, lastRun, hostPreview, rereadPreview, ref, fleetN, fleetWhy, scope, setScope, fleetRestart, setFleetRestart, fleet, fleetBusy, fleetOpen, setFleetOpen, updateFleet, reread };
 }
 
 export function AdminSoftware({ now }: { now: number }) {
   const matrix = useAdminPolled(useCallback(() => adminApi.software(), []), 60_000);
   const clients = useAdminPolled(useCallback(() => adminApi.clientVersions(), []), 5 * 60_000);
-  const [onlyBad, setOnlyBad] = useState(false);
+  const [need, setNeed] = useState<HostNeedFilter>('all');
   // The header, "By component" and the fleet update's count; the host table has its own "hide offline hosts".
   const [excludeOffline, setExcludeOffline] = useState(true);
   const [hideOffline, setHideOffline] = useState(false);
@@ -148,26 +164,28 @@ export function AdminSoftware({ now }: { now: number }) {
   const countHosts = useMemo(() => (m ? fleetCountHosts(m.hosts, excludeOffline && counts?.canExclude === true) : []), [m, excludeOffline, counts]);
   // One per tool, always all of them and in this order (hooks): Claude Code, Codex, the Cursor agent, the Devin CLI, pi, the GitHub CLI, the AWS CLI, Node, Python.
   const tools = [
-    useToolUpdates(UPDATE_TOOLS[0], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[1], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[2], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[3], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[4], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[5], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[6], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[7], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[8], m, countHosts, selected, setErr),
-    useToolUpdates(UPDATE_TOOLS[9], m, countHosts, selected, setErr),
+    useToolUpdates(UPDATE_TOOLS[0], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[1], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[2], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[3], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[4], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[5], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[6], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[7], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[8], m, countHosts, selected, setErr, now),
+    useToolUpdates(UPDATE_TOOLS[9], m, countHosts, selected, setErr, now),
   ];
   const enabled = tools.filter(t => t.runList);
 
-  const hosts = useMemo(() => tableHosts(m?.hosts ?? [], { kind, onlyBad, hideOffline }), [m, kind, onlyBad, hideOffline]);
+  const hosts = useMemo(() => tableHosts(m?.hosts ?? [], { kind, show: need, hideOffline }), [m, kind, need, hideOffline]);
   const components = m?.components ?? [];
 
   const sumCols: Column<SoftwareSummary>[] = [
     { id: 'component', label: 'component', value: r => components.indexOf(r.component), render: r => LABEL[r.component] ?? r.component },
     { id: 'reference', label: 'reference', value: r => r.reference ?? '', render: r => <span title={r.referenceNote}>{r.reference ? <span className="admin-mono">{r.reference}</span> : <span className="usage-dim">{COMMITS.has(r.component) ? 'image commit' : '—'}</span>}</span> },
-    ...STATES.map(s => ({
+    { id: 'floor', label: 'floor', value: r => r.floor ?? '', render: r => (r.floor ? <span className="admin-mono" title="the policy's security floor: below it is below floor">{r.floor}</span> : <span className="usage-dim">—</span>) },
+    // A state no component has (every count 0) has no column: `ahead` and `held` rarely do.
+    ...STATES.filter(s => (counts?.summary ?? []).some(r => r.counts[s] > 0)).map(s => ({
       id: s, label: STATE_LABEL[s], align: 'right' as const, value: (r: SoftwareSummary) => r.counts[s],
       render: (r: SoftwareSummary) => (r.counts[s] ? <span className={`admin-sw admin-sw--${s}`}>{r.counts[s]}</span> : <span className="usage-dim">0</span>),
     })),
@@ -189,7 +207,7 @@ export function AdminSoftware({ now }: { now: number }) {
   // Its scope and restart choices open under the table: the row has no room for them.
   if (enabled.length) sumCols.push({ id: 'update', label: '', value: () => 0, render: r => {
     const t = enabled.find(x => x.tool.inventory === r.component);
-    return t ? <button type="button" className="btn-ghost btn-tiny" aria-expanded={t.fleetOpen} onClick={() => t.setFleetOpen(o => !o)}>{fleetButtonLabel(t.scope, t.fleetN)}</button> : null;
+    return t ? <button type="button" className="btn-ghost btn-tiny" aria-expanded={t.fleetOpen} title={t.fleetWhy ?? undefined} onClick={() => t.setFleetOpen(o => !o)}>{fleetButtonLabel(t.scope, t.fleetN)}</button> : null;
   } });
   const runCols: Column<SoftwareUpdateRun>[] = [
     { id: 'host', label: 'host', value: r => nameOf(r.hostKey), render: r => <button type="button" className="admin-link" onClick={() => setSelected(r.hostKey)}>{nameOf(r.hostKey)}</button> },
@@ -201,24 +219,30 @@ export function AdminSoftware({ now }: { now: number }) {
     { id: 'at', label: 'requested', value: r => Date.parse(r.requestedAt), render: r => fmtAgo(r.requestedAt, now) },
   ];
 
-  const lastCol = (t: typeof tools[number]) => (t.tool.component === 'claude' ? 'last update' : `last ${LABEL[t.tool.inventory] ?? t.tool.inventory} update`);
   // The host matrix: its rows keep the server's order until a header is clicked. A version column sorts
-  // in natural order (2.1.318 above 2.1.99), a last-update column by when the run ended.
+  // in natural order (2.1.318 above 2.1.99). A tool's newest run is in its cell's badges and hover.
+  const runOf = (c: string, hostKey: string) => enabled.find(t => t.tool.inventory === c)?.lastRun.get(hostKey);
+  // The host matrix's columns: every component the inventories have, and a tool termag updates that has runs
+  // but no inventory row on any host (an agent that never probed it), so its runs show on their hosts' rows
+  // too, not only under Recent updates (Devin on #1608).
+  const matrixComponents = [...components, ...enabled.filter(t => !components.includes(t.tool.inventory) && (t.runList?.length ?? 0) > 0).map(t => t.tool.inventory)];
+  // What the host filter searches in a cell: the version, its badges, and its newest run's state and
+  // versions, the words the cell shows (Bugbot on #1608).
+  const cellText = (c: string, h: SoftwareHost): string => {
+    const cell = h.cells[c], run = runOf(c, h.hostKey);
+    const shown = !cell || cell.state === 'missing' ? '' : c === 'reboot' ? rebootCellText(cell, now) : show(c, cell.version);
+    const badges = !toolForInventory(c) ? [] : cell ? cellBadges(cell, run, isOffline(h), now).map(b => b.text) : run ? [runBadge(run, false)?.text ?? `last update: ${runStateText(run)}`] : [];
+    return [shown, ...badges, run ? runVersions(run) ?? '' : ''].filter(Boolean).join(' ');
+  };
   const hostCols: Column<SoftwareHost>[] = [
     { id: 'host', label: 'host', value: h => h.name, text: h => `${h.name}${isOffline(h) ? ' offline' : ''}`,
       render: h => <><button type="button" className="admin-link" onClick={() => setSelected(h.hostKey)}>{h.name}</button>{isOffline(h) ? <span className="usage-dim"> · offline</span> : null}</> },
     { id: 'owner', label: 'owner', value: h => h.owner ?? (h.kind === 'box' ? 'warm pool' : ''), render: h => <span className="usage-dim">{h.owner ?? (h.kind === 'box' ? 'warm pool' : '')}</span> },
-    ...components.map((c): Column<SoftwareHost> => ({
+    ...matrixComponents.map((c): Column<SoftwareHost> => ({
       id: `c:${c}`, label: LABEL[c] ?? c, title: c,
       value: h => { const cell = h.cells[c]; return !cell || cell.state === 'missing' ? null : cell.version; },
-      text: h => { const cell = h.cells[c]; return !cell || cell.state === 'missing' ? '' : c === 'reboot' ? rebootCellText(cell, now) : show(c, cell.version); },
-      render: h => <StateCell component={c} cell={h.cells[c]} now={now} />,
-    })),
-    ...enabled.map((t): Column<SoftwareHost> => ({
-      id: `run:${t.tool.component}`, label: lastCol(t), title: `the newest ${t.tool.label} update run on the host, of the last ${RUNS_LIMIT}`,
-      value: h => { const r = t.lastRun.get(h.hostKey); return r ? Date.parse(runAt(r)) : null; },
-      text: h => { const r = t.lastRun.get(h.hostKey); return r ? `${runStateText(r)} ${runVersions(r) ?? ''}` : ''; },
-      render: h => <RunCell run={t.lastRun.get(h.hostKey)} now={now} />,
+      text: h => cellText(c, h),
+      render: h => <StateCell component={c} cell={h.cells[c]} run={runOf(c, h.hostKey)} offline={isOffline(h)} orchestrator={h.kind === 'orchestrator'} now={now} />,
     })),
   ];
 
@@ -227,8 +251,8 @@ export function AdminSoftware({ now }: { now: number }) {
   return (
     <>
       {err && <div className="admin-error">{err}</div>}
-      <ChartCard title="Software" value={counts ? `${counts.needs} of ${counts.total} hosts need updates` : undefined}
-        subtitle={m ? `tools vs the newest version in the fleet · kernels vs the newest on their track and host kind · termag and images vs the newest image (box ${m.targets.boxCommit?.slice(0, 7) ?? '?'}, orchestrator ${m.targets.orchestratorImageCommit?.slice(0, 7) ?? '?'}) · orchestrator runs ${m.targets.runningCommit?.slice(0, 7) ?? '?'}` : pendingText(matrix)}
+      <ChartCard title="Software" value={counts ? headerText(counts) : undefined}
+        subtitle={m ? `tools termag updates vs each box’s policy (its target and floor), other tools vs the newest version in the fleet · kernels vs the newest on their track and host kind · termag and images vs the newest image (box ${m.targets.boxCommit?.slice(0, 7) ?? '?'}, orchestrator ${m.targets.orchestratorImageCommit?.slice(0, 7) ?? '?'}) · orchestrator runs ${m.targets.runningCommit?.slice(0, 7) ?? '?'}` : pendingText(matrix)}
         stale={matrix.loading}>
         {m && <KeyValues items={[
           ['inventories', `boxes and agents every 6 h and on connect · last sweep ${fmtAgo(m.collector.lastSweepAt, now)} · orchestrator ${fmtAgo(m.collector.lastSelfAt, now)}`],
@@ -257,7 +281,7 @@ export function AdminSoftware({ now }: { now: number }) {
               {SCOPE_CHOICES.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
             </select>
             <RestartSelect tool={t.tool} value={t.fleetRestart} onChange={t.setFleetRestart} />
-            <button type="button" className="btn-ghost btn-tiny" disabled={t.fleetBusy || t.fleetN === 0} onClick={() => void t.updateFleet(nameOf, rereadAfterUpdate)}>{t.fleetN == null ? 'update…' : `update ${t.fleetN}…`}</button>
+            <button type="button" className="btn-ghost btn-tiny" disabled={t.fleetBusy || t.fleetN === 0} title={t.fleetWhy ?? undefined} onClick={() => void t.updateFleet(nameOf, rereadAfterUpdate)}>{t.fleetN == null ? 'update…' : `update ${t.fleetN}…`}</button>
             <button type="button" className="btn-ghost btn-tiny" onClick={() => t.setFleetOpen(false)}>cancel</button>
           </div>
         ))}
@@ -273,15 +297,17 @@ export function AdminSoftware({ now }: { now: number }) {
         <div className="dash-section-title">
           Hosts {m && <span className="dash-count">{hosts.length}</span>}
           <span className="usage-dim">hover a cell for the full version line, path and when it was seen; click a host for its history</span>
-          <label className="admin-toggle"><input type="checkbox" checked={onlyBad} onChange={e => setOnlyBad(e.target.checked)} /> only hosts needing updates</label>
+          <select className="admin-select" value={need} onChange={e => setNeed(e.target.value as HostNeedFilter)} aria-label="show hosts">
+            <option value="all">every host</option><option value="needs">hosts needing updates</option><option value="below-floor">below a floor</option>
+          </select>
           <label className="admin-toggle"><input type="checkbox" checked={hideOffline} onChange={e => setHideOffline(e.target.checked)} /> hide offline hosts</label>
           <select className="admin-select" value={kind} onChange={e => setKind(e.target.value as typeof kind)} aria-label="host kind">
             <option value="all">all hosts</option><option value="box">boxes</option><option value="agent">orchestrator agents</option><option value="orchestrator">orchestrator</option>
           </select>
         </div>
         <DataTable rows={hosts} columns={hostCols} rowKey={h => h.hostKey} selectedKey={selected} dense className="admin-sw-matrix"
-          search="filter hosts" storageKey="software-hosts" resetKey={[kind, onlyBad, hideOffline]}
-          empty={m ? (onlyBad ? 'every host is current' : 'no hosts') : pendingText(matrix)} />
+          search="filter hosts" storageKey="software-hosts" resetKey={[kind, need, hideOffline]}
+          empty={m ? (need === 'below-floor' ? 'no host is below a floor' : need === 'needs' ? 'every host is current' : 'no hosts') : pendingText(matrix)} />
       </section>
 
       {selected && (

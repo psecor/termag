@@ -1,5 +1,8 @@
 // The simple UI's sidebar of tabs (chat/openItems.ts), grouped by space: agents, space files and new tabs,
-// one fixed-height line each, in the person's order. A chat's tab is in the
+// one fixed-height line each, in the person's order.
+// With chat-sidebar-recent-order-enabled, spaces and chats sort by session
+// activity instead, files follow chats, and manual reordering is disabled.
+// A chat's tab is in the
 // chat's own space (chat/chatSpaces.ts chatHomeSpace), wherever it was opened
 // from; a chat in no space of its own is in the space its tab was opened from
 // (OpenItem.openedIn), and the list scrolls to the open tab. A new tab goes on top
@@ -30,7 +33,7 @@ import { nestInOrder, readFoldedAgents, toggleFoldedAgent, type TreeRow } from '
 import { useBoxOf } from '../../chat/useBoxOf';
 import { chatLiveKey } from '../../chat/chatLiveStatus';
 import { canStartChatIn, chatHomeSpace, groupKey, readCollapsedSpaces, toggleCollapsedSpace } from '../../chat/chatSpaces';
-import { agentLabel, workstreamLabel, workstreamTip } from '../../chat/explorerAgents';
+import { workstreamTip } from '../../chat/explorerAgents';
 import { itemHref, itemKey, newTabId, NO_SPACE_EXPLORER, type OpenItem } from '../../chat/openItems';
 import { moveShown, useIncrementalWindows, type IncrementalList } from '../../chat/incrementalList';
 import { chatRowName, sidebarLine } from '../../chat/simpleChat';
@@ -43,6 +46,8 @@ import { useSimpleData } from './simpleData';
 import { ShowMoreRow } from './ShowMoreRow';
 import { SpaceSwatch } from './SpaceSwatch';
 import { SpaceShareDialog } from './SpaceShareDialog';
+import { SpaceSlackDialog } from './SpaceSlackDialog';
+import { spaceSlackActions } from '../../chat/spaceSlack';
 import { useAuth } from '../../contexts/AuthContext';
 import { spaceShareActions } from '../../chat/spaceShare';
 import { useChatChrome } from './chatChrome';
@@ -141,11 +146,12 @@ const STATUS_GROUP = '\u0000state:';
 
 /** The groups and their tabs. */
 export function OpenItemsGroups() {
-  const { items, rows, live, setupOf, spaces, activeTab, links, unseen } = useSimpleData();
+  const { items, rows, live, setupOf, spaces, activeTab, links, unseen, userProjectOf } = useSimpleData();
   const [foldedAgents, setFoldedAgents] = useState(() => readFoldedAgents(typeof localStorage === 'undefined' ? null : localStorage));
   const boxOf = useBoxOf();
   // A session's tab dragged into a composer puts a reference to it in the message (chat/sessionRef.ts).
   const refsOn = useFlag(FLAGS.chatSessionReferences, false);
+  const recentOrder = useFlag(FLAGS.chatSidebarRecentOrder, false);
   // The chrome refresh: a state mark and the age on each agent, the title alone, and a count per space.
   const { refresh } = useChatChrome();
   const navigate = useNavigate();
@@ -161,7 +167,9 @@ export function OpenItemsGroups() {
       if (i.kind !== 'chat') return null;
       const r = byKey.get(itemKey(i));
       return r ? chatRowState(r, live.get(chatLiveKey(r.projectId, r.workstream)), setupOf.get(r.projectId), unseen.has(r.key)).kind : null;
-    }, activeTab, i => byKey.get(itemKey(i))?.projectName ?? null)
+    }, activeTab, i => byKey.get(itemKey(i))?.projectName ?? null,
+    // Under user-projects-enabled, Group by Project is by the person's project.
+    userProjectOf ? i => userProjectOf(i.projectId) : undefined)
     : groups.map(g => ({ space: g.space, status: null, items: g.items, total: g.items.length }));
   /**
    * A group's whole order, for Close other tabs and Close tabs below: a space's
@@ -192,7 +200,10 @@ export function OpenItemsGroups() {
   const { user } = useAuth();
   const [sharing, setSharing] = useState<string | null>(null);
   const sharedSpace = sharing ? spaces.spaces.find(s => s.name === sharing) : undefined;
-  const shareActions = (space: string | null) => spaceShareActions(space, setSharing);
+  // Slack channels (space-channels-enabled): the space section's second item, after Share space; it opens SpaceSlackDialog.
+  const slackChannelsOn = useFlag(FLAGS.spaceChannels, false);
+  const [slackFor, setSlackFor] = useState<string | null>(null);
+  const shareActions = (space: string | null) => [...spaceShareActions(space, setSharing), ...spaceSlackActions(space, slackChannelsOn, setSlackFor)];
   const activeItem = items.state.items.find(i => i.id === activeTab);
   const activeChatKey = activeItem ? chatTreeKey(activeItem) : null;
   const unfoldedRuns = useUnfoldedRuns();
@@ -359,7 +370,7 @@ export function OpenItemsGroups() {
   function row(item: OpenItem, index: number, groupId: string, groupName: string, ids: string[], node?: TreeRow<OpenItem>, run?: { name?: string }) {
     const isActive = item.id === activeTab;
     // A state's group (view options) mixes spaces, so its tabs keep their places: no drag, no Alt+Up/Down.
-    const movable = !groupId.startsWith(STATUS_GROUP) && !run;
+    const movable = !recentOrder && !groupId.startsWith(STATUS_GROUP) && !run;
     const depth = node?.depth ?? 0;
     const kids = node?.childCount ?? 0;
     const treeKey = node?.key ?? null;
@@ -387,16 +398,13 @@ export function OpenItemsGroups() {
       state = refresh ? chatRowState(r, live.get(chatLiveKey(r.projectId, r.workstream)), setupOf.get(r.projectId), unseen.has(r.key)) : null;
       const since = refresh ? stateSince(r) : null;
       age = since ? fmtAge(Date.now() - new Date(since).getTime()) : null;
-      icon = state ? <StatusMark kind={state.kind} /> : <AgentIcon status={line.glyph} />;
-      // One line: Claude's title for the session with the project after it, or the project as before.
-      // Under the refresh, the title alone; the project is in its tooltip.
+      icon = state ? <StatusMark kind={state.kind} unseen={state.unseen} /> : <AgentIcon status={line.glyph} />;
+      // One line: the session's title (chat/sessionTitle.ts), the same string as its header, with no
+      // " · <workstream>" after it; the project is in its tooltip and a Standard row's second line.
       const named = chatRowName(r);
-      // An ask leads with its title (Claude's title for its session after it); otherwise as named.
-      name = run?.name ? run.name : named.title
-        ? <>{named.title}{named.where && !refresh && <span className="chat-row-ws"> · {named.where}</span>}</>
-        : <>{r.projectName}{r.workstream !== 'main' && <span className="chat-row-ws"> · {workstreamLabel(r)}</span>}</>;
-      label = named.title ? [named.title, named.where].filter(Boolean).join(' · ') : agentLabel(r);
-      where = named.title ? named.where || null : null;
+      name = run?.name ? run.name : named.title;
+      label = [named.title, named.where].filter(Boolean).join(' · ');
+      where = named.where;
       // Under the refresh, the state's words, which say when it is unseen.
       status = state?.text ?? line.state;
       const box = boxOf(r);
@@ -460,8 +468,8 @@ export function OpenItemsGroups() {
         )}
         {/* The href has no tab, so a modifier click opens the thing itself in a new browser tab. */}
         <Link to={itemHref(item)} draggable={false} data-tab={item.id} data-focus-key={`tab:${item.id}`} className={`chat-item${isActive ? ' active' : ''}`}
-          aria-current={isActive ? 'page' : undefined} aria-describedby="chat-items-move-hint"
-          data-kind={item.kind} data-band={band} data-state={state?.kind} data-density={standard ? 'standard' : undefined} data-tip={tip}
+          aria-current={isActive ? 'page' : undefined} aria-describedby={movable ? 'chat-items-move-hint' : undefined}
+          data-kind={item.kind} data-band={band} data-state={state?.kind} data-unseen={state?.unseen || undefined} data-density={standard ? 'standard' : undefined} data-tip={tip}
           onClick={e => {
             if (!plainClick(e)) return;
             e.preventDefault();
@@ -515,10 +523,10 @@ export function OpenItemsGroups() {
     ], `run:${r.key}`);
     return (
       <li key={`run:${r.key}`} className="chat-item-li chat-tree-li" style={{ '--chat-depth': 1 } as React.CSSProperties} onContextMenu={menu}>
-        <Link to={href} className="chat-item chat-run-link" data-focus-key={`run:${r.key}`} data-kind="chat" data-band={r.band} data-state={state?.kind}
+        <Link to={href} className="chat-item chat-run-link" data-focus-key={`run:${r.key}`} data-kind="chat" data-band={r.band} data-state={state?.kind} data-unseen={state?.unseen || undefined}
           data-density={standard ? 'standard' : undefined} data-tip={[label, status, line.message].filter(Boolean).join('\n')}
           onKeyDown={e => { if (isMenuKey(e)) menu(e); }}>
-          {state ? <StatusMark kind={state.kind} /> : <AgentIcon status={line.glyph} />}
+          {state ? <StatusMark kind={state.kind} unseen={state.unseen} /> : <AgentIcon status={line.glyph} />}
           {standard ? <StandardRowBody name={name} age={age} where={null} state={state} /> : (
             <>
               <span className="chat-item-name">{name}</span>
@@ -586,7 +594,7 @@ export function OpenItemsGroups() {
           <button type="button" className="chat-item chat-runs-item" data-focus-key={`runs:${g.projectId}`} aria-expanded={open} data-state={state?.kind}
             data-tip={[g.projectName, auto ? `automation: ${subtitle}` : 'automation', countText].join('\n')}
             onClick={() => setRunsUnfolded(g.projectId, !open)}>
-            {state ? <StatusMark kind={state.kind} /> : <AgentIcon status={glyphOf(lead)} />}
+            {state ? <StatusMark kind={state.kind} unseen={state.unseen} /> : <AgentIcon status={glyphOf(lead)} />}
             <span className="chat-item-name">{g.projectName}{subtitle && <span className="chat-row-ws"> · {subtitle}</span>}</span>
             <span className="chat-group-count" aria-label={countText}>{count}</span>
             <span className="chat-runs-caret chat-group-caret" aria-hidden="true" />
@@ -610,6 +618,7 @@ export function OpenItemsGroups() {
 
   return (
     <>
+      {slackFor && slackChannelsOn && <SpaceSlackDialog space={slackFor} onClose={() => setSlackFor(null)} />}
       {sharedSpace && (
         <SpaceShareDialog space={sharedSpace} userId={user?.id} onClose={() => setSharing(null)} onChanged={() => spaces.reload?.()}
           onLeft={() => {

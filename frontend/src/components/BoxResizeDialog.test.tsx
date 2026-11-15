@@ -13,7 +13,7 @@ const { BoxResizeDialog } = await import('./BoxResizeDialog');
 const SIZES = [
   { size: 'small' as const, vcpus: 2, memoryGiB: 8, instanceType: 'm8g.large' },
   { size: 'medium' as const, vcpus: 4, memoryGiB: 16, instanceType: 'm8g.xlarge' },
-  { size: 'large' as const, vcpus: 8, memoryGiB: 32, instanceType: 'm8g.2xlarge' },
+  { size: 'large' as const, vcpus: 4, memoryGiB: 32, instanceType: 'r8g.xlarge' },
 ];
 const info = (over: Partial<BoxResizeInfo> = {}, box: Partial<BoxResizeInfo['box']> = {}): BoxResizeInfo => ({
   box: { id: 'b1', name: 'olive', status: 'ready', size: 'small', instanceType: 'm8g.large', hibernationConfigured: false, ...box },
@@ -48,7 +48,7 @@ describe('the full UI Size… dialog', () => {
     mocks.resizeInfo.mockResolvedValue(info());
     await open();
     const options = [...document.querySelectorAll('#box-resize-size option')].map(o => o.textContent);
-    expect(options).toEqual(['Small · 2 vCPU, 8 GB RAM (current)', 'Medium · 4 vCPU, 16 GB RAM', 'Large · 8 vCPU, 32 GB RAM']);
+    expect(options).toEqual(['Small · 2 vCPU, 8 GB RAM (current)', 'Medium · 4 vCPU, 16 GB RAM', 'Large · 4 vCPU, 32 GB RAM']);
     expect((document.querySelector('#box-resize-size') as HTMLSelectElement).value).toBe('medium');
     expect(document.body.textContent).toContain('Now: Small · 2 vCPU, 8 GB RAM');
     expect(document.querySelector('.dialog-title')?.textContent).toBe('Resize “olive”');

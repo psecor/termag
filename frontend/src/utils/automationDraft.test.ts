@@ -5,6 +5,7 @@ const view: AutomationDraftSource = {
   schedule: '30 7 * * 1-5', timezone: 'Europe/Berlin', prompt: 'Triage the issues', tier: 'read',
   prOnChange: false, wakeBox: true, maxRunMinutes: 30, keepRuns: 5, enabled: false,
   spaceName: 'team', notifySlack: true,
+  alertPrefix: 'BLOCKER:', alertRegex: null, alertTarget: 'project', healthAlerts: false,
 };
 
 describe('emptyDraft', () => {
@@ -41,6 +42,15 @@ describe('draftFrom', () => {
     expect(d.notifySlack).toBe(false);
   });
 
+  it('reads a view without the alert fields as no keyword, the DM and health alerts on, which the server takes with its flag off', () => {
+    const { alertPrefix: _p, alertRegex: _r, alertTarget: _t, healthAlerts: _h, ...older } = view;
+    expect(draftBody(draftFrom(older))).toMatchObject({ alertPrefix: null, alertRegex: null, alertTarget: 'dm', healthAlerts: true });
+  });
+
+  it('sends a blank prefix or regex as off', () => {
+    expect(draftBody({ ...draftFrom(view), alertPrefix: '  ', alertRegex: '' })).toMatchObject({ alertPrefix: null, alertRegex: null });
+  });
+
   it('keeps a cron no preset matches as custom', () => {
     const d = draftFrom({ ...view, schedule: '*/20 * * * *' });
     expect(d.schedule).toMatchObject({ preset: 'custom', cron: '*/20 * * * *' });
@@ -67,7 +77,7 @@ describe('draftBody', () => {
 
   it('carries exactly the fields the routes take today', () => {
     expect(Object.keys(draftBody(emptyDraft())).sort()).toEqual(
-      ['enabled', 'keepRuns', 'maxRunMinutes', 'notifySlack', 'prOnChange', 'prompt', 'schedule', 'spaceName', 'tier', 'timezone', 'wakeBox'],
+      ['alertPrefix', 'alertRegex', 'alertTarget', 'enabled', 'healthAlerts', 'keepRuns', 'maxRunMinutes', 'notifySlack', 'prOnChange', 'prompt', 'schedule', 'spaceName', 'tier', 'timezone', 'wakeBox'],
     );
   });
 });

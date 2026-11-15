@@ -12,6 +12,8 @@ import { recentsBucket, RecentsBucket } from '../utils/recents';
 import { aggregateReviewRing, reviewsOf, ringStateFor, RingState } from '../utils/reviewRing';
 import { withoutAskChats } from '../utils/askChatVisibility';
 import type { ProjectKind } from '../utils/projectKind';
+import { statusText } from '../chat/statusWords';
+import { sessionTitle } from '../chat/sessionTitle';
 
 /** Where a row sits in the home list, in list order. */
 export type HomeBand = 'attention' | 'running' | 'reviewing' | 'other';
@@ -25,8 +27,10 @@ export interface InboxRow {
   workstream: string;
   /** The workstream's id; absent for a project with no workstreams yet (its implicit main). */
   workstreamId?: string | null;
-  /** Claude's own title for the session, from its workstream; null before it has one. */
+  /** Claude's own title for the session, or a person's rename, from its workstream; null before it has one. */
   sessionTitle?: string | null;
+  /** Who set sessionTitle (Workstream.sessionTitleSource): a person's rename wins over the ask's title (chat/sessionTitle.ts). */
+  sessionTitleSource?: string | null;
   /** The chat's own space (Workstream.spaceId), by id; null for none. */
   spaceId?: string | null;
   /** The server fixed that space (chat/chatSpaces.ts chatHomeSpace); false only from an older backend. */
@@ -55,6 +59,8 @@ export interface InboxRow {
   updatedAt: string | null;
   /** When the agent last came to rest from working or waiting (AgentStatus.stoppedAt): it has had a turn. */
   stoppedAt?: string | null;
+  /** When it entered its current status (AgentStatus.statusSince), when the status frame said. */
+  statusSince?: string | null;
   message: string | null;
   contextTokens: number | null;
   rateLimited: string | null;
@@ -117,7 +123,7 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
     const owner = p.ownerUsername ?? username;
     const workstreams = p.workstreams.filter(ws => !ws.archived);
     const list: Array<{
-      id?: string; name: string; sessionTitle?: string | null; spaceId?: string | null; spaceFixedAt?: string | null; askThread?: Workstream['askThread'];
+      id?: string; name: string; sessionTitle?: string | null; sessionTitleSource?: string | null; spaceId?: string | null; spaceFixedAt?: string | null; askThread?: Workstream['askThread'];
       explorerArchivedAt?: string | null;
     }> = workstreams.length > 0 ? workstreams : [{ id: undefined, name: 'main' }];
     for (const ws of list) {
@@ -130,6 +136,7 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
         workstream: ws.name,
         workstreamId: ws.id ?? null,
         sessionTitle: ws.sessionTitle ?? null,
+        sessionTitleSource: ws.sessionTitleSource ?? null,
         spaceId: ws.spaceId ?? null,
         spaceFixed: ws.spaceFixedAt != null,
         ...(ws.explorerArchivedAt ? { explorerArchived: true } : {}),
@@ -151,6 +158,7 @@ export function buildRows(projects: Project[], statusMap: Record<string, AgentSt
         waitingReason: st?.waitingReason ?? null,
         updatedAt: st?.updatedAt ?? p.lastActiveAt ?? null,
         stoppedAt: st?.stoppedAt ?? null,
+        statusSince: st?.statusSince ?? null,
         message: st?.message?.trim() || null,
         contextTokens: st?.contextTokens ?? null,
         rateLimited: st?.rateLimited ?? null,
@@ -304,10 +312,10 @@ export function recentSessions(rows: readonly InboxRow[], recents: RecentRow[] |
 
 /**
  * The Search tab's instant filter: every whitespace-separated term must hit
- * the project, workstream, owner, provider, status message or review PR
- * (`312` or `#312`), or the box's name when `boxNameOf` gives one, or the
- * name `nameOf` gives it (the simple UI's session title), case-insensitively.
- * Keeps the home order.
+ * the session's title (chat/sessionTitle.ts, what its row shows), the
+ * project, workstream, owner, provider, status message or review PR (`312`
+ * or `#312`), or the box's name when `boxNameOf` gives one, or the name
+ * `nameOf` gives it, case-insensitively. Keeps the home order.
  */
 export function searchRows(
   rows: readonly InboxRow[], query: string, boxNameOf?: (row: InboxRow) => string | null, nameOf?: (row: InboxRow) => string | null,
@@ -315,7 +323,7 @@ export function searchRows(
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean).map(t => t.replace(/^#(?=\d)/, ''));
   if (terms.length === 0) return [];
   return rows.filter(r => {
-    const hay = [r.projectName, r.workstream, r.owner, r.provider ?? '', r.message ?? '', r.review?.pr != null ? String(r.review.pr) : '', boxNameOf?.(r) ?? '', nameOf?.(r) ?? '']
+    const hay = [sessionTitle(r), r.projectName, r.workstream, r.owner, r.provider ?? '', r.message ?? '', r.review?.pr != null ? String(r.review.pr) : '', boxNameOf?.(r) ?? '', nameOf?.(r) ?? '']
       .join('\n').toLowerCase();
     return terms.every(t => hay.includes(t));
   });
@@ -364,21 +372,27 @@ export const STATUS_GLYPH: Record<AgentStatusValue, string> = {
   not_running: '·',
 };
 
+/** A waiting agent's words: Needs you, and what for. */
 export function waitingLabel(reason: AgentStatus['waitingReason']): string {
-  if (reason === 'approval') return 'Needs approval';
-  if (reason === 'user_input') return 'Asked you a question';
-  return 'Waiting';
+  if (reason === 'approval') return statusText('Needs you', 'approval');
+  if (reason === 'user_input') return statusText('Needs you', 'a question');
+  return statusText('Needs you');
 }
 
-/** The words beside a row's glyph: what state it is in, so the colour is not the only signal. */
+/**
+ * The words beside a row's glyph: what state it is in, so the colour is not
+ * the only signal. One of the four status words (chat/statusWords.ts), then
+ * why; the order is the band's (bandFor), so a finished review needs you even
+ * while the agent works.
+ */
 export function statusLabel(row: Pick<InboxRow, 'status' | 'waitingReason' | 'ring' | 'review'>): string {
   const pr = row.review?.pr != null ? ` #${row.review.pr}` : '';
   if (row.status === 'waiting') return waitingLabel(row.waitingReason);
-  if (row.ring === 'waiting') return 'Devin needs you';
-  if (row.ring === 'done') return `Review ready${pr}`;
-  if (row.status === 'working') return 'Running';
-  if (row.ring === 'reviewing') return `Reviewing${pr}`;
-  return row.status === 'idle' ? 'Ready' : 'Not running';
+  if (row.ring === 'waiting') return statusText('Needs you', 'Devin');
+  if (row.ring === 'done') return statusText('Needs you', `review${pr} ready`);
+  if (row.status === 'working') return statusText('Working');
+  if (row.ring === 'reviewing') return statusText('Working', `reviewing${pr}`);
+  return statusText(row.status === 'idle' ? 'Idle' : 'Not running');
 }
 
 /**

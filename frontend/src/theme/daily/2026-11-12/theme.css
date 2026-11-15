@@ -1,0 +1,33 @@
+/* Bay Bridge twilight. Accent contrast on base, surface, elevated and simple chrome:
+   dark #c4b5fd on #0d1117 10.25:1, #161b22 9.37:1, #21262d 8.24:1,
+   #181a1f 9.43:1, #23252a 8.31:1; white on dark dim #8263c5 4.63:1.
+   Dark dim borders on #0d1117 4.09:1, #161b22 3.74:1, #21262d 3.29:1,
+   #181a1f 3.76:1, #23252a 3.32:1.
+   light #6543ad on #ffffff 7.10:1, #f6f8fa 6.67:1, #eaeef2 6.09:1,
+   #f7f9fb 6.72:1; white on light dim #6543ad 7.10:1.
+   Light dim borders use the same #6543ad and ratios as the light accent.
+   Primary hover and active fills retain dim: white contrast stays 4.63:1
+   dark and 7.10:1 light, without lightening the fill toward white. */
+
+html[data-daily-theme="2026-11-12"],
+html[data-daily-theme="2026-11-12"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-12"] .lp-theme {
+  --accent: #c4b5fd;
+  --accent-dim: #8263c5;
+  --accent-rgb: 196, 181, 253;
+  --lp-color-bg-interactive-primary-hover: var(--accent-dim);
+  --lp-color-bg-interactive-primary-active: var(--accent-dim);
+}
+
+html[data-daily-theme="2026-11-12"][data-palette="light"],
+html[data-daily-theme="2026-11-12"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-12"][data-palette="light"] .lp-theme {
+  --accent: #6543ad;
+  --accent-dim: #6543ad;
+  --accent-rgb: 101, 67, 173;
+}
+
+html[data-daily-theme="2026-11-12"] .chat-send-btn:hover:not(:disabled),
+html[data-daily-theme="2026-11-12"] .chat-compose-send:hover:not(:disabled) {
+  background: var(--accent-dim);
+}

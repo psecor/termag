@@ -6,6 +6,8 @@ describe('workspaceChangeFromPush', () => {
     expect(workspaceChangeFromPush({ type: 'workspace', what: 'projects' })).toBe('projects');
     expect(workspaceChangeFromPush({ type: 'workspace', what: 'boxes' })).toBe('boxes');
     expect(workspaceChangeFromPush({ type: 'workspace', what: 'prs' })).toBe('prs');
+    expect(workspaceChangeFromPush({ type: 'workspace', what: 'preview-links' })).toBe('preview-links');
+    expect(workspaceChangeFromPush({ type: 'workspace', what: 'pins' })).toBe('pins');
   });
 
   it('ignores other frames and lists it does not know', () => {

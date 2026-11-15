@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { isEdgeSessionExpired } from '../contexts/ConnectionContext';
+import { isEdgeSessionExpired, isEdgeSignedOut } from '../contexts/ConnectionContext';
 import { CHAT_PDF_TYPE, createImageCache, storedImageUrl, type LoadedImage, type PreparedImage } from './chatImageData';
 import { formatFileSize, textFileKind, type BoxFile, type SentBoxFile, type TextFile } from './chatTextFiles';
 import { ImageLightbox } from './ImageLightbox';
+import { spaceFileLink } from '../utils/spaces';
 import type { ChatImage } from './sdkChat';
 
 // A chat's stored images do not change (named by their bytes), so one read
@@ -10,6 +11,8 @@ import type { ChatImage } from './sdkChat';
 const MAX_CACHED = 64;
 
 async function readStoredImage(url: string): Promise<LoadedImage> {
+  // Signed out at the edge, even an unfollowed 302 resets a login's nonce (utils/edgeSession.ts).
+  if (isEdgeSignedOut()) return { kind: 'error', message: 'Signed out' };
   try {
     // redirect: 'manual', as TerminalImagePreview: an expired session's 302 must not be followed in the background.
     const res = await fetch(url, { credentials: 'same-origin', redirect: 'manual' });
@@ -98,8 +101,20 @@ function MessageTextFile({ file }: { file: SentTextFile }) {
     : <span className="sdk-file" data-text-file="" title={title}>{inner}</span>;
 }
 
-/** A file the box keeps for a message (chat/chatTextFiles.ts): its name, and where on the box, which this browser can't fetch. */
+/**
+ * A file the box keeps for a message (chat/chatTextFiles.ts): its name, and where on the box, which this browser
+ * can't fetch. One in the chat's space (chat/chatSpaceFiles.ts) links to it there: the link is built again from
+ * the space and path the message names, on this page's origin, never taken from the message's text.
+ */
 function MessageBoxFile({ file }: { file: SentBoxFile }) {
+  if (file.space) {
+    const href = spaceFileLink(window.location.origin, import.meta.env.BASE_URL ?? '/', file.space, file.path);
+    return (
+      <a className="sdk-file" data-space-file="" href={href} target="_blank" rel="noopener noreferrer" title={`${file.name} · ${file.size} · in space ${file.space} at ${file.path}`}>
+        <span className="sdk-file-kind">{textFileKind(file.name)}</span><span className="sdk-file-name">{file.name}</span>
+      </a>
+    );
+  }
   return (
     <span className="sdk-file" data-box-file="" title={`${file.name} · ${file.size} · on the box at ${file.path}`}>
       <span className="sdk-file-kind">{textFileKind(file.name)}</span><span className="sdk-file-name">{file.name}</span>
@@ -170,6 +185,25 @@ function MessageImageList({ images, projectId, workstream }: { images: ChatImage
   );
 }
 
+/**
+ * Where a composer's other file is, in the few words the chip has room for: on its way (to the chat's space,
+ * with how much has gone, or to the box), waiting for the box to wake, or there: in the space, or on the box.
+ */
+export function boxFileStatus(file: BoxFile): string {
+  if (file.status === 'waking') return 'waking the box…';
+  if (file.status === 'kept') return file.space ? 'in space' : 'on the box';
+  if (!file.space) return 'uploading…';
+  const pct = typeof file.size === 'number' && file.size > 0 && file.sent ? Math.min(99, Math.floor((file.sent / file.size) * 100)) : 0;
+  return pct ? `uploading ${pct}%…` : 'uploading…';
+}
+
+/** The chip's title: name, size, where, and which space or why not one (the chip itself is too narrow to say it). */
+function boxFileTitle(file: BoxFile): string {
+  const size = typeof file.size === 'number' ? formatFileSize(file.size) : file.size;
+  const where = file.space ? (file.status === 'kept' ? `in space ${file.space} at ${file.path}` : `uploading to space ${file.space}`) : boxFileStatus(file);
+  return `${file.name} · ${size} · ${where}${file.fellBack ? ` (${file.fellBack})` : ''}`;
+}
+
 /** The composer's attached images, PDFs and text files, each with a remove button. */
 export function ComposerImages({ images, files = [], boxFiles = [], onRemove, disabled }: { images: PreparedImage[]; files?: TextFile[]; boxFiles?: BoxFile[]; onRemove: (id: string) => void; disabled?: boolean }) {
   if (!images.length && !files.length && !boxFiles.length) return null;
@@ -192,12 +226,14 @@ export function ComposerImages({ images, files = [], boxFiles = [], onRemove, di
         </div>
       ))}
       {boxFiles.map(file => {
-        // Where it is: on its way, waiting for the box to wake, or there (the message will name its path).
-        const status = file.status === 'kept' ? 'on the box' : file.status === 'waking' ? 'waking the box…' : 'uploading…';
+        const status = boxFileStatus(file);
+        // Kept on the box with no space tried says nothing, as before; in a space, or on the box instead of one, it says which.
+        const shown = file.status !== 'kept' || file.space || file.fellBack;
         return (
-          <div key={file.id} className="chat-attachment" data-file="" data-box-file={file.status} title={`${file.name} · ${typeof file.size === 'number' ? formatFileSize(file.size) : file.size} · ${status}`}>
+          <div key={file.id} className="chat-attachment" data-file="" data-box-file={file.status} data-in-space={file.status === 'kept' && file.space ? '' : undefined}
+            title={boxFileTitle(file)}>
             <span className="sdk-file-kind">{textFileKind(file.name)}</span><span className="chat-attachment-name">{file.name}</span>
-            {file.status !== 'kept' && <span className="chat-attachment-status" role="status">{status}</span>}
+            {shown && <span className="chat-attachment-status" role="status">{status}</span>}
             <button type="button" className="chat-attachment-remove" aria-label={`Remove ${file.name}`} disabled={disabled}
               onClick={() => onRemove(file.id)}>×</button>
           </div>

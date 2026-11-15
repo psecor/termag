@@ -6,8 +6,8 @@ import type { PrGroupMember, PrGroupMemberInput, PrGroupSuggestion, PrPipelineRe
 import { LANE_SHORT, isReviewLane, rowDetail } from './prPipeline';
 import { GITHUB_PR_URL } from './review';
 
-/** The views that carry the cards: a grouped row shows only in its card there. */
-export const CARD_VIEWS = ['needs_you', 'needs_my_review'] as const;
+/** The views that carry the cards: a grouped row shows only in its card there. Team reviews too: a team-requested stack's rows have no other lane, so there its grouping would otherwise be invisible. */
+export const CARD_VIEWS = ['needs_you', 'needs_my_review', 'team_review'] as const;
 export const isCardView = (view: string): boolean => (CARD_VIEWS as readonly string[]).includes(view);
 
 /** Where a PR typed without an owner is looked for, after the repositories the lanes know. */

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { installedAppMode, installedOnTouch, isAppleMobile, isStandalone, mobileHrefFromWorkspaceSearch, readOptOut, shouldRedirectToMobile, writeOptOut, MOBILE_OPT_OUT_KEY } from './redirect';
+import { installedAppMode, installedOnTouch, isAppleMobile, isStandalone, mobileHrefFromWorkspaceSearch, phoneChatSession, phoneLandingHref, readOptOut, shouldRedirectToMobile, writeOptOut, MOBILE_OPT_OUT_KEY } from './redirect';
 
 describe('shouldRedirectToMobile', () => {
   it('needs a phone-like viewport and no opt-out', () => {
@@ -47,6 +47,60 @@ describe('mobileHrefFromWorkspaceSearch', () => {
     expect(mobileHrefFromWorkspaceSearch('?project=abc')).toBe('/m/p/abc');
     expect(mobileHrefFromWorkspaceSearch('?project=abc&ws=main')).toBe('/m/p/abc');
     expect(mobileHrefFromWorkspaceSearch('?project=abc&ws=feat-64')).toBe('/m/p/abc?ws=feat-64');
+  });
+});
+
+describe('phoneLandingHref', () => {
+  const on = (search: string, hasChat = false) => phoneLandingHref({ search, phoneChat: true, hasChat });
+  const off = (search: string, hasChat = false) => phoneLandingHref({ search, phoneChat: false, hasChat });
+
+  it('flag on: the workspace URL opens the chat', () => {
+    expect(on('')).toBe('/chat');
+    expect(on('?')).toBe('/chat');
+    expect(on('?iss=https%3A%2F%2Fexample.okta.com')).toBe('/chat');
+  });
+
+  it('flag on: a link to a session the chat can show opens its chat', () => {
+    expect(on('?project=abc', true)).toBe('/chat/p/abc');
+    expect(on('?project=abc&ws=main', true)).toBe('/chat/p/abc');
+    expect(on('?project=abc&ws=fix-64', true)).toBe('/chat/p/abc?ws=fix-64');
+    expect(on('?project=a%2Fb&ws=x%20y', true)).toBe('/chat/p/a%2Fb?ws=x%20y');
+  });
+
+  it('flag on: a link to a session the chat cannot show (MetaTerm, an automation\'s main, unlisted, a failed read) stays on /m', () => {
+    expect(on('?project=abc', false)).toBe('/m/p/abc');
+    expect(on('?project=abc&ws=fix-64', false)).toBe('/m/p/abc?ws=fix-64');
+  });
+
+  it('flag on: a link that opens Lab on purpose, or carries what the chat has no equivalent for, stays on /m', () => {
+    expect(on('?project=abc&lab=1', true)).toBe('/m/p/abc');
+    expect(on('?lab=1', true)).toBe('/m');
+    expect(on('?prs=needs_you', true)).toBe('/m');
+    expect(on('?ws=x', true)).toBe('/m');
+    expect(on('?project=abc&ws=x&branchOff=1', true)).toBe('/m/p/abc?ws=x');
+    expect(on('?project=abc&ws=x&browser=open&browserShare=s1', true)).toBe('/m/p/abc?ws=x');
+  });
+
+  it('flag off: every landing is today\'s /m route', () => {
+    expect(off('')).toBe('/m');
+    expect(off('?project=abc', true)).toBe('/m/p/abc');
+    expect(off('?project=abc&ws=fix-64', true)).toBe('/m/p/abc?ws=fix-64');
+    expect(off('?project=abc&lab=1', true)).toBe('/m/p/abc');
+  });
+});
+
+describe('phoneChatSession', () => {
+  it('names the session of a plain link to one', () => {
+    expect(phoneChatSession('?project=abc')).toEqual({ projectId: 'abc', workstream: 'main' });
+    expect(phoneChatSession('?project=abc&ws=fix-64')).toEqual({ projectId: 'abc', workstream: 'fix-64' });
+    expect(phoneChatSession('?project=abc&iss=https%3A%2F%2Fexample.okta.com')).toEqual({ projectId: 'abc', workstream: 'main' });
+  });
+
+  it('is null for the workspace URL, a Lab-on-purpose link and other parameters', () => {
+    expect(phoneChatSession('')).toBeNull();
+    expect(phoneChatSession('?ws=x')).toBeNull();
+    expect(phoneChatSession('?project=abc&lab=1')).toBeNull();
+    expect(phoneChatSession('?project=abc&branchOff=1')).toBeNull();
   });
 });
 

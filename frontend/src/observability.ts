@@ -17,7 +17,11 @@ export type BrowserProductEvent =
   // The redrawn first run's funnel, under onboarding-refresh-enabled.
   | 'welcome.step' | 'welcome.github.connected' | 'welcome.dotfiles.saved' | 'welcome.mode.chosen' | 'welcome.finished'
   // Which client and view, and the chat UI's commands (usageEvents.ts).
-  | 'client.opened' | 'ui.mode.switched' | 'app.install.prompted' | 'app.installed' | 'chat.command';
+  | 'client.opened' | 'ui.mode.switched' | 'app.install.prompted' | 'app.installed' | 'chat.command'
+  // Someone left the chat or /m for Lab, and which way out (chat/labOpened.ts).
+  | 'lab.opened'
+  // A touch moved a scroll container, once per kind per page load (touchScrollEvents.ts).
+  | 'ui.touch.scrolled';
 export type ProductEventAttributes = Record<string, string | number | boolean>;
 
 export function recordProductEvent(_name: BrowserProductEvent, _attributes: ProductEventAttributes = {}): void {}

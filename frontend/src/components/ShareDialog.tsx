@@ -81,11 +81,14 @@ type Delivery = 'termag' | 'browser';
  * of their own on this box (the preview share below); or, with
  * preview-links-enabled, in their own browser at the app's own address (a
  * preview link, previewLinks/). The flag only hides the choice: the server
- * refuses a publish while it's off.
+ * refuses a publish while it's off. With it on, "In your browser" is listed
+ * first and is the one it opens on; nothing remembers the last choice, so
+ * every open starts there. With it off, delivery is ignored and the dialog is
+ * the preview share alone.
  */
 export function SharePreview(props: SharePreviewProps) {
   const linksOn = useFlag(FLAGS.previewLinks, false);
-  const [delivery, setDelivery] = useState<Delivery>('termag');
+  const [delivery, setDelivery] = useState<Delivery>('browser');
   const browser = linksOn && delivery === 'browser';
   // Once opened, each delivery stays mounted and is only hidden: a link's
   // one-time share URL and a share in flight survive a switch (Bugbot, #1485).
@@ -102,8 +105,8 @@ export function SharePreview(props: SharePreviewProps) {
         <RadioGroup className={`${LP_THEME} share-delivery`} value={delivery} onChange={v => setDelivery(v as Delivery)}>
           <Label>Where they open it</Label>
           <div className="share-delivery-choices">
-            <Radio value="termag">In termag</Radio>
             <Radio value="browser">In your browser</Radio>
+            <Radio value="termag">In termag</Radio>
           </div>
         </RadioGroup>
       )}
@@ -111,6 +114,7 @@ export function SharePreview(props: SharePreviewProps) {
         // Keyed: another project or workstream ("Share X instead") starts a fresh form, never showing the last one's key (Bugbot, #1485).
         <div hidden={!browser}><PreviewLinksPanel key={`${props.projectId}:${props.workstream}`} projectId={props.projectId} workstream={props.workstream} onBusyChange={setLinkBusy} /></div>
       )}
+      {/* Hidden under the browser delivery (the default with the flag on), its email field doesn't take the focus. */}
       <div hidden={browser}><ShareInTermag {...props} autoFocus={props.autoFocus && !browser} onBusyChange={setTermagBusy} /></div>
     </>
   );

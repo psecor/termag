@@ -107,7 +107,13 @@ export interface SetupStep {
 }
 
 export interface SetupInput {
-  box: Pick<Instance, 'name' | 'status' | 'provisioningError' | 'claimedAt' | 'claimUpdateStatus' | 'claimUpdateStartedAt'> | null;
+  box: Pick<Instance, 'name' | 'status' | 'provisioningError' | 'claimedAt' | 'claimUpdateStatus' | 'claimUpdateStartedAt' | 'wakeError'> | null;
+  /**
+   * With box-placement-enabled: a session on a parked
+   * box opened before the box was up, which the server woke. Its box step says
+   * "Waking box-a…", and a wake that failed says why.
+   */
+  wakes?: boolean;
   setupStatus: string | null | undefined;
   setupError?: string | null;
   /** `owner/name`, or null for a chat with no repository. */
@@ -128,8 +134,16 @@ export function boxComingUp(status: string | null | undefined): boolean {
   return status != null && (BOOTING.includes(status) || status === 'starting');
 }
 
-function boxStep(box: SetupInput['box'], eta: number | null): SetupStep {
+/** A box a session's wake starts: asleep, starting, or on its way down and started once it's down. */
+const WAKING = ['stopped', 'hibernated', 'starting', 'stopping', 'hibernating'];
+
+function boxStep(box: SetupInput['box'], eta: number | null, wakes = false): SetupStep {
   if (!box) return { id: 'box', state: 'active', text: 'Finding the box' };
+  if (wakes && WAKING.includes(box.status)) {
+    // The server's start was refused, and the box is still asleep: the session says why, with Retry and Start on a new box.
+    if (box.wakeError && (box.status === 'stopped' || box.status === 'hibernated')) return { id: 'box', state: 'failed', text: box.wakeError };
+    return { id: 'box', state: 'active', text: `Waking ${box.name}…` };
+  }
   if (box.status === 'failed') {
     return { id: 'box', state: 'failed', text: `Box ${box.name} failed to launch${box.provisioningError ? `: ${box.provisioningError}` : ''}` };
   }
@@ -156,7 +170,7 @@ function boxStep(box: SetupInput['box'], eta: number | null): SetupStep {
  * to `none` at once: there the clone is only known finished when Claude is up.
  */
 export function setupSteps(i: SetupInput): SetupStep[] {
-  const box = boxStep(i.box, i.etaMinutes);
+  const box = boxStep(i.box, i.etaMinutes, i.wakes);
   const steps: SetupStep[] = [box];
   const setupDone = i.setupStatus === 'ready' || i.setupStatus === 'none' || i.setupStatus == null || i.setupStatus === '';
   if (i.repo) {

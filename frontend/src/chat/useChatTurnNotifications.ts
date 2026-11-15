@@ -8,6 +8,7 @@ import { pushApi } from '../services/api';
 import { buildRows } from '../mobile/inbox';
 import { pushEndpointRemembered, registerServiceWorker, SW_SCOPE } from '../mobile/push';
 import { chatEvents } from './chatEvents';
+import { workstreamTitle } from './sessionTitle';
 import { chatTurnTag, chatTurnUrl, seedWorkingTurns, shouldNotifyHere, stepTurn, turnNotificationText, turnPreview } from './turnNotify';
 
 export function currentPermission(): NotificationPermission | 'unsupported' {
@@ -105,8 +106,9 @@ export function useChatTurnNotifier(shown: { projectId: string; workstream: stri
           shown: on,
           chat,
         })) return;
-        const name = list.find(p => p.id === frame.projectId)?.name ?? 'termag';
-        const { title, body } = turnNotificationText(name, frame.workstream, preview);
+        const project = list.find(p => p.id === frame.projectId);
+        const name = project ? workstreamTitle(project, frame.workstream, project.workstreams.find(w => w.name === frame.workstream)) : 'termag';
+        const { title, body } = turnNotificationText(name, preview);
         return showTurnNotification(title, body, chatTurnTag(chat.projectId, chat.workstream), chatTurnUrl(chat.projectId, chat.workstream));
       }).catch(err => console.warn('[chat] notification failed:', err));
     });

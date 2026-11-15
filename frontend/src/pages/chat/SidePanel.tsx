@@ -10,9 +10,16 @@
 // new tab's on a new tab. Picking in it shows the pick in the main pane.
 // Beside an agent with no space, and on a new tab on the agents in no space,
 // the tab is Agents instead: the explorer of agents only (AgentsExplorer.tsx).
+// Under the sidebar redesign (user-projects-enabled) files left the sidebar for
+// here: Files is the Files tool (FilesTool.tsx), this browser's open file tabs and new tabs over what it explores,
+// and it is offered wherever there is either.
 // As a phone's overlay, the panel follows the visual viewport (the keyboard,
 // hooks/useVisualViewport.ts) and its Terminal has a key bar (TerminalKeyBar.tsx).
-import React, { useLayoutEffect, useRef, useState } from 'react';
+// Under project-files-enabled a file picked in Files, or a file link in a reply, opens here as a file tab of
+// its own beside the tools (chat/openItems.ts openInPanel), and the chat stays: the tab shows the file page's own view
+// (SpaceFileView.tsx), names its file, is marked with where it lives (the project's icon for its Project files, a
+// person for My files) and has Open in main panel. The Files tool's Open list is the same tabs (panelFiles.ts).
+import React, { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useSetupContext } from '../../hooks/useSetupContext';
 import { Terminal } from '../../components/Terminal';
@@ -39,10 +46,18 @@ import {
 } from '../../chat/sidePanel';
 import { ExplorerPanel } from './FileExplorer';
 import { AgentsPanel } from './AgentsExplorer';
+import { FilesTool } from './FilesTool';
+import { filesToolOpenItems } from '../../chat/filesTool';
 import { useSimpleDataIfAny } from './simpleData';
 import { ShareTab } from './ShareTab';
 import { useChatChrome } from './chatChrome';
 import { IconButton, Tooltip, TooltipTrigger } from '@launchpad-ui/components';
+import { Icon } from '@launchpad-ui/icons';
+import { panelFileItems, type PanelFileItem } from '../../chat/openItems';
+import { SpaceFileView } from './SpaceFileView';
+import { PanelFilesContext, type PanelFilesApi } from './panelFiles';
+import { glyphIconsOf, ProjectGlyph } from './ProjectGlyph';
+import type { PanelTab } from '../../chat/panelTabs';
 import { LP_THEME } from '../../launchpad/theme';
 import { PanelTabStrip, ToolLauncher, usePanelTabs, type AgentAsk } from './PanelTabs';
 import { PrTab } from './PrTab';
@@ -68,6 +83,8 @@ interface Props {
   files?: SidePanelFiles | null;
   /** Something was picked in Files. */
   onPicked?: () => void;
+  /** The panel was carried here open on Files by that pick (ChatApp's carry): Files stays on screen, never this chat's remembered subagent. */
+  carried?: boolean;
   /** A folder of Files' space to open and focus (the file view's breadcrumb); `n` changes on each ask. */
   reveal?: { dir: string; n: number } | null;
   state: SidePanelState;
@@ -79,6 +96,8 @@ interface Props {
   agentAsk?: AgentAsk | null;
   onAgentAskUsed?: () => void;
   onChange: (next: SidePanelState) => void;
+  /** Shows file tab `id` here, or none (the tool), keeping the tool (ChatApp's setPlaceFile). */
+  onFile?: (id: string | null) => void;
   onClose: () => void;
   /** Phone width: an overlay over the chat, not resizable. */
   overlay: boolean;
@@ -124,10 +143,11 @@ function useFilesTarget(files: SidePanelFiles | null | undefined, workstream: st
   return { space: space ?? NO_SPACE_EXPLORER, activeAgent: { projectId: project.id, workstream } };
 }
 
-export function SidePanel({ project, workstream, files, onPicked, reveal, state, onChange, onClose, overlay, openShare, onOpenShareUsed, ask, onAskUsed, agentAsk, onAgentAskUsed }: Props) {
+export function SidePanel({ project, workstream, files, onPicked, carried = false, reveal, state, onChange, onFile, onClose, overlay, openShare, onOpenShareUsed, ask, onAskUsed, agentAsk, onAgentAskUsed }: Props) {
   // The chrome refresh: the collapse button is an icon at the panel's corner, where the header's
   // toggle was before the panel opened (chatChrome.tsx SidePanelButton).
-  const { refresh } = useChatChrome();
+  const { refresh, sidePanel: chromePanel } = useChatChrome();
+  const { user } = useAuth();
   const subagentsOn = useFlag(FLAGS.chatSubagents, false);
   const target = useFilesTarget(files, workstream);
   const agentsOnly = target?.space === NO_SPACE_EXPLORER;
@@ -138,16 +158,78 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
   // The Review tab: a session's review panes, with reviews on, on a phone's overlay
   // too, where a review's link opens it.
   const reviewsOn = useReviewsData().on;
-  const offer = { files: target != null, session: project != null, share: project?.role !== 'collaborator', pr: refresh === true && !overlay, review: reviewsOn };
+  // The sidebar redesign's Files tool, with the open file tabs the sidebar no longer lists.
+  const filesTool = useFlag(FLAGS.userProjects, false) && refresh === true;
+  const data = useSimpleDataIfAny();
+  const openFiles = filesTool && data
+    ? filesToolOpenItems(data.items.state.items).length > 0 || panelFileItems(data.items.state, chromePanel?.place).length > 0 : false;
+  // Project files (project-files-enabled): beside a session of the person's own project, whatever its space.
+  const projectFiles = useFlag(FLAGS.projectFiles, false) && filesTool && project?.role !== 'collaborator' && Boolean(project?.userProjectId);
+  const offer = { files: target != null || openFiles || projectFiles, session: project != null, share: project?.role !== 'collaborator', pr: refresh === true && !overlay, review: reviewsOn };
+  // Files open here (project-files-enabled): this place's file tabs, and the one on screen over the tool, if one.
+  const place = chromePanel?.place ?? null;
+  const showFile = chromePanel?.showFile;
+  const fileItems = data ? panelFileItems(data.items.state, place) : [];
+  const shownFile = state.file && fileItems.some(i => i.id === state.file) ? state.file : null;
+  const panelFiles: PanelFilesApi | null = place && showFile && data
+    ? { place, open: ref => showFile(data.items.openInPanel(ref, place)), show: showFile }
+    : null;
+  // The full-width file page, a tab of the main panel (its own, if it has one), and this file tab closed.
+  const openInMain = (item: PanelFileItem) => {
+    if (item.id === shownFile) onFile?.(null);
+    data?.items.dismiss(item.id);
+    chromePanel?.openInMain?.({ space: item.space, path: item.path });
+  };
+  // Where a file tab's file lives, for its mark and tooltip: its project's files, the person's My files, another space.
+  const whereOf = (space: string): { name: string; icon: React.ReactNode } => {
+    if (user?.myFilesSpace && space === user.myFilesSpace) return { name: 'My files', icon: <Icon name="person" size="medium" /> };
+    const p = data?.userProjects?.list?.find(x => x.filesSpace?.name === space);
+    if (p) return { name: `${p.name}'s files`, icon: <ProjectGlyph repos={p.repos?.map(r => r.repoKey) ?? []} icons={glyphIconsOf(p)} size={16} /> };
+    return { name: space, icon: <Icon name="folders" size="medium" /> };
+  };
+  const fileItemOf = (id: string) => fileItems.find(i => i.id === id);
   const tab = shownSidePanelTab(state.tab, offer);
   // The chrome refresh's tabs (PanelTabs.tsx): added with +, closed, each a tool or a launcher.
   const tabsOn = refresh === true && !overlay;
   // A subagent's agent tab shows beside its own chat only.
   const agentChat = subagentsOn && project ? `${project.id}|${workstream}` : null;
-  const tabsUi = usePanelTabs(tabsOn, sidePanelTabs(offer), state.tab, t => onChange({ ...state, tab: t }), ask, onAskUsed, agentChat, agentAsk, onAgentAskUsed);
+  const fileTabs: PanelTab[] = fileItems.map(i => ({ id: i.id, kind: 'file', file: { space: i.space, path: i.path } }));
+  const tabsUi = usePanelTabs(tabsOn, sidePanelTabs(offer), state.tab, t => onChange({ ...state, tab: t, file: null }), ask, onAskUsed, agentChat, agentAsk, onAgentAskUsed, carried,
+    panelFiles ? {
+      tabs: fileTabs,
+      shown: shownFile,
+      onShow: id => onFile?.(id),
+      close: id => data?.items.dismiss(id),
+      decor: t => {
+        const where = whereOf(t.file?.space ?? '');
+        const item = fileItemOf(t.id);
+        return {
+          icon: where.icon,
+          tip: `${t.file?.path ?? ''} · ${where.name}`,
+          actions: item ? [{ id: 'main', label: 'Open in main panel', onAction: () => openInMain(item) }] : [],
+        };
+      },
+      // The order is every place's (chat/panelTabs.ts orderPanelTabs); the Open list's file tabs follow it.
+      known: new Set((data?.items.state.panel ?? []).map(i => i.id)),
+      arrange: order => data?.items.arrangePanel(place!, order),
+    } : undefined);
   const launcherShown = tabsOn && tabsUi.active.kind === 'launcher';
   const agentShown = tabsOn && tabsUi.active.kind === 'agent' ? tabsUi.active.agent ?? null : null;
-  const shownTool: SidePanelTab = tabsOn && tabsUi.active.kind !== 'launcher' && tabsUi.active.kind !== 'agent' ? tabsUi.active.kind : tab;
+  // The file on screen: the strip's file tab, or (the phone's overlay, which has no strip) the place's.
+  const fileShown = fileItemOf((tabsOn ? (tabsUi.active.kind === 'file' ? tabsUi.active.id : null) : shownFile) ?? '') ?? null;
+  const activeKind = tabsUi.active.kind;
+  // The phone's strip scrolls: the file tab shown is brought into it.
+  const overlayTabs = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!overlay || !fileShown) return;
+    overlayTabs.current?.querySelector('.chat-side-file-tab.active')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+  }, [overlay, fileShown?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const shownTool: SidePanelTab = tabsOn && activeKind !== 'launcher' && activeKind !== 'agent' && activeKind !== 'file' ? activeKind : tab;
+
+  // What Files explores: the agents in no space, or a space's explorer.
+  const explored = !target ? null : agentsOnly
+    ? <AgentsPanel key={NO_SPACE_EXPLORER} activeAgent={target.activeAgent} onPicked={onPicked} />
+    : <ExplorerPanel key={target.space} space={target.space} activePath={target.activePath} activeAgent={target.activeAgent} activeDir={target.activeDir} onPicked={onPicked} reveal={reveal ?? undefined} />;
 
   const panelRef = useRef<HTMLElement>(null);
   // An overlay is a phone's full screen: its top and height come from the visual
@@ -184,6 +266,7 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
   const onDividerUp = () => { drag.current = null; };
 
   return (
+    <PanelFilesContext.Provider value={panelFiles}>
     <aside
       ref={panelRef}
       className="chat-side-panel"
@@ -206,19 +289,31 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
       )}
       <div className="chat-side-head">
         {tabsOn && <PanelTabStrip ui={tabsUi} />}
-        {!tabsOn && <div className="chat-side-tabs" role="tablist">
+        {!tabsOn && <div className="chat-side-tabs" role="tablist" ref={overlayTabs}>
           {sidePanelTabs(offer).map(t => (
             <button
               key={t}
               type="button"
               role="tab"
-              aria-selected={tab === t}
-              className={`chat-side-tab ${tab === t ? 'active' : ''}`}
-              onClick={() => onChange({ ...state, tab: t })}
+              aria-selected={tab === t && !fileShown}
+              className={`chat-side-tab ${tab === t && !fileShown ? 'active' : ''}`}
+              onClick={() => onChange({ ...state, tab: t, file: null })}
             >
-              {t === 'files' && agentsOnly ? 'Agents' : TAB_LABEL[t]}
+              {t === 'files' && agentsOnly && !filesTool ? 'Agents' : TAB_LABEL[t]}
             </button>
           ))}
+          {/* The phone's file tabs: each its name and a close, as the strip's own tabs are. */}
+          {panelFiles && fileItems.map(i => {
+            const name = i.path.slice(i.path.lastIndexOf('/') + 1);
+            const on = fileShown?.id === i.id;
+            return (
+              <span key={i.id} className={`chat-side-tab chat-side-file-tab ${on ? 'active' : ''}`}>
+                <button type="button" role="tab" aria-selected={on} className="chat-side-file-tab-main" onClick={() => onFile?.(i.id)}>{name}</button>
+                <IconButton icon="cancel" size="small" variant="minimal" className={`${LP_THEME} chat-side-file-tab-close`} aria-label={`Close ${name}`}
+                  onPress={() => { if (on) onFile?.(null); data?.items.dismiss(i.id); }} />
+              </span>
+            );
+          })}
         </div>}
         {refresh && !overlay ? (
           <TooltipTrigger delay={300}>
@@ -230,28 +325,31 @@ export function SidePanel({ project, workstream, files, onPicked, reveal, state,
           ✕
         </button>}
       </div>
-      <div className="chat-side-body" role="tabpanel" data-tool={tabsOn ? (launcherShown ? 'launcher' : agentShown ? 'agent' : shownTool) : undefined}>
+      <div className="chat-side-body" role="tabpanel" data-tool={fileShown ? 'file' : tabsOn ? (launcherShown ? 'launcher' : agentShown ? 'agent' : shownTool) : undefined}>
+        {fileShown && (
+          <SpaceFileView key={fileShown.id} file={{ space: fileShown.space, path: fileShown.path }} inPanel={{ openInMain: () => openInMain(fileShown) }} />
+        )}
+        {!fileShown && <>
         {/* An ask's tab is an agent tab whose id names its thread (chat/askStore.ts askTabId). */}
         {agentShown && project && (askThreadOf(agentShown.id)
           ? <AskTab key={agentShown.id} project={project} workstream={workstream} agent={agentShown} />
           : <AgentTab key={agentShown.id} project={project} workstream={workstream} agent={agentShown} openAgent={tabsUi.openAgent} />)}
         {launcherShown && (
           <ToolLauncher tools={sidePanelTabs(offer)} onPick={tabsUi.pick}
-            context={project ? `For ${project.name}${target ? ` in ${where}` : ''}` : target ? `In ${where}` : ''} />
+            context={project ? `For ${project.name}${target && !projectFiles ? ` in ${where}` : ''}` : target ? `In ${where}` : ''} />
         )}
-        {!launcherShown && !agentShown && shownTool === 'files' && target && agentsOnly && (
-          <AgentsPanel key={NO_SPACE_EXPLORER} activeAgent={target.activeAgent} onPicked={onPicked} />
-        )}
-        {!launcherShown && !agentShown && shownTool === 'files' && target && !agentsOnly && (
-          <ExplorerPanel key={target.space} space={target.space} activePath={target.activePath} activeAgent={target.activeAgent} activeDir={target.activeDir} onPicked={onPicked} reveal={reveal ?? undefined} />
-        )}
+        {!launcherShown && !agentShown && shownTool === 'files' && (filesTool
+          ? <FilesTool onPicked={onPicked} project={project} workstream={workstream} target={target} reveal={reveal}>{explored}</FilesTool>
+          : explored)}
         {!launcherShown && !agentShown && shownTool === 'pr' && project && <PrTab project={project} workstream={workstream} />}
         {!launcherShown && !agentShown && shownTool === 'review' && project && <ReviewPaneTab key={`${project.id}|${workstream}`} project={project} workstream={workstream} />}
         {!launcherShown && !agentShown && shownTool !== 'files' && shownTool !== 'pr' && shownTool !== 'review' && project && (
           <SessionTools project={project} workstream={workstream} tab={shownTool} showReset openShare={openShare} onOpenShareUsed={onOpenShareUsed} overlay={overlay} />
         )}
+        </>}
       </div>
     </aside>
+    </PanelFilesContext.Provider>
   );
 }
 

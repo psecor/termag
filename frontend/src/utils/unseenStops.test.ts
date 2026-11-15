@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  SEEN_STOPS_KEY, UNSEEN_MAX_AGE_MS, formatStopAge, markSeen, mergeSeenStops, readSeenStops, seenStopKey, unseenStopAge, writeSeenStops,
+  SEEN_STOPS_KEY, UNSEEN_MAX_AGE_MS, canMarkUnseen, formatStopAge, markSeen, markUnseen, mergeSeenStops, readSeenStops, seenStopKey, unseenStopAge, writeSeenStops,
 } from './unseenStops';
 
 function memStorage(init: Record<string, string> = {}) {
@@ -70,5 +70,30 @@ describe('unseen stops', () => {
     expect(formatStopAge(10_000)).toBe('now');
     expect(formatStopAge(12 * min)).toBe('12m');
     expect(formatStopAge(3 * 60 * min + 5)).toBe('3h');
+  });
+});
+
+describe('Mark as unread (a sidebar card menu)', () => {
+  const stop = iso(T - 20 * min);
+  it('puts the blue dot back on a session that was seen, until it is looked at again', () => {
+    const seen = markSeen({ since: T - 60 * min, seen: {} }, 'p:main', T, stop);
+    expect(unseenStopAge(seen, 'p:main', 'idle', stop, T)).toBeNull();
+    const unread = markUnseen(seen, 'p:main', stop);
+    expect(unseenStopAge(unread, 'p:main', 'idle', stop, T)).toBe('recent');
+    expect(unseenStopAge(markSeen(unread, 'p:main', T + min, stop), 'p:main', 'idle', stop, T + min)).toBeNull();
+  });
+
+  it('works on a stop from before this browser began keeping marks', () => {
+    const unread = markUnseen({ since: T, seen: {} }, 'p:main', stop);
+    expect(unseenStopAge(unread, 'p:main', 'not_running', stop, T)).not.toBeNull();
+  });
+
+  it('applies only to a session at rest whose dot has not expired', () => {
+    expect(canMarkUnseen('idle', stop, T)).toBe(true);
+    expect(canMarkUnseen('not_running', stop, T)).toBe(true);
+    expect(canMarkUnseen('working', stop, T)).toBe(false);
+    expect(canMarkUnseen('idle', null, T)).toBe(false);
+    expect(canMarkUnseen('idle', iso(T - UNSEEN_MAX_AGE_MS - 1), T)).toBe(false);
+    expect(markUnseen({ since: T, seen: {} }, 'p:main', null)).toEqual({ since: T, seen: {} });
   });
 });

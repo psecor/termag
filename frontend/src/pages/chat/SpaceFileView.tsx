@@ -26,9 +26,14 @@
 // aria-label, with a tooltip on hover or focus). The buttons go Reload,
 // Download, Share | 🔗, then Tools, beside the panel it opens, as in every
 // chat header; on a phone (or a header too narrow for them) they are under ⋮
-// in the same order, as an agent's actions are. The back arrow at the
+// in the same order, as an agent's actions are. Copy link answers on the button
+// pressed (🔗, or ⋮ for its menu's): a check and "Link copied" in its tooltip for a
+// moment, or "Couldn't copy the link", and the same to a screen reader. The back arrow at the
 // header's left, before the breadcrumb and the same button as Reload, closes
 // the file's tab and goes back to the tab shown before it (TabClose.tsx).
+// The same view is a side panel's file tab (project-files-enabled, SidePanel.tsx: `file` and `inPanel`), beside
+// the chat: there it has no back arrow, sessions button, Tools or chat about the file, which the page beside it
+// has, and leads with Open in main panel, which closes the tab for this page.
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { spacesApi, type SpaceViewUrl } from '../../services/api';
@@ -45,12 +50,16 @@ import { isMermaidPath } from '../../chat/mermaidFence';
 import { LiveCue, useSpaceFileLive } from './SpaceFileLive';
 import { REPLAY_BLOCK_CLASS } from '../../observability';
 import { ChatHistoryButton, SidePanelButton, useChatChrome } from './chatChrome';
-import { CloseAndBackButton } from './TabClose';
+import { CloseAndBackButton, useCloseTabs, useTabGroups } from './TabClose';
+import { Button } from '@launchpad-ui/components';
+import { LP_THEME } from '../../launchpad/theme';
+import { FLAGS, useFlag } from '../../flags';
 import { menuButtonKeys, useCoarsePointer, useContextMenu, type MenuTrigger } from './ContextMenu';
 import { FileComposeLinks, SpaceFileChat } from './FileChat';
 import { SpaceMarkdownImages } from './SpaceMarkdownImage';
 import { folderHref, tabForRoute } from '../../chat/openItems';
 import { useSimpleDataIfAny } from './simpleData';
+import { retip } from './Tooltips';
 
 type Loaded =
   | { state: 'loading' }
@@ -59,6 +68,12 @@ type Loaded =
   | { state: 'ok'; url: string; size: number; type: string; show: FileShow; text?: string; truncated?: boolean };
 
 type ShareState = NonNullable<SpaceViewUrl['share']>;
+
+/** How long Copy link's answer shows: a failure a little longer, to be read. */
+const COPY_SHOWN_MS = { copied: 1500, failed: 3000 } as const;
+const COPY_WORDS = { copied: 'Link copied', failed: "Couldn't copy the link" } as const;
+/** The button's own text, where it has some (no Share beside it). */
+const COPY_SHORT = { copied: 'Copied', failed: "Couldn't copy" } as const;
 
 function localStore(): Storage | null {
   try { return window.localStorage; } catch { return null; }
@@ -110,6 +125,22 @@ function ShareConfirm({ name, space, onCancel, onConfirm }: { name: string; spac
         <button type="button" className="confirm-btn confirm-btn-primary" onClick={() => onConfirm(dontAsk)} autoFocus>Share file</button>
       </div>
     </Dialog>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+      <path d="M3.2 8.4 6.4 11.4 12.8 4.8" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function OpenMainIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+      <path d="M9.5 2.5h4v4M13.5 2.5 8.5 7.5M6.5 13.5h-4v-4M2.5 13.5l5-5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
   );
 }
 
@@ -216,10 +247,27 @@ function FileBreadcrumb({ space, path, revealDir, onFoldedWidth }: {
   );
 }
 
-export function SpaceFileView() {
+/** A deleted file's Close, in place: its tab goes, as the Files tool's Open list closes one. Nothing outside the tabs. */
+function GoneClose({ name }: { name: string }) {
+  const tab = useSimpleDataIfAny()?.activeTab ?? null;
+  return tab ? <GoneCloseTab name={name} tab={tab} /> : null;
+}
+
+function GoneCloseTab({ name, tab }: { name: string; tab: string }) {
+  const close = useCloseTabs(useTabGroups());
+  // In LaunchPad's theme whether or not the chrome refresh scopes the page (ChatApp adds it only with the refresh).
+  return <Button size="small" variant="default" className={`${LP_THEME} fv-gone-close`} aria-label={`Close ${name}`} onPress={() => close([tab])}>Close</Button>;
+}
+
+export function SpaceFileView({ file, inPanel }: {
+  /** The file, for a side panel's file tab; else the route's. */
+  file?: { space: string; path: string };
+  /** Shown in a side panel's file tab: Open in main panel opens this file's page there. */
+  inPanel?: { openInMain: () => void };
+} = {}) {
   const params = useParams();
-  const space = params.space ?? '';
-  const path = params['*'] ?? '';
+  const space = file?.space ?? params.space ?? '';
+  const path = file?.path ?? params['*'] ?? '';
   const navigate = useNavigate();
   const { search } = useLocation();
   // The tab showing this file (the route's ?tab=, or the one the route opened for a pasted link): a folder takes it over.
@@ -228,7 +276,14 @@ export function SpaceFileView() {
   const tabRef = useRef(tabShown);
   tabRef.current = tabShown;
   const [loaded, setLoadedNow] = useState<Loaded>({ state: 'loading' });
-  const [copied, setCopied] = useState(false);
+  // Under project-files-enabled a deleted file offers to close its tab in place.
+  const freshFiles = useFlag(FLAGS.projectFiles, false);
+  // Copy link's answer, for COPY_SHOWN_MS: the button pressed (🔗, or ⋮ whose menu closed on Copy link) shows a check
+  // and says so in its tooltip, and the status line says it to a screen reader. A refused clipboard says that.
+  const [copy, setCopy] = useState<{ result: 'copied' | 'failed'; from: 'link' | 'more' } | null>(null);
+  const copyTimer = useRef<number | undefined>(undefined);
+  const linkRef = useRef<HTMLButtonElement>(null);
+  const moreRef = useRef<HTMLButtonElement>(null);
   const [reloads, setReloads] = useState(0);
   // The file's sharing as the server last said, and whether the viewer reached the space through a share
   // (not a member). Each is kept with what it was read for, so another file or space shows neither until it loads.
@@ -329,19 +384,39 @@ export function SpaceFileView() {
         const folder = !viaLink && await spacesApi.tree(space, `${path}/`)
           .then(t => t.dirs.length > 0 || t.files.length > 0, () => false);
         if (cancelled) return;
-        if (folder) navigate(folderHref(space, `${path}/`, tabRef.current), { replace: true });
+        // A side panel's tab has no page to take over: a folder there is no file.
+        if (folder && !inPanel) navigate(folderHref(space, `${path}/`, tabRef.current), { replace: true });
         else setLoaded({ state: 'gone', notShared: viaLink });
       } else setLoaded({ state: 'error', text: errorMessage(err, 'Could not open the file') });
     });
     return () => { cancelled = true; };
   }, [space, path, reloads]);
 
-  const copyLink = () => {
-    navigator.clipboard?.writeText(spaceFileLink(window.location.origin, import.meta.env.BASE_URL, space, path)).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    }).catch(() => {});
+  const copyLink = (from: 'link' | 'more') => {
+    const done = (result: 'copied' | 'failed') => {
+      window.clearTimeout(copyTimer.current);
+      setCopy({ result, from });
+      copyTimer.current = window.setTimeout(() => setCopy(null), COPY_SHOWN_MS[result]);
+    };
+    try {
+      const wrote = navigator.clipboard?.writeText(spaceFileLink(window.location.origin, import.meta.env.BASE_URL, space, path));
+      if (!wrote) done('failed');
+      else wrote.then(() => done('copied'), () => done('failed'));
+    } catch { done('failed'); }
   };
+  // The tooltip of the button pressed says what happened, though the press hid it; back to its own once that's done.
+  const copyShownOn = useRef<HTMLButtonElement | null>(null);
+  // Leaving the view mid-answer: no timer left, and no "Link copied" left on screen.
+  useEffect(() => () => { window.clearTimeout(copyTimer.current); retip(copyShownOn.current, true); }, []);
+  useEffect(() => {
+    if (copy) {
+      copyShownOn.current = copy.from === 'link' ? linkRef.current : moreRef.current;
+      retip(copyShownOn.current);
+    } else {
+      retip(copyShownOn.current, true);
+      copyShownOn.current = null;
+    }
+  }, [copy]);
   const download = () => { void downloadFile(space, path).catch(() => {}); };
 
   const shared = share?.shared === true;
@@ -365,7 +440,9 @@ export function SpaceFileView() {
     if (skipsShareConfirm(localStore(), space)) { void setSharing(true); return; }
     setConfirmFor({ space, path });
   };
-  const copyLabel = copied ? 'Link copied' : `Copy link (${linkAudience(shared || viaShare)})`;
+  const copied = copy?.result === 'copied';
+  const copyWords = copy ? COPY_WORDS[copy.result] : null;
+  const copyLabel = copyWords ?? `Copy link (${linkAudience(shared || viaShare)})`;
 
   const name = path.slice(path.lastIndexOf('/') + 1);
   const show = loaded.state === 'ok' ? loaded.show : null;
@@ -374,28 +451,37 @@ export function SpaceFileView() {
   const pdfOutside = loaded.state === 'ok' && show?.kind === 'frame' && loaded.type === 'application/pdf'
     && (coarse || (navigator as { pdfViewerEnabled?: boolean }).pdfViewerEnabled === false);
   const openMore = (e: MenuTrigger) => more.open(e, `${name}: more`, [
+    ...(inPanel ? [{ label: 'Open in main panel', onSelect: inPanel.openInMain }] : []),
     { label: 'Reload', onSelect: () => setReloads(n => n + 1) },
     ...(member ? [{ label: 'Download', disabled: loaded.state === 'gone', onSelect: download }] : []),
     ...(canShare ? [{ label: shared ? 'Make private' : 'Share with termag users…', disabled: shareBusy, onSelect: toggleShare }] : []),
-    { label: copied ? 'Link copied' : 'Copy link', onSelect: copyLink },
-    ...(sidePanel && member ? [{ label: sidePanel.open ? 'Hide tools' : 'Show tools', onSelect: sidePanel.toggle }] : []),
+    { label: 'Copy link', onSelect: () => copyLink('more') },
+    ...(sidePanel && member && !inPanel ? [{ label: sidePanel.open ? 'Hide tools' : 'Show tools', onSelect: sidePanel.toggle }] : []),
   ]);
 
   return (
     <div className="chat-view">
       <section className="chat-conv">
-        <LiveCue space={space} cue={live.cue} onReload={live.applyPending} />
+        <LiveCue space={space} cue={live.cue} onReload={live.applyPending} name={name} onKeepMine={live.keepMine} />
         <header ref={headerRef} className="chat-header fv-header" data-compact={compact || undefined}>
-          <CloseAndBackButton />
-          <ChatHistoryButton />
+          {!inPanel && <CloseAndBackButton />}
+          {!inPanel && <ChatHistoryButton />}
           <div ref={titleRef} className="chat-title">
-            <FileBreadcrumb space={space} path={path} revealDir={member ? sidePanel?.revealDir : undefined} onFoldedWidth={setFoldedWidth} />
+            <FileBreadcrumb space={space} path={path} revealDir={member && !inPanel ? sidePanel?.revealDir : undefined} onFoldedWidth={setFoldedWidth} />
             {viaShare && share?.shared && (
               <span className="fv-shared-by">Shared by {share.sharedBy?.displayName ?? 'someone who left termag'}</span>
             )}
           </div>
           <div ref={actionsRef} className="chat-header-actions">
             <span ref={wideRef} className="fv-wide-group">
+              {/* Hand-rolled like Reload beside it, for the same reason as TabClose.tsx's Close and go back: one
+                  button box, border and 14px icon across this header, where LaunchPad's IconButton and 20px icons aren't. */}
+              {inPanel && (
+                <button type="button" className="btn-ghost fv-icon-btn fv-open-main" aria-label="Open in main panel" data-tip="Open in main panel"
+                  onClick={inPanel.openInMain}>
+                  <OpenMainIcon />
+                </button>
+              )}
               <button type="button" className="btn-ghost fv-icon-btn fv-reload" aria-label="Reload" data-tip="Reload (signs a fresh link)" onClick={() => setReloads(n => n + 1)}>
                 <ReloadIcon />
               </button>
@@ -414,22 +500,27 @@ export function SpaceFileView() {
                     <span>{shared ? 'Shared' : 'Share'}</span>
                   </button>
                 )}
-                <button type="button" className={`btn-ghost fv-share-link${canShare ? '' : ' alone'}`} aria-label={copyLabel} data-tip={copyLabel} onClick={copyLink}>
-                  <LinkIcon />
-                  {!canShare && <span>{copied ? 'Copied' : 'Copy link'}</span>}
+                <button ref={linkRef} type="button" className={`btn-ghost fv-share-link${canShare ? '' : ' alone'}`} aria-label={copyLabel} data-tip={copyLabel}
+                  data-copied={copied || undefined} onClick={() => copyLink('link')}>
+                  {copied ? <CheckIcon /> : <LinkIcon />}
+                  {!canShare && <span>{copy ? COPY_SHORT[copy.result] : 'Copy link'}</span>}
                 </button>
-                <span className="chat-sr" role="status">{copied ? 'Link copied' : ''}</span>
               </div>
-              {sidePanel && member && <span className="fv-tools"><SidePanelButton /></span>}
+              {sidePanel && member && !inPanel && <span className="fv-tools"><SidePanelButton /></span>}
             </span>
-            <button type="button" className="btn-ghost fv-more" aria-label="More" aria-haspopup="menu"
+            <button ref={moreRef} type="button" className="btn-ghost fv-more" aria-label="More" aria-haspopup="menu"
+              data-tip={copy?.from === 'more' ? copyWords ?? undefined : undefined} data-copied={(copied && copy?.from === 'more') || undefined}
               onPointerDown={e => { e.currentTarget.dataset.pointer = e.pointerType; }}
               onClick={openMore} onKeyDown={menuButtonKeys(openMore)}>
-              <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
-                <circle cx="8" cy="3.5" r="1.4" fill="currentColor" /><circle cx="8" cy="8" r="1.4" fill="currentColor" /><circle cx="8" cy="12.5" r="1.4" fill="currentColor" />
-              </svg>
+              {copied && copy?.from === 'more' ? <CheckIcon /> : (
+                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+                  <circle cx="8" cy="3.5" r="1.4" fill="currentColor" /><circle cx="8" cy="8" r="1.4" fill="currentColor" /><circle cx="8" cy="12.5" r="1.4" fill="currentColor" />
+                </svg>
+              )}
             </button>
             {more.menu}
+            {/* Outside the buttons, which are hidden in the ⋮ layout, so it is read either way. */}
+            <span className="chat-sr" role="status" aria-live="polite">{copyWords ?? ''}</span>
           </div>
         </header>
         {shareError && <div className="fv-note fv-share-error" role="alert">{shareError}</div>}
@@ -494,7 +585,9 @@ export function SpaceFileView() {
               {loaded.state === 'loading' && <div className="chat-empty">Loading…</div>}
               {loaded.state === 'gone' && <div className="chat-empty">{loaded.notShared
                 ? 'This file isn\'t shared with you. It may have been made private, moved or deleted.'
-                : <>This file is gone from {space}. Close its tab from the ⋮ menu.</>}</div>}
+                : freshFiles
+                  ? <>This file isn't in {space} anymore: it was moved or deleted. {!inPanel && <GoneClose name={name} />}</>
+                  : <>This file is gone from {space}. Close its tab from the ⋮ menu.</>}</div>}
               {loaded.state === 'error' && <div className="chat-archived-error" role="alert">{loaded.text}</div>}
               {loaded.state === 'ok' && show?.kind === 'markdown' && loaded.text !== undefined && (
                 <div className="fv-md sdk-text"><FileComposeLinks space={space}>
@@ -516,7 +609,7 @@ export function SpaceFileView() {
             </div>
           </div>
         )}
-        <SpaceFileChat space={space} path={path} />
+        {!inPanel && <SpaceFileChat space={space} path={path} />}
       </section>
     </div>
   );

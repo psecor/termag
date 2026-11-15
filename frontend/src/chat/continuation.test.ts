@@ -3,9 +3,9 @@ import { continuationPolls, continuationStatus, heldToShow } from './continuatio
 
 describe('a chat coming back on its box (docs/chat-resume.md)', () => {
   it('the status line says starting a new box, then restoring, then nothing of its own', () => {
-    expect(continuationStatus({ phase: 'starting-box' })?.text).toBe('Starting a new box for this chat…');
-    expect(continuationStatus({ phase: 'restoring' })?.text).toBe('Restoring this conversation…');
-    expect(continuationStatus({ phase: 'starting' })?.text).toBe('Starting the box…');
+    expect(continuationStatus({ phase: 'starting-box' })?.text).toBe('Working · starting a new box for this chat…');
+    expect(continuationStatus({ phase: 'restoring' })?.text).toBe('Working · restoring this conversation…');
+    expect(continuationStatus({ phase: 'starting' })?.text).toBe('Working · starting the box…');
     expect(continuationStatus({ held: [{ id: 'm1', text: 'x', error: null }] })).toBeNull();
     expect(continuationStatus(undefined)).toBeNull();
   });

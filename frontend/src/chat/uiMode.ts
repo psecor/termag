@@ -1,11 +1,17 @@
 // Which UI this browser was last in: the simple UI at /chat or the full
 // workspace. Showing /chat records simple; showing the workspace records
-// full. A page load at the bare workspace URL (`/termag/`) with simple
+// full. Under chat-ui-nudge-enabled a visit records nothing and only a switch
+// does (Lab's Open in termag, the chat's Open Lab, the Lab toast's Switch to
+// chat, the end of setup), so a deep link into Lab doesn't change where
+// termag opens. A page load at the bare workspace URL (`/termag/`) with simple
 // recorded opens /chat instead, so coming back to termag lands where the
 // user left it. Only that first load is redirected: a link or the back
 // button to `/` inside the app, and any deep link (`/?project=…`), open the
 // workspace, except a share link its owner opened, which opens in the simple
-// UI's side panel (simpleUiShareHandoff).
+// UI's side panel (simpleUiShareHandoff), and, under chat-ui-nudge-enabled, a
+// page loaded at a link to a project's session, which opens its chat
+// (simpleUiDeepLink). The parameters an identity provider's app tile adds
+// (Okta's `?iss=`, withoutLoginParams) don't make a landing a deep link.
 
 import { recordProductEvent } from '../observability';
 
@@ -57,10 +63,50 @@ export function recordUiMode(mode: UiMode): void {
 /** The user's kept choice, applied to this browser before any route reads it; not reported back. */
 export function adoptUiMode(mode: UiMode): void { writeUiMode(local(), mode); }
 
-/** The router path (BrowserRouter's basename is /termag) plus query of a page URL. */
+/**
+ * What an identity provider adds to the URL it opens termag at when a person
+ * starts from its app tile (OpenID Connect's third-party-initiated login): the
+ * Okta tile opens `/termag/?iss=https%3A%2F%2F<org>.okta.com`. The ALB has
+ * signed the person in by the time the page loads, so termag never reads them,
+ * and a landing that carries them is still the bare workspace URL.
+ */
+export const LOGIN_INITIATION_PARAMS = ['iss', 'login_hint', 'target_link_uri'] as const;
+
+/** A query string without the login-initiation parameters; '' when nothing else is left. */
+export function withoutLoginParams(search: string): string {
+  if (!search || search === '?') return '';
+  const sp = new URLSearchParams(search);
+  if (!LOGIN_INITIATION_PARAMS.some(k => sp.has(k))) return search;
+  for (const k of LOGIN_INITIATION_PARAMS) sp.delete(k);
+  const rest = sp.toString();
+  return rest ? `?${rest}` : '';
+}
+
+/**
+ * Takes the login-initiation parameters out of the address bar, before the
+ * router reads it (main.tsx), so the workspace doesn't carry `?iss=` into every
+ * URL it writes (`?iss=…&project=…`), where a reload or a bookmark would make
+ * it a deep link. The history entry's state is kept, so the router still sees
+ * the page's first location.
+ */
+export function dropLoginParamsFromAddressBar(win: Pick<Window, 'location' | 'history'>): void {
+  try {
+    const search = withoutLoginParams(win.location.search);
+    if (search === win.location.search) return;
+    win.history.replaceState(win.history.state, '', `${win.location.pathname}${search}${win.location.hash}`);
+  } catch { /* a sandboxed frame or a test stub: the URL just keeps them */ }
+}
+
+/** The router path (BrowserRouter's basename is /termag) plus query of a page URL, login-initiation parameters left out. */
 export function routerEntry(loc: { pathname: string; search: string }): string {
   const path = loc.pathname.replace(/^\/termag(?=\/|$)/, '') || '/';
-  return `${path}${loc.search === '?' ? '' : loc.search}`;
+  return `${path}${withoutLoginParams(loc.search)}`;
+}
+
+/** A router path plus query (`/?iss=…`), login-initiation parameters left out. */
+function withoutLoginParamsIn(here: string): string {
+  const q = here.indexOf('?');
+  return q < 0 ? here : `${here.slice(0, q)}${withoutLoginParams(here.slice(q))}`;
 }
 
 // Where this page was loaded, until the workspace has been shown once.
@@ -88,8 +134,9 @@ export function shouldOpenSimpleUi(i: {
 }): boolean {
   if (i.mode !== 'simple') return false;
   if (i.locationKey !== INITIAL_LOCATION_KEY) return false;
-  if (i.entry == null || i.here !== i.entry) return false;
-  return i.here === '/';
+  const here = withoutLoginParamsIn(i.here);
+  if (i.entry == null || here !== i.entry) return false;
+  return here === '/';
 }
 
 /**
@@ -111,4 +158,44 @@ export function simpleUiShareHandoff(i: { mode: UiMode; search: string }): strin
     if (value != null) q.set(key, value);
   }
   return `/chat/p/${encodeURIComponent(project)}?${q}`;
+}
+
+/**
+ * Marks a link that opens Lab on purpose: the chat's and the phone's Open in
+ * Lab (fullUiHref). Its page load stays in Lab (simpleUiDeepLink), so opening
+ * one in a new tab, or reloading Lab after it, doesn't send a chat person
+ * back to the chat.
+ */
+export const LAB_PARAM = 'lab';
+
+// The workspace parameters a project's chat stands in for: the project and its session.
+const CHAT_EQUIVALENT_PARAMS: ReadonlySet<string> = new Set(['project', 'ws']);
+
+/**
+ * Under chat-ui-nudge-enabled, a Lab link to a project's session
+ * (`/?project=<id>[&ws=<name>]`: Slack's and the automation reports' links,
+ * briefing/slack.ts sessionLink) opened by someone whose kept choice is the
+ * chat: the session it names, and its chat, `/chat/p/<id>[?ws=<name>]`
+ * (chatHref), where SimpleUiReturnGate sends it, as simpleUiShareHandoff does
+ * for a share link, once the project list shows that the session has a
+ * conversation there (simpleChat.ts sessionHasChat). Only for the page's
+ * first load, as shouldOpenSimpleUi, so in-app navigation to Lab stays there;
+ * and only when every parameter has a chat equivalent. Null for anything else
+ * (another Lab page, `branchOff`, a link marked LAB_PARAM), which opens Lab.
+ */
+export function simpleUiDeepLink(i: {
+  mode: UiMode; entry: string | null; here: string; locationKey: string;
+}): { projectId: string; workstream: string; href: string } | null {
+  if (i.mode !== 'simple' || i.locationKey !== INITIAL_LOCATION_KEY) return null;
+  const here = withoutLoginParamsIn(i.here);
+  if (i.entry == null || here !== i.entry) return null;
+  const q = here.indexOf('?');
+  if (q < 0 || here.slice(0, q) !== '/') return null;
+  const sp = new URLSearchParams(here.slice(q));
+  if ([...sp.keys()].some(key => !CHAT_EQUIVALENT_PARAMS.has(key))) return null;
+  const project = sp.get('project');
+  if (!project) return null;
+  const workstream = sp.get('ws') || 'main';
+  const href = `/chat/p/${encodeURIComponent(project)}${workstream !== 'main' ? `?ws=${encodeURIComponent(workstream)}` : ''}`;
+  return { projectId: project, workstream, href };
 }

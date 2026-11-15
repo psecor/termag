@@ -35,10 +35,12 @@ import { FILE_SHARE_EVENT, type FileShareChange } from '../../chat/fileShare';
 import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
 import { CloseAndBackButton } from './TabClose';
 import { AgentIcon, FileIcon, FolderIcon, plainClick } from './OpenItems';
+import { usePanelFiles } from './panelFiles';
 import { useSpaceListingLive } from './SpaceFileLive';
 import { useSimpleData, WithSimpleData } from './simpleData';
 import { useSpaceReach, type SpaceReach } from '../../chat/useSpaceReach';
 import { Caret, Highlight, SearchIcon, sessionKey, useAgentTree, type AgentKey } from './ExplorerTree';
+import type { MenuAction } from './ContextMenu';
 import { useAutomations } from '../../chat/useAutomations';
 import { automationsIn, searchAutomations } from '../../chat/automationPlaces';
 
@@ -65,6 +67,26 @@ function cacheOf(space: string): SpaceCache {
   let c = caches.get(space);
   if (!c) { c = { listings: new Map(), expanded: new Set(['']), shut: new Set(), index: null, gen: 0 }; caches.set(space, c); }
   return c;
+}
+
+/** Forget what's kept for `space`, so its explorer lists it afresh: only as an explorer first shows it (below). */
+function forgetListings(space: string): void {
+  const c = caches.get(space);
+  if (!c) return;
+  c.gen++;
+  c.listings.clear();
+  c.index = null;
+}
+
+// Spaces to list afresh the next time an explorer shows them (forgetListingsWhenNextShown).
+const staleSpaces = new Set<string>();
+
+/**
+ * List `space` afresh the next time an explorer shows it, leaving the one on screen as it is (its live listing
+ * keeps it current, with the pages it has loaded): the source of a move, which may be left before that lands.
+ */
+export function forgetListingsWhenNextShown(space: string): void {
+  staleSpaces.add(space);
 }
 
 // The file view shared or unshared a file: mark it in the listings kept for its space. Listened
@@ -111,6 +133,14 @@ type PanelProps = {
   onPicked?: () => void;
   /** A folder to open, scroll to and focus ('' for the space); `n` changes on each ask. */
   reveal?: { dir: string; n: number };
+  /** In place of the head's title (the space's name): the Files tool's Project files | My files (FilesTool.tsx). */
+  head?: React.ReactNode;
+  /** In place of "No agents or files yet." when the space has neither. */
+  empty?: React.ReactNode;
+  /** Files only, no agents or automations: the Files tool's Project files and My files, whose sessions are the sidebar's. */
+  filesOnly?: boolean;
+  /** More of a file's ⋮ actions, after the opens: the Files tool's Move to My files or Move to Project files. */
+  fileActions?: (path: string) => MenuAction[];
 };
 
 /** The explorer for `space`, with `activePath`, `activeDir` or `activeAgent` (if any) highlighted and revealed. */
@@ -118,15 +148,19 @@ export function ExplorerPanel(props: PanelProps) {
   return <WithSimpleData><Panel {...props} /></WithSimpleData>;
 }
 
-function Panel({ space, activePath, activeAgent, activeDir, onPicked, reveal }: PanelProps) {
+function Panel({ space, activePath, activeAgent, activeDir, onPicked, reveal, head, empty, filesOnly = false, fileActions }: PanelProps) {
   const { items, rows, live, setupOf, spaces, links, activeTab } = useSimpleData();
+  // In the side panel under project-files-enabled (panelFiles.ts): a file picked opens there, as a file tab.
+  const panelFiles = usePanelFiles();
   const navigate = useNavigate();
   const [tick, rerender] = useReducer((n: number) => n + 1, 0);
   const [query, setQuery] = useState('');
+  // A space marked stale while it wasn't shown lists afresh as this explorer (keyed by space) first shows it.
+  useState(() => { if (staleSpaces.delete(space)) forgetListings(space); return null; });
   const cache = cacheOf(space);
-  const agents = useMemo(() => explorerAgents(rows, space, spaces.index, links), [rows, space, spaces.index, links]);
+  const agents = useMemo(() => (filesOnly ? [] : explorerAgents(rows, space, spaces.index, links)), [filesOnly, rows, space, spaces.index, links]);
   const { enabled: automationsOn, list: automationList } = useAutomations();
-  const placed = useMemo(() => (automationsOn ? automationsIn(automationList, space, spaces.spaces) : []), [automationsOn, automationList, space, spaces.spaces]);
+  const placed = useMemo(() => (automationsOn && !filesOnly ? automationsIn(automationList, space, spaces.spaces) : []), [automationsOn, filesOnly, automationList, space, spaces.spaces]);
   const reach = useSpaceReach(spaces, space);
   const bodyRef = useRef<HTMLDivElement>(null);
   const [revealed, setRevealed] = useState<string | null>(null);
@@ -284,9 +318,9 @@ function Panel({ space, activePath, activeAgent, activeDir, onPicked, reveal }: 
     return (
       <li key={`f:${f.path}`} className="fx-item">
         {itemRow({
-          href: itemHref(ref), open: newTab => show(ref, newTab), label: fileName(f.path),
+          href: itemHref(ref), open: newTab => (panelFiles && !newTab ? panelFiles.open({ space, path: f.path }) : show(ref, newTab)), label: fileName(f.path),
           tip, cls: `fx-file${cls}`, active: f.path === activePath,
-          icon: <FileIcon />,
+          icon: <FileIcon />, extra: fileActions?.(f.path),
           children: <>{children}{f.shared && <><SharedMark /><span className="chat-sr">, shared with termag</span></>}</>,
         })}
       </li>
@@ -337,7 +371,7 @@ function Panel({ space, activePath, activeAgent, activeDir, onPicked, reveal }: 
   return (
     <aside className="fx-panel" aria-label={`Explorer for ${space}`}>
       <div className="fx-panel-head">
-        <span className="fx-panel-title" data-tip={space}>{space}</span>
+        {head ?? <span className="fx-panel-title" data-tip={space}>{space}</span>}
         <button type="button" className="fx-refresh" aria-label={`Refresh ${space}`} data-tip="Refresh" onClick={refresh}>
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
             <path fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.5h-2.5" />
@@ -346,7 +380,7 @@ function Panel({ space, activePath, activeAgent, activeDir, onPicked, reveal }: 
       </div>
       <label className="fx-search">
         <SearchIcon />
-        <input type="search" disabled={reach !== 'yes'} placeholder="Search agents and files" aria-label={`Search agents and files in ${space}`}
+        <input type="search" disabled={reach !== 'yes'} placeholder={filesOnly ? 'Search files' : 'Search agents and files'} aria-label={filesOnly ? 'Search files' : `Search agents and files in ${space}`}
           value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => { if (e.key === 'Escape') setQuery(''); }} />
       </label>
       <div className="fx-panel-body" ref={bodyRef}>
@@ -372,7 +406,7 @@ function Panel({ space, activePath, activeAgent, activeDir, onPicked, reveal }: 
             })}
             {ready?.capped && <li className="fx-note">Searched the first {SEARCH_MAX_FILES_PER_SPACE} files of {space}.</li>}
           </ul>
-        ) : (
+        ) : nothing && empty ? empty : (
           <ul className="fx-tree" aria-label={space}>
             {agentNodes(agents, true)}
             {folder('')}

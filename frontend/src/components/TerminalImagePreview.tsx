@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { isEdgeSessionExpired } from '../contexts/ConnectionContext';
+import { isEdgeSessionExpired, isEdgeSignedOut } from '../contexts/ConnectionContext';
 
 /**
  * The floating preview of an image path hovered in a terminal pane
@@ -32,6 +32,9 @@ export function loadImagePreview(url: string, now: number = Date.now()): Promise
     cache.delete(k);
     void v.result.then(r => { if (r.kind === 'image') URL.revokeObjectURL(r.objectUrl); });
   }
+  // Signed out at the edge, even an unfollowed 302 resets a login's nonce
+  // (utils/edgeSession.ts); and it is not kept, so the hover after a sign-in reads.
+  if (isEdgeSignedOut()) return Promise.resolve({ kind: 'error', message: 'Signed out. Reload the page to sign in again' });
   const result = (async (): Promise<Loaded> => {
     try {
       // redirect: 'manual', as the status probe does: behind the ALB an

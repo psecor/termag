@@ -2,7 +2,7 @@
 // and sidebar (chat/chatSpaces.ts). A failed load reads as no spaces, so the simple UI behaves as
 // it does without spaces. ChatApp loads them once and shares them
 // (ChatSpacesProvider), so the sidebar and the chat header agree.
-import { createContext, createElement, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
+import { createContext, createElement, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { spacesApi, type SpaceView } from '../services/api';
 import { boxSpaceIndex } from './chatSpaces';
 import { spaceColor, type SpaceColorOf } from './spaceColors';
@@ -52,7 +52,8 @@ export function useChatSpaces(opts: { withBoxes: boolean; reloadKey?: string }):
 /** What ChatApp shares: the spaces, and each one's colour among them (spaceColors.spacePalette). */
 export interface SharedChatSpaces extends ChatSpaces { colorOf: SpaceColorOf }
 
-const Shared = createContext<SharedChatSpaces>({ loaded: false, spaces: [], index: new Map(), current: false, colorOf: spaceColor });
+const NONE: SharedChatSpaces = { loaded: false, spaces: [], index: new Map(), current: false, colorOf: spaceColor };
+const Shared = createContext<SharedChatSpaces>(NONE);
 
 export function ChatSpacesProvider({ value, children }: { value: SharedChatSpaces; children: ReactNode }) {
   return createElement(Shared.Provider, { value }, children);
@@ -61,4 +62,32 @@ export function ChatSpacesProvider({ value, children }: { value: SharedChatSpace
 /** The spaces ChatApp loaded, with their boxes; none outside a ChatSpacesProvider. */
 export function useSharedChatSpaces(): SharedChatSpaces {
   return useContext(Shared);
+}
+
+/**
+ * `value` once ChatApp's spaces have loaded: at once if they have (or there
+ * is no ChatSpacesProvider), else when they land, as `value` is then, or null
+ * if they haven't after `waitMs`. A wait still open when the chat (`key`)
+ * changes or unmounts fails instead, so nothing meant for it goes elsewhere.
+ */
+export function useWhenSpacesLoaded<T>(value: T, key: string, waitMs = 15_000): () => Promise<T | null> {
+  const shared = useContext(Shared);
+  const loaded = shared.loaded || shared === NONE;
+  const latest = useRef({ loaded, value });
+  latest.current = { loaded, value };
+  const waiters = useRef(new Set<(left: boolean) => void>());
+  useEffect(() => {
+    if (loaded) for (const done of [...waiters.current]) done(false);
+  }, [loaded, value]);
+  useEffect(() => () => { for (const done of [...waiters.current]) done(true); }, [key]);
+  return useCallback(() => latest.current.loaded ? Promise.resolve(latest.current.value) : new Promise<T | null>((resolve, reject) => {
+    const done = (left: boolean) => {
+      clearTimeout(timer);
+      waiters.current.delete(done);
+      if (left) reject(new Error('the chat closed before its spaces loaded'));
+      else resolve(latest.current.loaded ? latest.current.value : null);
+    };
+    const timer = setTimeout(() => done(false), waitMs);
+    waiters.current.add(done);
+  }), [waitMs]);
 }

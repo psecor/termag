@@ -20,6 +20,8 @@ export function statusFromPush(msg: Record<string, any>): AgentStatus {
     contextTokens: msg.contextTokens,
     rateLimited: msg.rateLimited,
     stoppedAt: msg.stoppedAt,
+    // When it entered this status (the backend's statusSince): the sidebar card's time.
+    statusSince: msg.statusSince ?? null,
     milestone: msg.milestone ?? null,
     // The Devin review pane's state (utils/reviewRing).
     review: msg.review ?? null,

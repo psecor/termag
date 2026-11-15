@@ -53,13 +53,22 @@ export function refreshLine(pool: EnvironmentPoolView, now: number = Date.now())
   return `Next refresh check ${inLabel(pool.nextRefreshAt, now)}`;
 }
 
+/** The newest ready box's on-warm run, in a line: "termag's warm-up done in 41 s"; null when none ran. */
+export function onWarmLine(pool: EnvironmentPoolView): { text: string; failed: boolean } | null {
+  const w = pool.onWarm;
+  if (!w || w.state === 'skipped') return null;
+  if (w.state === 'failed') return { text: "termag's warm-up failed on the newest box; it was prepared anyway, and its owner's setup finishes it", failed: true };
+  if (w.state === 'succeeded') return { text: `termag's warm-up done${w.seconds ? ` in ${w.seconds} s` : ''}`, failed: false };
+  return { text: "termag's warm-up didn't finish on the newest box", failed: true };
+}
+
 /**
- * The Pool card's line for its last failed prepare: when, and what the pool does next. A setup that ran and failed
- * holds it until the setup or a default branch changes; any other failure (the launch, the image, a clone, a timeout)
- * is tried again ENV_POOL_RETRY_MS (backend services/envPool.ts) after it.
+ * The Pool card's line for its last failed prepare: when, and what the pool does next. Whatever failed, it holds the
+ * pool at that setup and those default-branch heads until either changes or ENV_POOL_RETRY_MS (an hour, backend
+ * services/envPool.ts) passes.
  */
 export function poolFailureLine(at: string, now: number = Date.now()): string {
-  return `The last prepare failed ${agoLabel(at, now)}. A failed setup holds the pool until its setup or a default branch changes; any other failure is tried again 10 minutes after it.`;
+  return `The last prepare failed ${agoLabel(at, now)}. The pool waits until its setup or a default branch changes, or an hour after the failure.`;
 }
 
 /** What a create dialog says about a new box for this environment: a pool box starts in about 20 s. */

@@ -8,6 +8,7 @@ import { useProjects } from '../../contexts/ProjectContext';
 import { activityApi, projectsApi, reviewApi, sessionsApi, visitsApi, workstreamsApi } from '../../services/api';
 import { PROVIDERS } from '../../providers/registry';
 import { sessionName } from '../../utils/sessionName';
+import { workstreamTitle } from '../../chat/sessionTitle';
 import { workstreamNameFromBranch } from '../../utils/workstreamChoices';
 import { statusKey } from '../../utils/statusKey';
 import { contextLevel } from '../../utils/thresholds';
@@ -17,7 +18,8 @@ import { draftAfterSend, flattenForSend, MAX_KEYS, sendErrorText } from '../../c
 import { useFollowBottom } from '../../chat/useFollowBottom';
 import { quickKeys, QuickKey } from '../../chat/quickKeys';
 import { paneKey, useCapture } from '../../chat/useCapture';
-import { providerFor, STATUS_GLYPH, waitingLabel } from '../../mobile/inbox';
+import { providerFor, STATUS_GLYPH, statusLabel } from '../../mobile/inbox';
+import { asDetail } from '../../chat/statusWords';
 import { initialPaneHistory, loadEarlierDone, loadEarlierFail, loadEarlierStart, PaneHistoryState } from '../../mobile/paneHistory';
 import { useReview } from '../../mobile/useReview';
 import { PaneRole, reviewKeyLabel, reviewPollStatus, reviewStopCopy, reviewTabLabel, roleFromParam } from '../../mobile/review';
@@ -26,7 +28,8 @@ import { recordProductEventOnce } from '../../observability';
 import { ringStateFor } from '../../utils/reviewRing';
 import { optOutOfMobile } from '../../mobile/redirect';
 import { openInChatHref, opensInChat, showsAsChat } from '../../mobile/chatLinks';
-import { isSdkChat } from '../../chat/simpleChat';
+import { fullUiHref, isSdkChat } from '../../chat/simpleChat';
+import { recordLabOpened } from '../../chat/labOpened';
 import { ActionSheet, ConfirmSheet, Sheet, apiError } from './Sheet';
 import { HeaderPrPills } from './HeaderPrPills';
 import { heldNext, ReviewSheet } from './ReviewSheet';
@@ -357,8 +360,9 @@ export function Conversation() {
   useEffect(() => { setBranchOpen(false); resetBranchForm(); }, [projectId, resetBranchForm]);
   const closeArchive = useCallback(() => setArchiveOpen(false), []);
   const openFull = () => {
+    recordLabOpened('phone');
     optOutOfMobile();
-    navigate(`/?project=${encodeURIComponent(projectId)}${ws !== 'main' ? `&ws=${encodeURIComponent(ws)}` : ''}`);
+    navigate(fullUiHref(projectId, ws));
   };
   const togglePin = async () => {
     if (!project) return;
@@ -423,6 +427,8 @@ export function Conversation() {
   const ctx = status?.contextTokens;
   const ctxLevel = contextLevel(ctx);
   const liveWorkstreams = project?.workstreams.filter(w => !w.archived) ?? [];
+  // The session's one title (chat/sessionTitle.ts), as the chat and the home list name it.
+  const title = project ? workstreamTitle(project, ws, project.workstreams.find(w => w.name === ws)) : null;
 
   return (
     <div className="m-screen">
@@ -430,12 +436,12 @@ export function Conversation() {
         <Link className="m-link m-back" to="/m" aria-label="Back to inbox">‹</Link>
         <div className="m-conv-title">
           <span className="m-conv-name">
-            {project?.name ?? '…'}
-            {liveWorkstreams.length > 1 ? (
-              <select className="m-ws-select" value={ws} onChange={e => setWs(e.target.value)} aria-label="Workstream">
-                {liveWorkstreams.map(w => <option key={w.id} value={w.name}>{w.name}</option>)}
+            {title ?? '…'}
+            {liveWorkstreams.length > 1 && project && (
+              <select className="m-ws-select" value={ws} onChange={e => setWs(e.target.value)} aria-label="Session">
+                {liveWorkstreams.map(w => <option key={w.id} value={w.name}>{workstreamTitle(project, w.name, w)}</option>)}
               </select>
-            ) : ws !== 'main' ? <span className="m-ws"> · {ws}</span> : null}
+            )}
           </span>
           <span className="m-conv-sub">
             <span className="m-conv-state">
@@ -443,8 +449,8 @@ export function Conversation() {
               {' '}
               {role === 'review'
                 ? (reviewAlive ? reviewStateText(reviewDock, review.status?.reviewer) : 'no review running')
-                : status?.status === 'waiting' ? waitingLabel(status.waitingReason) : status?.status?.replace('_', ' ') ?? 'not running'}
-              {parsed?.spinner && role === 'agent' && <span className="m-spinner"> · {parsed.spinner.replace(/^[✻✶✳✢·]\s*/, '')}</span>}
+                : statusLabel({ status: status?.status ?? 'not_running', waitingReason: status?.waitingReason ?? null, ring: null, review: null })}
+              {parsed?.spinner && role === 'agent' && <span className="m-spinner"> · {asDetail(parsed.spinner.replace(/^[✻✶✳✢·]\s*/, ''))}</span>}
             </span>
             {project && <HeaderPrPills projectId={project.id} workstream={ws} milestone={status?.milestone} />}
           </span>

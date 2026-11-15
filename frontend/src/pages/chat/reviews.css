@@ -211,6 +211,13 @@
 .chat-root[data-chrome='refresh'] .rv-pane-acts { margin-left: auto; display: flex; align-items: center; gap: 4px; }
 .chat-root[data-chrome='refresh'] .rv-pane-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px; }
 .chat-root[data-chrome='refresh'] .rv-pane-body .m-block-plain { font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
+/* The reviewer's screen as it is, when its turns can't be read (ReviewPaneTab showsScreen): terminal output, so mono. */
+.chat-root[data-chrome='refresh'] .rv-pane-screen { margin: 8px 0 0; }
+.chat-root[data-chrome='refresh'] .rv-pane-screen-cap { font-family: var(--font-ui); font-size: 12.5px; color: var(--text-secondary); margin: 0 0 6px; }
+.chat-root[data-chrome='refresh'] .rv-pane-screen-text {
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+  margin: 0; padding: 8px 10px; border-radius: 6px; background: var(--bg-surface); border: 1px solid var(--border); color: var(--text-primary);
+}
 .chat-root[data-chrome='refresh'] .rv-pane-keys { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border); flex-wrap: wrap; }
 .chat-root[data-chrome='refresh'] .rv-send-failed { padding: 8px 12px 0; color: var(--danger); }
 .chat-root[data-chrome='refresh'] .rv-pane-keys-sep { align-self: stretch; width: 1px; margin: 2px 4px; background: var(--border); }

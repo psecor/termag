@@ -49,8 +49,9 @@ const mocks = vi.hoisted(() => ({
   tree: null as null | ((space: string, prefix: string) => Promise<SpaceTree>),
   /** chat-session-references-enabled. */
   refs: false,
+  recentOrder: false,
   members: vi.fn(),
-  status: {} as Record<string, { status: string }>,
+  status: {} as Record<string, { status: string; updatedAt?: string }>,
   /** Review sessions (reviewsData's sessionKeys), by mobile/inbox rowKey. */
   reviewKeys: new Set<string>(),
 }));
@@ -95,7 +96,7 @@ vi.mock('../../flags', async () => {
   const actual = await vi.importActual<typeof import('../../flags')>('../../flags');
   return {
     ...actual,
-    useFlag: <T,>(key: string, fallback: T) => (key === 'chat-session-references-enabled' ? mocks.refs as T : fallback),
+    useFlag: <T,>(key: string, fallback: T) => (key === 'chat-sidebar-recent-order-enabled' ? mocks.recentOrder as T : key === 'chat-session-references-enabled' ? mocks.refs as T : fallback),
   };
 });
 
@@ -137,6 +138,7 @@ function FilesPanel() {
 }
 
 beforeEach(() => {
+  mocks.recentOrder = false;
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   commits = [];
   localStorage.clear();
@@ -224,6 +226,40 @@ const rightClick = (el: Element) => act(() => { el.dispatchEvent(new MouseEvent(
 const stored = () => JSON.parse(localStorage.getItem(openItemsKey('u1'))!) as { items: Array<{ id: string; kind: string; path?: string }> };
 
 describe('tabs sidebar', () => {
+  it('automatically sorts by session activity and disables manual reorder when enabled', async () => {
+    mocks.recentOrder = true;
+    mocks.projects = ['a', 'b', 'c'].map((id, index) => ({
+      ...fixedTo(project(id, '2026-10-01T00:00:00Z'), id === 'c' ? 'id-assets' : 'id-notes'),
+      workstreams: [{ id: `ws-${id}`, name: 'main', archived: false, spaceId: id === 'c' ? 'id-assets' : 'id-notes', spaceFixedAt: '2026-10-01T00:00:00Z', lastActiveAt: `2026-10-${10 + index}T00:00:00Z` }],
+    } as unknown as Project));
+    await render();
+    expect(groups()).toEqual([['assets', ['c']], ['notes', ['b', 'a']]]);
+    expect(tab('a').closest('li')!.getAttribute('draggable')).toBe('false');
+    expect(host.querySelectorAll('[data-tab][aria-describedby="chat-items-move-hint"]')).toHaveLength(0);
+    key(tab('a'), 'ArrowUp', { altKey: true });
+    expect(groups()).toEqual([['assets', ['c']], ['notes', ['b', 'a']]]);
+    mocks.status = { [statusKey('box-a', sessionName('ada', 'a', 'agent'))]: { status: 'working', updatedAt: '2026-10-20T00:00:00Z' } };
+    await render();
+    expect(groups()).toEqual([['notes', ['a', 'b']], ['assets', ['c']]]);
+    mocks.status = { [statusKey('box-a', sessionName('ada', 'a', 'agent'))]: { status: 'working', updatedAt: 'invalid' } };
+    await render();
+    expect(groups()).toEqual([['assets', ['c']], ['notes', ['b', 'a']]]);
+    mocks.status = {};
+  });
+  it('does not give an idle sibling the active session’s project-wide timestamp', async () => {
+    mocks.recentOrder = true;
+    const p = project('a', '2026-10-20T00:00:00Z');
+    p.workstreams = ['main', 'active'].map(name => ({ id: `ws-${name}`, name, archived: false, spaceId: 'id-notes', spaceFixedAt: '2026-10-01T00:00:00Z', lastActiveAt: '2026-10-01T00:00:00Z', sessionTitle: name })) as Project['workstreams'];
+    mocks.projects = [p];
+    localStorage.setItem(openItemsKey('u1'), JSON.stringify({ v: 2, seeded: true, items: ['main', 'active'].map(workstream => ({ id: workstream, kind: 'chat', projectId: 'a', workstream, openedAt: 0 })) }));
+    mocks.status = { [statusKey('box-a', sessionName('ada', 'a', 'agent', 'active'))]: { status: 'working', updatedAt: '2026-10-20T00:00:00Z' } };
+    try {
+      await render();
+      expect(groups()).toContainEqual(['notes', ['active', 'main']]);
+    } finally {
+      mocks.status = {};
+    }
+  });
   beforeEach(() => {
     mocks.spaces = true;
     mocks.list = [space('notes'), space('assets', 'viewer')];
@@ -362,15 +398,15 @@ describe('tabs sidebar', () => {
     expect(document.activeElement).toBe(tab('b'));
   });
 
-  it('leads a tab with Claude\'s title for its session, the project after it', async () => {
+  it('leads a tab with its session\'s one title, nothing after it; the project is in its label', async () => {
     const titled = (title: string | null) => [{
       ...project('a', '2026-10-20T00:00:00Z'),
       workstreams: [{ id: 'w1', projectId: 'a', name: 'main', branch: 'main', archived: false, sessionTitle: title }],
     } as unknown as Project];
     mocks.projects = titled('Login rate limiting');
     await render();
-    expect(groups()).toEqual([['assets', []], ['notes', ['Login rate limiting · a']]]);
-    expect(host.querySelector('.chat-item-name .chat-row-ws')!.textContent).toBe(' · a');
+    expect(groups()).toEqual([['assets', []], ['notes', ['Login rate limiting']]]);
+    expect(host.querySelector('.chat-item-name .chat-row-ws')).toBeNull();
     expect(dots('Login rate limiting · a')).not.toBeNull();
 
     // No title yet: the project.

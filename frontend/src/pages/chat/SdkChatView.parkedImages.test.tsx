@@ -231,7 +231,7 @@ describe('images in a stored chat whose box is down', () => {
     expect(container.querySelector('.chat-composer img')).toBeNull();
     await act(async () => { vi.advanceTimersByTime(3500); });
     await flush();
-    expect(statusLine()).toBe('Starting the box…');
+    expect(statusLine()).toBe('Working · starting the box…');
     expect(heldBubble()?.textContent).toContain('what is in this screenshot?');
     expect(heldBubble()?.querySelector('img')?.getAttribute('src')).toBe('/termag/api/projects/p1/chat/held/m1/images/0?workstream=main');
   });

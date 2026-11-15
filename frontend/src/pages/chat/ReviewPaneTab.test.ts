@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { answerDigits, arrowOptions, paneOptions, restoredWhileWaking, reviewKeys, reviewQuote, spacedSender } from './ReviewPaneTab';
+import { answerDigits, arrowOptions, paneOptions, restoredWhileWaking, reviewKeys, reviewQuote, screenTail, showsScreen, spacedSender, SCREEN_ROWS } from './ReviewPaneTab';
 
 const PROMPT = [
   'I reviewed termag#812.',
@@ -191,5 +191,52 @@ describe('a pane listed while its box wakes', () => {
     expect(restoredWhileWaking({ at: '2026-11-06T16:00:00Z' }, { pending: true })).toBe(false);
     expect(restoredWhileWaking({ at: '2026-11-06T16:00:00Z' }, { pending: false, heldSince: since })).toBe(false);
     expect(restoredWhileWaking({ at: null }, { pending: true, heldSince: since })).toBe(false);
+  });
+});
+
+// Claude Code's first-run theme picker in a fresh review pane, as capture-pane -e gives it (trimmed).
+const THEME_PICKER = [
+  '\x1b[1m Let\'s get started.\x1b[0m',
+  '',
+  ' Choose the text style that looks best with your terminal',
+  ' To change this later, run /theme',
+  '',
+  '     Auto (match terminal)',
+  ' \x1b[38;5;153m❯ ✔ Dark mode\x1b[39m',
+  '     Light mode',
+  '',
+  ' \x1b]8;id=1;https://example.com\x1b\\  Syntax theme: Monokai Extended (ctrl+t to disable)\x1b]8;;\x1b\\',
+  '',
+  '',
+].join('\n');
+
+describe("the reviewer's screen, when its turns can't be read", () => {
+  it('is its last rows as plain text: colours and links off, blank rows trimmed', () => {
+    const text = screenTail(THEME_PICKER)!;
+    expect(text.startsWith(" Let's get started.")).toBe(true);
+    expect(text).toContain(' ❯ ✔ Dark mode');
+    expect(text.endsWith('Syntax theme: Monokai Extended (ctrl+t to disable)')).toBe(true);
+    expect(text).not.toMatch(/\x1b/);
+  });
+  it(`keeps only the last ${SCREEN_ROWS} rows, and says nothing for an empty screen`, () => {
+    const rows = Array.from({ length: 60 }, (_, i) => `row ${i}`).join('\n');
+    const text = screenTail(rows)!;
+    expect(text.split('\n')).toHaveLength(SCREEN_ROWS);
+    expect(text.endsWith('row 59')).toBe(true);
+    expect(screenTail('\n\n   \n')).toBeNull();
+    expect(screenTail(null)).toBeNull();
+  });
+  it('shows when the turns read as nothing, or a wait whose choices were not read; never for an exited pane', () => {
+    expect(showsScreen('reviewing', 0, false, false)).toBe(true);
+    expect(showsScreen('waiting', 3, false, false)).toBe(true);
+    expect(showsScreen('waiting', 3, true, false)).toBe(false);
+    expect(showsScreen('waiting', 3, false, true)).toBe(false);
+    expect(showsScreen('done', 3, false, false)).toBe(false);
+    expect(showsScreen('exited', 0, false, false)).toBe(false);
+  });
+  it("reads Claude's theme picker as a wait whose choices it can't read: the keys alone would be blind", () => {
+    expect(paneOptions(THEME_PICKER)).toEqual([]);
+    expect(arrowOptions(THEME_PICKER)).toEqual([]);
+    expect(reviewKeys('waiting', 'waiting', THEME_PICKER, 0, 'claude').choices.map(c => c.keys)).toEqual(['1', '2', '3']);
   });
 });

@@ -7,7 +7,11 @@
 //   (input + cache read + cache creation tokens) on `message_start` and on
 //   each `assistant` event;
 // - context window: `result.modelUsage[<model>].contextWindow`, or a guess
-//   from the model's name until a result says;
+//   from the model's name until a result says, held to the turn-start's
+//   `compactWindow` when the box sets one (agent chat-runner.js
+//   autoCompactWindowOf: CLAUDE_CODE_AUTO_COMPACT_WINDOW, which the Bedrock
+//   gateway delivers from claude-context-tokens). Claude Code compacts there,
+//   and its result still reports the model's full window;
 // - plan windows: `rate_limit_event`, one window per event, which Claude Code
 //   sends only for a claude.ai sign-in (never on the Bedrock gateway). What
 //   they hold depends on the plan: Pro and Max report 5-hour and 7-day windows
@@ -37,6 +41,11 @@ export interface ChatUsage {
   model: string | null;
   /** The context window the latest result reported for that model. */
   contextWindow: number | null;
+  /**
+   * Where Claude Code auto-compacts, from the latest turn-start: null when it
+   * names none (the model's full window), absent until a turn-start is seen.
+   */
+  compactWindow?: number | null;
   /** Plan rate-limit windows seen, by Claude Code's rateLimitType (five_hour, seven_day, …). */
   limits: Record<string, PlanWindow>;
 }
@@ -81,6 +90,13 @@ export function withResultUsage(u: ChatUsage, modelUsage: unknown): ChatUsage {
   const own = u.model ? entries.find(([name]) => name === u.model || name.startsWith(u.model!) || u.model!.startsWith(name)) : undefined;
   const window = own ? own[1] : Math.max(...entries.map(e => e[1]));
   return { ...u, contextWindow: window };
+}
+
+/** A turn-start's `compactWindow`: where this turn's Claude Code compacts, or null for the model's window. */
+export function withCompactWindow(u: ChatUsage, compactWindow: unknown): ChatUsage {
+  const w = num(compactWindow);
+  const next = w != null && w > 0 ? w : null;
+  return u.compactWindow === next ? u : { ...u, compactWindow: next };
 }
 
 /** A `rate_limit_event`'s `rate_limit_info`: one plan window, by its type. */
@@ -164,15 +180,20 @@ export function assumedWindow(model: string | null): number {
 
 export interface ContextView {
   used: number;
+  /** What the context can fill to before Claude Code compacts: the smaller of the compact window and the model's. */
   window: number;
+  /** The model's own window. */
+  modelWindow: number;
   /** 0-100, rounded. */
   percent: number;
 }
 
 export function contextView(u: ChatUsage): ContextView | null {
   if (u.contextTokens == null) return null;
-  const window = u.contextWindow ?? assumedWindow(u.model);
-  return { used: u.contextTokens, window, percent: Math.round(Math.min(1, u.contextTokens / window) * 100) };
+  const modelWindow = u.contextWindow ?? assumedWindow(u.model);
+  // Claude Code caps the compact window at the model's own.
+  const window = u.compactWindow ? Math.min(u.compactWindow, modelWindow) : modelWindow;
+  return { used: u.contextTokens, window, modelWindow, percent: Math.round(Math.min(1, u.contextTokens / window) * 100) };
 }
 
 /** A plan window's use as 0-100 (it can pass 100 when usage runs past the cap). */

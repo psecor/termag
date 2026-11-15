@@ -15,7 +15,7 @@ const { RESIZE_POLL_MS } = await import('../../hooks/useBoxResize');
 const SIZES = [
   { size: 'small' as const, vcpus: 2, memoryGiB: 8, instanceType: 'm8g.large' },
   { size: 'medium' as const, vcpus: 4, memoryGiB: 16, instanceType: 'm8g.xlarge' },
-  { size: 'large' as const, vcpus: 8, memoryGiB: 32, instanceType: 'm8g.2xlarge' },
+  { size: 'large' as const, vcpus: 4, memoryGiB: 32, instanceType: 'r8g.xlarge' },
 ];
 const info = (box: Partial<BoxResizeInfo['box']> = {}, resize: ResizeView | null = null): BoxResizeInfo => ({
   box: { id: 'b1', name: 'olive', status: 'ready', size: 'small', instanceType: 'm8g.large', hibernationConfigured: false, ...box },

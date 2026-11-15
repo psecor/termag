@@ -92,8 +92,13 @@ export function reviewProjectName(repo: string, taken: Iterable<string>): string
   return uniqueName(base, taken);
 }
 
-export type ClonePhase = 'waking' | 'creating' | 'cloning' | 'checkout';
-export interface CloneProgress { repo: string; box: string; phase: ClonePhase; projectName?: string }
+/**
+ * A step before a review starts. The clone's: `waking` its box, `creating` the project, `cloning`, `checkout` (a
+ * pane clone's checkout landing). A review chat's in a project that's there (simple-ui-review-chat-enabled):
+ * `box` (its box waking) and `session` (the PR checked out for it), which carry the PR's `number`.
+ */
+export type ClonePhase = 'waking' | 'creating' | 'cloning' | 'checkout' | 'box' | 'session';
+export interface CloneProgress { repo: string; box: string; phase: ClonePhase; projectName?: string; number?: number }
 
 export interface CloneDeps {
   listBoxes: () => Promise<Pick<Instance, 'id' | 'name' | 'status'>[]>;
@@ -121,19 +126,38 @@ function message(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback;
 }
 
-/** Wake a box that's asleep, then wait until it takes projects. */
-async function boxUp(box: Pick<Instance, 'id' | 'name' | 'status'>, deps: CloneDeps): Promise<void> {
-  if (TAKES_PROJECTS.has(box.status)) return;
-  if (ASLEEP.has(box.status)) await deps.startBox(box.id);
+/**
+ * Wake a box that's asleep, then wait until it takes projects. One still on its way down (stopping, hibernating)
+ * is woken once it's down: a start before then is refused, and waiting alone would never see it up.
+ */
+async function boxUp(box: Pick<Instance, 'id' | 'name' | 'status'>, deps: Pick<CloneDeps, 'listBoxes' | 'startBox' | 'sleep' | 'now'>, agentIn = false): Promise<void> {
+  // A clone takes a box still coming up; a review chat's checkout needs its agent in (`ready`).
+  const up = (status: string) => (agentIn ? status === 'ready' : TAKES_PROJECTS.has(status));
+  if (up(box.status)) return;
+  let started = false;
+  if (ASLEEP.has(box.status)) { await deps.startBox(box.id); started = true; }
   const until = deps.now() + BOX_WAIT_MS;
   for (;;) {
     const now = (await deps.listBoxes()).find(b => b.id === box.id);
     if (!now) throw new Error(`${box.name} is gone`);
-    if (TAKES_PROJECTS.has(now.status)) return;
+    if (up(now.status)) return;
+    if (!started && ASLEEP.has(now.status)) { await deps.startBox(box.id); started = true; }
     if (now.status === 'failed') throw new Error(`${box.name} failed to start`);
     if (deps.now() > until) throw new Error(`${box.name} took too long to start`);
     await deps.sleep(POLL_MS);
   }
+}
+
+/**
+ * A review chat's project box (simple-ui-review-chat-enabled), woken and waited for when it's asleep, as a clone's
+ * would be: `onWake` says so first. A box that's up, or not listed (a project with no box), goes on at once.
+ */
+export async function wakeProjectBox(instanceId: string | null | undefined, deps: Pick<CloneDeps, 'listBoxes' | 'startBox' | 'sleep' | 'now'>, onWake: (boxName: string) => void): Promise<void> {
+  if (!instanceId) return;
+  const box = (await deps.listBoxes()).find(b => b.id === instanceId);
+  if (!box || box.status === 'ready') return;
+  onWake(box.name);
+  await boxUp(box, deps, true);
 }
 
 /**
@@ -301,5 +325,13 @@ export function cloneProgressText(p: CloneProgress): string {
   if (p.phase === 'waking') return `Waking ${p.box} to clone ${p.repo}…`;
   if (p.phase === 'creating') return `Making a project for ${p.repo} on ${p.box}…`;
   if (p.phase === 'checkout') return `Waiting for ${p.projectName ?? p.repo}'s checkout to land…`;
+  if (p.phase === 'box') return `Waking ${p.box}…`;
+  if (p.phase === 'session') return `Checking out ${prRef(p)} in ${p.projectName ?? 'its project'}…`;
   return `Cloning ${p.repo} into ${p.projectName ?? 'a new project'} on ${p.box}…`;
+}
+
+/** `name#N` of a step's PR, or the repository alone. */
+function prRef(p: CloneProgress): string {
+  const name = p.repo.split('/').pop() ?? p.repo;
+  return p.number != null ? `${name}#${p.number}` : p.repo;
 }

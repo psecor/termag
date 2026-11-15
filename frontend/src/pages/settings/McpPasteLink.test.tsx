@@ -43,7 +43,7 @@ describe('Settings → MCP paste box (mcp-oauth-loopback-servers)', () => {
     expect(form).not.toBeNull();
     expect(form.method).toBe('post');
     expect(form.getAttribute('action')).toBe('/termag/api/mcp-connectors/c1/oauth/paste');
-    expect(form.textContent).toContain("Sign in in the new tab. When it lands on a page that won't load, copy that page's address, close the tab and paste it here.");
+    expect(form.textContent).toContain("Sign in in the new tab, then paste the address of the page it ends on.");
     expect(form.querySelector('input[name="url"]')).not.toBeNull();
   });
 
@@ -79,7 +79,7 @@ describe('Link on a listed server opens the sign-in in a new tab', () => {
   afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
   const clickLink = async () => {
-    const link = [...el.querySelectorAll('button')].find(b => b.textContent === 'Link') as HTMLButtonElement;
+    const link = [...el.querySelectorAll('button')].find(b => b.textContent === 'Connect') as HTMLButtonElement;
     await act(async () => { link.click(); });
     await flush();
   };
@@ -95,7 +95,7 @@ describe('Link on a listed server opens the sign-in in a new tab', () => {
     expect(assign).not.toHaveBeenCalled();
     expect(el.querySelector('form.mcp-paste')).not.toBeNull();
     expect(el.querySelector('.mcp-paste-fallback')).toBeNull();
-    const link = [...el.querySelectorAll('button')].find(b => b.textContent === 'Link') as HTMLButtonElement;
+    const link = [...el.querySelectorAll('button')].find(b => b.textContent === 'Connect') as HTMLButtonElement;
     expect(link.disabled).toBe(false);
   });
 
@@ -116,7 +116,7 @@ describe('Link on a listed server opens the sign-in in a new tab', () => {
     api.startOAuth.mockResolvedValue(LOOPBACK_URL);
     await render([connector({ pasteLink: true, linkStatus: 'linked' })]);
     expect(el.querySelector('form.mcp-paste')).toBeNull();
-    const relink = [...el.querySelectorAll('button')].find(b => b.textContent === 'Re-link') as HTMLButtonElement;
+    const relink = [...el.querySelectorAll('button')].find(b => b.textContent === 'Reconnect') as HTMLButtonElement;
     await act(async () => { relink.click(); });
     await flush();
     expect(el.querySelector('form.mcp-paste')?.getAttribute('action')).toContain('/c1/');
@@ -126,7 +126,7 @@ describe('Link on a listed server opens the sign-in in a new tab', () => {
     vi.spyOn(window, 'open').mockReturnValue({ opener: null } as Window);
     api.startOAuth.mockResolvedValue(LOOPBACK_URL);
     await render([connector({ pasteLink: true, linkStatus: 'linked' })]);
-    const relink = [...el.querySelectorAll('button')].find(b => b.textContent === 'Re-link') as HTMLButtonElement;
+    const relink = [...el.querySelectorAll('button')].find(b => b.textContent === 'Reconnect') as HTMLButtonElement;
     await act(async () => { relink.click(); });
     await flush();
     // A reload: a new page with nothing in React state.

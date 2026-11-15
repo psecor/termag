@@ -3,6 +3,7 @@
  * beacon that tells the backend which build each user runs.
  */
 import type { AxiosInstance } from 'axios';
+import { isEdgeSignedOut } from './utils/edgeSession';
 
 declare const __TERMAG_SHA__: string | undefined;
 
@@ -37,6 +38,9 @@ const BEACON_MS = 3600_000;
 
 export function startClientBeacon(): void {
   const send = () => {
+    // Nothing while signed out at the edge: even unfollowed, the ALB's redirect
+    // resets the nonce of a login in progress (utils/edgeSession.ts).
+    if (isEdgeSignedOut()) return;
     // redirect: 'manual', as the status probe does: an edge sign-in 302 must
     // not be followed into the identity provider from a background request.
     void fetch('/termag/api/client/hello', {

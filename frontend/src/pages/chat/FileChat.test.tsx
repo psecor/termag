@@ -324,6 +324,15 @@ describe('the conversation\'s composer under the file', () => {
     expect(attach?.disabled).toBe(false);
   });
 
+  it("is a Cursor chat's as its conversation has it: no Claude model picker (Bugbot)", async () => {
+    mocks.projects = [project('docs'), project('termag-5', 'cursor-chat'), project('pane', 'claude')];
+    mocks.history.mockResolvedValue(history({ imageInput: false }));
+    await open();
+    const bar = host.querySelector('.fv-chat .chat-composer-bar')!;
+    expect(bar).not.toBeNull();
+    expect(bar.querySelector('.chat-compose-model-btn')).toBeNull();
+  });
+
   it('takes an image while the target\'s box is stopped, and sends it with the text to the orchestrator, which holds both (#971)', async () => {
     mocks.noBoxes = [{ id: 'box-1', name: 'box-1', kind: 'ec2', ec2InstanceId: 'i-1', status: 'stopped' }];
     // A stored chat whose send the orchestrator holds while its box is down (routes/chat.ts holdIfContinuing).
@@ -739,7 +748,7 @@ describe('above the box: one line, never more', () => {
   it('stays one row while a long reply streams in, quoting only its first line', async () => {
     await open();
     expect(aboveBox().map(k => k.className)).toEqual(['fv-chat-line']);
-    expect(lineText()).toBe('termag-5 · Say what you want to do');
+    expect(lineText()).toBe('termag-5 · Idle · no messages yet');
     await type('mark 755 ready');
     await enter();
     const message = 'mark 755 ready\n\n(viewing improve-termag:pr-outbox.md)';
@@ -788,7 +797,7 @@ describe('above the box: one line, never more', () => {
     const name = host.querySelector<HTMLElement>('.fv-chat-line-name')!;
     expect(name.textContent).toBe(long);
     expect(name.title).toBe(`${long} · termag-5`);
-    expect(host.querySelector('.fv-chat-line-status')?.textContent).toBe(' · Say what you want to do');
+    expect(host.querySelector('.fv-chat-line-status')?.textContent).toBe(' · Idle · no messages yet');
     expect(host.querySelector('.fv-chat-open')?.textContent).toBe('Open');
   });
 });

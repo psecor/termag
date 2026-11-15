@@ -1,17 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Terminal as XTerm, type IBufferCell, type ILink } from 'xterm';
-import { FitAddon } from '@xterm/addon-fit';
-import { WebLinksAddon } from '@xterm/addon-web-links';
-import 'xterm/css/xterm.css';
+import type { Terminal as XTerm, IBufferCell, ILink } from 'xterm';
+import { openTerminal } from './terminalEngine';
 import { useConnection } from '../contexts/ConnectionContext';
 import { shouldKickTerminalOnGlobalRecovery, TerminalPaneState } from '../utils/connection';
 import { connectionTracker } from '../utils/connectionTracker';
+import { edgeDialGate } from '../utils/edgeSession';
 import { noteFirstTerminalData } from '../services/claimTiming';
 import { recordProductEventOnce } from '../observability';
 import { isAgentPaneSession } from '../utils/sessionName';
 import { boxStatusBus } from '../utils/boxStatusBus';
 import { COARSE_POINTER_QUERY, customKeySequence, touchTypingAttributes } from '../utils/terminalKeys';
-import { guardViewportAfterDispose, hasLayoutSize } from '../utils/xtermLifecycle';
+import { cellAt, wheelReports } from '../utils/touchScroll';
+import { endMouseTracking, hasLayoutSize } from '../utils/xtermLifecycle';
 import { findImagePathLinks, imagePreviewUrl, RowText } from '../utils/imagePathLinks';
 import { ImagePreviewAnchor, TerminalImagePreview } from './TerminalImagePreview';
 import { documentPalette, terminalTheme, TERMINAL_ISLAND_CLASS } from './terminalTheme';
@@ -72,6 +72,19 @@ export interface TerminalHandle {
   isFocused: () => boolean;
   /** The pane is in application cursor mode (arrows are SS3). */
   appCursor: () => boolean;
+  /**
+   * What a scroll gesture should drive (pages/chat/useTouchScroll.ts):
+   * `select` while the select toggle is on (the gesture is left to xterm),
+   * `wheel` while the app asked for mouse reports (tmux with mouse on, so
+   * its copy-mode scrolls), else `buffer`, xterm's own scrollback.
+   */
+  scrollTarget: () => 'select' | 'wheel' | 'buffer';
+  /** One row's height in CSS px (0 before layout). */
+  lineHeight: () => number;
+  /** Scrolls xterm's own buffer; positive is toward newer lines. */
+  scrollLines: (lines: number) => void;
+  /** Sends `count` wheel reports at the cell under the point: negative is up (older), positive down. */
+  wheel: (count: number, clientX: number, clientY: number) => void;
 }
 
 // Regex to match mouse tracking enable/disable escape sequences
@@ -290,7 +303,7 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
       token('--font-mono', 'JetBrains Mono Variable, JetBrains Mono, monospace'),
       terminalFontRef.current,
     );
-    const term = new XTerm({
+    const { term, fit: fitTerminal } = openTerminal(container, {
       allowTransparency: true,
       theme: terminalTheme(css, documentPalette()),
       fontSize: 13,
@@ -299,9 +312,6 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
       scrollback: 10000,
     });
 
-    const fitAddon = new FitAddon();
-    term.loadAddon(fitAddon);
-    term.loadAddon(new WebLinksAddon());
     // Image paths an agent printed (screenshots) preview on hover and open on
     // click; the box reads the file (utils/imagePathLinks.ts, GET /api/projects/:id/image).
     let previewTimer: ReturnType<typeof setTimeout> | null = null;
@@ -333,16 +343,27 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
         }));
       },
     }) : null;
-    term.open(container);
     // A palette switch (Settings, or its preview) changes only how opaque the
     // background is; xterm read its colours once, so give it them again.
     const paletteObserver = new MutationObserver(() => {
       term.options.theme = terminalTheme(getComputedStyle(container), documentPalette());
     });
     paletteObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-palette'] });
-    guardViewportAfterDispose(term);
     // Route OSC 52 (clipboard) sequences emitted by tmux to the browser clipboard.
     term.parser.registerOscHandler(52, handleOsc52);
+    // Whether the app asked for SGR mouse reports (mode 1006), for the wheel
+    // reports a touch drag sends (utils/touchScroll.ts). xterm's public API
+    // says which mouse events are on but not their encoding, so watch the
+    // mode switch go by and let xterm handle it as usual (return false).
+    let sgrMouse = false;
+    const noteSgr = (on: boolean) => (params: (number | number[])[]) => {
+      if (params.includes(1006)) sgrMouse = on;
+      return false;
+    };
+    const sgrHandlers = [
+      term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, noteSgr(true)),
+      term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, noteSgr(false)),
+    ];
     termRef.current = term;
 
     const onFocus = () => { setFocused(true); onFocusRef.current?.(); };
@@ -353,8 +374,11 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let loop: PaneLoop = initialPaneLoop;
     let connect: () => void = () => {};
+    // Signed out at the edge, a dial only resets a login's nonce: wait for the
+    // sign-in instead (utils/edgeSession.ts).
+    const edge = edgeDialGate();
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-    const fit = () => { if (hasLayoutSize(container)) fitAddon.fit(); };
+    const fit = () => { if (hasLayoutSize(container)) fitTerminal(); };
 
     // xterm sizes its cells from the font it measures when it opens. On a first
     // visit the bundled JetBrains Mono may still be downloading, and cells sized
@@ -425,6 +449,7 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
         // "back online" kick can both want to connect; whichever runs second
         // must not open a second socket into the same pane.
         if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+        if (!edge.allows(() => connect())) return;
         // Retire any prior socket. Detach its handlers FIRST: closing a
         // socket (even one still CONNECTING) fires its onclose later, and if
         // that handler were still wired it would null wsRef (clobbering the
@@ -539,6 +564,18 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
         focus: () => term.focus(),
         isFocused: () => textarea != null && document.activeElement === textarea,
         appCursor: () => term.modes.applicationCursorKeysMode,
+        scrollTarget: () => selectModeRef.current ? 'select' : term.modes.mouseTrackingMode !== 'none' ? 'wheel' : 'buffer',
+        lineHeight: () => {
+          const screen = container.querySelector('.xterm-screen');
+          return screen && term.rows > 0 ? screen.getBoundingClientRect().height / term.rows : 0;
+        },
+        scrollLines: (lines: number) => term.scrollLines(lines),
+        wheel: (count: number, clientX: number, clientY: number) => {
+          const screen = container.querySelector('.xterm-screen');
+          if (!screen || count === 0) return;
+          const { col, row } = cellAt(clientX, clientY, screen.getBoundingClientRect(), term.cols, term.rows);
+          sendInput(wheelReports(count, col, row, sgrMouse));
+        },
       });
 
       const sendPasteImage = async (blob: Blob) => {
@@ -655,7 +692,9 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
 
     return () => {
       disposed = true;
+      edge.cancel();
       paletteObserver.disconnect();
+      for (const h of sgrHandlers) h.dispose();
       unsubscribeBoxStatus();
       imageLinks?.dispose();
       clearPreview();
@@ -681,6 +720,7 @@ export function Terminal({ sessionName, projectId, workstream, instanceId, activ
       }
       if (ws) ws.close();
       wsRef.current = null;
+      endMouseTracking(term);
       term.dispose();
       setFocused(false);
       termRef.current = null;

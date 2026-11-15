@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
 import {
   Button, ButtonGroup, Dialog, Disclosure, DisclosurePanel, Heading, Modal, ModalOverlay, Radio, RadioGroup, Text,
 } from '@launchpad-ui/components';
@@ -8,13 +8,15 @@ import { useAuth } from '../../contexts/AuthContext';
 import { NewProjectForm } from '../../components/NewProjectForm';
 import { boxFeed } from '../../services/boxFeed';
 import { blocksManagedBox } from '../../boxGate';
-import { credentialsApi, type CredentialsStatus } from '../../services/api';
+import { credentialsApi, mcpConnectorsApi, type CredentialsStatus, type McpConnectorList } from '../../services/api';
 import { recordProductEvent } from '../../observability';
 import { recordUiMode } from '../../chat/uiMode';
+import { FLAGS, useFlag } from '../../flags';
 import { LP_THEME } from '../../launchpad/theme';
 import { ensureLaunchPadSprite } from '../../launchpad/sprite';
 import type { SshKeysSectionHandle } from '../settings/SshKeysSection';
 import { DotfilesField, GithubField, SshKeyField } from './SetupFields';
+import { McpStepRefresh, usableMcpServer } from './McpStepRefresh';
 import './welcome.css';
 
 /**
@@ -22,20 +24,56 @@ import './welcome.css';
  * one optional row; how you work, termag (the chat UI, preselected) or Lab
  * (the terminal workspace); and the start. termag ends on the chat UI's New
  * session; Lab keeps the New project form and opens the project in Lab.
+ * Under onboarding-mcp-step-enabled, an MCP servers step comes before the
+ * start when the catalog offers a server (McpStepRefresh.tsx).
  */
 
 export type WorkMode = 'termag' | 'lab';
-type StepId = 'github' | 'mode' | 'start';
-const STEP_LABELS: Record<StepId, string> = { github: 'GitHub', mode: 'How you work', start: 'Start' };
+type StepId = 'github' | 'mode' | 'mcp' | 'start';
+const STEP_LABELS: Record<StepId, string> = { github: 'GitHub', mode: 'How you work', mcp: 'Tools', start: 'Start' };
 /** How setup ended: New session, a Lab project (or a branch-off of one), or Skip for now. */
 type SetupExit = 'session' | 'project' | 'branch-off' | 'skip';
 
 export default function WelcomeRefresh() {
   const { user, setOnboarded } = useAuth();
   const navigate = useNavigate();
-  const steps: StepId[] = ['github', 'mode', 'start'];
-  const [step, setStep] = useState<StepId>('github');
+  const { search } = useLocation();
+  // An MCP sign-in started on the MCP step returns to /welcome?step=mcp&server=<id>&linked=1 (or &error=).
+  const returned = new URLSearchParams(search).get('step') === 'mcp';
+  const mounted = useRef(false);
+
+  // The MCP step shows while onboarding-mcp-step-enabled is on and the catalog
+  // (mcp-default-connectors, minus the servers the user has) offers an MCP
+  // server; API providers (`kind: 'api'`) alone don't count. Once offered it
+  // stays for the visit, so connecting the last one doesn't take it away; the
+  // return from a sign-in shows it too, with a failed load's error and Retry.
+  // With the flag off the list isn't loaded and the wizard has three steps.
+  const mcpStepOn = useFlag(FLAGS.onboardingMcpStep, false);
+  const [mcpList, setMcpList] = useState<McpConnectorList | null>(null);
+  const [mcpError, setMcpError] = useState('');
+  const [catalogOffered, setCatalogOffered] = useState(returned);
+  // Its progress segment shows done only once it has been open: the list can
+  // answer after the person has moved on to Start.
+  const [mcpSeen, setMcpSeen] = useState(returned);
+  const loadMcp = () => {
+    setMcpError('');
+    return mcpConnectorsApi.list().then(l => {
+      if (!mounted.current) return;
+      setMcpList(l);
+      if (l.catalog?.some(s => s.kind !== 'api')) setCatalogOffered(true);
+    }).catch(() => { if (mounted.current) setMcpError('Couldn\'t load MCP servers.'); });
+  };
+  useEffect(() => { if (mcpStepOn) void loadMcp(); }, [mcpStepOn]);
+  const offerMcp = mcpStepOn && catalogOffered;
+
+  const steps: StepId[] = offerMcp ? ['github', 'mode', 'mcp', 'start'] : ['github', 'mode', 'start'];
+  const [stepId, setStep] = useState<StepId>(returned ? 'mcp' : 'github');
+  const step: StepId = steps.includes(stepId) ? stepId : 'github';
   const at = steps.indexOf(step);
+  const stepAfter = (id: StepId) => steps[Math.min(steps.indexOf(id) + 1, steps.length - 1)];
+  const stepBefore = (id: StepId) => steps[Math.max(steps.indexOf(id) - 1, 0)];
+  useEffect(() => { if (step === 'mcp') setMcpSeen(true); }, [step]);
+  const isDone = (id: StepId, i: number) => i < at && (id !== 'mcp' || mcpSeen);
   const [chosen, setMode] = useState<WorkMode>('termag');
   const mode: WorkMode = chosen;
   // Continue waits for this: until it answers, nobody knows whether GitHub is
@@ -48,7 +86,6 @@ export default function WelcomeRefresh() {
   const ssh = useRef<SshKeysSectionHandle>(null);
   const [sshBusy, setSshBusy] = useState(false);
   const [pending, setPending] = useState<(() => void) | null>(null);
-  const mounted = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -68,6 +105,12 @@ export default function WelcomeRefresh() {
 
   useEffect(() => {
     recordProductEvent('welcome.step', { 'termag.step': step });
+  }, [step]);
+  // The page is its own scroller (welcome.css), shared by every step: a step
+  // opens at its top, not at the offset the last one was scrolled to.
+  const page = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (page.current) page.current.scrollTop = 0;
   }, [step]);
 
   const githubBlocked = blocksManagedBox(cred?.github.boxGate);
@@ -107,7 +150,7 @@ export default function WelcomeRefresh() {
   }
 
   return (
-    <div className={`wel-root ${LP_THEME}`}>
+    <div ref={page} className={`wel-root ${LP_THEME}`}>
       <header className="wel-top">
         <span className="wel-brand"><Icon name="terminal" size="medium" aria-hidden="true" />termag</span>
         <Button variant="minimal" isDisabled={sshBusy} onPress={() => leave(skip)}>Skip for now</Button>
@@ -116,7 +159,7 @@ export default function WelcomeRefresh() {
       <main className="wel-card" aria-labelledby="wel-h">
         <ol className="wel-progress" aria-label="Setup steps">
           {steps.map((id, i) => (
-            <li key={id} className={i < at ? 'is-done' : i === at ? 'is-current' : ''} aria-current={i === at ? 'step' : undefined}>
+            <li key={id} className={isDone(id, i) ? 'is-done' : i === at ? 'is-current' : ''} aria-current={i === at ? 'step' : undefined}>
               <span className="wel-progress-bar" />
               <span className="wel-progress-label">{STEP_LABELS[id]}</span>
             </li>
@@ -177,7 +220,20 @@ export default function WelcomeRefresh() {
             </RadioGroup>
             <footer className="wel-foot">
               <Button variant="minimal" onPress={() => setStep('github')}>Back</Button>
-              <Button variant="primary" size="large" onPress={() => { recordProductEvent('welcome.mode.chosen', { 'termag.mode': mode }); setStep('start'); }}>Continue</Button>
+              <Button variant="primary" size="large" onPress={() => { recordProductEvent('welcome.mode.chosen', { 'termag.mode': mode }); setStep(stepAfter('mode')); }}>Continue</Button>
+            </footer>
+          </>
+        )}
+
+        {step === 'mcp' && (
+          <>
+            <StepHead title="Connect your tools" sub="Your agents can use these MCP servers in every session." />
+            <McpStepRefresh list={mcpList} loadError={mcpError} search={search} onReload={() => void loadMcp()} />
+            <footer className="wel-foot">
+              <Button variant="minimal" onPress={() => setStep('mode')}>Back</Button>
+              {mcpList?.connectors.some(usableMcpServer)
+                ? <Button variant="primary" size="large" onPress={() => setStep('start')}>Continue</Button>
+                : <Button size="large" onPress={() => setStep('start')}>Skip</Button>}
             </footer>
           </>
         )}
@@ -191,7 +247,7 @@ export default function WelcomeRefresh() {
               <li><Icon name="rocket" size="medium" aria-hidden="true" /><span>termag starts a box and the agent</span></li>
             </ol>
             <footer className="wel-foot">
-              <Button variant="minimal" onPress={() => setStep('mode')}>Back</Button>
+              <Button variant="minimal" onPress={() => setStep(stepBefore('start'))}>Back</Button>
               <Button variant="primary" size="large" onPress={() => void finish('/chat/new')}>Start a session</Button>
             </footer>
           </>
@@ -205,7 +261,7 @@ export default function WelcomeRefresh() {
                 onGithubRequired={() => { void loadCred(); setStep('github'); }}
                 submitLabel="Create project"
                 quiet
-                actions={<Button variant="minimal" onPress={() => setStep('mode')}>Back</Button>}
+                actions={<Button variant="minimal" onPress={() => setStep(stepBefore('start'))}>Back</Button>}
                 onBranchOff={projectId => void finish(`/?project=${encodeURIComponent(projectId)}&branchOff=1`, 'lab', 'branch-off')}
                 onCreated={project => finish(`/?project=${encodeURIComponent(project.id)}`, 'lab', 'project')}
               />

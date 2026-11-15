@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { PrOverview, PrPipelineResponse, PrRow } from '../services/api';
-import { prGates, sessionPr } from './prGates';
+import { prGates, sessionOpenPrs, sessionPr } from './prGates';
 
 type Checks = PrOverview['checks'];
 const pr = (over: Partial<PrOverview> = {}) => ({
@@ -79,5 +79,22 @@ describe('sessionPr', () => {
     expect(sessionPr(res(rows), 'p1', 'feat')?.number).toBe(4);
     expect(sessionPr(res(rows), 'p2', 'main')).toBeNull();
     expect(sessionPr(null, 'p1', 'main')).toBeNull();
+  });
+});
+
+describe('sessionOpenPrs', () => {
+  it("is every open PR linked to a session, by the session's row key, and no merged PR or bare branch", () => {
+    const rows = [
+      row({ number: 1, mergedAt: '2026-10-20T00:00:00Z' }),
+      row({ number: 2 }),
+      row({ number: 3, workstream: { projectId: 'p2', workstream: 'feat' } as PrRow['workstream'] }),
+      row({ number: 4, kind: 'branch' }),
+      row({ number: 5, workstream: null }),
+    ];
+    expect(sessionOpenPrs(res(rows))).toEqual([
+      { key: 'p1|main', pr: 'example-org/termag#2' },
+      { key: 'p2|feat', pr: 'example-org/termag#3' },
+    ]);
+    expect(sessionOpenPrs(null)).toEqual([]);
   });
 });

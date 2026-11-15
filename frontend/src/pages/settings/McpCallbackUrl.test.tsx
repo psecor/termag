@@ -35,7 +35,7 @@ async function render(connectors: object[]) {
 
 async function link(data: object) {
   api.startOAuth.mockRejectedValue({ response: { status: 400, data } });
-  const button = [...el.querySelectorAll('button')].find(b => b.textContent === 'Link') as HTMLButtonElement;
+  const button = [...el.querySelectorAll('button')].find(b => b.textContent === 'Connect') as HTMLButtonElement;
   await act(async () => { button.click(); });
   await flush();
   return el.querySelector('.error-banner') as HTMLElement;

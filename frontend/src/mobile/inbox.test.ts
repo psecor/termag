@@ -74,6 +74,12 @@ describe('buildRows', () => {
     expect(main).toMatchObject({ status: 'working', message: 'Editing App.tsx', contextTokens: 412_000, pinned: true, provider: 'claude' });
   });
 
+  it('carries when the session entered its status, for the sidebar card, null where the status never said', () => {
+    const since = buildRows(projects, { ...statusMap, [statusKey('box1', 'psecor-termag-agent')]: { ...statusMap[statusKey('box1', 'psecor-termag-agent')], statusSince: '2026-11-13T19:00:00.000Z' } }, 'psecor');
+    expect(since.find(r => r.key === 'p1|main')!.statusSince).toBe('2026-11-13T19:00:00.000Z');
+    expect(rows.find(r => r.key === 'p2|main')!.statusSince).toBeNull();
+  });
+
   it('carries the workstream\'s session title, null where there is none', () => {
     const titled = projects.map(p => (p.id === 'p1'
       ? { ...p, workstreams: p.workstreams.map(w => (w.name === 'termag-tui' ? { ...w, sessionTitle: 'TUI resize bug' } : w)) }
@@ -163,12 +169,12 @@ describe('buildHome', () => {
 
   it('labels each row with its state', () => {
     const label = (key: string) => statusLabel(home.rows.find(r => r.key === key)!);
-    expect(label('p2|main')).toBe('Needs approval');
-    expect(label('p1|termag-tui')).toBe('Asked you a question');
-    expect(label('p8|main')).toBe('Review ready #313');
-    expect(label('p1|main')).toBe('Running');
-    expect(label('p7|main')).toBe('Reviewing #312');
-    expect(label('p3|main')).toBe('Ready');
+    expect(label('p2|main')).toBe('Needs you · approval');
+    expect(label('p1|termag-tui')).toBe('Needs you · a question');
+    expect(label('p8|main')).toBe('Needs you · review #313 ready');
+    expect(label('p1|main')).toBe('Working');
+    expect(label('p7|main')).toBe('Working · reviewing #312');
+    expect(label('p3|main')).toBe('Idle');
   });
 
   it('opens the review tab only when the row is about its review', () => {
@@ -231,6 +237,9 @@ describe('search tab', () => {
   it('matches every term across name, workstream, owner, message and PR', () => {
     expect(searchRows(home.rows, 'termag tui').map(r => r.key)).toEqual(['p1|termag-tui']);
     expect(searchRows(home.rows, 'ZANE').map(r => r.key)).toEqual(['p4|main']);
+    // The title a row shows (chat/sessionTitle.ts) is searchable too.
+    const titled = home.rows.map(r => (r.key === 'p4|main' ? { ...r, sessionTitle: 'Retry the webhook', sessionTitleSource: 'claude' } : r));
+    expect(searchRows(titled, 'webhook').map(r => r.key)).toEqual(['p4|main']);
     expect(searchRows(home.rows, 'pnpm').map(r => r.key)).toEqual(['p2|main']);
     expect(searchRows(home.rows, '#312').map(r => r.key)).toEqual(['p7|main']);
     expect(searchRows(home.rows, '   ')).toEqual([]);

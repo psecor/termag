@@ -48,7 +48,7 @@ describe('plainPreview', () => {
   it('matches the push: no emphasis, ticks or leading marker', () => {
     expect(plainPreview('Read **README.md** and `src/`')).toBe('Read README.md and src/');
     expect(plainPreview('> quoted')).toBe('quoted');
-    expect(turnNotificationText('orchestrator', 'main', '**Done**').body).toBe('Your turn · Done');
+    expect(turnNotificationText('orchestrator', '**Done**').body).toBe('Idle · Done');
   });
 });
 
@@ -60,9 +60,10 @@ describe('turnPreview and turnNotificationText', () => {
   });
 
   it('matches the push', () => {
-    expect(turnNotificationText('orchestrator', 'main', 'All green.')).toEqual({ title: 'orchestrator', body: 'Your turn · All green.' });
-    expect(turnNotificationText('orchestrator', 'feat', null)).toEqual({ title: 'orchestrator · feat', body: 'Done · your turn' });
-    expect(turnNotificationText('p', 'main', 'x'.repeat(400)).body).toHaveLength('Your turn · '.length + 180);
+    expect(turnNotificationText('orchestrator', 'All green.')).toEqual({ title: 'orchestrator', body: 'Idle · All green.' });
+    // The title is the session's one title (chat/sessionTitle.ts), never "project · workstream".
+    expect(turnNotificationText('Fix the login test', null)).toEqual({ title: 'Fix the login test', body: 'Idle · your turn' });
+    expect(turnNotificationText('p', 'x'.repeat(400)).body).toHaveLength('Idle · '.length + 180);
     expect(chatTurnTag('p1', 'main')).toBe('chat-turn:p1:main');
     expect(chatTurnUrl('p1', 'feat')).toBe('/termag/chat/p/p1?ws=feat');
   });

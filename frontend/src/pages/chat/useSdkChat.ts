@@ -7,7 +7,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { historyComingUp, historyFailureIsSetup, isPowerRestart, readRunningBox, subscribeRunningBoxes, type ReopenNavigationState } from '../../chat/archive';
-import { activityApi, chatApi, instancesApi, type ChatContinuation, type ChatTrust } from '../../services/api';
+import { activityApi, chatApi, instancesApi, spacesApi, type ChatContinuation, type ChatTrust } from '../../services/api';
 import { CONTINUATION_POLL_MS, continuationPolls, continuationStatus, heldToShow } from '../../chat/continuation';
 import { useProjects } from '../../contexts/ProjectContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -17,6 +17,7 @@ import { boxFeed } from '../../services/boxFeed';
 import { useSetupContext } from '../../hooks/useSetupContext';
 import { cloneTile } from '../../utils/cloneTile';
 import { chatEvents } from '../../chat/chatEvents';
+import { recheckFiles } from '../../chat/spaceFileLive';
 import { MAX_KEYS } from '../../chat/compose';
 import { reduceHold, refusalFromSend, statusBesideHold, type HoldState } from '../../chat/terminalHold';
 import { chatLiveKey, publishChatStatus } from '../../chat/chatLiveStatus';
@@ -26,6 +27,7 @@ import { addPending, applyEvent, applyFrame, chatCostTotal, chatStatus, contextA
 import type { ContextControls } from '../../chat/ContextRing';
 import { chromeFromHistory, composerChrome, rememberChrome, rememberedChrome, updateRememberedChrome, type ComposerChrome } from '../../chat/composerChrome';
 import { fullUiHref, repoSlug } from '../../chat/simpleChat';
+import { recordLabOpened, type LabOpenedFrom } from '../../chat/labOpened';
 import { useAutoGrow } from '../../chat/useAutoGrow';
 import { useComposerText } from '../../chat/useHandedDraft';
 import { useDictation } from '../../chat/useDictation';
@@ -40,6 +42,10 @@ import { useComposerAttachments } from '../../chat/useComposerAttachments';
 import { attachmentsPhrase, finishFirstMessage, firstImages, firstMessageText, releaseFirstImages } from '../../chat/firstImages';
 import { heldBoxFiles, heldTextFiles, messageTooLong, queueJoinRefusal, splitTextFiles, withTextFiles, type BoxFile, type TextFile } from '../../chat/chatTextFiles';
 import type { BoxFileUpload } from '../../chat/useComposerAttachments';
+import { keepChatFile } from '../../chat/chatSpaceFiles';
+import { chatHomeSpace } from '../../chat/chatSpaces';
+import { useSharedChatSpaces, useWhenSpacesLoaded } from '../../chat/useChatSpaces';
+import { uploadFile as uploadSpaceFile } from '../../services/spaceTransfer';
 import { FLAGS, useFlag } from '../../flags';
 import type { Project } from '../../types';
 import { useSimpleDataIfAny } from './simpleData';
@@ -47,6 +53,7 @@ import { useChatChrome } from './chatChrome';
 import { countSent } from '../../chat/fileChat';
 import { createHeadingStore, headingOfEvent } from '../../chat/toolGroupHeadings';
 import { boxDownText, boxIsDown, reportStoredOpen, START_WAIT_MS, startDidNotTake, startDue, storedOpenAnswer } from '../../chat/storedOpen';
+import { asDetail, statusText } from '../../chat/statusWords';
 
 const HISTORY_POLL_MS = 2000;
 
@@ -612,9 +619,15 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   const narratedBox = comingUp
     ? { name: box?.name || reopenNav?.reopenBoxName || 'box', status: 'starting' as const, provisioningError: box?.provisioningError, claimedAt: box?.claimedAt }
     : box;
+  // Runs on: Auto: a session opened on a parked box narrates its wake, and a failed one says why.
+  const placementOn = useFlag(FLAGS.boxPlacement, false);
+  const wakes = placementOn && project.setupStatus === 'pending';
   const steps = useMemo(() => setupSteps({
-    box: narratedBox, setupStatus: project.setupStatus, setupError: project.setupError, repo: (restart || comingUp) ? null : repo, agentUp: runnerReady, etaMinutes: eta,
-  }), [narratedBox, project.setupStatus, project.setupError, repo, restart, comingUp, runnerReady, eta]);
+    // A new session waking its box isn't a reopen: its clone is still to come, so the step stays.
+    box: wakes ? box : narratedBox, setupStatus: project.setupStatus, setupError: project.setupError, repo: !wakes && (restart || comingUp) ? null : repo, agentUp: runnerReady, etaMinutes: eta, wakes,
+  }), [wakes, box, narratedBox, project.setupStatus, project.setupError, repo, restart, comingUp, runnerReady, eta]);
+  // The wake the server asked for was refused: the session's Retry starts the box again, Start on a new box moves it.
+  const wakeFailed = wakes && !!box?.wakeError && (box.status === 'stopped' || box.status === 'hibernated');
 
   // Starts with a first message New chat handed over, if any (chat/useHandedDraft.ts).
   const [text, setText] = useComposerText(chatId);
@@ -647,7 +660,7 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // Other files go to the chat's box as they are attached (backend services/chatFiles.ts). One for a box that
   // is asleep wakes it, its chip saying so, and goes once the box is up (the rule: the wait shows where it is).
   const filesOn = useFlag(FLAGS.chatFileAttachments, false);
-  const upload = useCallback<BoxFileUpload>(async (file, waiting) => {
+  const toBox = useCallback(async (file: File, waiting: () => void) => {
     for (let tries = 0; ; tries++) {
       try {
         return await chatApi.putFile(project.id, workstream, file);
@@ -660,6 +673,17 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
       }
     }
   }, [project.id, workstream, askStart]);
+  // In a chat that belongs to a space, the same files go to that space instead, uploaded under the person's own
+  // session; where it can't take one, the box keeps it, and its chip says so (chat/chatSpaceFiles.ts).
+  const { spaces: mySpaces, index: spaceIndex } = useSharedChatSpaces();
+  const wsRow = project.workstreams.find(w => w.name === workstream);
+  const homeSpace = wsRow ? chatHomeSpace({ instanceId: project.instanceId ?? null, spaceId: wsRow.spaceId, spaceFixed: wsRow.spaceFixedAt != null }, mySpaces, spaceIndex) : null;
+  const homeSpaceView = homeSpace ? mySpaces.find(sp => sp.name === homeSpace) ?? null : null;
+  const homeSpaceLoaded = useWhenSpacesLoaded(homeSpaceView, `${project.id}/${workstream}`);
+  const upload = useCallback<BoxFileUpload>((file, waiting, progress) => keepChatFile(file, waiting, p => progress?.(p), {
+    space: homeSpaceLoaded(), current: name => spacesApi.get(name).then(r => r.space), workstreamId: wsRow?.id ?? workstream, toSpace: uploadSpaceFile, toBox,
+    origin: window.location.origin, base: import.meta.env.BASE_URL ?? '/',
+  }), [homeSpaceLoaded, wsRow?.id, workstream, toBox]);
   const attachments = useComposerAttachments({
     pdfs: pdfInput, coming: imagesComing,
     upload: filesOn && fileOffer.fileInput ? upload : undefined,
@@ -691,8 +715,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   const deliver = useCallback(async (raw: string, from: 'composer' | 'unsent' | 'retry', attached: PreparedImage[] = [], textFiles: TextFile[] = [], onBox: BoxFile[] = []): Promise<boolean> => {
     const typed = raw.trim();
     const pendingFile = onBox.find(f => !f.path);
-    if (pendingFile) { setSendError(`${pendingFile.name} is still on its way to the box: send once its chip says it is there`); return false; }
-    const kept = onBox.map(f => ({ path: f.path!, size: f.size }));
+    if (pendingFile) { setSendError(`${pendingFile.name} is still on its way to ${pendingFile.space ?? 'the box'}: send once its chip says it is there`); return false; }
+    const kept = onBox.map(f => ({ path: f.path!, size: f.size, space: f.space, url: f.url }));
     const message = withTextFiles(decorated(typed, attached.length > 0 || textFiles.length > 0 || kept.length > 0), textFiles, kept);
     if ((!message && !attached.length) || sendingRef.current || openingRef.current || reclaimingRef.current || recovery) return false;
     const tooLong = messageTooLong(message);
@@ -893,8 +917,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     const textFiles = files;
     const onBox = boxFiles;
     const pendingFile = onBox.find(f => !f.path);
-    if (pendingFile) { setSendError(`${pendingFile.name} is still on its way to the box: send once its chip says it is there`); return; }
-    const message = withTextFiles(decorated(typed, attached.length > 0 || textFiles.length > 0 || onBox.length > 0), textFiles, onBox.map(f => ({ path: f.path!, size: f.size })));
+    if (pendingFile) { setSendError(`${pendingFile.name} is still on its way to ${pendingFile.space ?? 'the box'}: send once its chip says it is there`); return; }
+    const message = withTextFiles(decorated(typed, attached.length > 0 || textFiles.length > 0 || onBox.length > 0), textFiles, onBox.map(f => ({ path: f.path!, size: f.size, space: f.space, url: f.url })));
     const drafting = Boolean(message || attached.length);
     const tooLong = drafting ? messageTooLong(message) : null;
     if (tooLong) { setSendError(tooLong); return; }
@@ -1019,6 +1043,13 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // dialog is open (Escape closes that) or the stop menu is (Escape closes it).
   const running = chat.running && !recovery;
   useEffect(() => { if (!running) { setConfirmStop(null); setStopMenu(false); } }, [running]);
+  // A turn that ends may have written files (an agent's report to My files): the Files tool and an open file look
+  // again (chat/spaceFileLive.ts recheckFiles; only what's on screen under project-files-enabled listens).
+  const ranTurn = useRef(false);
+  useEffect(() => {
+    if (running) { ranTurn.current = true; return; }
+    if (ranTurn.current) { ranTurn.current = false; recheckFiles(); }
+  }, [running]);
   useEffect(() => { if (!asks) setStopMenu(false); }, [asks]);
   useEffect(() => {
     if (!running) return;
@@ -1047,7 +1078,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   // Open in full UI continues this session in the agent pane, then goes
   // there; a turn still running is refused, and says so here. One at a time,
   // and nothing is sent from here meanwhile: the pane is about to own the session.
-  const openFull = async () => {
+  // `from` is the way out it was opened by, for lab.opened (chat/labOpened.ts).
+  const openFull = async (from: LabOpenedFrom) => {
     if (openingRef.current) return;
     openingRef.current = true;
     setOpening(true);
@@ -1055,13 +1087,15 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
       await chatApi.openInTerminal(project.id, workstream);
     } catch (err) {
       const e = errorOf(err, '');
-      if (e.code === 'turn-running' || e.code === 'ask-chat') {
+      // Refusals that leave the chat where it is: a running turn, an ask's chat, another engine's (Cursor's) session.
+      if (e.code === 'turn-running' || e.code === 'ask-chat' || e.code === 'engine-no-terminal') {
         setSendError(e.text);
         openingRef.current = false;
         setOpening(false);
         return;
       }
     }
+    recordLabOpened(from);
     navigate(fullUiHref(project.id, workstream));
   };
 
@@ -1093,19 +1127,25 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     }, wait);
     return () => clearTimeout(id);
   }, [chatId, desktopStep]);
+  // Every line leads with a status word (chat/statusWords.ts) that agrees with its tone: working
+  // reads Working, idle Idle, error Needs you, and a box that is down Not running. The loading
+  // placeholder is the view's, not the session's, and is never published to the sidebar.
   const status = statusBesideHold(showHold, chat.running, recovery
-    ? { tone: 'error' as const, text: recovery.message }
+    ? { tone: 'error' as const, text: statusText('Needs you', recovery.message) }
     : loading ? { tone: 'idle' as const, text: 'Loading the conversation…' }
     // Its owner's send is bringing it back: a new box, or the stopped one.
-    : continuationStatus(continuation) ?? (boxDownNote && box ? { tone: 'idle' as const, text: `${boxDownText(box.status)} · sending a message starts it` }
+    : continuationStatus(continuation) ?? (boxDownNote && box ? { tone: 'off' as const, text: statusText('Not running', `${asDetail(boxDownText(box.status))}, sending a message starts it`) }
     // Asked for: a box still stopping is started once it has stopped.
-    : stored && startAsked && !startSent.current && box && (box.status === 'stopping' || box.status === 'hibernating') ? { tone: 'working' as const, text: `${boxDownText(box.status)} · it starts once it has stopped` }
-    : awaitingBox ? { tone: 'working' as const, text: 'Starting the box…' }
+    : stored && startAsked && !startSent.current && box && (box.status === 'stopping' || box.status === 'hibernating') ? { tone: 'working' as const, text: statusText('Working', `${asDetail(boxDownText(box.status))}, it starts once it has stopped`) }
+    : awaitingBox ? { tone: 'working' as const, text: statusText('Working', 'starting the box…') }
     : showSteps && !runnerReady && !loadError
-    ? { tone: 'working' as const, text: `Setting up · ${(held ? setup.label : activeStep?.text.toLowerCase()) ?? 'starting claude'}` }
-    : loadError ? { tone: 'error' as const, text: loadError.text }
+    ? { tone: 'working' as const, text: statusText('Working', `setting up · ${(held ? setup.label : activeStep?.text.toLowerCase()) ?? 'starting claude'}`) }
+    : loadError ? { tone: 'error' as const, text: statusText('Needs you', loadError.text) }
     // The desktop app's thread holds the session and is on a turn: this chat's own runner is idle.
     : desktopTurn ?? chatStatus(chat, sendsLive)));
+  // The desktop app's thread waits on the person: the line says so with a working tone (a send here
+  // is refused), so the row reads the status pipeline's Needs you rather than this line's tone.
+  const desktopWaits = desktopTurn !== null && desktopSession?.status === 'waiting' && status.text === desktopTurn.text;
   // A turn that only waits on its background tasks is open, but Claude is idle: the header's dot says so, as the status line does.
   const claudeWorking = (chat.running && chat.phase !== 'waiting') || (desktopTurn !== null && desktopSession?.status === 'working');
   // Before the runner is ready a message is queued (main workstream only, where the queue lives).
@@ -1146,8 +1186,8 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
   const liveTone = settingUp ? 'setup' : status.tone;
   // While the history loads, the row keeps its own line rather than a placeholder's.
   useEffect(() => {
-    publishChatStatus(liveKey, loading ? null : { tone: liveTone, text: status.text, preview });
-  }, [liveKey, loading, liveTone, status.text, preview]);
+    publishChatStatus(liveKey, loading || desktopWaits ? null : { tone: liveTone, text: status.text, preview });
+  }, [liveKey, loading, desktopWaits, liveTone, status.text, preview]);
   useEffect(() => () => publishChatStatus(liveKey, null), [liveKey]);
 
   // Opening the chat (and the composer opening once setup is done) puts the cursor in it.
@@ -1248,6 +1288,7 @@ export function useSdkChat(project: Project, workstream: string, follow: React.M
     eta,
     narratedBox,
     steps,
+    wakeFailed,
     text,
     setText,
     composer,

@@ -9,7 +9,7 @@ import type { BoxSizeChoice } from './boxSize';
 const SIZES: BoxSizeChoice[] = [
   { size: 'small', vcpus: 2, memoryGiB: 8, instanceType: 'm8g.large' },
   { size: 'medium', vcpus: 4, memoryGiB: 16, instanceType: 'm8g.xlarge' },
-  { size: 'large', vcpus: 8, memoryGiB: 32, instanceType: 'm8g.2xlarge' },
+  { size: 'large', vcpus: 4, memoryGiB: 32, instanceType: 'r8g.xlarge' },
 ];
 const view = (over: Partial<ResizeView> = {}): ResizeView => ({
   to: 'large', from: 'small', phase: 'stopping', running: true, startedAt: new Date().toISOString(), finishedAt: null,
@@ -20,7 +20,7 @@ const NOW = Date.parse('2026-10-28T12:00:00Z');
 describe('the size choices', () => {
   it('reads each size as the New box pickers do, the current one marked', () => {
     expect(SIZES.map(s => resizeOptionLabel(s, 'medium'))).toEqual([
-      'Small · 2 vCPU, 8 GB RAM', 'Medium · 4 vCPU, 16 GB RAM (current)', 'Large · 8 vCPU, 32 GB RAM',
+      'Small · 2 vCPU, 8 GB RAM', 'Medium · 4 vCPU, 16 GB RAM (current)', 'Large · 4 vCPU, 32 GB RAM',
     ]);
   });
 
@@ -35,7 +35,7 @@ describe('the size choices', () => {
 describe('the current size, for the Resize box menu item', () => {
   it('reads "Medium: 4 vCPU 16GB RAM", or as the AWS type for a custom box', () => {
     expect(SIZES.map(s => currentSizeLabel({ size: s.size, instanceType: s.instanceType }, SIZES)))
-      .toEqual(['Small: 2 vCPU 8GB RAM', 'Medium: 4 vCPU 16GB RAM', 'Large: 8 vCPU 32GB RAM']);
+      .toEqual(['Small: 2 vCPU 8GB RAM', 'Medium: 4 vCPU 16GB RAM', 'Large: 4 vCPU 32GB RAM']);
     // The dropdown options keep their own wording.
     expect(resizeOptionLabel(SIZES[1], null)).toBe('Medium · 4 vCPU, 16 GB RAM');
     expect(currentSizeLabel({ size: 'medium', instanceType: 'm8g.xlarge' }, null)).toBe('Medium');
@@ -74,7 +74,7 @@ describe('the progress', () => {
     expect(resizeFromStatus(view({ phase: 'resizing' }), 'stopped')).toBe('stopped');
   });
   it('reads the outcome', () => {
-    expect(resizeOutcome(view({ phase: 'ready', running: false }), SIZES)).toBe('Now Large · 8 vCPU, 32 GB RAM, and running.');
+    expect(resizeOutcome(view({ phase: 'ready', running: false }), SIZES)).toBe('Now Large · 4 vCPU, 32 GB RAM, and running.');
     expect(resizeOutcome(view({ phase: 'stopped', running: false, to: 'medium' }), SIZES)).toBe('Now Medium · 4 vCPU, 16 GB RAM, and stopped.');
     expect(resizeOutcome(view({ phase: 'failed', running: false, error: 'no capacity' }), SIZES)).toBe('The resize failed: no capacity');
     expect(resizeOutcome(view(), SIZES)).toBe(null);

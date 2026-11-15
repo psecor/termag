@@ -6,7 +6,7 @@
 // reviews and files change on GitHub with nothing to tell termag. Both are
 // re-read at once when a PR changes (PRS_CHANGED_EVENT).
 import { useEffect, useMemo, useState } from 'react';
-import { prsApi, type PrOverview, type PrRow } from '../../services/api';
+import { prsApi, type PrOverview, type PrPipelineResponse, type PrRow } from '../../services/api';
 import { PRS_CHANGED_EVENT } from '../../utils/prPipeline';
 import { sessionPr } from '../../chat/prGates';
 import { usePolled } from '../dashboard/useDashboardData';
@@ -22,6 +22,23 @@ export interface SessionPr {
 
 /** The last overview read, and which PR it was for (`repo#number`). */
 interface OverviewRead { pr: string; overview: PrOverview | null; failed: boolean }
+
+/**
+ * Only the session's PR row, without its overview (no GitHub read of its own):
+ * the header's PR chip under user-projects-enabled.
+ * Reads nothing while `on` is false.
+ */
+export function useSessionPrRow(projectId: string, workstream: string, on: boolean): PrRow | null {
+  const prs = usePolled<PrPipelineResponse | null>(() => (on ? prsApi.list() : Promise.resolve(null)), 60_000, { deps: [on] });
+  const { refresh } = prs;
+  useEffect(() => {
+    if (!on) return;
+    const onChanged = () => refresh();
+    window.addEventListener(PRS_CHANGED_EVENT, onChanged);
+    return () => window.removeEventListener(PRS_CHANGED_EVENT, onChanged);
+  }, [on, refresh]);
+  return useMemo(() => (on ? sessionPr(prs.data, projectId, workstream) : null), [on, prs.data, projectId, workstream]);
+}
 
 export function useSessionPr(projectId: string, workstream: string): SessionPr {
   const prs = usePolled(() => prsApi.list(), 60_000);

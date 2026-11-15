@@ -1,7 +1,8 @@
 import React, { useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useRecents } from '../../hooks/useRecents';
-import { InboxRow, recentSessions, searchRows, STATUS_GLYPH } from '../../mobile/inbox';
+import { InboxRow, recentSessions, rowKey, searchRows, STATUS_GLYPH } from '../../mobile/inbox';
+import { sessionTitle } from '../../chat/sessionTitle';
 import { asPaneSearchResult, focusLine, paneHitHref, paneHitKey, paneSearchError, paneSearchScope } from '../../mobile/paneSearch';
 import { sessionsApi, type PaneSearchHit, type PaneSearchResult } from '../../services/api';
 import type { AgentStatusValue } from '../../types';
@@ -33,7 +34,9 @@ function Highlight({ text, needle }: { text: string; needle: string }) {
   return <>{out}</>;
 }
 
-function PaneHit({ hit, needle, onOpen }: { hit: PaneSearchHit; needle: string; onOpen: () => void }) {
+/** `row` is the hit's session in the home list, for its title (chat/sessionTitle.ts); absent, the hit names it by the fallback. */
+function PaneHit({ hit, row, needle, onOpen }: { hit: PaneSearchHit; row?: InboxRow; needle: string; onOpen: () => void }) {
+  const title = sessionTitle(row ?? hit);
   const status = (hit.status in STATUS_GLYPH ? hit.status : 'not_running') as AgentStatusValue;
   return (
     <li className="m-row-wrap">
@@ -41,8 +44,8 @@ function PaneHit({ hit, needle, onOpen }: { hit: PaneSearchHit; needle: string; 
         <span className="m-glyph" data-status={status} aria-hidden>{STATUS_GLYPH[status]}</span>
         <span className="m-row-main">
           <span className="m-row-title">
-            {hit.projectName}
-            {hit.workstream !== 'main' && <span className="m-ws"> · {hit.workstream}</span>}
+            {title}
+            {title !== hit.projectName && <span className="m-row-project">{hit.projectName}</span>}
             {hit.access !== 'owner' && <span className="m-owner"> ({hit.owner})</span>}
           </span>
           {/* Pane text is untrusted output: plain text, and kept out of session replays. */}
@@ -97,6 +100,7 @@ export function Search() {
 
   const hits = useMemo(() => searchRows(rows, query), [rows, query]);
   const recent = useMemo(() => recentSessions(rows, recents, now), [rows, recents, now]);
+  const byKey = useMemo(() => new Map(rows.map(r => [r.key, r])), [rows]);
   const searching = query.trim().length > 0;
   // Opening a hit is what makes a search worth keeping.
   const onOpen = (_row: InboxRow) => { if (searching) remember(query); };
@@ -143,7 +147,7 @@ export function Search() {
             ) : pane.result.hits.length === 0 ? (
               <li className="m-empty m-empty-inline">No pane mentions “{pane.q}”.</li>
             ) : (
-              pane.result.hits.map(h => <PaneHit key={paneHitKey(h)} hit={h} needle={pane.q} onOpen={() => remember(pane.q)} />)
+              pane.result.hits.map(h => <PaneHit key={paneHitKey(h)} hit={h} row={byKey.get(rowKey(h.projectId, h.workstream))} needle={pane.q} onOpen={() => remember(pane.q)} />)
             )}
           </ul>
         ) : (

@@ -1,0 +1,24 @@
+/* Crescent at dusk: sea-glass accents, with the existing surfaces unchanged.
+   Dark #8bd5ca on #0d1117 11.24:1, #161b22 10.27:1, #21262d 9.04:1,
+   simple chrome #181a1f 10.34:1 and #23252a 9.10:1.
+   Dark dim #397d75 on #0d1117 3.93:1, #161b22 3.60:1, #21262d 3.16:1,
+   #181a1f 3.62:1 and #23252a 3.19:1; white on it 4.81:1.
+   Light #236b64 on #ffffff 6.25:1, #f6f8fa 5.87:1, #eaeef2 5.36:1,
+   simple chrome #f7f9fb 5.92:1. White on light dim #296e68 5.96:1;
+   light dim on #eaeef2 5.11:1 (the darkest light surface). */
+
+html[data-daily-theme="2026-11-11"],
+html[data-daily-theme="2026-11-11"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-11"] .lp-theme {
+  --accent: #8bd5ca;
+  --accent-dim: #397d75;
+  --accent-rgb: 139, 213, 202;
+}
+
+html[data-daily-theme="2026-11-11"][data-palette="light"],
+html[data-daily-theme="2026-11-11"][data-palette="light"] .chat-root[data-chrome='refresh'],
+html[data-daily-theme="2026-11-11"][data-palette="light"] .lp-theme {
+  --accent: #236b64;
+  --accent-dim: #296e68;
+  --accent-rgb: 35, 107, 100;
+}

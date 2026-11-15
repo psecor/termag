@@ -1,5 +1,6 @@
 // New chat in the simple UI: one composer. The question above it names the
-// repository, the Claude model and the permissions sit in its bar, and the
+// repository (with user-projects-enabled, the project),
+// the Claude model and the permissions sit in its bar, and the
 // drawer under it says where the session runs: a new box (the server claims
 // a warm one when the pool has one, else launches one) or one of yours, its space and names, and with
 // automations-enabled whether it runs on a schedule instead. Sending the
@@ -29,27 +30,39 @@ import {
   newChatNames, orchestratorOption, queueKey, readLastPick, readLastStart, readPermissionPick, rememberStartPick, sessionWords, startBlocker, worktreeName,
   worktreeTargets, writeLastPick, writeLastStart, writePermissionPick, writeQueued,
 } from '../../chat/newChat';
-import { chatAgentName, chatModelTakesPdfs, newChatCreateFields, repoTriggerLabel, type ChatEffortId, type ChatModelId } from '../../chat/composer';
+import { chatAgentName, chatModelTakesPdfs, newChatCreateFields, noRepoCreateFields, repoTriggerLabel, type ChatEffortId, type ChatModelId } from '../../chat/composer';
 import { CHAT_PROVIDER_ID, PROVIDERS } from '../../providers/registry';
 import { isSendKey, MAX_KEYS } from '../../chat/compose';
 import type { Instance, Project } from '../../types';
 import { SpacePicker } from './SpacePicker';
 import { RepoPicker } from './RepoPicker';
+import { ProjectPicker } from './ProjectPicker';
+import { useUserProjectList } from '../../chat/useUserProjectList';
+import {
+  checkoutBaseName, defaultUserProject, nextCheckoutName, offeredProjects, projectCreateRepos, projectSelection, projectWorktreeTargets,
+  RESERVED_CHECKOUT_NAMES,
+} from '../../chat/projectPick';
+import { Button } from '@launchpad-ui/components';
+import { LP_THEME } from '../../launchpad/theme';
 import { SchedulePicker } from './SchedulePicker';
 import { ModelPicker } from '../../chat/ModelPicker';
 import { writeEffortPick } from '../../chat/useChatEffort';
 import { FollowsPermissions, PermissionPicker } from '../../chat/PermissionPicker';
 import { writeModelPick } from '../../chat/useChatModel';
 import { CheckoutPicker, OWN_CLONE, type WorktreeBase } from './CheckoutPicker';
+import { WorktreePill } from './WorktreePill';
 import { OrchestratorToggle } from '../../chat/OrchestratorToggle';
-import { launchableBoxes, LaunchDrawer, NEW_BOX, newBoxSummary } from './LaunchDrawer';
+import { launchableBoxes, LaunchDrawer, NEW_BOX, newBoxSummary, placementBoxes } from './LaunchDrawer';
+import { useBoxPlacement } from '../../hooks/useBoxPlacement';
+import { AUTO, autoChoice, hotBoxNote, repoWordsFor } from '../../chat/boxPlacement';
+import { writeHotBoxNotice } from '../../chat/hotBoxNotice';
 import { BoxSizeSelect } from '../../components/BoxSizePicker';
 import { BoxDiskInput } from '../../components/BoxDiskField';
 import { useBoxDiskPick, useBoxSizePick, useBoxSizes } from '../../hooks/useBoxSizes';
 import { useWarmBoxReady } from '../../hooks/useWarmBoxReady';
 import { useEnvironmentPool } from '../../hooks/useEnvironmentPool';
 import { poolHasBox, POOL_READY_HINT } from '../../utils/environmentPool';
-import { sizeToSend } from '../../utils/boxSize';
+import { preselectedSize, REPO_DEFAULT, sizeToSend } from '../../utils/boxSize';
 import { diskInputError, diskToSend } from '../../utils/boxDisk';
 import { canStartBox } from '../../utils/boxPower';
 import { SendIcon } from '../../chat/ComposerIcons';
@@ -72,10 +85,16 @@ import { messageTooLong, withTextFiles } from '../../chat/chatTextFiles';
 import { holdFirstImages, queuedFirstText, releaseFirstImages } from '../../chat/firstImages';
 import { recordTypedChatCommand } from '../../usageEvents';
 
+/** The power states the server takes a session on with Runs on: Auto, waking the box (backend services/projectSetup.ts WAKEABLE_BOX_STATUSES). */
+const WAKEABLE_STATUSES = ['stopped', 'hibernated', 'starting', 'stopping', 'hibernating'];
+
 /** The automation API's prompt cap (backend routes/automations.ts MAX_PROMPT). */
 const MAX_AUTOMATION_PROMPT = 20_000;
 
 const PROJECT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
+
+/** No repository picked: one object, so a project with none reads as the same pick from render to render. */
+const EMPTY_PICK: RepoPick = { kind: 'empty' };
 
 /** Phone drawer has no docked list, so New chat needs the same Chats control
  *  as a conversation. The composer stays the child; the stack is `display:
@@ -93,6 +112,10 @@ function NewChatFrame({ children }: { children: React.ReactNode }) {
 
 function apiError(err: unknown, fallback: string): string {
   return (err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? fallback;
+}
+
+function apiCode(err: unknown): string | undefined {
+  return (err as { response?: { data?: { code?: string } } })?.response?.data?.code;
 }
 
 const browserStore = () => (typeof localStorage !== 'undefined' ? localStorage : null);
@@ -114,8 +137,10 @@ export function NewChat() {
   const { key: visit, state: arrival } = useLocation();
   const messageRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => { messageRef.current?.focus(); }, [visit]);
+  // After a menu closes, which hands focus back to its trigger first (React Aria), then to the message.
+  function focusMessageSoon() { setTimeout(() => messageRef.current?.focus(), 0); }
 
-  const [pick, setPick] = useState<RepoPick>(last.pick ?? { kind: 'empty' });
+  const [repoPick, setPick] = useState<RepoPick>(last.pick ?? { kind: 'empty' });
   // An environment names the repositories instead of the
   // picker: ?environment= (an environment's New session) opens on it.
   // An environment's page passes the environment it opens New session with, so the first frame has it (no pop-in).
@@ -145,11 +170,39 @@ export function NewChat() {
       .catch(() => { if (!cancelled) setEnvironmentRepos({ id: environment.id, repos: [], error: `Could not read ${environment.name}` }); });
     return () => { cancelled = true; };
   }, [environment?.id, environmentReads]);
+  // New session starts from a project, with user-projects-enabled:
+  // the pill is the person's project, most recently active first (the server's order, so the default
+  // follows them across browsers), or ?project= (a project's New session here). From a repository…, or
+  // projects that fail to load, bring today's repository picker back; the server still files the session
+  // under the project for its repositories. An environment names the repositories instead, as before.
+  const projectsOn = useFlag(FLAGS.userProjects, false);
+  const userProjects = useUserProjectList(projectsOn);
+  const projectParam = params.get('project');
+  const [projectChoice, setProjectChoice] = useState<string | null>(null);
+  const [fromRepository, setFromRepository] = useState(false);
+  // A new ?project= (New session here, on a mounted page) is picked afresh, as ?environment= is.
+  const [projectFor, setProjectFor] = useState(projectParam);
+  if (projectFor !== projectParam) {
+    setProjectFor(projectParam);
+    setProjectChoice(null);
+    setFromRepository(false);
+  }
+  const projectMode = projectsOn && !fromRepository && userProjects.kind !== 'failed' && !environment;
+  const projectList = userProjects.kind === 'ready' ? userProjects.projects : [];
+  const userProject = projectMode
+    ? offeredProjects(projectList).find(p => p.id === projectChoice) ?? defaultUserProject(projectList, projectParam)
+    : null;
+  const [projectOpen, setProjectOpen] = useState(false);
+  // What the project stands for as a repository pick, so Send, the permission pill, the size and Runs on: Auto read it as a picked repository.
+  const projectPicked = useMemo(() => (userProject ? projectSelection(userProject) : null), [userProject]);
+  const noRepoProject = !!userProject && userProject.repos.length === 0;
+  const pick: RepoPick = projectMode ? projectPicked?.pick ?? EMPTY_PICK : repoPick;
   // More repositories ticked after the pick: two or more make a multi-repo
   // project. Only with multi-repo-projects-enabled.
+  // A project's own come with it.
   const multiRepoOn = useFlag(FLAGS.multiRepo, false);
   const [morePicked, setMore] = useState<ListedPick[]>([]);
-  const more = multiRepoOn ? morePicked : [];
+  const more = projectMode ? projectPicked?.more ?? [] : multiRepoOn ? morePicked : [];
   const [picked, setPicked] = useState<ChatModelId>(lastPick.model ?? last.model);
   const setModel = (id: ChatModelId) => { setPicked(id); writeLastPick(browserStore(), { model: id }); };
   // The last start's model while it is still offered: a Fireworks model shows once the menus load.
@@ -160,6 +213,8 @@ export function NewChat() {
   const setEffort = (id: ChatEffortId) => { setEffortState(id); writeLastPick(browserStore(), { effort: id }); };
   const [message, setMessage] = useState('');
   const [repoOpen, setRepoOpen] = useState(false);
+  /** Every other menu closes when one opens: the project menu's own part of that. */
+  function closeProjectMenu() { setProjectOpen(false); }
   const [modelOpen, setModelOpen] = useState(false);
   const [permissionOpen, setPermissionOpen] = useState(false);
   // Bumped when another menu opens or the form sends, so the space menu closes.
@@ -178,6 +233,13 @@ export function NewChat() {
   const simpleAutomations = useAutomationsEnabled();
   const { reload: reloadAutomations } = useAutomations();
   const scheduled = automationsOn && schedulePicked;
+  // Under project-files-enabled a session has no space pill: its
+  // space is its project's Project files, which the server sets (services/chatSpace.ts), from a repository too. An
+  // automation keeps its pill: it isn't a session of a project, and its space is where it and its runs are listed.
+  const projectFilesOn = useFlag(FLAGS.projectFiles, false) && projectsOn;
+  const spaceUse = projectFilesOn && !scheduled
+    ? { ...spaceStep, show: false, pending: false, ready: true, error: '', prepare: async (): Promise<string | null> => null, grant: async () => {} }
+    : spaceStep;
   const dictation = useDictation({ text: message, setText: setMessage, max: scheduled ? MAX_AUTOMATION_PROMPT : MAX_KEYS });
   // A session dragged in from the sidebar goes into the message as a reference to it (chat/sessionRef.ts).
   const refDrop = useSessionRefDrop({ input: messageRef, text: message, setText: t => { dictation.onEdit(); setMessage(t); }, max: scheduled ? MAX_AUTOMATION_PROMPT : MAX_KEYS });
@@ -193,9 +255,15 @@ export function NewChat() {
   // Checked here, not in the dialog, so the answer keeps coming once Done closes it.
   const scheduleCheck = useScheduleCheck(draft, scheduled);
   const [fallbackName] = useState(() => funnyProjectName());
+  // A project's checkout is named after its first repository, or for a no-repo project its name made a directory
+  // name (chat/projectPick.ts checkoutBaseName), never MetaTerm's; people see the project's name, not this.
   const defaults = useMemo(
-    () => newChatNames((environment ? environment.name : suggestedName(pick)) ?? fallbackName, projects.map(p => p.name), boxes.map(b => b.name)),
-    [pick, environment, fallbackName, projects, boxes],
+    () => newChatNames(
+      (environment ? environment.name : userProject ? checkoutBaseName(userProject) : suggestedName(pick)) ?? fallbackName,
+      userProject ? [...projects.map(p => p.name), ...RESERVED_CHECKOUT_NAMES] : projects.map(p => p.name),
+      boxes.map(b => b.name),
+    ),
+    [pick, environment, userProject, fallbackName, projects, boxes],
   );
   const [nameEdit, setNameEdit] = useState<string | null>(null);
   const [boxEdit, setBoxEdit] = useState<string | null>(null);
@@ -232,39 +300,88 @@ export function NewChat() {
   // A box launched for an attempt whose project was then refused is reused
   // by the retry, so a second Send never launches a second box.
   const [launched, setLaunched] = useState<Instance | null>(null);
-  // Where the session runs: NEW_BOX, or the id of one of the user's boxes.
+  // Runs on: Auto: with box-placement-enabled, New
+  // session starts on Auto every time, and Auto is what GET
+  // /api/boxes/placement recommends for the repositories picked.
+  const placementOn = useFlag(FLAGS.boxPlacement, false);
+  // What the drawer shows picked: AUTO, NEW_BOX, or the id of one of the
+  // user's boxes; null until a pick, so the default follows the flag. An
+  // explicit pick holds for this session only.
   // An asleep box is woken when it is picked; the start waits until it is up.
-  const [boxChoice, setBoxChoice] = useState<string>(NEW_BOX);
+  const [boxPicked, setBoxChoice] = useState<string | null>(null);
+  // Send while Auto is still checking your boxes: it goes as soon as Auto knows where (never a hold on Send).
+  const [sendWhenPlaced, setSendWhenPlaced] = useState(false);
+  const selection = boxPicked ?? (placementOn ? AUTO : NEW_BOX);
+  // The repositories Auto is asked about, as owner/name: the picked one and any ticked (an environment's once read).
+  // A pasted URL only once it reads as a GitHub repository, and never as typed: what the person pasted (a token
+  // in its userinfo, say) stays out of the query string, which access logs and network recording keep.
+  const placementRepos = useMemo(() => {
+    if (environment) return environmentRepos?.id === environment.id ? environmentRepos.repos.map(r => r.repo) : [];
+    if (userProject) return userProject.repos.map(r => r.repoKey);
+    const first = pick.kind === 'listed' ? pick.fullName : pick.kind === 'pasted' ? repoKey(pick.url) ?? '' : '';
+    return [first, ...(multiRepoOn ? morePicked.map(r => r.fullName) : [])].filter(Boolean);
+  }, [environment, environmentRepos, userProject, pick, multiRepoOn, morePicked]);
+  // The size New box would launch at, once the sizes are read (below): the pool keeps each size apart.
+  const [placementSize, setPlacementSize] = useState<string | null>(null);
+  // Asked again when a box wakes, sleeps, comes or goes.
+  const boxesKey = useMemo(() => boxes.map(b => `${b.id}:${b.status}`).sort().join(','), [boxes]);
+  // With a project, Auto asks about it: a box with a checkout of the project, rather than of its repositories.
+  const placement = useBoxPlacement(placementOn, placementRepos, placementSize, boxesKey, userProject?.id ?? null);
   // The new box's size: the dropdown shows only while box-default-size is on, preselecting what the
   // server says a box for the repository launches at (its .termag/environment.json, utils/boxSize.ts).
 
   const [wakingId, setWakingId] = useState<string | null>(null);
   // The box whose wake was refused: Send says so instead of waiting on a box nobody is starting.
   const [wakeFailedId, setWakeFailedId] = useState<string | null>(null);
-  const ownBoxes = useMemo(() => launchableBoxes(boxes), [boxes]);
+  // With Runs on: Auto, a box on its way down is listed too: a session on it starts it once it's down.
+  const ownBoxes = useMemo(() => (placementOn ? placementBoxes(boxes) : launchableBoxes(boxes)), [boxes, placementOn]);
+  // Where the session runs: Auto resolved (its box, New box, or AUTO while the placement loads), else the pick.
+  const autoResolved = autoChoice({ view: placement.view, failed: placement.failed, boxIds: new Set(ownBoxes.map(b => b.id)), newBox: NEW_BOX });
+  const boxChoice = selection === AUTO ? autoResolved ?? AUTO : selection;
   const chosenBox = boxChoice === NEW_BOX ? null : ownBoxes.find(b => b.id === boxChoice) ?? null;
   // A chosen box that drops out of the list (a reload in flight, a backend
   // restart, a box going away) stays chosen, as it was last seen: Send waits
   // for it rather than quietly launching a new box instead.
   const lastSeenBox = useRef<Instance | null>(null);
   if (chosenBox) lastSeenBox.current = chosenBox;
-  const missingBox = boxChoice !== NEW_BOX && !chosenBox
+  const missingBox = boxChoice !== NEW_BOX && boxChoice !== AUTO && !chosenBox
     ? (lastSeenBox.current?.id === boxChoice ? lastSeenBox.current : null)
     : null;
   const drawerBoxes = missingBox ? [...ownBoxes, missingBox] : ownBoxes;
   // The server takes a project on a box that is up, or still launching (it waits for the agent).
-  const chosenBoxUp = !chosenBox || ['ready', 'provisioning', 'awaiting-agent'].includes(chosenBox.status);
+  // With Runs on: Auto it also takes the caller's parked box, and wakes it: Send never waits on a box.
+  // Not for a schedule: an automation's create still needs its box up (backend routes/projects.ts takes a parked box for a session only).
+  const chosenBoxUp = !chosenBox || ['ready', 'provisioning', 'awaiting-agent'].includes(chosenBox.status)
+    || (placementOn && !scheduled && WAKEABLE_STATUSES.includes(chosenBox.status));
   // How the session gets its code (pages/chat/CheckoutPicker.tsx): its own
   // clone, or a worktree of a project already on the chosen box with the same
   // repository. A choice that no longer applies falls back to the clone.
-  const [checkoutChoice, setCheckoutChoice] = useState<string>(OWN_CLONE);
+  // Picked for a box: with Runs on: Auto a pick holds on the box it was made for, and another box gets its own default.
+  const [checkoutPick, setCheckoutPick] = useState<{ box: string | null; choice: string } | null>(null);
   const [worktreeBase, setWorktreeBase] = useState<WorktreeBase>('origin');
   // Only with chat-worktree-sessions-enabled; the server drops the fetch while it is off for the caller.
   const worktreeOn = useFlag(FLAGS.chatWorktreeSessions, false);
+  // With Runs on: Auto, a worktree only on a box that is up: making one needs the box's agent there
+  // (a parked box gets a new checkout, which waits for its agent).
+  const worktreeBox = placementOn && chosenBox?.status !== 'ready' ? null : chosenBox;
+  // A project's session is a worktree of the project's own checkouts there, not of any with the same repository.
   const worktreeOptions = useMemo(
-    () => (scheduled || !worktreeOn ? [] : worktreeTargets(pick, projects, chosenBox?.id ?? null)),
-    [scheduled, worktreeOn, pick, projects, chosenBox],
+    () => (scheduled || !worktreeOn ? []
+      : userProject ? projectWorktreeTargets(userProject, projects, worktreeBox?.id ?? null)
+      : worktreeTargets(pick, projects, worktreeBox?.id ?? null)),
+    [scheduled, worktreeOn, userProject, pick, projects, worktreeBox],
   );
+  // Auto's pick of an up box with the repository: a worktree of that checkout (from a fresh fetch, the base's default), not a clone.
+  const autoCheckout = placementOn && selection === AUTO && worktreeBox
+    ? placement.view?.boxes.find(b => b.instanceId === worktreeBox.id)?.checkoutProjectId ?? null
+    : null;
+  // A project on a box that is up with a checkout of it: a worktree of that checkout, wherever the box was chosen;
+  // the newest when it has several. The choice stays under Options.
+  const defaultCheckout = autoCheckout && worktreeOptions.some(p => p.id === autoCheckout) ? autoCheckout
+    : userProject && worktreeOptions.length ? worktreeOptions[0].id : OWN_CLONE;
+  const checkoutChoice = !placementOn ? checkoutPick?.choice ?? (userProject ? defaultCheckout : OWN_CLONE)
+    : checkoutPick && checkoutPick.box === (worktreeBox?.id ?? null) ? checkoutPick.choice : defaultCheckout;
+  const setCheckoutChoice = (choice: string) => setCheckoutPick({ box: worktreeBox?.id ?? null, choice });
   // An environment makes a project of its own repositories, never a worktree of another.
   const worktree: Project | null = environment ? null : worktreeOptions.find(p => p.id === checkoutChoice) ?? null;
   // A worktree is one repository's workstream: the extra repositories ticked
@@ -273,14 +390,18 @@ export function NewChat() {
   // origin/<default> for a worktree: the project's default branch, else the
   // picked repository's (the same repository, worktreeTargets). A project
   // made from a pasted URL may know neither; then it starts off the checkout.
-  const worktreeDefault = (p: Project): string | null =>
-    p.repoDefaultBranch || (pick.kind === 'listed' ? pick.defaultBranch || null : null);
+  // A checkout of several repositories has no one default to fetch (the server refuses a fetched one): off its checkout.
+  const worktreeDefault = (p: Project): string | null => (p.layout === 'workspace' ? null
+    : p.repoDefaultBranch || (pick.kind === 'listed' ? pick.defaultBranch || null : null));
   const worktreeStart: WorktreeBase = worktree && worktreeDefault(worktree) ? worktreeBase : 'checkout';
   // A worktree from a fresh fetch is new code nobody on the box has looked at,
   // so it asks as a fresh clone does: the permission pill, on the choice last
   // picked for the repository. Full access is offered only where the project
   // itself has it; a read-only project's fetched worktree is read-only too.
   const fetchedTrustable = !!worktree && worktreeStart === 'origin' && worktree.chatTrusted === true;
+  // chat-session-permissions-enabled: the bar says which code the session gets (WorktreePill), and a worktree's
+  // permission pill names the setting and the checkout (FollowsPermissions' named words), not "As <checkout>".
+  const sessionChoicesOn = useFlag(FLAGS.chatSessionPermissions, false);
   // Its workstream's name: the session name if typed, else the message's first words.
   const worktreeNameFor = (typed: string | null) => worktree
     ? worktreeName(typed?.trim() || sessionWords(message) || fallbackName, worktree.workstreams.map(w => w.name))
@@ -293,7 +414,7 @@ export function NewChat() {
   const environmentUrls = environment ? (resolvedRepos?.repos ?? []).map(r => githubRepoUrl(r.repo)) : null;
   const fields = environmentUrls
     ? (environmentUrls.length ? newChatCreateFields({ kind: 'pasted', url: environmentUrls[0] }, model) : null)
-    : newChatCreateFields(pick, model);
+    : noRepoProject ? noRepoCreateFields(model) : newChatCreateFields(pick, model);
   const repoUrl = fields?.repoUrl ?? null;
   const workspaceRepos = fields && !environment ? selectionRepos({ pick, more: ticked }) : null;
   // What a new box is sized for: every repository of a multi-repo project (the server takes the largest), else the one;
@@ -301,6 +422,9 @@ export function NewChat() {
   const sizeRepos = environment ? null : workspaceRepos ? workspaceRepos.map(r => r.url) : repoUrl;
   const { sizes: boxSizes, disk: boxDisk } = useBoxSizes(boxChoice === NEW_BOX, sizeRepos, environment?.name);
   const [boxSize, setBoxSize] = useBoxSizePick(sizeRepos, environment?.name);
+  // What Auto asks the pool about: the size picked, else the one preselected for the repository.
+  const sizeForPlacement = boxSizes ? sizeToSend(boxSizes, boxSize) ?? boxSizes.defaultSize ?? null : null;
+  useEffect(() => { setPlacementSize(sizeForPlacement); }, [sizeForPlacement]);
   // The new box's disk, beside its size: what the person typed, else the repository's diskGiB or 120 (utils/boxDisk.ts).
   const [diskTyped, setDiskTyped] = useBoxDiskPick(sizeRepos, environment?.name);
   const warmBoxReady = useWarmBoxReady(boxChoice === NEW_BOX && !!boxDisk);
@@ -331,6 +455,11 @@ export function NewChat() {
     return remembered ? remembered === 'full' : repoStartsTrusted(u);
   });
   const trustChecked = trustChoice?.key === selectionKey ? trustChoice.checked : startsTrusted;
+  // The bar's worktree pill, where Options offers a worktree: a press makes the session a new checkout, or a worktree
+  // of the checkout Auto would pick (else the newest).
+  const worktreePill: Project | null = sessionChoicesOn && worktreeOptions.length > 0 && fields && !environment
+    ? worktree ?? worktreeOptions.find(p => p.id === defaultCheckout) ?? worktreeOptions[0]
+    : null;
   // Act as an orchestrator: the box tells the chat's turns to use the opt-in
   // agent-orchestrator skill, out of the conversation (chat/newChat.ts).
   const [orchestrate, setOrchestrate] = useState(false);
@@ -353,17 +482,29 @@ export function NewChat() {
   const scheduleTier: AutomationDraft['tier'] = askTrust ? (trustChecked ? 'full' : 'read') : draft.tier;
   const environmentWait = environment && !environmentUrls?.length && !busy
     ? (resolvedRepos?.error ?? `Reading ${environment.name}…`) : '';
-  const whyNot = environmentWait || startBlocker({
+  // With projects on and none picked (still loading, or the person has none yet): Send waits for one.
+  const projectWait = projectMode && !userProject && !busy
+    ? (userProjects.kind === 'loading' ? 'Loading your projects…' : 'Pick a project, or start from a repository') : '';
+  const whyNot = environmentWait || projectWait || startBlocker({
     busy: !!busy, hasRepo: fields !== null, name: worktree ? worktreeNameFor(nameEdit) ?? '' : name, nameError,
-    spacesReady: spaceStep.ready, spaceError: spaceStep.error,
+    spacesReady: spaceUse.ready, spaceError: spaceUse.error,
     boxReady: !!launched || boxChoice !== NEW_BOX, boxName, boxError: boxError || (diskError ? `Disk: ${diskError}` : ''),
   }) || (chosenBox && !chosenBoxUp && !busy
-    ? (wakeFailedId === chosenBox.id ? `${chosenBox.name} didn't wake up: pick it again to retry, or pick another box` : `Waiting for ${chosenBox.name} to wake up`)
+    ? (wakeFailedId === chosenBox.id ? `${chosenBox.name} didn't wake up: pick it again to retry, or pick another box`
+      // Auto's asleep pick isn't woken while composing; a schedule needs its box up, so a pick of it wakes it.
+      : scheduled && selection === AUTO && canStartBox(chosenBox) && wakingId !== chosenBox.id ? `A schedule needs its box up: pick ${chosenBox.name} to wake it, or pick another box`
+      : `Waiting for ${chosenBox.name} to wake up`)
     : '')
-    || (boxChoice !== NEW_BOX && !chosenBox && !busy ? `${missingBox?.name ?? 'That box'} isn't available right now: pick it again or another box` : '')
+    // Auto still checking your boxes holds nothing: Send goes once it knows where (sendWhenPlaced).
+    || (boxChoice !== NEW_BOX && boxChoice !== AUTO && !chosenBox && !busy ? `${missingBox?.name ?? 'That box'} isn't available right now: pick it again or another box` : '')
     || (scheduleOk || busy ? '' : 'Pick a schedule the runs can keep, and say what each run should do')
     || (scheduled && workspaceRepos && !busy ? 'A scheduled run works in one repository: untick the others' : '')
     || (scheduled && environment && !busy ? "A schedule doesn't take an environment yet: pick its repository instead" : '')
+    || (scheduled && noRepoProject && !busy ? 'A scheduled run works in a repository: pick a project with one' : '')
+    // A new checkout of a project with several repositories is a multi-repo create, which the server refuses while
+    // multi-repo projects are off for the person (a worktree of a checkout it has still works).
+    || (userProject && userProject.repos.length > 1 && !multiRepoOn && !worktree && !busy
+      ? `${userProject.name} has several repositories, which aren't on for you: pick another project, or start from a repository` : '')
     || (scheduled && (attachments.images.length || attachments.files.length) && !busy ? 'A scheduled run takes no attachments: remove them' : '')
     || (attachments.preparing && !busy ? 'Getting the attachments ready to send' : '')
     || (!scheduled && !busy ? messageTooLong(firstMessage) ?? '' : '');
@@ -420,9 +561,31 @@ export function NewChat() {
       .finally(() => setWakingId(w => (w === box.id ? null : w)));
   }
 
-  async function start(e?: React.FormEvent) {
+  /**
+   * With Runs on: Auto, once a session exists: a hot box it was started on
+   * leaves a note in its transcript (never a gate), and a parked one it woke
+   * is read again, so the session narrates the wake from the box's new state.
+   */
+  function noteSessionPlaced(projectId: string, ws: string, onBox: Instance | null) {
+    if (!placementOn || !onBox) return;
+    const note = placement.view ? hotBoxNote(placement.view.boxes.find(b => b.instanceId === onBox.id), placement.view) : null;
+    if (note) writeHotBoxNotice(browserStore(), `${projectId}|${ws}`, note);
+    if (WAKEABLE_STATUSES.includes(onBox.status)) void boxFeed.reload();
+  }
+
+  // Send while Auto is still checking your boxes: it goes as soon as Auto knows where (never a hold on Send).
+  useEffect(() => {
+    if (!sendWhenPlaced || boxChoice === AUTO) return;
+    setSendWhenPlaced(false);
+    void start(undefined, true);
+  }, [sendWhenPlaced, boxChoice]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function start(e?: React.FormEvent, placed = false) {
     e?.preventDefault();
     if (!canStart || !fields) return;
+    // Taken once: a second Send while Auto checks does nothing (the effect below sends it once Auto knows where).
+    if (sendWhenPlaced && !placed) return;
+    if (boxChoice === AUTO) { setSendWhenPlaced(true); return; }
     // Never a new box for a chosen one that is missing (whyNot holds Send for it too).
     if (boxChoice !== NEW_BOX && !chosenBox) return;
     dictation.detach();
@@ -430,11 +593,12 @@ export function NewChat() {
     setRepoOpen(false);
     setModelOpen(false);
     setPermissionOpen(false);
+    closeProjectMenu();
     dismissSpaceMenu();
     let space: string | null;
     try {
       setBusy('space');
-      space = await spaceStep.prepare();
+      space = await spaceUse.prepare();
     } catch (err) {
       setError((err as Error).message);
       setBusy(null);
@@ -460,7 +624,7 @@ export function NewChat() {
     }
     try {
       setBusy('space');
-      await spaceStep.grant(space, box.id);
+      await spaceUse.grant(space, box.id);
     } catch (err) {
       setError((err as Error).message);
       setBusy(null);
@@ -506,23 +670,42 @@ export function NewChat() {
       return;
     }
     try {
-      const project = await projectsApi.create({
-        name,
+      const body = {
         instanceId: box.id,
         initialAgent: { enabled: true, provider: CHAT_PROVIDER_ID, ...(fields.backend ? { backend: fields.backend, model: fields.model } : {}) },
         replaySessionId: await replaySessionId(),
         // The checkouts it was read as (and any Full access given for): the server holds the create to them, since an ask
         // of the project runs them without asking whenever it comes (Bugbot, #985).
+        // A project's own repositories as it keeps them (an ssh URL stays ssh), not as the pick reads them.
         ...(environment ? { environment: environment.name, environmentRepos: checkoutsPin(resolvedRepos?.repos ?? []) }
-          : workspaceRepos ? { repos: workspaceRepos } : { repoUrl: fields.repoUrl, defaultBranch: fields.defaultBranch }),
+          : (userProject && projectCreateRepos(userProject))
+            || (workspaceRepos ? { repos: workspaceRepos } : { repoUrl: fields.repoUrl, defaultBranch: fields.defaultBranch })),
         claudeModel: fields.claudeModel,
         chatTrusted: askTrust && trustChecked,
         ...(orchestrate && orchestrator === 'available' ? { chatOrchestrator: true } : {}),
         // The chat belongs to the space it was started in, or to none, for good (backend services/chatSpace.ts).
-        ...(spaceStep.show ? { chatSpace: space } : {}),
-      });
+        // With no pill (project-files-enabled) and the project named, an explicit none: the server pins the session to
+        // its project's files at the create, or with none to no space, never leaving it for a box's first grant. A
+        // repository's or an environment's create names no project: the server finds it and gives the session its
+        // Project files after the create, which a space fixed now would block, so it sends nothing.
+        ...(spaceUse.show || (spaceUse !== spaceStep && userProject) ? { chatSpace: space } : {}),
+        // The project it starts in: the checkout is one of it.
+        ...(userProject ? { userProjectId: userProject.id } : {}),
+      };
+      let project: Project;
+      try {
+        project = await projectsApi.create({ name, ...body });
+      } catch (err) {
+        // A project's checkout name is New session's to choose, so a name another checkout holds (one made meanwhile,
+        // or an archived one, which a project's create never brings back) is tried once more with the next suffix.
+        if (!userProject || apiCode(err) !== 'checkout_name_taken') throw err;
+        const base = nameEdit?.trim() || checkoutBaseName(userProject);
+        project = await projectsApi.create({ name: nextCheckoutName(base, name, projects.map(p => p.name)), ...body });
+      }
       noteProjectCreated(project.id, box.id);
-      writeLastStart(browserStore(), { pick, space, model, effort });
+      noteSessionPlaced(project.id, 'main', box);
+      // With no space pill a session picked none: the remembered space (New automation's default) stays as it was.
+      writeLastStart(browserStore(), { pick, space: spaceUse === spaceStep ? space : last.space ?? null, model, effort });
       // The first message goes from the session's view, at this effort (chat/useChatEffort.ts).
       writeEffortPick(`${project.id}|main`, effort);
       // The attachments' count goes in storage before the text, so a reload never finds the text without it.
@@ -541,9 +724,20 @@ export function NewChat() {
         setLaunched(null);
         await boxFeed.reload();
         setError('The box failed to launch. Start again to launch another.');
+      } else if (userProject && ['user_project_archived', 'user_project_not_found', 'user_project_repos_mismatch'].includes(apiCode(err) ?? '')) {
+        // Archived (or changed) elsewhere since the list was read: say so, read the projects again, and open the menu.
+        const code = apiCode(err);
+        setError(code === 'user_project_repos_mismatch'
+          ? `${userProject.name}'s repositories changed since this page read them. Check them and send again.`
+          : `${userProject.name} was ${code === 'user_project_archived' ? 'archived' : 'removed'}. Pick another project.`);
+        userProjects.reload();
+        // Changed: the same project, read again, so the next Send sends its repositories as they are now.
+        // Archived or gone: the menu opens to pick another.
+        if (code === 'user_project_repos_mismatch') setProjectChoice(userProject.id);
+        else { setProjectChoice(null); setProjectOpen(true); }
       } else {
         setError(apiError(err, 'Could not start the session'));
-        if ((err as { response?: { data?: { code?: string } } })?.response?.data?.code === 'environment_repos_changed') setEnvironmentReads(n => n + 1);
+        if (apiCode(err) === 'environment_repos_changed') setEnvironmentReads(n => n + 1);
       }
       setBusy(null);
     }
@@ -561,11 +755,12 @@ export function NewChat() {
     const branch = worktreeDefault(project);
     try {
       // The chat belongs to the space it was started in, as a clone's does (backend services/chatSpace.ts).
-      const inSpace = spaceStep.show ? { chatSpace: space } : {};
+      const inSpace = spaceUse.show || spaceUse !== spaceStep ? { chatSpace: space } : {};
       const ws = await workstreamsApi.create(project.id, worktreeStart === 'origin' && branch
-        ? { name: wsName, baseRef: `origin/${branch}`, fetch: { remoteBranch: branch, fullAccess: fetchedTrustable && trustChecked }, ...inSpace }
-        : { name: wsName, ...inSpace });
+        ? { name: wsName, baseRef: `origin/${branch}`, fetch: { remoteBranch: branch, fullAccess: fetchedTrustable && trustChecked }, ...inSpace, newSession: true }
+        : { name: wsName, ...inSpace, newSession: true });
       // Its first message goes from its own view, on the model and at the effort picked here.
+      noteSessionPlaced(project.id, ws.name, worktreeBox);
       writeModelPick(`${project.id}|${ws.name}`, model);
       writeEffortPick(`${project.id}|${ws.name}`, effort);
       writeLastStart(browserStore(), { pick, space, model, effort });
@@ -592,7 +787,8 @@ export function NewChat() {
     );
   }
 
-  const sendLabel = busy === 'space' ? 'Setting up the space'
+  const sendLabel = sendWhenPlaced ? 'Finding a box'
+    : busy === 'space' ? 'Setting up the space'
     : busy === 'box' ? 'Launching a box'
     : busy === 'chat' ? (scheduled ? 'Creating' : 'Starting')
     : scheduled ? 'Create automation' : 'Send';
@@ -601,10 +797,26 @@ export function NewChat() {
     <NewChatFrame>
       <form ref={rootRef} className="chat-compose chat-new-card" onSubmit={e => void start(e)} {...(takesImages && !busy ? attachments.dropHandlers(() => messageRef.current?.focus()) : {})}>
         {attachments.dragging && <div className="chat-drop-overlay" aria-hidden="true">Drop images to attach</div>}
+        {/* One sentence that wraps as text: the repository and its "?" are one unbreakable piece (chat.css). */}
         <div className="chat-launch-ask">
-        <span>{fields || environment ? 'What are we doing in' : 'What are we doing?'}</span>
+        {fields || environment ? 'What are we doing in ' : 'What are we doing? '}
+        <span className="chat-launch-subject">
         {environment ? (
-          <span className="chat-launch-environment">{environment.name}</span>
+          <span className="chat-launch-environment" title={environment.name}>{environment.name}</span>
+        ) : projectMode ? (
+        <ProjectPicker
+          state={userProjects}
+          selected={userProject}
+          // Picked, the next thing to do is say what to do there: the cursor goes to the message once the menu has closed.
+          onSelect={p => { setProjectChoice(p.id); setNameEdit(null); setBoxEdit(null); setCheckoutPick(null); setError(''); focusMessageSoon(); }}
+          onFromRepository={() => { setFromRepository(true); setRepoOpen(true); setError(''); }}
+          // + New project: listed at once and picked; Send makes its first checkout on the box Runs on picked.
+          onCreated={p => { userProjects.upsert(p); setProjectChoice(p.id); setNameEdit(null); setBoxEdit(null); setCheckoutPick(null); setError(''); focusMessageSoon(); }}
+          multiRepo={multiRepoOn}
+          open={projectOpen}
+          onOpenChange={open => { setProjectOpen(open); if (open) { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); dismissSpaceMenu(); } }}
+          disabled={!!busy}
+        />
         ) : (
         <RepoPicker
           pick={pick}
@@ -614,11 +826,20 @@ export function NewChat() {
           onOpenChange={open => { setRepoOpen(open); if (open) { setModelOpen(false); setPermissionOpen(false); dismissSpaceMenu(); } }}
           more={ticked}
           onToggle={multiRepoOn && !worktree ? toggleMore : undefined}
+          // From a repository…: back to the projects, while they're there to go back to.
+          back={fromRepository && userProjects.kind === 'ready' ? { label: 'Your projects', onBack: () => { setFromRepository(false); setRepoOpen(false); setProjectOpen(true); } } : undefined}
         />
         )}
-
         {(fields || environment) && <span className="chat-launch-q" aria-hidden="true">?</span>}
+        </span>
         </div>
+        {/* Projects that couldn't be read: today's repository picker, and Send works as it always has (the server files the session under a project). */}
+        {projectsOn && userProjects.kind === 'failed' && !environment && (
+          <div className={`${LP_THEME} chat-launch-project-note`} role="status">
+            Couldn't load your projects; pick a repository.
+            <Button variant="minimal" size="small" onPress={() => userProjects.reload()}>Try again</Button>
+          </div>
+        )}
         {/* What it clones, on screen before Send whatever the permission: an ask of the project runs them unprompted. */}
         {resolvedRepos?.repos.length ? <EnvironmentCheckouts repos={resolvedRepos.repos} className="chat-launch-checkouts" /> : null}
 
@@ -644,7 +865,7 @@ export function NewChat() {
             aria-label="Message"
             rows={4}
           />
-          <div className="chat-compose-bar">
+          <div className="chat-compose-bar" data-extras={worktreePill ? 'wide' : undefined}>
             <div className="chat-compose-pills">
             <ModelPicker
               model={model}
@@ -653,9 +874,28 @@ export function NewChat() {
               effort={scheduled ? null : effort}
               onEffortChange={setEffort}
               open={modelOpen}
-              onOpenChange={open => { setModelOpen(open); if (open) { setRepoOpen(false); setPermissionOpen(false); dismissSpaceMenu(); } }}
+              onOpenChange={open => { setModelOpen(open); if (open) { setRepoOpen(false); setPermissionOpen(false); closeProjectMenu(); dismissSpaceMenu(); } }}
             />
-            {worktree && !fetchedTrustable ? <FollowsPermissions project={worktree.name} fetched={worktreeStart === 'origin'} /> : (askTrust || environmentResolving) && (
+            {/* Permissions and the orchestrator: beside the model where the bar has room, else a
+                row of their own above it (chat.css, the composer bar's container query). */}
+            <div className="chat-compose-extras">
+            {worktreePill && (
+              <WorktreePill
+                worktree={worktree?.name ?? null}
+                target={worktreePill.name}
+                of={userProject ? userProject.name : repoTriggerLabel(pick)}
+                fetchedFrom={worktree && worktreeStart === 'origin' ? `origin/${worktreeDefault(worktree)}` : null}
+                onSwitch={() => setCheckoutChoice(worktree ? OWN_CLONE : worktreePill.id)}
+                disabled={!!busy}
+              />
+            )}
+            {worktree && !fetchedTrustable ? (
+              <FollowsPermissions
+                project={worktree.name}
+                fetched={worktreeStart === 'origin'}
+                named={sessionChoicesOn ? { trusted: worktree.chatTrusted === true, of: userProject?.name ?? null } : undefined}
+              />
+            ) : (askTrust || environmentResolving) && (
               <PermissionPicker
                 value={trustChecked ? 'full' : 'read'}
                 onChange={choice => {
@@ -664,7 +904,7 @@ export function NewChat() {
                   if (ticked.length === 0 && !environment) writePermissionPick(browserStore(), repoUrl, choice);
                 }}
                 open={permissionOpen}
-                onOpenChange={open => { setPermissionOpen(open); if (open) { setRepoOpen(false); setModelOpen(false); dismissSpaceMenu(); } }}
+                onOpenChange={open => { setPermissionOpen(open); if (open) { setRepoOpen(false); setModelOpen(false); closeProjectMenu(); dismissSpaceMenu(); } }}
                 checkouts={resolvedRepos?.repos.map(r => (r.branch ? `${r.repo} at ${r.branch}` : r.repo))}
                 scheduled={scheduled}
                 disabled={!!busy || environmentResolving}
@@ -674,12 +914,13 @@ export function NewChat() {
               <OrchestratorToggle on={orchestrate} onChange={setOrchestrate} state={orchestrator} disabled={!!busy} />
             )}
             </div>
+            </div>
             <div className="chat-compose-actions">
             {takesImages && <ComposerAttach onFiles={files => { void attachments.attach(files); }} disabled={!!busy} className="chat-compose-mic chat-compose-attach" />}
             <DictationButton dictation={dictation} disabled={!!busy} className="chat-compose-mic" />
             {/* Shows once there is a message, and stays while the session starts. */}
             {(message.trim() || hasAttachments || busy) && (
-              <button type="submit" className="chat-compose-send" aria-label={sendLabel} disabled={!canStart} aria-describedby={whyNot ? 'chat-new-why' : undefined}>
+              <button type="submit" className="chat-compose-send" aria-label={sendLabel} disabled={!canStart || sendWhenPlaced} aria-describedby={whyNot ? 'chat-new-why' : undefined}>
                 <SendIcon />
               </button>
             )}
@@ -690,26 +931,33 @@ export function NewChat() {
           boxes={drawerBoxes}
           boxChoice={boxChoice}
           onBoxChoice={chooseBox}
+          placement={placementOn ? {
+            view: placement.view, failed: placement.failed, onRetry: placement.retry, selection,
+            repoWords: userProject ? `has ${userProject.name}` : repoWordsFor(placementRepos),
+            // A type the repository's requirements matched is never in the pool, which holds presets only.
+            // So is one whose size's own ask failed: the pool's answer for it isn't known (useBoxPlacement sizeStale).
+            newBoxCold: placement.sizeStale || (!!boxSizes && (boxSize ?? preselectedSize(boxSizes)) === REPO_DEFAULT),
+          } : null}
           wakingId={wakingId}
           newBox={newBox}
           disabled={!!busy}
           // After a launched box's project was refused, the retry keeps that box; the session name stays editable.
           boxLocked={!!launched}
-          space={spaceStep.pending ? (
+          space={spaceUse.pending ? (
             // Spaces still loading: the trigger holds its place, disabled, so nothing shifts when they come.
-            <SpacePicker {...spaceStep.pickerProps} disabled menuEpoch={spaceMenuEpoch} onOpen={() => {}} />
-          ) : spaceStep.show ? (
+            <SpacePicker {...spaceUse.pickerProps} disabled menuEpoch={spaceMenuEpoch} onOpen={() => {}} />
+          ) : spaceUse.show ? (
             <SpacePicker
-              {...spaceStep.pickerProps}
+              {...spaceUse.pickerProps}
               // A space is remembered once picked; a new one only once the session makes it.
               onChange={next => {
-                spaceStep.pickerProps.onChange(next);
+                spaceUse.pickerProps.onChange(next);
                 if (next.kind !== 'new') rememberStartPick(browserStore(), { space: next.kind === 'existing' ? next.name : null });
               }}
-              error={spaceStep.error}
+              error={spaceUse.error}
               disabled={!!busy}
               menuEpoch={spaceMenuEpoch}
-              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); }}
+              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); closeProjectMenu(); }}
             />
           ) : null}
           // Offered with no environment too (its dialog's New environment makes one from here), unless environment selection is off.
@@ -721,7 +969,7 @@ export function NewChat() {
               disabled={!!busy || !!launched}
               // The space's epoch: what closes its dialog (a menu opening, a send) closes this one too.
               menuEpoch={spaceMenuEpoch}
-              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); }}
+              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); closeProjectMenu(); }}
             />
           ) : null}
           checkout={worktreeOptions.length > 0 && fields && !environment ? (
@@ -732,9 +980,9 @@ export function NewChat() {
               onBase={setWorktreeBase}
               targets={worktreeOptions}
               defaultBranchOf={worktreeDefault}
-              repoName={repoTriggerLabel(pick)}
+              repoName={userProject ? userProject.name : repoTriggerLabel(pick)}
               disabled={!!busy}
-              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); dismissSpaceMenu(); }}
+              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); closeProjectMenu(); dismissSpaceMenu(); }}
             />
           ) : null}
           schedule={automationsOn ? (
@@ -746,7 +994,7 @@ export function NewChat() {
               check={scheduleCheck}
               tierElsewhere={askTrust}
               disabled={!!busy}
-              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); dismissSpaceMenu(); }}
+              onOpen={() => { setRepoOpen(false); setModelOpen(false); setPermissionOpen(false); closeProjectMenu(); dismissSpaceMenu(); }}
             />
           ) : null}
           newBoxName={
@@ -778,6 +1026,7 @@ export function NewChat() {
 
         {/* Why Send is disabled: only once there is a message to send. */}
         {whyNot && (message.trim() || hasAttachments || scheduled) && <span className="chat-compose-why" id="chat-new-why">{whyNot}</span>}
+        {sendWhenPlaced && !busy && <div className="chat-compose-status" role="status">Finding a box…</div>}
         {busy && <div className="chat-compose-status" role="status">{busy === 'space' ? 'Setting up the space…' : busy === 'box' ? 'Launching a box…' : scheduled ? 'Creating…' : 'Starting…'}</div>}
         {error && <div className="chat-compose-error" role="alert">{error}</div>}
         {refDrop.note && <div className="chat-compose-error" role="status">{refDrop.note}</div>}

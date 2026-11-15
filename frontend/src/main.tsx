@@ -7,6 +7,7 @@ import { startClientBeacon } from './buildInfo';
 // Starts listening for beforeinstallprompt before the lazy /m chunk loads (mobile/install.ts).
 import './mobile/install';
 import { NAVIGATE_EVENT } from './mobile/push';
+import { dropLoginParamsFromAddressBar } from './chat/uiMode';
 // JetBrains Mono ships with the app (--font-mono in App.css), so code and terminals
 // don't depend on the OS's `monospace` font, which some Linux and Windows setups map to a serif.
 import '@fontsource-variable/jetbrains-mono/wght.css';
@@ -41,6 +42,10 @@ navigator.serviceWorker?.addEventListener('message', (e) => {
 // addEventListener alone leaves the client message queue closed in WebKit
 // (only onmessage or startMessages() opens it), so messages never arrive.
 navigator.serviceWorker?.startMessages();
+
+// Okta's app tile opens termag at /termag/?iss=…: take that out before the
+// router reads the URL, so the landing is the bare workspace URL (chat/uiMode.ts).
+dropLoginParamsFromAddressBar(window);
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

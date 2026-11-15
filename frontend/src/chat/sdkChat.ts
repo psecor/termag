@@ -4,8 +4,9 @@
 // user bubbles, assistant text (streamed), tool cards with their results —
 // and the one status line. Unknown events are ignored, never fatal.
 import { isClaudeAuthError } from './claudeLogin';
-import { emptyUsage, withMessageUsage, withPlanSpend, withRateLimit, withResultUsage, withSpendReset, type ChatUsage } from './contextUsage';
+import { emptyUsage, withCompactWindow, withMessageUsage, withPlanSpend, withRateLimit, withResultUsage, withSpendReset, type ChatUsage } from './contextUsage';
 import { agentResult, isAgentTool, mergeInfo, notificationInfo, taskEvent, taskStatus, type SubagentInfo, type SubagentRecord } from './subagents';
+import { DONE_YOUR_TURN, statusText } from './statusWords';
 
 /**
  * An image in a user message: `src` while it is only in this browser (a data
@@ -94,6 +95,8 @@ export interface TurnCost {
 export interface TurnRecord extends TurnCost {
   turnId: string; prompt: string; at?: string | null; isError?: boolean; userUuid?: string | null;
   sessionId?: string | null; sessionCostUsd?: number | null;
+  /** Where the turn's Claude Code compacted (agent chat-runner.js autoCompactWindowOf); null for the model's window, absent from an older box. */
+  compactWindow?: number | null;
 }
 
 export interface ChatState {
@@ -698,6 +701,8 @@ function withUsage(state: ChatState, e: AnyEvent): ChatState {
   else if (e.type === 'rate_limit_event') usage = withRateLimit(before, e.rate_limit_info);
   // The box's notice after an answer (agent/claude-plan-usage.js): a seat's monthly spend.
   else if (e.type === 'plan-usage') usage = withPlanSpend(before, e.spend);
+  // Where the turn's Claude Code compacts (agent chat-runner.js autoCompactWindowOf); none named is the model's window.
+  else if (e.type === 'turn-start') usage = withCompactWindow(before, e.compactWindow);
   if (usage === before) return state;
   // A reply says the context's size again: what it was compacted from is history.
   return usage.contextTokens != null && usage.contextTokens !== before.contextTokens ? { ...state, usage, compactedFrom: null } : { ...state, usage };
@@ -1362,7 +1367,7 @@ export function applyFrame(state: ChatState, frame: { turnId?: string | null; se
  * turn-start to say it runs; the box's `head` (agent chat-runner.js
  * eventsFromLog: the turn-start and the background tasks as of the cut) goes
  * first, and without one (an older agent) `running` alone marks the turn
- * open, or the chat said "Done" over a turn still at work.
+ * open, or the chat said "Idle" over a turn still at work.
  */
 export function fromHistory(
   entries: unknown[],
@@ -1378,6 +1383,10 @@ export function fromHistory(
   const priced = turnCosts(records, clears, sessionId);
   const before = turn ? turnCosts(records.filter(r => r.turnId !== turn.turnId), clears, sessionId) : priced;
   state = { ...state, sessionCostUsd: before.sessionCostUsd, clearedSessionCostUsd: before.clearedSessionCostUsd };
+  // The newest finished turn's compact window, which a transcript does not carry. The replayed turn's own
+  // turn-start (in its events, or in the head of a capped replay) is applied after this and takes over.
+  const finished = records[records.length - 1];
+  if (finished && finished.compactWindow !== undefined) state = { ...state, usage: withCompactWindow(state.usage ?? emptyUsage, finished.compactWindow) };
   // With a replay, the entries are the turns before it, which have ended:
   // no background call of theirs is still running, whatever their last
   // word was (a Stop, a notification the history cut).
@@ -1433,11 +1442,17 @@ export function withKeptUsage(prev: ChatState, next: ChatState, remembered: Chat
   if (!kept) return next;
   const got = next.usage;
   if (!got) return { ...next, usage: kept };
+  // A history whose calls carry no sizes (an older box's) may still name the compact window (its turn records).
+  if (got.contextTokens == null && got.model == null) {
+    return { ...next, usage: { ...kept, ...(got.compactWindow !== undefined ? { compactWindow: got.compactWindow } : {}), limits: withSpendReset({ ...kept.limits, ...got.limits }) } };
+  }
   return {
     ...next,
     usage: {
       ...got,
       contextWindow: got.contextWindow ?? (got.model === kept.model ? kept.contextWindow : null),
+      // A history cut before its last turn-start says nothing about the compact window: keep what the chat had.
+      compactWindow: got.compactWindow !== undefined ? got.compactWindow : kept.compactWindow,
       // Merged by type; the live-only spend's reset follows the merged overage window (withSpendReset).
       limits: withSpendReset({ ...kept.limits, ...got.limits }),
     },
@@ -1485,7 +1500,8 @@ export function toolSummary(name: string, input: unknown): { title: string; deta
   }
 }
 
-export interface ChatStatusLine { tone: 'idle' | 'working' | 'error'; text: string }
+/** `off`: no agent runs for the chat (its box is down); its row reads Not running. */
+export interface ChatStatusLine { tone: 'idle' | 'working' | 'error' | 'off'; text: string }
 
 /**
  * Whether a message sent now goes into the running turn: a live turn, and a
@@ -1574,9 +1590,10 @@ export function isStopNote(it: ChatItem | undefined): boolean {
  */
 export function desktopTurnStatus(status: { status?: string; source?: string | null } | undefined): ChatStatusLine | null {
   if (!status || typeof status.source !== 'string' || !status.source.startsWith('t3:')) return null;
-  if (status.status === 'working') return { tone: 'working', text: 'Working in the desktop app' };
-  // Waiting on an approval or an answer there: still the desktop's turn, and a send here is refused.
-  if (status.status === 'waiting') return { tone: 'working', text: 'Waiting for you in the desktop app' };
+  if (status.status === 'working') return { tone: 'working', text: statusText('Working', 'in the desktop app') };
+  // Waiting on an approval or an answer there: still the desktop's turn, and a send here is refused. The
+  // open chat publishes no live status for it (useSdkChat), so its row reads the pipeline's Needs you.
+  if (status.status === 'waiting') return { tone: 'working', text: statusText('Needs you', 'in the desktop app') };
   return null;
 }
 
@@ -1604,26 +1621,30 @@ export function desktopStepReloads(shown: { chatId: string; step: string | null 
   return shown !== null && shown.chatId === chatId && shown.step !== step;
 }
 
-/** The single line under the chat saying what Claude is doing now. */
+/**
+ * The single line under the chat saying what Claude is doing now, leading
+ * with one of the four status words (chat/statusWords.ts): a failed turn
+ * needs you, and every way a turn ends is Idle.
+ */
 export function chatStatus(state: ChatState, sendsLive = false): ChatStatusLine {
   if (!state.running) {
     const last = state.items[state.items.length - 1];
-    if (last?.kind === 'error') return { tone: 'error', text: 'Failed · your turn' };
-    if (isStopNote(last)) return { tone: 'idle', text: 'Stopped · your turn' };
+    if (last?.kind === 'error') return { tone: 'error', text: statusText('Needs you', 'failed') };
+    if (isStopNote(last)) return { tone: 'idle', text: statusText('Idle', 'stopped') };
     if (last?.kind === 'divider') {
-      const text = last.variant === 'compacted' ? 'Context compacted · your turn' : last.undone ? 'Previous context resumed · your turn' : 'Context cleared · your turn';
-      return { tone: 'idle', text };
+      const what = last.variant === 'compacted' ? 'context compacted' : last.undone ? 'context resumed' : 'context cleared';
+      return { tone: 'idle', text: statusText('Idle', what) };
     }
-    // Sent, and its turn not started yet: not the last turn's "Done".
-    if (last?.kind === 'user' && last.pending) return { tone: 'working', text: 'Sending…' };
-    return { tone: 'idle', text: state.items.length ? 'Done · your turn' : 'Say what you want to do' };
+    // Sent, and its turn not started yet: not the last turn's "Idle".
+    if (last?.kind === 'user' && last.pending) return { tone: 'working', text: statusText('Working', 'sending…') };
+    return { tone: 'idle', text: state.items.length ? DONE_YOUR_TURN : statusText('Idle', 'no messages yet') };
   }
   if (state.phase === 'tool' && state.activeTool) {
     const { title, detail } = toolSummary(state.activeTool.name, state.activeTool.input);
-    return { tone: 'working', text: detail ? `Running ${title} · ${detail.length > 70 ? `${detail.slice(0, 69)}…` : detail}` : `Running ${title}` };
+    return { tone: 'working', text: statusText('Working', detail ? `${title} · ${detail.length > 70 ? `${detail.slice(0, 69)}…` : detail}` : title) };
   }
-  if (state.phase === 'writing') return { tone: 'working', text: 'Writing…' };
-  if (state.phase === 'compacting') return { tone: 'working', text: 'Compacting the conversation…' };
+  if (state.phase === 'writing') return { tone: 'working', text: statusText('Working', 'writing…') };
+  if (state.phase === 'compacting') return { tone: 'working', text: statusText('Working', 'compacting…') };
   if (state.phase === 'waiting') {
     // Claude has answered and only its background tasks run: idle, as the
     // session's status says (backend statusForChatEvent), with what is left.
@@ -1631,12 +1652,13 @@ export function chatStatus(state: ChatState, sendsLive = false): ChatStatusLine 
     // Subagents alone are agents; with a command among them, tasks.
     const agents = n > 0 && state.background!.every(t => t.subagent);
     const tasks = n === 0 ? 'background work' : agents ? (n === 1 ? '1 agent' : `${n} agents`) : n === 1 ? '1 background task' : `${n} background tasks`;
+    const left = `${tasks} still running`;
     return sendGoesLive(state, sendsLive)
-      ? { tone: 'idle', text: `Your turn · ${tasks} ${n === 0 ? 'still running' : 'running'}` }
-      : { tone: 'idle', text: `Waiting on ${tasks} · a message waits until ${n > 1 ? 'they end' : 'it ends'}` };
+      ? { tone: 'idle', text: statusText('Idle', left) }
+      : { tone: 'idle', text: statusText('Idle', `${left} · a message waits until ${n > 1 ? 'they end' : 'it ends'}`) };
   }
-  if (state.woken) return { tone: 'working', text: 'Working · background task finished' };
-  return { tone: 'working', text: 'Thinking…' };
+  if (state.woken) return { tone: 'working', text: statusText('Working', 'background task finished') };
+  return { tone: 'working', text: statusText('Working', 'thinking…') };
 }
 
 /** The message Retry sends again: the last prompt, when the chat ended on an error. */

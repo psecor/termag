@@ -72,7 +72,7 @@ describe('the repo pill over a started session', () => {
 
   it('names the project\'s repositories, ticked and locked, the others open to add', async () => {
     await show();
-    expect(pill()!.textContent).toBe('acme/web + api');
+    expect(pill()!.textContent).toBe('web + api');
     await click(pill());
     for (const name of ['acme/web', 'acme/api']) {
       expect(option(name)!.getAttribute('aria-selected')).toBe('true');
@@ -91,14 +91,14 @@ describe('the repo pill over a started session', () => {
     await click(pill());
     await click(option('acme/docs'));
     expect(mocks.addRepo).toHaveBeenCalledWith('p1', { url: 'https://github.com/acme/docs.git' });
-    expect(pill()!.textContent).toBe('acme/web + api + docscloning…');
+    expect(pill()!.textContent).toBe('web + api + docscloning…');
     expect(option('acme/docs')!.getAttribute('aria-disabled')).toBe('true');
     expect(option('acme/docs')!.textContent).toContain('Waiting to clone');
 
     mocks.repos.mockResolvedValue({ repos: [row('web', 0), row('api', 1), row('docs', 2)] });
     await act(async () => { vi.advanceTimersByTime(REPOS_POLL_MS); });
     await flush();
-    expect(pill()!.textContent).toBe('acme/web + api + docs');
+    expect(pill()!.textContent).toBe('web + api + docs');
     expect(option('acme/docs')!.textContent).toBe('acme/docs');
     expect(mocks.reloadProjects).toHaveBeenCalledTimes(1);
   });
@@ -107,7 +107,7 @@ describe('the repo pill over a started session', () => {
     mocks.repos.mockResolvedValue({ repos: [row('web', 0), row('docs', 1, { setupStatus: 'failed', setupError: 'repository not found' })] });
     mocks.retryClone.mockResolvedValue({ setupStatus: 'ready' });
     await show();
-    expect(pill()!.textContent).toBe('acme/web + docsfailed');
+    expect(pill()!.textContent).toBe('web + docsfailed');
     await click(pill());
     expect(option('acme/docs')!.textContent).toContain('Failed: repository not found');
     await click([...el.querySelectorAll('button')].find(b => b.textContent === 'Retry'));

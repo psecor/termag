@@ -38,12 +38,12 @@ describe('applyEvent: a live turn', () => {
     expect(s.items[1]).toMatchObject({ kind: 'text', text: 'Let me look.', streaming: false });
     expect(s.items[2]).toMatchObject({ kind: 'tool', name: 'Bash', input: { command: 'ls -la' }, result: 'README.md\nsrc', done: true });
     expect(s.items[3]).toMatchObject({ kind: 'text', text: '## Layout\n', streaming: true });
-    expect(chatStatus(s)).toEqual({ tone: 'working', text: 'Writing…' });
+    expect(chatStatus(s)).toEqual({ tone: 'working', text: 'Working · writing…' });
   });
 
   it('says which tool runs while it runs', () => {
     const s = run(turn.slice(0, 13));
-    expect(chatStatus(s)).toEqual({ tone: 'working', text: 'Running Bash · ls -la' });
+    expect(chatStatus(s)).toEqual({ tone: 'working', text: 'Working · Bash · ls -la' });
   });
 
   it('replaces the streamed text with the final block and rests at the turn end', () => {
@@ -57,7 +57,7 @@ describe('applyEvent: a live turn', () => {
     expect(s.items.filter(i => i.kind === 'text').map(i => i.kind === 'text' && i.text)).toEqual(['Let me look.', '## Layout\n- src/']);
     expect(s.running).toBe(false);
     expect(chatCostTotal(s)).toBeCloseTo(0.01);
-    expect(chatStatus(s)).toEqual({ tone: 'idle', text: 'Done · your turn' });
+    expect(chatStatus(s)).toEqual({ tone: 'idle', text: 'Idle · your turn' });
   });
 
   it('matches the pending bubble to its turn instead of adding a second one', () => {
@@ -80,10 +80,10 @@ describe('applyEvent: a live turn', () => {
   it('a read-only note is no stop: a turn ending on it is done, and a real stop still says so (Bugbot, #940)', () => {
     const start = { type: 'turn-start', text: 'fix it', readOnly: 'HEAD is detached' };
     const done = run([start, { type: 'turn-end', exitCode: 0 }]);
-    expect(chatStatus(done)).toEqual({ tone: 'idle', text: 'Done · your turn' });
+    expect(chatStatus(done)).toEqual({ tone: 'idle', text: 'Idle · your turn' });
     const stopped = run([start, { type: 'turn-end', exitCode: 130 }]);
     expect(stopped.items[stopped.items.length - 1]).toMatchObject({ kind: 'note', text: 'Stopped by you' });
-    expect(chatStatus(stopped)).toEqual({ tone: 'idle', text: 'Stopped · your turn' });
+    expect(chatStatus(stopped)).toEqual({ tone: 'idle', text: 'Idle · stopped' });
   });
 
   it('closes a tool cut off by a stopped turn and says so neutrally, not as an error', () => {
@@ -95,7 +95,7 @@ describe('applyEvent: a live turn', () => {
     expect(s.items.find(i => i.kind === 'tool')).toMatchObject({ done: true, result: null });
     expect(s.items.some(i => i.kind === 'error')).toBe(false);
     expect(s.items[s.items.length - 1]).toMatchObject({ kind: 'note', text: 'Stopped by you' });
-    expect(chatStatus(s)).toEqual({ tone: 'idle', text: 'Stopped · your turn' });
+    expect(chatStatus(s)).toEqual({ tone: 'idle', text: 'Idle · stopped' });
   });
 
   it('a Stop pressed here keeps whatever error text Claude ends with out of the chat', () => {
@@ -331,7 +331,7 @@ describe('mergeHistory', () => {
       { type: 'turn-end', exitCode: 0 },
     ]);
     expect(s.running).toBe(false);
-    expect(chatStatus(s).text).toBe('Done · your turn');
+    expect(chatStatus(s).text).toBe('Idle · your turn');
   });
 
   it('keeps live stream events instead of wiping them, without duplicating what the snapshot has', () => {
@@ -789,17 +789,17 @@ describe('applyEvent: a live turn takes messages in while it runs', () => {
     expect(s.items.filter(i => i.kind === 'user').map(i => i.text)).toEqual(['start the ask']);
     expect(s.running).toBe(true);
     expect(s.phase).toBe('waiting');
-    expect(chatStatus(s, true)).toEqual({ tone: 'idle', text: 'Your turn · background work still running' });
+    expect(chatStatus(s, true)).toEqual({ tone: 'idle', text: 'Idle · background work still running' });
     expect(sendGoesLive(s, true)).toBe(true);
   });
 
   it('invites a send only when the turn is live and this viewer\'s sends are', () => {
     const live = run(answered);
-    expect(chatStatus(live, false).text).toBe('Waiting on background work · a message waits until it ends');
+    expect(chatStatus(live, false).text).toBe('Idle · background work still running · a message waits until it ends');
     expect(sendGoesLive(live, false)).toBe(false);
     const plain = run([{ type: 'turn-start', text: 'start the ask' }, ...answered.slice(2)]);
     expect(plain.phase).toBe('waiting');
-    expect(chatStatus(plain, true).text).toBe('Waiting on background work · a message waits until it ends');
+    expect(chatStatus(plain, true).text).toBe('Idle · background work still running · a message waits until it ends');
     expect(sendGoesLive(plain, true)).toBe(false);
     const ended = run([{ type: 'turn-end', exitCode: 0 }], live);
     expect(ended.liveTurn).toBe(false);
@@ -857,7 +857,7 @@ describe('applyEvent: a live turn takes messages in while it runs', () => {
     expect(s.items.map(i => (i.kind === 'user' ? `${i.text}${i.pending ? ' (queued)' : ''}` : i.kind))).toEqual(['start the ask', 'text', 'text', 'are you there?']);
     expect(s.phase).toBe('thinking');
     s = run([{ type: 'result', subtype: 'success', is_error: false, result: 'Yes.' }, { type: 'turn-end', exitCode: 0 }], s);
-    expect(chatStatus(s).text).toBe('Done · your turn');
+    expect(chatStatus(s).text).toBe('Idle · your turn');
   });
 
   it('a transcript\'s user lines are not replays: an equal prompt later in a chat still shows', () => {
@@ -955,7 +955,7 @@ describe('applyEvent: a local command (a mod\'s /reload-plugins)', () => {
     ]);
     expect(lines(h)).toEqual(['user: hi', 'text: Hello.', 'Ran /reload-plugins']);
     expect(h.items.some(i => i.kind === 'user' && /<command-/.test(i.text))).toBe(false);
-    expect(chatStatus(h).text).toBe('Done · your turn');
+    expect(chatStatus(h).text).toBe('Idle · your turn');
   });
 
   it('joins the output to its echo, and folds eight of the same into one line', () => {
@@ -1138,7 +1138,7 @@ describe('context-cleared', () => {
     expect(s.sessionId).toBeNull();
     expect(s.usage?.contextTokens).toBeNull();
     expect(s.usage?.limits.five_hour?.utilization).toBe(0.4);
-    expect(chatStatus(s).text).toBe('Context cleared · your turn');
+    expect(chatStatus(s).text).toBe('Idle · context cleared');
   });
 
   it('is one divider when the answer and the frame both arrive', () => {
@@ -1240,7 +1240,7 @@ describe('context-resumed', () => {
     expect(divider?.kind === 'divider' && divider.undone).toBe(true);
     expect(s.sessionId).toBe('sess-1');
     expect(s.usage?.contextTokens).toBe(40_000);
-    expect(chatStatus(s).text).toBe('Previous context resumed · your turn');
+    expect(chatStatus(s).text).toBe('Idle · context resumed');
     expect(costSinceCleared(s)).toBeNull();
   });
 
@@ -1272,7 +1272,7 @@ describe('compact', () => {
   it('is a divider, not a bubble or the summary, and empties the ring until the next reply', () => {
     let s = run([...opening, compactTurn[0]]);
     expect(s.running).toBe(true);
-    expect(chatStatus(s).text).toBe('Compacting the conversation…');
+    expect(chatStatus(s).text).toBe('Working · compacting…');
     s = run(compactTurn.slice(1), s);
     expect(s.items.map(it => it.kind)).toEqual(['user', 'text', 'divider']);
     const divider = s.items[2];
@@ -1281,7 +1281,7 @@ describe('compact', () => {
     expect(s.usage?.contextTokens).toBeNull();
     expect(s.compactedFrom).toBe(163_152);
     expect(s.running).toBe(false);
-    expect(chatStatus(s).text).toBe('Context compacted · your turn');
+    expect(chatStatus(s).text).toBe('Idle · context compacted');
     expect(chatCostTotal(s)).toBe(0.46);
     s = run([
       { type: 'turn-start', text: 'and now?' },
@@ -1392,9 +1392,9 @@ describe('applyEvent: a background task wakes Claude after its answer', () => {
   it('says it is your turn, with the tasks still running, once Claude has answered', () => {
     const s = run(answered);
     expect(s.running).toBe(true);
-    expect(chatStatus(s, true)).toEqual({ tone: 'idle', text: 'Your turn · 3 background tasks running' });
-    expect(chatStatus(s, false)).toEqual({ tone: 'idle', text: 'Waiting on 3 background tasks · a message waits until they end' });
-    expect(chatStatus(run([tasks(1)], s), false).text).toBe('Waiting on 1 background task · a message waits until it ends');
+    expect(chatStatus(s, true)).toEqual({ tone: 'idle', text: 'Idle · 3 background tasks still running' });
+    expect(chatStatus(s, false)).toEqual({ tone: 'idle', text: 'Idle · 3 background tasks still running · a message waits until they end' });
+    expect(chatStatus(run([tasks(1)], s), false).text).toBe('Idle · 1 background task still running · a message waits until it ends');
   });
 
   it('shows the background call as running in the background, not as a finished or pending call', () => {
@@ -1404,22 +1404,22 @@ describe('applyEvent: a background task wakes Claude after its answer', () => {
     expect(tool(run([{ ...notification, status: 'killed' }], run(answered))).background).toBe('stopped');
   });
 
-  it('works again when the task ends, says why, and is Done only at the turn end', () => {
+  it('works again when the task ends, says why, and is Idle only at the turn end', () => {
     const woken = run([notification, tasks(2), { type: 'system', subtype: 'init', session_id: 's1' }], run(answered));
     expect(woken.phase).toBe('thinking');
     expect(chatStatus(woken, true)).toEqual({ tone: 'working', text: 'Working · background task finished' });
     const reading = run([{ type: 'assistant', message: { id: 'm3', content: [{ type: 'tool_use', id: 'tr', name: 'Read', input: { file_path: '/tmp/b2q.output' } }] } }], woken);
-    expect(chatStatus(reading, true).text).toBe('Running Read · /tmp/b2q.output');
+    expect(chatStatus(reading, true).text).toBe('Working · Read · /tmp/b2q.output');
     const thinking = run([{ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tr', content: 'hi' }] } }], reading);
     expect(chatStatus(thinking, true).text).toBe('Working · background task finished');
     const again = run([
       { type: 'assistant', message: { id: 'm4', content: [{ type: 'text', text: 'It printed hi.' }] } },
       { type: 'result', subtype: 'success', is_error: false, result: 'It printed hi.' },
     ], thinking);
-    expect(chatStatus(again, true)).toEqual({ tone: 'idle', text: 'Your turn · 2 background tasks running' });
+    expect(chatStatus(again, true)).toEqual({ tone: 'idle', text: 'Idle · 2 background tasks still running' });
     expect(again.woken).toBe(false);
     const ended = run([tasks(0), { type: 'turn-end', exitCode: 0 }], again);
-    expect(chatStatus(ended, true)).toEqual({ tone: 'idle', text: 'Done · your turn' });
+    expect(chatStatus(ended, true)).toEqual({ tone: 'idle', text: 'Idle · your turn' });
   });
 
   it('wakes on the first streamed or final assistant event too, for a log without the notification', () => {
@@ -1430,7 +1430,7 @@ describe('applyEvent: a background task wakes Claude after its answer', () => {
   it('a message, not a task, is what a replayed user line is', () => {
     const s = run([notification, { type: 'user', isReplay: true, uuid: 'u2', message: { role: 'user', content: 'and now?' } }], run(answered));
     expect(s.woken).toBe(false);
-    expect(chatStatus(s, true).text).toBe('Thinking…');
+    expect(chatStatus(s, true).text).toBe('Working · thinking…');
   });
 
   it('a background call nothing reports again ends with its turn', () => {
@@ -1456,7 +1456,7 @@ describe('applyEvent: a background task wakes Claude after its answer', () => {
 
 // A long live turn's replay is only its newest lines (agent chat-runner.js
 // TURN_EVENTS_MAX), so it has no turn-start: the chat must not take the turn
-// for over, which said "Done · your turn" over a Bash card still running.
+// for over, which said "Idle · your turn" over a Bash card still running.
 describe('fromHistory: a running turn replayed from its newest lines only', () => {
   const tail = [
     { seq: 6001, event: { type: 'assistant', message: { id: 'm7', content: [{ type: 'tool_use', id: 'tx', name: 'Bash', input: { command: 'termag ask x' } }] } } },
@@ -1470,9 +1470,9 @@ describe('fromHistory: a running turn replayed from its newest lines only', () =
     const s = fromHistory([], 's1', { turnId: 't1', events: tail }, [], { running: true, liveInput: true });
     expect(s.running).toBe(true);
     expect(s.liveTurn).toBe(true);
-    expect(chatStatus(s, true).text).toBe('Running Bash · termag ask x');
-    // Without the box's word (an older frontend's call) it was Done.
-    expect(chatStatus(fromHistory([], 's1', { turnId: 't1', events: tail }), true).text).toBe('Done · your turn');
+    expect(chatStatus(s, true).text).toBe('Working · Bash · termag ask x');
+    // Without the box's word (an older frontend's call) it was Idle.
+    expect(chatStatus(fromHistory([], 's1', { turnId: 't1', events: tail }), true).text).toBe('Idle · your turn');
   });
 
   it('takes the prompt and the background tasks from the head the box sends with the cut', () => {
@@ -1482,7 +1482,7 @@ describe('fromHistory: a running turn replayed from its newest lines only', () =
     ];
     const s = fromHistory([], 's1', { turnId: 't1', events: answeredTail, head }, [], { running: true, liveInput: true });
     expect(s.items[0]).toMatchObject({ kind: 'user', text: 'orchestrate' });
-    expect(chatStatus(s, true)).toEqual({ tone: 'idle', text: 'Your turn · 2 background tasks running' });
+    expect(chatStatus(s, true)).toEqual({ tone: 'idle', text: 'Idle · 2 background tasks still running' });
     expect(s.cursor).toEqual({ turnId: 't1', seq: 6002 });
     // The next live frame goes on from the tail.
     expect(applyFrame(s, { turnId: 't1', seq: 6003, event: { type: 'system', subtype: 'init', session_id: 's1' } }).state.woken).toBe(true);
@@ -1571,12 +1571,12 @@ describe('background task notifications: a muted line, never a bubble', () => {
 });
 
 describe('chatStatus: a message on its way', () => {
-  it('says Sending… between the send and its turn-start, not the last turn\'s Done', () => {
+  it('says Sending… between the send and its turn-start, not the last turn\'s Idle', () => {
     const done = run([{ type: 'turn-start', text: 'hi' }, { type: 'result', subtype: 'success' }, { type: 'turn-end', exitCode: 0 }]);
-    expect(chatStatus(done).text).toBe('Done · your turn');
-    expect(chatStatus(addPending(done, 'next'))).toEqual({ tone: 'working', text: 'Sending…' });
-    expect(chatStatus(addPending(emptyChat, 'first'))).toEqual({ tone: 'working', text: 'Sending…' });
-    expect(chatStatus(run([{ type: 'turn-start', text: 'next' }], addPending(done, 'next'))).text).toBe('Thinking…');
+    expect(chatStatus(done).text).toBe('Idle · your turn');
+    expect(chatStatus(addPending(done, 'next'))).toEqual({ tone: 'working', text: 'Working · sending…' });
+    expect(chatStatus(addPending(emptyChat, 'first'))).toEqual({ tone: 'working', text: 'Working · sending…' });
+    expect(chatStatus(run([{ type: 'turn-start', text: 'next' }], addPending(done, 'next'))).text).toBe('Working · thinking…');
   });
 });
 
@@ -1840,8 +1840,8 @@ describe('stopChoices', () => {
 
 describe('desktopTurnStatus', () => {
   it("says the desktop app's thread is working on the session, or waiting there, not that the chat is done", () => {
-    expect(desktopTurnStatus({ status: 'working', source: 't3:claude' })).toEqual({ tone: 'working', text: 'Working in the desktop app' });
-    expect(desktopTurnStatus({ status: 'waiting', source: 't3:claude' })).toEqual({ tone: 'working', text: 'Waiting for you in the desktop app' });
+    expect(desktopTurnStatus({ status: 'working', source: 't3:claude' })).toEqual({ tone: 'working', text: 'Working · in the desktop app' });
+    expect(desktopTurnStatus({ status: 'waiting', source: 't3:claude' })).toEqual({ tone: 'working', text: 'Needs you · in the desktop app' });
   });
 
   it("is nothing for the chat's own runner, a pane, a resting thread or no status", () => {

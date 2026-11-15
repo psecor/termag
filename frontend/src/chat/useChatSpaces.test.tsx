@@ -3,7 +3,8 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SpaceBoxGrant, SpaceView } from '../services/api';
-import { useChatSpaces, type ChatSpaces } from './useChatSpaces';
+import { ChatSpacesProvider, useChatSpaces, useWhenSpacesLoaded, type ChatSpaces, type SharedChatSpaces } from './useChatSpaces';
+import { spaceColor } from './spaceColors';
 
 const mocks = vi.hoisted(() => {
   const pending: Array<() => void> = [];
@@ -85,3 +86,55 @@ describe('useChatSpaces', () => {
   });
 });
 
+
+describe('useWhenSpacesLoaded', () => {
+  const shared = (loaded: boolean): SharedChatSpaces => ({ loaded, spaces: [], index: new Map(), current: loaded, colorOf: spaceColor });
+  let get: () => Promise<string | null>;
+  function Asker({ value, chat = 'p/a' }: { value: string | null; chat?: string }) {
+    get = useWhenSpacesLoaded(value, chat, 1000);
+    return null;
+  }
+
+  it('waits for the spaces to land and gives the value they make', async () => {
+    act(() => root.render(<ChatSpacesProvider value={shared(false)}><Asker value={null} /></ChatSpacesProvider>));
+    let got: string | null | undefined;
+    void get().then(v => { got = v; });
+    await act(async () => { await Promise.resolve(); });
+    expect(got).toBeUndefined();
+    await act(async () => { root.render(<ChatSpacesProvider value={shared(true)}><Asker value="team-alpha" /></ChatSpacesProvider>); });
+    expect(got).toBe('team-alpha');
+    await expect(get()).resolves.toBe('team-alpha');
+  });
+
+  it('gives up with null when they never land', async () => {
+    vi.useFakeTimers();
+    try {
+      act(() => root.render(<ChatSpacesProvider value={shared(false)}><Asker value="team-alpha" /></ChatSpacesProvider>));
+      const got = get();
+      await act(async () => { vi.advanceTimersByTime(1000); });
+      await expect(got).resolves.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails a wait when its chat unmounts, rather than giving null', async () => {
+    act(() => root.render(<ChatSpacesProvider value={shared(false)}><Asker value="team-alpha" /></ChatSpacesProvider>));
+    const got = expect(get()).rejects.toThrow('the chat closed before its spaces loaded');
+    act(() => root.render(<ChatSpacesProvider value={shared(false)}>{null}</ChatSpacesProvider>));
+    await got;
+  });
+
+  it('fails a wait when the chat changes, rather than giving the next chat\'s space', async () => {
+    act(() => root.render(<ChatSpacesProvider value={shared(false)}><Asker value={null} chat="p/a" /></ChatSpacesProvider>));
+    const got = expect(get()).rejects.toThrow('the chat closed before its spaces loaded');
+    await act(async () => { root.render(<ChatSpacesProvider value={shared(true)}><Asker value="other-space" chat="p/b" /></ChatSpacesProvider>); });
+    await got;
+    await expect(get()).resolves.toBe('other-space');
+  });
+
+  it('does not wait outside a ChatSpacesProvider', async () => {
+    act(() => root.render(<Asker value={null} />));
+    await expect(get()).resolves.toBeNull();
+  });
+});

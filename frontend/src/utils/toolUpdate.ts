@@ -4,7 +4,7 @@
  * and how a run reads in a cell. The browser never reads a tool's policy flag (<tool>-update-policy, whose
  * mode off turns updating off): a route answering 404 claude_update_off hides the action it backs.
  */
-import type { ToolRestart, ToolUpdatePreview, ToolUpdateScope, FleetSkipReason, FleetToolUpdate, SoftwareHost, SoftwareUpdateRun, UpdatableTool } from '../services/adminApi';
+import type { ToolRestart, ToolUpdatePreview, ToolUpdateScope, FleetSkipReason, FleetToolUpdate, SoftwareCell, SoftwareHost, SoftwareRefusal, SoftwareUpdateRun, UpdatableTool } from '../services/adminApi';
 
 /** A tool the tab can update, as the orchestrator's registry has it (backend services/toolUpdate/components.ts). */
 export interface UpdateTool {
@@ -126,51 +126,90 @@ export function compareVersions(a: string | null | undefined, b: string | null |
   return 0;
 }
 
+/** How old a host's row may be and still count, as the server's INVENTORY_STALE_MS (backend toolUpdate/fleet.ts): older, the fleet skips it (no_inventory). */
+export const INVENTORY_STALE_MS = 24 * 3600_000;
+
 /**
- * How many hosts a fleet update would ask, for the button's (N): the tool installed and older than
- * the floor or the target. Without a known floor (no preview has answered yet) there's no count for
- * below-floor; without an exact target, "behind" counts against the server's reference for dated builds
- * (datedReference) and otherwise falls back to the matrix's own behind and outdated.
- * The orchestrator host is left out: it has its own action in its host panel (phase 2e). The server's runs and skipped are the truth.
+ * How many hosts a fleet update would ask, for the button's (N): the box cells whose `fleet` says that
+ * scope's update takes them. The backend answers `fleet` by calling the update's own selectFleet per
+ * scope (services/software/queries.ts), and nothing here decides a scope (Bugbot on #1607). The tab and
+ * its backend ship in one orchestrator image, so a matrix without `fleet` is not one to grade: it counts
+ * 0, and scopeCountWhy says why (Devin on #1607). The orchestrator host is left out: it has its own
+ * action in its host panel. The server's runs and skipped are the truth.
  */
-// A dated build, 2026.10.22-27dcf5f (the Cursor agent's): its date, then its build hash.
-const BUILD = /^(\d{4}\.\d{2}\.\d{2})-[0-9a-f]+$/;
-const DAY = /^\d{4}\.\d{2}\.\d{2}$/;
-/**
- * What "behind" compares dated builds with under a target that is not exact (latest), as the server's
- * fleet.ts behindReference: the newest day's build, or that day alone when the column has several builds
- * of it, whose order no hash tells (every build of the day is then behind). Null when none is dated
- * (Bugbot on #1080: the matrix's own states order same-day builds by their hash).
- */
-function datedReference(versions: Array<string | null>): string | null {
-  const builds = versions.filter((v): v is string => !!v && BUILD.test(v));
-  if (builds.length === 0) return null;
-  const day = builds.map(v => BUILD.exec(v)![1]).reduce((a, b) => ((compareVersions(b, a) ?? 0) > 0 ? b : a));
-  const ofDay = new Set(builds.filter(v => v.startsWith(`${day}-`)));
-  return ofDay.size === 1 ? [...ofDay][0] : day;
-}
-/**
- * Whether a host's version is older than what it is compared with; another build of the same day is
- * behind a target (or a day alone), but not below a floor of that day (as the server's fleet.ts
- * compareToReference).
- */
-function isBehind(version: string | null, versus: string, floor = false): boolean {
-  const a = version ? BUILD.exec(version) : null, b = BUILD.exec(versus);
-  if (a && DAY.test(versus)) return a[1] === versus || compareVersions(a[1], versus) === -1;
-  if (a && b && a[1] === b[1]) return !floor && version !== versus;
-  return compareVersions(version, versus) === -1;
+export function scopeCount(tool: UpdateTool, hosts: SoftwareHost[], scope: Exclude<ToolUpdateScope, 'all'>): number {
+  return hosts.filter(h => h.kind !== 'orchestrator').filter(h => h.cells[tool.inventory]?.fleet?.[scope]).length;
 }
 
-// `referenceHosts`: what the dated reference is taken from, every box in the matrix whether counted or not,
-// as the server's behindReference takes every box's inventory, online or not (Bugbot on #1080).
-export function scopeCount(tool: UpdateTool, hosts: SoftwareHost[], scope: Exclude<ToolUpdateScope, 'all'>, ref: { floor: string | null; target: string | null } | null, referenceHosts: SoftwareHost[] = hosts): number | null {
-  const cells = hosts.filter(h => h.kind !== 'orchestrator').map(h => h.cells[tool.inventory]).filter(c => c && c.state !== 'missing' && c.version);
-  const versus = scope === 'below-floor' ? ref?.floor : ref?.target;
-  if (versus && parseVersion(versus)) return cells.filter(c => isBehind(c.version, versus, scope === 'below-floor')).length;
-  if (scope === 'below-floor') return null;
-  const dated = datedReference(referenceHosts.filter(h => h.kind !== 'orchestrator').map(h => h.cells[tool.inventory]?.version ?? null));
-  if (dated) return cells.filter(c => isBehind(c.version, dated)).length;
-  return cells.filter(c => c.state === 'behind' || c.state === 'outdated').length;
+/** Why a fleet button counts 0, for its title: no box cell says the update would take it, or the matrix sent no selection at all. */
+export function scopeCountWhy(tool: UpdateTool, hosts: SoftwareHost[], scope: Exclude<ToolUpdateScope, 'all'>): string | null {
+  if (scopeCount(tool, hosts, scope) > 0) return null;
+  const boxes = hosts.filter(h => h.kind !== 'orchestrator' && h.cells[tool.inventory]);
+  if (!boxes.some(h => h.cells[tool.inventory].fleet)) return `the matrix says for no host whether this update takes it (no fleet selection for ${tool.label}), so there is nothing to count`;
+  return scope === 'below-floor' ? 'the fleet update takes no host: none is below its floor and updatable now' : 'the fleet update takes no host: none is behind its reference and updatable now';
+}
+
+/** A refusal as words, for a hover or a badge. */
+export const REFUSAL_TEXT: Record<SoftwareRefusal, string> = {
+  claude_update_off: 'mode off', offline: 'the box is offline', not_capable: 'its agent can’t run this update', run_in_flight: 'an update is already running',
+  no_inventory: 'its inventory is over a day old', not_installed: 'it isn’t installed', version_unreadable: 'its version is unreadable', unknown_version: 'its version compares with nothing',
+  orchestrator: 'the fleet buttons skip the orchestrator', orchestrator_panel_off: 'the fleet buttons skip the orchestrator, and your host panel has no Update for it',
+};
+/** A refusal that only means the tool is being updated already, or by another action: not one that leaves it as it is. */
+export const refusalBlocks = (r: SoftwareRefusal | null | undefined): boolean => !!r && r !== 'run_in_flight' && r !== 'orchestrator' && r !== 'orchestrator_panel_off';
+/**
+ * Whether nothing on the tab, or the sweep, would update a cell: its refusal, except for the orchestrator,
+ * whose answer is its own policy's mode (off: neither its nightly run nor a host panel for that context),
+ * the same for every admin, not the viewing admin's host panel (Bugbot on #1607).
+ */
+export const cellBlocks = (cell: SoftwareCell): boolean =>
+  cell.refusal === 'orchestrator' || cell.refusal === 'orchestrator_panel_off' ? cell.policy?.mode === 'off' : refusalBlocks(cell.refusal);
+
+/**
+ * The orchestrator's Claude Code, in its hover: the viewing admin's host panel (their own view, from
+ * `panel`), then what the orchestrator's own policy does, which its grade is (its nightly run under auto).
+ */
+function orchestratorText(cell: SoftwareCell, label: string): string {
+  const p = cell.policy!;
+  const panel = cell.panel
+    ? cell.panel.offered ? 'your host panel’s Update reaches it'
+      : `your host panel has no Update for it (${cell.panel.mode === 'off' ? 'your policy is mode off' : 'the orchestrator’s own policy is mode off'})`
+    : cell.refusal === 'orchestrator' ? 'its host panel’s Update reaches it' : 'its host panel has no Update for it';
+  const own = p.mode === 'auto' ? 'the orchestrator’s own nightly run still applies its policy (mode auto)' : `the orchestrator’s own policy is mode ${p.mode}, so no nightly run`;
+  return `${label}: ${panel}; ${own}; the fleet buttons skip the orchestrator`;
+}
+
+/**
+ * A tool cell's policy lines in its hover: what it was graded against, and what really happens to it, for
+ * each state and mode. A box below its floor stays below-floor whatever the mode; what acts on it is the
+ * sweep's floor run (mode auto: backend toolUpdate/auto.ts, whose first check is the mode) and "Update
+ * below floor" (mode manual or auto), and neither when the fleet update would skip it (`refusal`).
+ */
+export function cellPolicyText(cell: SoftwareCell, orchestrator = false): string | null {
+  if (cell.policyUnavailable) return 'policy unavailable: its read failed, so it is graded as a box with no owner’s, and nothing updates it from here';
+  const p = cell.policy;
+  if (!p) return cell.state === 'held' ? 'no owner: no policy, so nothing updates it until someone takes the box' : null;
+  const target = p.reference && p.reference !== p.target ? `${p.target} → ${p.reference}` : p.target;
+  const line = `target ${target} · floor ${p.floor} · mode ${p.mode}`;
+  const skip = cell.refusal ? REFUSAL_TEXT[cell.refusal] : null;
+  const sweep = p.mode === 'auto' ? null : `the sweep leaves it (mode ${p.mode})`;
+  const label = cell.state === 'below-floor' ? 'below the floor' : 'behind';
+  const due = cell.state === 'below-floor' || cell.state === 'behind';
+  // The orchestrator: its grade is its own policy's, its host panel the viewing admin's (Bugbot on #1607).
+  if (orchestrator || cell.refusal === 'orchestrator' || cell.refusal === 'orchestrator_panel_off') {
+    return due || cell.state === 'held' ? `${line}\n${orchestratorText(cell, due ? label : 'held')}` : line;
+  }
+  // Neither a skip nor a reach: an update on its way, or the orchestrator's own action (Bugbot on #1607).
+  const other = !due ? null
+    : cell.refusal === 'run_in_flight' ? `${label}: an update is already running`
+    : null;
+  const what = other ?? (cell.state === 'below-floor'
+    ? (skip ? `below the floor, but Update below floor skips it: ${skip}${p.mode === 'off' ? '; the sweep leaves it too' : ''}` : `below the floor: Update below floor reaches it${sweep ? `; ${sweep}` : ', and so does the sweep’s floor run'}`)
+    : cell.state === 'behind'
+      ? (skip ? `behind, but Update behind skips it: ${skip}` : `behind: Update behind reaches it${sweep ? `; ${sweep}` : ', and so does the nightly run'}`)
+      : cell.state === 'held' ? 'held: mode off, so neither this tab nor the sweep updates it'
+      : null);
+  return what ? `${line}\n${what}` : line;
 }
 
 export function fleetButtonLabel(scope: Exclude<ToolUpdateScope, 'all'>, n: number | null): string {

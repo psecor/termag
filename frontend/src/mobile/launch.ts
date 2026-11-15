@@ -11,14 +11,26 @@ export const APP_START_PATH = '/app';
 
 /**
  * Where a launch from the app icon opens: a phone or tablet gets the phone
- * client, a desktop install the simple UI. One manifest serves both, so start_url cannot say.
+ * client, or the chat under chat-phone-home-enabled (`phoneChat`), and a
+ * desktop install the simple UI. One manifest serves both, so start_url cannot say.
  * Outside an installed window (`standalone`) it is the workspace URL, so a tab
  * keeps the phone redirect and its "Lab" opt-out.
  */
-export function appStartTarget(i: { touch: boolean; standalone: boolean }): string {
+export function appStartTarget(i: { touch: boolean; standalone: boolean; phoneChat: boolean }): string {
   if (!i.standalone) return '/';
-  if (i.touch) return '/m';
+  if (i.touch) return i.phoneChat ? '/chat' : '/m';
   return '/chat';
+}
+
+/**
+ * The router state AppStart's redirect carries: the page was loaded at the
+ * app icon's start_url, so the workspace URL it hands a tab to is still the
+ * page's landing (MobileRedirectGate lands a phone in the chat only then).
+ */
+export const APP_START_LANDING = { appStart: true } as const;
+
+export function isAppStartLanding(state: unknown): boolean {
+  return typeof state === 'object' && state != null && (state as { appStart?: unknown }).appStart === true;
 }
 
 interface LaunchParams { targetURL?: string | null }

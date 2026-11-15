@@ -6,7 +6,7 @@
 export const TERMINAL_HOLDS_CODE = 'terminal-holds';
 
 export const TERMINAL_HOLD_VIEW = {
-  statusText: 'Open in Lab',
+  statusText: 'Idle · open in Lab',
   text: "Claude is open in Lab, so this chat can't send yet.",
   returnLabel: 'Return it to this chat',
   fullUiLabel: 'Continue in Lab',
@@ -38,8 +38,9 @@ export function refusalFromSend(code: string | null): boolean {
 }
 
 /**
- * The header while the notice is up. "Done · your turn" would otherwise sit
- * next to a composer that cannot send. A running turn keeps its own line.
+ * The header while the notice is up: "Idle · open in Lab", where "Idle · your
+ * turn" would otherwise sit next to a composer that cannot send. A running
+ * turn keeps its own line.
  */
 export function statusBesideHold<T extends { tone: string; text: string }>(
   showing: boolean,

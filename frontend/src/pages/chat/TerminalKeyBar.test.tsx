@@ -26,6 +26,10 @@ vi.mock('../../components/Terminal', async () => {
           focus: () => { pane.focusCalls++; pane.focused = true; },
           isFocused: () => pane.focused,
           appCursor: () => pane.appCursor,
+          scrollTarget: () => 'wheel',
+          lineHeight: () => 0,
+          scrollLines: () => {},
+          wheel: () => {},
         });
         return () => p.onReady?.(null);
       }, []);

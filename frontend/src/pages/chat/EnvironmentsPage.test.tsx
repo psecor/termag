@@ -22,8 +22,9 @@ const mocks = vi.hoisted(() => ({
   setVisibility: vi.fn(),
 }));
 vi.mock('../../services/api', () => ({ environmentsApi: mocks }));
-// Signed in as Pat (u1), who owns full-stack.
-vi.mock('../../contexts/AuthContext', () => ({ useAuth: () => ({ user: { id: 'u1' } }) }));
+// Signed in as Pat (u1), who owns full-stack, and is an admin unless a test says not.
+const auth = vi.hoisted(() => ({ user: { id: 'u1', role: 'admin' } as { id: string; role?: string } }));
+vi.mock('../../contexts/AuthContext', () => ({ useAuth: () => auth }));
 vi.mock('./chatChrome', () => ({
   ChatHistoryButton: () => null,
   // The ⋮ menu as plain buttons, one per action.
@@ -106,6 +107,7 @@ async function type(label: string, value: string) {
 }
 
 beforeEach(() => {
+  auth.user = { id: 'u1', role: 'admin' };
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   // React Aria's dialog escapes ids with CSS.escape, which jsdom lacks (as RepoPicker.test.tsx).
   const css = (globalThis as { CSS?: { escape?: (v: string) => string } }).CSS;
@@ -265,10 +267,40 @@ describe('EnvironmentsPage', () => {
     expect(button('Make personal')).toBeTruthy();
   });
 
-  it("offers no switch on someone else's shared environment", async () => {
+  it("lets an admin make someone else's shared environment personal", async () => {
     await show('/chat/environments/e2');
     expect(container.textContent).toContain("Shared, Sam's");
-    expect([...container.querySelectorAll('[data-testid="more"] button')].map(b => b.textContent)).not.toContain('Make personal');
+    expect(button('Make personal')).toBeTruthy();
+    expect(button('Edit').disabled).toBe(false);
+  });
+
+  it("goes back to the list once an admin has made someone else's shared environment personal: it is theirs now", async () => {
+    mocks.setVisibility.mockResolvedValueOnce({ ...POINTER, visibility: 'personal' });
+    await show('/chat/environments/e2');
+    await press(button('Make personal'));
+    expect(mocks.setVisibility).toHaveBeenCalledWith('e2', 'personal', POINTER.updatedAt);
+    expect(where).toBe('/chat/environments');
+  });
+
+  it("shows a non-admin a shared environment's Edit and Delete… disabled, no switch, and says why", async () => {
+    auth.user = { id: 'u1', role: 'member' };
+    await show('/chat/environments/e2');
+    expect(container.textContent).toContain('Only admins can change shared environments; make a personal one.');
+    const more = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="more"] button')];
+    expect(more.map(b => [b.textContent, b.disabled])).toEqual([['Edit', true], ['History', false], ['About environments', false], ['Delete…', true]]);
+  });
+
+  it("offers a non-admin no Shared choice on New environment, and no share on their own, saying why", async () => {
+    auth.user = { id: 'u1', role: 'member' };
+    await show('/chat/environments/new');
+    expect(container.textContent).toContain('Only admins make shared environments; yours is personal');
+    expect((radio('Shared').querySelector('input') as HTMLInputElement).disabled).toBe(true);
+    act(() => root.unmount());
+    root = createRoot(container);
+    await show('/chat/environments/e1');
+    expect([...container.querySelectorAll('[data-testid="more"] button')].map(b => b.textContent)).not.toContain('Share with everyone');
+    expect(button('Edit').disabled).toBe(false);
+    expect(button('Delete…').disabled).toBe(false);
   });
 
   it("shows an environment's definition, what it resolves to and the commands that create from it, its actions in the menu", async () => {
@@ -279,7 +311,7 @@ describe('EnvironmentsPage', () => {
     expect(container.textContent).toContain('termag project create <box>/<name> --agent claude --environment from-file');
     expect(container.textContent).toContain('--new-box --environment from-file');
     expect(container.querySelector('table')).toBeNull();
-    expect([...container.querySelectorAll('[data-testid="more"] button')].map(b => b.textContent)).toEqual(['Edit', 'History', 'About environments', 'Delete…']);
+    expect([...container.querySelectorAll('[data-testid="more"] button')].map(b => b.textContent)).toEqual(['Edit', 'Make personal', 'History', 'About environments', 'Delete…']);
   });
 
   it("shows only that environment's history, from its menu", async () => {

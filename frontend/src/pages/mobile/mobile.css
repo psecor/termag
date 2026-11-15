@@ -164,6 +164,8 @@
 .m-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .m-row-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .m-ws { color: var(--text-secondary); font-weight: 400; font-size: 13px; }
+/* A row's project beside its session's title, in the UI font: a place, not code. */
+.m-row-project { color: var(--text-secondary); font-weight: 400; font-size: 13px; margin-left: 6px; }
 .m-owner { color: var(--text-muted); font-weight: 400; }
 .m-metaterm { color: var(--warning); }
 .m-row-preview {

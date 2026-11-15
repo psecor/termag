@@ -70,11 +70,26 @@ describe('chatCommands', () => {
     expect(ids(chatCommands(input({ panel: { open: false, toggle: () => {} }, tools: ['terminal'] })))).not.toContain('tool:terminal');
   });
 
+  it('under the sidebar redesign, one list: no Show, Group by orders it, and Sort offers the other order', () => {
+    const setView = vi.fn();
+    const out = chatCommands(input({ view: { ...DEFAULT_SIDEBAR_VIEW, show: 'projects', groupBy: 'project' }, redesign: true, setView }));
+    expect(out.filter(a => a.id.startsWith('view:')).map(a => a.label)).toEqual([
+      'Standard rows', 'Group by space', 'Group by status', 'Sort by recent activity', 'Hide files and new tabs', "Hide sessions that aren't running",
+    ]);
+    byId(out, 'view:sort-recent').run();
+    expect(setView).toHaveBeenLastCalledWith({ sort: 'recent' });
+    const recent = chatCommands(input({ view: { ...DEFAULT_SIDEBAR_VIEW, show: 'projects', sort: 'recent' }, redesign: true, setView }));
+    expect(recent.map(a => a.label)).toContain('Sort by created');
+    expect(recent.map(a => a.label)).not.toContain('Sort by recent activity');
+    byId(recent, 'view:sort-created').run();
+    expect(setView).toHaveBeenLastCalledWith({ sort: 'created' });
+  });
+
   it("the sidebar's view options, each offering the other choice", () => {
     const setView = vi.fn();
     const out = chatCommands(input({ view: DEFAULT_SIDEBAR_VIEW, setView }));
     expect(out.filter(a => a.id.startsWith('view:')).map(a => a.label)).toEqual([
-      'Standard rows', 'Group by project', 'Group by status', 'Hide files and new tabs', "Hide sessions that aren't running",
+      'Show every session', 'Standard rows', 'Group by project', 'Group by status', 'Hide files and new tabs', "Hide sessions that aren't running",
     ]);
     byId(out, 'view:by-project').run();
     expect(setView).toHaveBeenLastCalledWith({ groupBy: 'project' });
@@ -83,12 +98,21 @@ describe('chatCommands', () => {
     byId(out, 'view:idle').run();
     expect(setView).toHaveBeenNthCalledWith(1, { density: 'standard' });
     expect(setView).toHaveBeenNthCalledWith(2, { showIdle: false });
-    const flipped = chatCommands(input({ view: { density: 'standard', groupBy: 'status', showFiles: false, showIdle: false } }));
+    const flipped = chatCommands(input({ view: { show: 'tabs', density: 'standard', groupBy: 'status', showFiles: false, showIdle: false, olderDays: 3, sort: 'created' } }));
     expect(flipped.filter(a => a.id.startsWith('view:')).map(a => a.label)).toEqual([
-      'Compact rows', 'Group by space', 'Group by project', 'Show files and new tabs', "Show sessions that aren't running",
+      'Show every session', 'Compact rows', 'Group by space', 'Group by project', 'Show files and new tabs', "Show sessions that aren't running",
     ]);
+    // Projects groups by itself: no Group by, and the way back to the tabs.
+    const projects = chatCommands(input({ view: { ...DEFAULT_SIDEBAR_VIEW, show: 'projects' }, setView }));
+    expect(projects.filter(a => a.id.startsWith('view:')).map(a => a.label)).toEqual([
+      'Show tabs', 'Standard rows', 'Hide files and new tabs', "Hide sessions that aren't running",
+    ]);
+    setView.mockClear();
+    byId(projects, 'view:tabs').run();
+    expect(setView).toHaveBeenLastCalledWith({ show: 'tabs' });
     const byProject = chatCommands(input({ view: { ...DEFAULT_SIDEBAR_VIEW, groupBy: 'project' } }));
     expect(byProject.filter(a => a.id.startsWith('view:by-')).map(a => a.label)).toEqual(['Group by space', 'Group by status']);
     expect(flipped.some(a => a.id.startsWith('view:') && a.suggested)).toBe(false);
   });
+
 });

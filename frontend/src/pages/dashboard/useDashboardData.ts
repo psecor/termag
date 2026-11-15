@@ -15,14 +15,19 @@ export interface Polled<T> {
 
 /**
  * Poll a fetcher on an interval. Keeps the last good payload across errors
- * (the UI dims rather than blanks), pauses while the tab is hidden, and
- * refetches as soon as it becomes visible again. `retryMs` is the cadence used
- * after an error, so a 503 from an offline agent is re-probed sooner than the
- * normal interval without hammering.
+ * (the UI dims rather than blanks) and pauses while the tab is hidden (a page
+ * opened in a background tab makes its first fetch when it is shown). Back on
+ * the tab it fetches only once the next poll is due, so flipping tabs does not
+ * refetch a payload that is still fresh. `retryMs` is the first wait after an
+ * error, so a 503 from an offline agent is re-probed sooner than the normal
+ * interval; each further error in a row doubles it, up to `maxRetryMs`, so a
+ * backend that keeps failing is not asked again at the same pace.
  */
 export interface PolledOptions {
-  /** Retry interval after an error; defaults to the poll interval. */
+  /** First wait after an error; defaults to the poll interval. */
   retryMs?: number;
+  /** The longest wait the error backoff grows to; defaults to the poll interval (or `retryMs`, if longer). */
+  maxRetryMs?: number;
   /**
    * The caller's inputs (a range, a grouping). When they change, the fetcher
    * is run at once and a result still in flight from the old inputs is
@@ -32,8 +37,13 @@ export interface PolledOptions {
   deps?: readonly unknown[];
 }
 
+/** The wait before the next try after `failures` errors in a row: `retryMs`, doubled per further error, at most `maxRetryMs`. */
+export function retryDelay(failures: number, retryMs: number, maxRetryMs: number): number {
+  return Math.min(retryMs * 2 ** Math.max(0, failures - 1), Math.max(retryMs, maxRetryMs));
+}
+
 export function usePolled<T>(fetcher: () => Promise<T>, intervalMs: number, opts: number | PolledOptions = {}): Polled<T> & { refresh: () => void } {
-  const { retryMs = intervalMs, deps = [] } = typeof opts === 'number' ? { retryMs: opts } : opts;
+  const { retryMs = intervalMs, maxRetryMs = intervalMs, deps = [] } = typeof opts === 'number' ? { retryMs: opts } : opts;
   const [state, setState] = useState<Polled<T>>({ data: null, error: null, fetchedAt: null, loading: true });
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetcherRef = useRef(fetcher);
@@ -42,10 +52,20 @@ export function usePolled<T>(fetcher: () => Promise<T>, intervalMs: number, opts
   // Each (re)start of the effect is a generation; a fetch resolving under an
   // older one is dropped.
   const generation = useRef(0);
+  // When the next fetch is due (epoch ms), kept while the tab is hidden so
+  // coming back waits out the rest of the interval or backoff.
+  const dueAt = useRef(0);
+  // The generation of the fetch still in flight, or -1: `dueAt` is only set
+  // once a fetch finishes, so revealing the tab mid-fetch must not start a
+  // second one.
+  const pending = useRef(-1);
+  // Errors in a row, for the backoff; a success resets it.
+  const failures = useRef(0);
   const depsKey = JSON.stringify(deps);
 
   const schedule = useCallback((ms: number) => {
     if (timer.current) clearTimeout(timer.current);
+    dueAt.current = Date.now() + ms;
     if (document.visibilityState === 'hidden') return; // resumed by the visibility handler
     timer.current = setTimeout(() => { void run(); }, ms);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -53,26 +73,42 @@ export function usePolled<T>(fetcher: () => Promise<T>, intervalMs: number, opts
 
   const run = useCallback(async () => {
     const gen = generation.current;
+    if (timer.current) clearTimeout(timer.current);
+    pending.current = gen;
     setState(s => ({ ...s, loading: true }));
     try {
       const data = await fetcherRef.current();
       if (!alive.current || gen !== generation.current) return;
+      failures.current = 0;
       setState({ data, error: null, fetchedAt: Date.now(), loading: false });
       schedule(intervalMs);
     } catch (error) {
       if (!alive.current || gen !== generation.current) return;
+      failures.current++;
       setState(s => ({ ...s, error, loading: false }));
-      schedule(retryMs);
+      schedule(retryDelay(failures.current, retryMs, maxRetryMs));
+    } finally {
+      if (pending.current === gen) pending.current = -1;
     }
-  }, [intervalMs, retryMs, schedule]);
+  }, [intervalMs, retryMs, maxRetryMs, schedule]);
 
   useEffect(() => {
     alive.current = true;
     generation.current++;
-    void run();
+    failures.current = 0;
+    // A page opened in a background tab waits to be looked at: dueAt 0 makes
+    // the visibility handler fetch as soon as it is.
+    dueAt.current = 0;
+    if (document.visibilityState !== 'hidden') void run();
     const onVis = () => {
-      if (document.visibilityState === 'visible') void run();
-      else if (timer.current) clearTimeout(timer.current);
+      if (document.visibilityState !== 'visible') {
+        if (timer.current) clearTimeout(timer.current);
+        return;
+      }
+      if (pending.current === generation.current) return; // it will schedule itself
+      const wait = dueAt.current - Date.now();
+      if (wait <= 0) void run();
+      else schedule(wait);
     };
     document.addEventListener('visibilitychange', onVis);
     return () => {

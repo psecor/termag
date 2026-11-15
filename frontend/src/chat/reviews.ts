@@ -584,3 +584,52 @@ export function githubListUrl(section: QueueSection): string | null {
   const q = Q[section];
   return q ? `https://github.com/pulls?q=${encodeURIComponent(q)}` : null;
 }
+
+// ---- The sidebar redesign's reviews (user-projects-enabled) ----
+
+/**
+ * The blue "Review N pull requests" row: the PRs that ask for your review by name and that you haven't started (no
+ * review session on them yet), with who asked, each once in the order the queue has them. Deferred ones aren't in
+ * `queue.items`, so they don't count.
+ */
+export function reviewAsks(
+  queue: Pick<ReviewQueue, 'items' | 'grouped'>,
+  /**
+   * The PRs the person's agent reviews are on (reviewsData agentReviews, read ones too: the queue drops a read one's
+   * mark), by repository and number (agentReviewRepo); one whose repository isn't known started nothing here.
+   */
+  startedByAgents: ReadonlyArray<{ repo: string | null; number: number }> = [],
+): { count: number; requesters: string[] } {
+  // A request folded into a group's card on the Reviews page still asks you.
+  const started = (i: QueueItem) => startedByAgents.some(a => a.repo !== null && a.number === i.number && a.repo.toLowerCase() === i.repo.toLowerCase());
+  const asks = [...queue.items, ...queue.grouped].filter(i => i.section === 'to-review' && !i.session && !i.agent && !started(i));
+  const requesters = [...new Set(asks.flatMap(i => (i.author ? [i.author] : [])))];
+  return { count: asks.length, requesters };
+}
+
+/** The review sessions that are your call (Your call, Pushed since your review), by their session's row key: they sit in Needs you. */
+export function yourCallSessions(queue: Pick<ReviewQueue, 'items'>, keyOf: (projectId: string, workstream: string) => string): Set<string> {
+  return new Set(queue.items.filter(i => NEEDS_YOU.includes(i.section) && i.session).map(i => keyOf(i.session!.projectId, i.session!.workstream)));
+}
+
+/** Two letters for an avatar: a login's first two parts' initials (peter-secor → PS), else its first two letters. */
+export function loginInitials(login: string): string {
+  const parts = login.split(/[-_.\s]+/).filter(Boolean);
+  const letters = parts.length >= 2 ? parts[0][0] + parts[1][0] : login.slice(0, 2);
+  return letters.toUpperCase();
+}
+
+/** The mark a review session that's your call shows (yourCallSessions): Needs you's, unless it already needs you. */
+export function reviewCallKind<K extends string>(kind: K, yourCall: boolean): K | 'approval' {
+  return yourCall && kind !== 'approval' && kind !== 'unread' && kind !== 'error' ? 'approval' : kind;
+}
+
+/**
+ * The repository an agent review is on: its PR URL's owner/name, else its checkout's one repository; null when
+ * neither says (a shared viewer's review has no URL, and a multi-repo checkout can't tell).
+ */
+export function agentReviewRepo(url: string | null, checkoutRepoKeys: readonly string[] | undefined): string | null {
+  const m = url ? /github\.com\/([^/]+\/[^/]+)\/pull\/\d+/i.exec(url) : null;
+  if (m) return m[1].toLowerCase();
+  return checkoutRepoKeys && checkoutRepoKeys.length === 1 ? checkoutRepoKeys[0].toLowerCase() : null;
+}

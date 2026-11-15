@@ -25,6 +25,10 @@ vi.mock('./admin/AdminBugs', async () => {
     BugsBadge: () => <span className="admin-badge">3</span>,
   };
 });
+vi.mock('./admin/AdminFeedback', () => ({
+  AdminFeedback: tab('feedback'),
+  FeedbackBadge: () => <span className="admin-badge">2</span>,
+}));
 vi.mock('./dashboard/RangePicker', () => ({ RangePicker: () => null }));
 const auth = vi.hoisted(() => ({ user: { role: 'admin' } as { role: string } | null }));
 vi.mock('../contexts/AuthContext', () => ({ useAuth: () => auth }));
@@ -114,6 +118,14 @@ describe('Admin routes (v7 path resolution)', () => {
     mount('/admin/bugs/cmbug123');
     expect(shown()).toBe('bug cmbug123');
     expect(where()).toBe('/admin/bugs/cmbug123');
+  });
+
+  it('opens the feedback list from its URL, beside Bugs, with the new-feedback badge on the tab', () => {
+    mount('/admin/feedback?status=new');
+    expect(shown()).toBe('feedback');
+    expect([...el.querySelectorAll('nav.admin-tabs a.active')].map(a => a.textContent)).toEqual(['Feedback2']);
+    const tabs = [...el.querySelectorAll('nav.admin-tabs a')].map(a => a.textContent);
+    expect(tabs.indexOf('Feedback2')).toBe(tabs.indexOf('Bugs3') + 1);
   });
 
   it('sends a non-admin to the dashboard', () => {

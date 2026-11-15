@@ -9,11 +9,16 @@ vi.mock('../services/previewLinksApi', async () => {
   const actual = await vi.importActual<typeof import('../services/previewLinksApi')>('../services/previewLinksApi');
   return { ...actual, previewLinksApi: api };
 });
+const search = vi.hoisted(() => vi.fn());
+vi.mock('../services/api', () => ({ usersApi: { search } }));
 vi.mock('../launchpad/sprite', () => ({ ensureLaunchPadSprite: () => Promise.resolve() }));
 
+const { RECENT_PEOPLE_KEY } = await import('../utils/recentPeople');
 const { PublishPreviewLink, LINK_WARNING, nameNote } = await import('./PublishPreviewLink');
 
-const OK: PreviewListener = { port: 5173, pid: 10, command: 'node vite', verdict: { ok: true }, inCheckout: true };
+const OK: PreviewListener = { port: 5173, pid: 10, command: 'node vite', verdict: { ok: true }, inCheckout: true, confined: true };
+// Started in the owner's shell, in the checkout: "Only me" may have it, no wider audience (SR9).
+const UNCONFINED: PreviewListener = { port: 4000, pid: 13, command: 'node api.js', verdict: { ok: true }, inCheckout: true };
 const OUTSIDE: PreviewListener = { port: 3000, pid: 11, command: 'node server.js', verdict: { ok: true }, inCheckout: false };
 const REFUSED: PreviewListener = { port: 9229, pid: 12, command: 'node --inspect', verdict: { ok: false, code: 'devtools', reason: 'a debugger can run any code as you' }, inCheckout: true };
 
@@ -36,6 +41,8 @@ beforeEach(() => {
   if (!css?.escape) (globalThis as { CSS?: unknown }).CSS = { ...css, escape: (v: string) => v.replace(/[^\w-]/g, c => `\\${c}`) };
   for (const f of Object.values(api)) f.mockReset();
   api.listeners.mockResolvedValue([REFUSED, OUTSIDE, OK]);
+  search.mockReset().mockResolvedValue([]);
+  localStorage.clear();
   el = document.createElement('div');
   document.body.appendChild(el);
   root = createRoot(el);
@@ -150,12 +157,57 @@ describe('publishing from the Share dialog', () => {
     expect(warning.previousElementSibling?.textContent?.trim()).toBe('Anyone on termag with the link');
     act(() => { radio('People I name').click(); });
     expect(publishButton().disabled).toBe(true);
-    const emails = el.querySelector('.preview-links-emails input') as HTMLInputElement;
-    type(emails, 'Gus@x.test, gus@x.test  ana@x.test');
+    // The teammate picker: a recent person picked from the list, and a typed email added with Enter.
+    const people = () => el.querySelector('.preview-links-people input') as HTMLInputElement;
+    localStorage.setItem(RECENT_PEOPLE_KEY, JSON.stringify([{ email: 'gus@x.test', displayName: 'Gus', at: 1 }]));
+    await act(async () => { people().focus(); });
+    await act(async () => { (document.querySelector('.preview-links-people-popover [role="option"]') as HTMLElement).click(); });
     expect(publishButton().disabled).toBe(false);
+    type(people(), 'Ana@x.test');
+    await act(async () => { people().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); });
+    expect([...el.querySelectorAll('.preview-links-people-tags [role="row"]')].map(t => t.textContent)).toEqual(['Gusgus@x.test', 'ana@x.test']);
     api.publish.mockResolvedValue({ link: linkView({ audience: 'people' }), renewed: false, shareUrl: 'https://termag.test/termag/previews/shop-feature-x' });
     await act(async () => { publishButton().click(); });
     expect(api.publish.mock.calls[0][1]).toMatchObject({ audience: 'people', emails: ['gus@x.test', 'ana@x.test'] });
+    // Remembered as the other share dialogs do: newest first, with the name it was picked with.
+    expect(JSON.parse(localStorage.getItem(RECENT_PEOPLE_KEY)!).map((p: { email: string; displayName: string }) => [p.email, p.displayName]))
+      .toEqual([['ana@x.test', ''], ['gus@x.test', 'Gus']]);
+  });
+
+  it('publishes to a full email still typed in the picker, without Enter (Devin, #1758)', async () => {
+    await mount({ audiencesOn: true });
+    act(() => { radio('People I name').click(); });
+    const people = () => el.querySelector('.preview-links-people input') as HTMLInputElement;
+    type(people(), 'Ana@x.test');
+    expect(publishButton().disabled).toBe(false);
+    type(people(), 'ana@');
+    expect(publishButton().disabled).toBe(true);
+    type(people(), 'ana@x.test');
+    api.publish.mockResolvedValue({ link: linkView({ audience: 'people' }), renewed: false, shareUrl: 'https://termag.test/termag/previews/shop-feature-x' });
+    await act(async () => { publishButton().click(); });
+    expect(api.publish.mock.calls[0][1]).toMatchObject({ audience: 'people', emails: ['ana@x.test'] });
+  });
+
+  it('for people or anyone with the link, disables a listener not started with termag preview run, and says how', async () => {
+    api.listeners.mockResolvedValue([UNCONFINED, OK]);
+    await mount({ audiencesOn: true });
+    // "Only me" may have it, and it's the first in the checkout.
+    expect(portShown()).toBe('4000 · node api.js');
+    expect(publishButton().disabled).toBe(false);
+    expect(el.textContent).not.toContain("wasn't started with termag preview run");
+    act(() => { radio('Anyone on termag with the link').click(); });
+    expect(publishButton().disabled).toBe(true);
+    expect(el.textContent).toContain("Port 4000 wasn't started with termag preview run, so only you can have it.");
+    await act(async () => { (el.querySelector('.preview-links-select-button') as HTMLButtonElement).click(); });
+    const options = [...document.querySelectorAll('.preview-links-port-popover [role="option"]')] as HTMLElement[];
+    expect(options[0].getAttribute('aria-disabled')).toBe('true');
+    expect(options[0].textContent).toContain('Only for "Only me": start it with termag preview run to share it more widely');
+    expect(options[1].getAttribute('aria-disabled')).not.toBe('true');
+    await act(async () => { options[1].click(); });
+    expect(portShown()).toBe('5173 · node vite');
+    expect(publishButton().disabled).toBe(false);
+    act(() => { radio('Only me').click(); });
+    expect(publishButton().disabled).toBe(false);
   });
 
   it('shows the lifetime from the server\'s default, clamped to 1 to 168 hours, and the 30-day cap', async () => {

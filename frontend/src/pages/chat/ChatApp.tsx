@@ -9,7 +9,7 @@
 // pane). An automation has its own page, /chat/automations/:id
 // (pages/chat/automations/, behind simple-ui-automations-enabled), opened
 // from its row in its space's explorer, with that explorer beside it.
-import React, { startTransition, useCallback, useEffect, useMemo, useState } from 'react';
+import React, { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, Route, Routes, useLocation, useMatch, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { useProjects } from '../../contexts/ProjectContext';
@@ -19,17 +19,22 @@ import { boxFeed } from '../../services/boxFeed';
 import { useStartParkedBoxOnOpen } from '../../hooks/useStartParkedBoxOnOpen';
 import { useBrowserShareHandoff } from '../../hooks/useBrowserShareHandoff';
 import { CHAT_NARROW_QUERY, chatHistoryMode, chatZoomable } from '../../chat/chatLayout';
-import { MOBILE_MEDIA_QUERY } from '../../mobile/redirect';
+import { installedAppMode, MOBILE_MEDIA_QUERY } from '../../mobile/redirect';
 import { useZoomableViewport } from '../../hooks/useZoomableViewport';
 import { recordUiMode } from '../../chat/uiMode';
-import { isSidePanelShortcut, readSidePanel, writeSidePanel, type SidePanelState, type SidePanelTab } from '../../chat/sidePanel';
+import {
+  isSidePanelShortcut, readOpenSidePanels, readSidePanel, readSidePanelTabs, sidePanelFileAt, sidePanelPlace, sidePanelTabAt, withSidePanelOpen, withSidePanelTab,
+  writeOpenSidePanels, writeSidePanel, writeSidePanelTabs,
+  type SidePanelPlaceTab, type SidePanelPrefs, type SidePanelState, type SidePanelTab,
+} from '../../chat/sidePanel';
 import { isNewSessionShortcut } from '../../chat/shortcuts';
 import { spacePalette } from '../../chat/spaceColors';
 import { ChatSpacesProvider, useChatSpaces } from '../../chat/useChatSpaces';
 import { useChatTurnNotifier } from '../../chat/useChatTurnNotifications';
 import { NAVIGATE_EVENT, routerPathFor } from '../../mobile/push';
+import { InferredNotificationTap, PhoneNotificationUpkeep } from '../../mobile/phoneNotifications';
 import { isSdkChat } from '../../chat/simpleChat';
-import { ChatChromeProvider } from './chatChrome';
+import { ChatChromeProvider, useChatChrome } from './chatChrome';
 import { ChatSidebar } from './ChatSidebar';
 import { NewChat } from './NewChat';
 import { ChatRoute } from './ChatRoute';
@@ -49,6 +54,7 @@ import { folderForRoute, folderHref, itemHref, NO_SPACE_EXPLORER, spaceLinkTarge
 import { SimpleDataProvider, useSimpleData } from './simpleData';
 import { Tooltips } from './Tooltips';
 import { SidePanel, type SidePanelFiles } from './SidePanel';
+import { OpenFilesHome } from './FilesTool';
 import { useAgentAsk, useToolAsk } from './PanelTabs';
 import type { AgentTabRef } from '../../chat/panelTabs';
 import { LP_THEME } from '../../launchpad/theme';
@@ -59,6 +65,7 @@ import '@launchpad-ui/tokens/fonts.css';
 import './chrome.css';
 import './reviews.css';
 import { DailyThemeLayer } from '../../theme/daily/DailyThemeLayer';
+import { NoticeBanner } from '../../notice/NoticeBanner';
 
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(
@@ -99,25 +106,37 @@ function localStore(): Storage | null {
 function SpaceFileLinks({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   const { items, activeTab } = useSimpleData();
-  const { pick } = items;
+  const { pick, openInPanel } = items;
+  // Under project-files-enabled, beside a side panel, a file's link opens in the panel as a file tab; the chat stays.
+  const { sidePanel } = useChatChrome();
+  const panelPlace = sidePanel?.place ?? null;
+  const showFile = sidePanel?.showFile;
   const openLink = useMemo(() => (href: string) => {
     const target = spaceLinkTarget(href, window.location.origin, import.meta.env.BASE_URL);
     if (!target) return false;
     const { ref, dir } = target;
+    if (dir == null && ref.kind === 'file' && panelPlace && showFile) {
+      showFile(openInPanel(ref, panelPlace));
+      return true;
+    }
     startTransition(() => {
       const tab = pick(ref, activeTab);
       navigate(dir == null ? itemHref(ref, tab) : folderHref(ref.space, dir, tab));
     });
     return true;
-  }, [navigate, pick, activeTab]);
+  }, [navigate, pick, activeTab, openInPanel, panelPlace, showFile]);
   return <MarkdownLinkContext.Provider value={openLink}>{children}</MarkdownLinkContext.Provider>;
 }
 
 function ChatHome() {
+  // The sidebar redesign's files are the side panel's (FilesTool.tsx), and home has none: its open files are here.
+  const { refresh } = useChatChrome();
+  const filesTool = useFlag(FLAGS.userProjects, false) && refresh === true;
   return (
     <div className="chat-home">
       <h1>termag</h1>
       <p>Pick a session on the left, or start a new session from a repository.</p>
+      {filesTool && <OpenFilesHome />}
     </div>
   );
 }
@@ -150,6 +169,13 @@ export default function ChatApp() {
   const narrow = useMediaQuery(CHAT_NARROW_QUERY);
   // A phone, not a narrow desktop window (mobile/redirect.ts): pinch-zoom and the 16 px fields.
   const phone = useMediaQuery(MOBILE_MEDIA_QUERY);
+  // Under chat-phone-home-enabled phones land here, not on /m, so on a phone
+  // (or the app installed on a touch device) the chat does /m's notification
+  // upkeep: the badge, stale and blocked notifications. Needs-you taps open
+  // the chat then, so it infers a tap wherever Apple's installed apps send no
+  // click (infersTaps), a Mac's included.
+  const phoneHome = useFlag(FLAGS.chatPhoneHome, false);
+  const phoneClient = phoneHome && (phone || installedAppMode(window));
   useSimpleUiDocumentMark();
   const location = useLocation();
   const { pathname } = location;
@@ -159,6 +185,10 @@ export default function ChatApp() {
   const chromeRefresh = useFlag(FLAGS.chatChromeRefresh, false);
   // PR reviews, under the refresh: the Reviews page and a PR's page.
   const reviewsOn = useFlag(FLAGS.simpleUiReviews, false) && chromeRefresh;
+  // Files open in the side panel (project-files-enabled), where the Files tool is (the sidebar redesign's).
+  const projectFilesOn = useFlag(FLAGS.projectFiles, false);
+  const userProjectsOn = useFlag(FLAGS.userProjects, false);
+  const panelFilesOn = projectFilesOn && userProjectsOn && chromeRefresh;
   useEffect(() => { if (chromeRefresh) void ensureLaunchPadSprite(); }, [chromeRefresh]);
   const mode = chatHistoryMode(pathname, narrow);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -172,8 +202,10 @@ export default function ChatApp() {
     return () => window.removeEventListener('keydown', onKey);
   }, [historyOpen]);
 
-  // The next load of the bare workspace URL comes back here (chat/uiMode.ts).
-  useEffect(() => { recordUiMode('simple'); }, []);
+  // The next load of the bare workspace URL comes back here (chat/uiMode.ts),
+  // unless chat-ui-nudge-enabled leaves that to an explicit switch.
+  const switchesOnly = useFlag(FLAGS.chatUiNudge, false);
+  useEffect(() => { if (!switchesOnly) recordUiMode('simple'); }, [switchesOnly]);
 
   // The box list drives the setup state of a conversation whose box is
   // still coming up (hooks/useSetupContext), as it does in the workspace.
@@ -195,8 +227,10 @@ export default function ChatApp() {
     [spacesLoaded, spaces, index, spacesCurrent, reloadSpaces],
   );
 
-  // The side panel: docked and remembered on desktop, an overlay that
-  // starts shut on a phone. For a conversation the project list knows, a new
+  // The side panel: docked on desktop, open or shut and on its tab in each
+  // session (and space, automation page, agents in no space) as it was left
+  // there, shut on Terminal where it never was opened (chat/sidePanel.ts sidePanelPlace); an overlay
+  // that starts shut on a phone. For a conversation the project list knows, a new
   // tab on the agents in no space and, where the user has spaces (its Files
   // tab), a space file and a new tab.
   const automationsOn = useAutomationsEnabled();
@@ -212,7 +246,43 @@ export default function ChatApp() {
   const shownProject = shown ? projects.find(p => p.id === shown.projectId) : undefined;
   // An SDK chat shows its stored transcript instead of starting a parked box (chat/storedOpen.ts).
   useStartParkedBoxOnOpen(shownProject, shownWs, Boolean(shownProject && isSdkChat(shownProject, shownWs)));
-  const [panel, setPanelState] = useState<SidePanelState>(() => readSidePanel(localStore()));
+  const panelPlace = sidePanelPlace({
+    session: shown, agents: Boolean(agentsMatch), automation: automationShown, space: (fileMatch ?? newTabMatch)?.params.space,
+  });
+  // The width, shared; open or not, and the tab, the place's own.
+  const [prefs, setPrefs] = useState<SidePanelPrefs>(() => readSidePanel(localStore()));
+  const [openPlaces, setOpenPlacesState] = useState<string[]>(() => readOpenSidePanels(localStore()));
+  const [placeTabs, setPlaceTabsState] = useState<SidePanelPlaceTab[]>(() => readSidePanelTabs(localStore()));
+  // The lists as last set, so two changes before a render (an effect's, then a handler's) both land.
+  const openPlacesNow = useRef(openPlaces);
+  const placeTabsNow = useRef(placeTabs);
+  const setPlaceOpen = useCallback((place: string, open: boolean) => {
+    const next = withSidePanelOpen(openPlacesNow.current, place, open);
+    openPlacesNow.current = next;
+    setOpenPlacesState(next);
+    writeOpenSidePanels(localStore(), next);
+  }, []);
+  const setPlaceTab = useCallback((place: string, tab: SidePanelTab, file: string | null = null) => {
+    const next = withSidePanelTab(placeTabsNow.current, place, tab, file);
+    placeTabsNow.current = next;
+    setPlaceTabsState(next);
+    writeSidePanelTabs(localStore(), next);
+  }, []);
+  // A pick in the panel's Files (or Agents) keeps the docked panel open on Files where it
+  // lands, so the explorer doesn't shut or switch away under the click; that place then
+  // stays open on Files. Where it was picked (`from`, at location `key`): read as open on
+  // Files on the first render of the new place, so the panel never unmounts between the two.
+  const [carry, setCarry] = useState<{ from: string; key: string } | null>(null);
+  const carried = carry != null && !narrow && location.key !== carry.key && panelPlace != null && panelPlace !== carry.from;
+  const panel = useMemo<SidePanelState>(
+    () => ({
+      ...prefs,
+      tab: carried ? 'files' : sidePanelTabAt(placeTabs, panelPlace),
+      file: panelFilesOn && !carried ? sidePanelFileAt(placeTabs, panelPlace) : null,
+      open: panelPlace != null && (carried || openPlaces.includes(panelPlace)),
+    }),
+    [prefs, placeTabs, openPlaces, panelPlace, carried, panelFilesOn],
+  );
   const [overlayOpen, setOverlayOpen] = useState(false);
   // A tool asked for by something outside the panel (a share link, a breadcrumb folder, the
   // context card's PR): the panel opens on it, though an empty panel otherwise opens on a launcher.
@@ -221,9 +291,27 @@ export default function ChatApp() {
   // A subagent's row asks for its agent tab, the same way.
   const { ask: agentAsk, askAgent, forget: forgetAgentAsk } = useAgentAsk();
   const setPanel = useCallback((next: SidePanelState) => {
-    setPanelState(next);
-    writeSidePanel(localStore(), next);
-  }, []);
+    if (next.width !== prefs.width) {
+      const shared = { width: next.width };
+      setPrefs(shared);
+      writeSidePanel(localStore(), shared);
+    }
+    if (panelPlace && (next.tab !== sidePanelTabAt(placeTabsNow.current, panelPlace) || (next.file ?? null) !== sidePanelFileAt(placeTabsNow.current, panelPlace))) {
+      setPlaceTab(panelPlace, next.tab, next.file ?? null);
+    }
+    if (panelPlace && next.open !== openPlacesNow.current.includes(panelPlace)) setPlaceOpen(panelPlace, next.open);
+  }, [prefs, panelPlace, setPlaceOpen, setPlaceTab]);
+  // The file tab shown here (null: the tool), keeping the tool as last set, so it can follow a tool change in the same handler.
+  const setPlaceFile = useCallback((file: string | null) => {
+    if (panelPlace && file !== sidePanelFileAt(placeTabsNow.current, panelPlace)) setPlaceTab(panelPlace, sidePanelTabAt(placeTabsNow.current, panelPlace), file);
+  }, [panelPlace, setPlaceTab]);
+  // A visit to a place makes it the most recent in each list it's on, so a session in use doesn't age out of the last 50.
+  useEffect(() => {
+    if (!panelPlace) return;
+    if (openPlacesNow.current[0] !== panelPlace && openPlacesNow.current.includes(panelPlace)) setPlaceOpen(panelPlace, true);
+    const tabs = placeTabsNow.current;
+    if (tabs[0]?.place !== panelPlace && tabs.some(t => t.place === panelPlace)) setPlaceTab(panelPlace, sidePanelTabAt(tabs, panelPlace), sidePanelFileAt(tabs, panelPlace));
+  }, [panelPlace, setPlaceOpen, setPlaceTab]);
   const panelOpen = narrow ? overlayOpen : panel.open;
   const togglePanel = useCallback(() => {
     forgetToolAsk();
@@ -241,7 +329,8 @@ export default function ChatApp() {
     : agentsMatch ? { space: NO_SPACE_EXPLORER }
     : automationShown ? { automation: automationShown }
     : { space: (fileMatch ?? newTabMatch)?.params.space ?? '', path: fileMatch?.params['*'], dir: folderDir ?? undefined };
-  useEffect(() => { setOverlayOpen(false); }, [pathname]);
+  // Another page, or another session of the same project (only ?ws= changes), starts with the overlay shut.
+  useEffect(() => { setOverlayOpen(false); }, [pathname, panelPlace]);
   // A share link its owner opened (chat/uiMode.ts simpleUiShareHandoff): the
   // panel opens on Browser, the overlay on a phone, and that conversation's
   // pane dials the share's app at its page. Only that conversation gets it:
@@ -251,7 +340,7 @@ export default function ChatApp() {
   const [handoffKey] = useState(() => (shown ? `${shown.projectId}/${shown.workstream}` : null));
   const openBrowser = useCallback(() => {
     askTool('browser');
-    setPanel({ ...panel, tab: 'browser', open: narrow ? panel.open : true });
+    setPanel({ ...panel, tab: 'browser', file: null, open: narrow ? panel.open : true });
   }, [narrow, panel, setPanel, askTool]);
   const openOverlay = useCallback(() => setOverlayOpen(true), []);
   const { openShare, consumeOpenShare } = useBrowserShareHandoff({ browserKey, isNarrow: narrow, expandDock: openBrowser, showCtrl: openOverlay });
@@ -260,7 +349,7 @@ export default function ChatApp() {
   const openTools = (location.state as { openTools?: boolean } | null)?.openTools === true;
   useEffect(() => {
     if (!openTools || !panelAvailable) return;
-    if (!narrow && !panel.open) setPanel({ ...panel, open: true });
+    if (panel.tab !== 'files' || panel.file || (!narrow && !panel.open)) setPanel({ ...panel, tab: 'files', file: null, open: narrow ? panel.open : true });
     // Once: not again on a reload or on coming back to this tab.
     navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -271,7 +360,7 @@ export default function ChatApp() {
     if (!panelTool || !panelAvailable) return;
     askTool(panelTool);
     if (narrow) setOverlayOpen(true);
-    setPanel({ ...panel, tab: panelTool, open: narrow ? panel.open : true });
+    setPanel({ ...panel, tab: panelTool, file: null, open: narrow ? panel.open : true });
     navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key, panelTool, panelAvailable]);
@@ -283,19 +372,30 @@ export default function ChatApp() {
     setReveal(r => ({ dir, n: (r?.n ?? 0) + 1 }));
     if (narrow) setOverlayOpen(true);
     askTool('files');
-    if (panel.tab !== 'files' || (!narrow && !panel.open)) setPanel({ ...panel, tab: 'files', open: narrow ? panel.open : true });
+    if (panel.tab !== 'files' || panel.file || (!narrow && !panel.open)) setPanel({ ...panel, tab: 'files', file: null, open: narrow ? panel.open : true });
   }, [narrow, panel, setPanel, askTool]);
   // A link to a folder opens Files on it (the overlay on a phone), once per visit, as a breadcrumb's folder does.
   useEffect(() => {
     if (folderDir == null) return;
     if (narrow) setOverlayOpen(true);
     askTool('files');
-    if (panel.tab !== 'files' || (!narrow && !panel.open)) setPanel({ ...panel, tab: 'files', open: narrow ? panel.open : true });
+    if (panel.tab !== 'files' || panel.file || (!narrow && !panel.open)) setPanel({ ...panel, tab: 'files', file: null, open: narrow ? panel.open : true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key, folderDir]);
   const pickedInFiles = useCallback(() => {
     if (panel.tab !== 'files') setPanel({ ...panel, tab: 'files' });
-  }, [panel, setPanel]);
+    setCarry(!narrow && panelPlace ? { from: panelPlace, key: location.key } : null);
+  }, [panel, setPanel, narrow, panelPlace, location.key]);
+  // The navigation the pick made spends the carry, whether or not it moved to another place; one that did is remembered open on Files.
+  useEffect(() => {
+    if (!carry || location.key === carry.key) return;
+    if (carried && panelPlace) {
+      setPlaceOpen(panelPlace, true);
+      setPlaceTab(panelPlace, 'files');
+    }
+    setCarry(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.key]);
   useEffect(() => {
     if (!panelAvailable) return;
     // Capture phase, so the shortcut works from inside the terminal too.
@@ -330,10 +430,17 @@ export default function ChatApp() {
     sidePanel: panelAvailable ? {
       open: panelOpen,
       toggle: togglePanel,
-      show: (tab: SidePanelTab) => { askTool(tab); if (narrow) setOverlayOpen(true); setPanel({ ...panel, tab, open: narrow ? panel.open : true }); },
+      show: (tab: SidePanelTab) => { askTool(tab); if (narrow) setOverlayOpen(true); setPanel({ ...panel, tab, file: null, open: narrow ? panel.open : true }); },
       revealDir: fileMatch ? revealDir : undefined,
       // Agent tabs are the refresh's tabs, which a phone's overlay doesn't have.
-      showAgent: chromeRefresh && !narrow ? (agent: AgentTabRef) => { askAgent(agent); setPanel({ ...panel, open: true }); } : undefined,
+      showAgent: chromeRefresh && !narrow ? (agent: AgentTabRef) => { askAgent(agent); setPanel({ ...panel, file: null, open: true }); } : undefined,
+      place: panelFilesOn ? panelPlace : null,
+      showFile: panelFilesOn && panelPlace ? (id: string) => {
+        if (narrow) setOverlayOpen(true);
+        else if (!openPlacesNow.current.includes(panelPlace)) setPlaceOpen(panelPlace, true);
+        setPlaceFile(id);
+      } : undefined,
+      openInMain: panelFilesOn ? (file: { space: string; path: string }) => startTransition(() => navigate(itemHref({ kind: 'file', ...file }))) : undefined,
     } : undefined,
     refresh: chromeRefresh,
   };
@@ -353,12 +460,17 @@ export default function ChatApp() {
       <SpaceFileLinks>
         <div className={chromeRefresh ? `chat-root ${LP_THEME}` : 'chat-root'} data-chrome={chromeRefresh ? 'refresh' : undefined} data-pane={mode} data-history={mode === 'page' || historyOpen ? 'open' : 'closed'}>
           <ConnectionOverlay />
+          {phoneHome && <InferredNotificationTap />}
+          {phoneClient && <PhoneNotificationUpkeep />}
           <Tooltips />
           <DailyThemeLayer />
           {mode === 'drawer' && historyOpen && (
             <button type="button" className="chat-backdrop" aria-label="Close sessions" onClick={() => setHistoryOpen(false)} />
           )}
           <ChatSidebar />
+          {/* The main pane: the notice banner over the route and the side panel, so the sidebar never moves. */}
+          <div className="chat-pane">
+          <NoticeBanner className="chat-pane-notice" />
           <main className="chat-main">
             <Routes>
               <Route index element={<ChatHome />} />
@@ -389,9 +501,11 @@ export default function ChatApp() {
                 workstream={shown?.workstream ?? 'main'}
                 files={panelFiles}
                 onPicked={pickedInFiles}
+                carried={carried}
                 reveal={reveal}
                 state={panel}
                 onChange={setPanel}
+                onFile={setPlaceFile}
                 onClose={closePanel}
                 overlay={narrow}
                 openShare={browserKey === handoffKey ? openShare : null}
@@ -399,6 +513,7 @@ export default function ChatApp() {
               />
             )}
           </main>
+          </div>
         </div>
       </SpaceFileLinks>
       </ReviewsDataProvider>

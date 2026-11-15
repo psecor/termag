@@ -120,7 +120,7 @@ export function AdminFleet({ range, now }: { range: AdminRange; now: number }) {
                 ['resize', <AdminBoxResize key={detail.id} boxId={detail.id} onChanged={list.refresh} />],
                 ['image', detail.imageId ? <><span className="admin-mono">{detail.imageId}</span> · {detail.imageSource ?? 'published'}</> : 'not recorded (launched before images were recorded, or external)'],
                 ['auto-park', autoParkCell(detail.lifecycle, now, detail)],
-                ['iam / sg', <><span className="admin-mono">{detail.iamRoleName ?? '—'}</span> / <span className="admin-mono">{detail.securityGroupId ?? '—'}</span></>],
+                ['iam / sg', <><span className="admin-mono">{detail.iamRoleName ?? '—'}</span>{detail.iamRoleShared ? ' (shared)' : ''} / <span className="admin-mono">{detail.securityGroupId ?? '—'}</span></>],
                 ['error', detail.provisioningError ?? '—'],
                 ['tokens', detail.tokens.length ? detail.tokens.map((t, i) => <React.Fragment key={`${t.tokenPrefix}:${i}`}>{i ? ' · ' : ''}{t.name} (<span className="admin-mono">{t.tokenPrefix}</span>{t.revokedAt ? ', revoked' : ''})</React.Fragment>) : '—'],
                 ['host', detail.host ? <span className={pressureClass(detail.host)}>{pressureCell(detail.host)} · {detail.host.keptCheckouts ?? 0} kept cloud checkout{detail.host.keptCheckouts === 1 ? '' : 's'} · sampled {fmtAgo(detail.host.sampledAt, now)}</span> : 'no sample yet (agent predates host sampling)'],

@@ -62,6 +62,29 @@ describe('setupSteps', () => {
     expect(setupSteps({ ...base, etaMinutes: null })[0].text).toBe('Launching box web · usually a few minutes');
   });
 
+  // Runs on: Auto: a session opened on a parked box the server woke.
+  it('says Waking box-a… for a box the session wakes, then the clone and Claude in turn', () => {
+    for (const status of ['stopped', 'hibernated', 'starting', 'stopping', 'hibernating'] as const) {
+      expect(setupSteps({ ...base, wakes: true, box: { ...base.box!, status } })).toEqual([
+        { id: 'box', state: 'active', text: 'Waking web…' },
+        { id: 'clone', state: 'pending', text: 'Clone acme/web' },
+        { id: 'agent', state: 'pending', text: 'Starting Claude' },
+      ]);
+    }
+    // Without the flag, a starting box reads as before.
+    expect(setupSteps({ ...base, box: { ...base.box!, status: 'starting' } })[0].text).toBe('Box web is starting');
+    // Up, the box step is done as it always was.
+    expect(setupSteps({ ...base, wakes: true, box: { ...base.box!, status: 'ready' } })[0]).toEqual({ id: 'box', state: 'done', text: 'Box web is up' });
+  });
+
+  it("says why a wake failed while the box is still asleep, and holds the clone", () => {
+    const failed = setupSteps({ ...base, wakes: true, box: { ...base.box!, status: 'stopped', wakeError: "Couldn't wake web: EC2 refused the start" } });
+    expect(failed[0]).toEqual({ id: 'box', state: 'failed', text: "Couldn't wake web: EC2 refused the start" });
+    expect(failed[1].state).toBe('pending');
+    // Started again by Retry: waking once more.
+    expect(setupSteps({ ...base, wakes: true, box: { ...base.box!, status: 'starting', wakeError: "Couldn't wake web: EC2 refused the start" } })[0].text).toBe('Waking web…');
+  });
+
   // backend services/claimUpdate.ts: a stale pool box runs current main before its first launch.
   it('says the claimed box is updating, and holds the clone and Claude until it is done', () => {
     const updating = { ...base, box: { ...base.box!, status: 'ready' as const, claimedAt: '2026-10-15T10:00:00Z', claimUpdateStatus: 'updating', claimUpdateStartedAt: new Date(Date.now() - 5_000).toISOString() } };

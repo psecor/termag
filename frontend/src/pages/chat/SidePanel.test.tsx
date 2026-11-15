@@ -263,7 +263,7 @@ describe('SidePanel Files', () => {
     const state = { ...DEFAULT_SIDE_PANEL, open: true, tab: 'terminal' as const };
     render(project(), state, { files: { agent: project() }, onChange, onPicked });
     act(() => (host.querySelector('[role="tab"]') as HTMLButtonElement).click());
-    expect(onChange).toHaveBeenCalledWith({ ...state, tab: 'files' });
+    expect(onChange).toHaveBeenCalledWith({ ...state, tab: 'files', file: null });
     render(project(), { ...state, tab: 'files' }, { files: { agent: project() }, onChange, onPicked });
     act(() => (host.querySelector('[data-testid="files"]') as HTMLButtonElement).click());
     expect(onPicked).toHaveBeenCalled();
@@ -297,6 +297,6 @@ describe('SidePanel Share', () => {
     const state = { ...DEFAULT_SIDE_PANEL, open: true, tab: 'terminal' as const };
     render(project(), state, { onChange });
     act(() => ([...host.querySelectorAll('[role="tab"]')].find(t => t.textContent === 'Share') as HTMLButtonElement).click());
-    expect(onChange).toHaveBeenCalledWith({ ...state, tab: 'share' });
+    expect(onChange).toHaveBeenCalledWith({ ...state, tab: 'share', file: null });
   });
 });

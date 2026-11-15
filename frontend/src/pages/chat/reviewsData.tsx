@@ -14,7 +14,7 @@ import { statusKey } from '../../utils/statusKey';
 import { chatLiveKey } from '../../chat/chatLiveStatus';
 import { chatRowState } from '../../chat/rowState';
 import { rowKey } from '../../mobile/inbox';
-import { prShort, reviewQueue, sidebarItems, type AgentReview, type PostedRound, type QueueItem, type ReviewQueue, type SessionState } from '../../chat/reviews';
+import { prShort, reviewQueue, sidebarItems, yourCallSessions, type AgentReview, type PostedRound, type QueueItem, type ReviewQueue, type SessionState } from '../../chat/reviews';
 import { usePolled } from '../dashboard/useDashboardData';
 import { useChatChrome } from './chatChrome';
 import { useSimpleData } from './simpleData';
@@ -266,4 +266,14 @@ export function useReviewOf(projectId: string | null | undefined, workstream: st
 const REVIEWER_NAME: Record<string, string> = { devin: 'Devin', claude: 'Claude', cursor: 'Cursor', pi: 'pi' };
 export function reviewerName(id: string | null | undefined): string {
   return REVIEWER_NAME[id ?? 'devin'] ?? (id ?? 'Devin');
+}
+
+/**
+ * The sidebar redesign's review sessions that are your call (chat/reviews.ts yourCallSessions), by row key, under
+ * user-projects-enabled: the list, the rail and the phone's Sessions count give them Needs you's mark alike.
+ */
+export function useYourCallReviews(): ReadonlySet<string> {
+  const { on, queue } = useReviewsData();
+  const redesign = useFlag(FLAGS.userProjects, false);
+  return useMemo(() => (redesign && on ? yourCallSessions(queue, rowKey) : NO_KEYS), [redesign, on, queue]);
 }

@@ -15,13 +15,13 @@ const OPTIONS: BoxSizeOptions = {
   sizes: [
     { size: 'small', vcpus: 2, memoryGiB: 8, instanceType: 'm8g.large' },
     { size: 'medium', vcpus: 4, memoryGiB: 16, instanceType: 'm8g.xlarge' },
-    { size: 'large', vcpus: 8, memoryGiB: 32, instanceType: 'm8g.2xlarge' },
+    { size: 'large', vcpus: 4, memoryGiB: 32, instanceType: 'r8g.xlarge' },
   ],
 };
 // GET /api/instances/sizes?repo= for a repo whose .termag/environment.json says large, and one that asks for 4 vCPU / 32 GB.
 const LARGE_REPO: BoxSizeOptions = { ...OPTIONS, defaultSize: 'large' };
 const R8G_REPO: BoxSizeOptions = { ...OPTIONS, defaultSize: 'small', defaultRequirements: { vcpu: 4, memoryGiB: 32, instanceType: 'r8g.xlarge' } };
-const LABELS = ['Small · 2 vCPU, 8 GB RAM', 'Medium · 4 vCPU, 16 GB RAM', 'Large · 8 vCPU, 32 GB RAM'];
+const LABELS = ['Small · 2 vCPU, 8 GB RAM', 'Medium · 4 vCPU, 16 GB RAM', 'Large · 4 vCPU, 32 GB RAM'];
 
 describe('the labels and the preselection', () => {
   it('labels each size from the size table', () => {
@@ -110,12 +110,12 @@ describe('BoxSizeSelect (simple UI): LaunchPad\'s Select', () => {
 
   it('preselects the owner\'s large default', () => {
     render(null, { ...OPTIONS, defaultSize: 'large' });
-    expect(shown()).toBe('Large · 8 vCPU, 32 GB RAM');
+    expect(shown()).toBe('Large · 4 vCPU, 32 GB RAM');
   });
 
   it('starts at the repo file\'s size', () => {
     render(null, LARGE_REPO);
-    expect(shown()).toBe('Large · 8 vCPU, 32 GB RAM');
+    expect(shown()).toBe('Large · 4 vCPU, 32 GB RAM');
   });
 
   it('puts the repo\'s own type, r8g.xlarge, above Small, Medium and Large, preselected, and reports picking it', async () => {

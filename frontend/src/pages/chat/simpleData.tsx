@@ -1,12 +1,14 @@
 // What the simple UI's sidebar and a space's explorer both read: the agent
 // sessions, their live state, the user's spaces and which boxes reach them,
 // which agent started which, the tabs, the tab the route shows, and which
-// sessions finished since this browser last had them on screen. Loaded
-// once for the page (ChatApp) rather than by each, so the side panel's Files
-// costs no requests of its own. The spaces are ChatApp's
+// sessions finished since this browser last had them on screen; and, under
+// user-projects-enabled, the person's projects (GET /api/user-projects),
+// re-read on each `projects`
+// push. Loaded once for the page (ChatApp) rather than by each, so the side
+// panel's Files costs no requests of its own. The spaces are ChatApp's
 // (ChatSpacesProvider). A component rendered without the page around it (a
 // test) gets its own through WithSimpleData.
-import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
 import { useProjects } from '../../contexts/ProjectContext';
@@ -18,10 +20,30 @@ import { activeTab, itemForRoute, itemKey, tabForRoute } from '../../chat/openIt
 import { useOpenItems, useOpenOnRoute, type OpenItemsApi } from '../../chat/useOpenItems';
 import type { SpawnLink } from '../../chat/explorerAgents';
 import { askLinks } from '../../chat/agentTree';
-import { spawnsApi } from '../../services/api';
+import { spawnsApi, userProjectsApi, type UserProjectView } from '../../services/api';
+import { PROJECTS_PUSH_EVENT } from '../../utils/workspacePush';
 import { FLAGS, useFlag } from '../../flags';
 import { useSeenStops } from '../../hooks/useSeenStops';
-import { markSeen, seenStopKey, unseenStopAge } from '../../utils/unseenStops';
+import { markSeen, markUnseen, seenStopKey, unseenStopAge } from '../../utils/unseenStops';
+
+/** The person's projects (milestone 5's record), as the page read them. */
+export interface UserProjectsRead {
+  /**
+   * Every project of theirs, archived ones included, once GET /api/user-projects
+   * has answered; null before it has, with user-projects-enabled off, and when
+   * the server says it's off for them. Until then the sidebar groups by
+   * repository set (chat/sidebarGroups.ts).
+   */
+  list: readonly UserProjectView[] | null;
+  /** The latest read failed; `list` is the last one that didn't. */
+  failed: boolean;
+  /** A read has answered since the flag turned on: a list, a failure, or the server saying it's off. False while the first one is out. */
+  settled: boolean;
+  reload: () => Promise<void>;
+}
+
+/** A checkout's live project, by its name, for the sidebar and the header. */
+export interface OwnProject { id: string; name: string }
 
 export interface SimpleData {
   items: OpenItemsApi;
@@ -39,14 +61,73 @@ export interface SimpleData {
    * had them on screen, for their blue dot.
    */
   unseen: ReadonlySet<string>;
+  /** Mark a session unread again (its blue dot) or read, as a sidebar card's menu does (utils/unseenStops.ts). */
+  setUnseen: (row: Pick<InboxRow, 'projectId' | 'workstream' | 'workstreamId' | 'stoppedAt'>, unseen: boolean) => void;
+  userProjects: UserProjectsRead;
+  /** A checkout's (Project.id) live project, once the projects are read; null without one. */
+  userProjectOf: (projectId: string) => OwnProject | null;
+}
+
+const NO_USER_PROJECTS = { list: null, failed: false, settled: false } as const;
+const OFF_ON_THE_SERVER = { list: null, failed: false, settled: true } as const;
+
+/**
+ * GET /api/user-projects while user-projects-enabled is on: once, again on each
+ * `projects` push, and on reload(). The latest read wins. When the flag turns
+ * on while the page is open, the project list is read again too
+ * (`reloadProjects`): it was read with the flag off, so its checkouts carry no
+ * userProjectId to group by.
+ */
+function useUserProjectsRead(on: boolean, reloadProjects: () => Promise<void>): UserProjectsRead {
+  const [read, setRead] = useState<{ list: readonly UserProjectView[] | null; failed: boolean; settled: boolean }>(NO_USER_PROJECTS);
+  const generation = useRef(0);
+  const reload = useCallback(async () => {
+    if (!on) return;
+    const mine = ++generation.current;
+    try {
+      const list = await userProjectsApi.list();
+      if (mine === generation.current) setRead({ list: Array.isArray(list) ? list : [], failed: false, settled: true });
+    } catch (err) {
+      if (mine !== generation.current) return;
+      // The server's flag is the word: off for this person, there is nothing to show and nothing failed.
+      const off = (err as { response?: { data?: { code?: string } } })?.response?.data?.code === 'user_projects_disabled';
+      setRead(r => (off ? OFF_ON_THE_SERVER : { list: r.list, failed: true, settled: true }));
+    }
+  }, [on]);
+  const wasOn = useRef(on);
+  useEffect(() => {
+    const turnedOn = on && !wasOn.current;
+    wasOn.current = on;
+    if (turnedOn) reloadProjects().catch(() => { /* ProjectContext says so: projectsRefreshFailed */ });
+  }, [on, reloadProjects]);
+  useEffect(() => {
+    generation.current += 1;
+    setRead(NO_USER_PROJECTS);
+    if (!on) return;
+    void reload();
+    const onPush = () => { void reload(); };
+    window.addEventListener(PROJECTS_PUSH_EVENT, onPush);
+    return () => window.removeEventListener(PROJECTS_PUSH_EVENT, onPush);
+  }, [on, reload]);
+  return useMemo(() => ({ ...read, reload }), [read, reload]);
 }
 
 const SimpleDataContext = createContext<SimpleData | null>(null);
 
 export function SimpleDataProvider({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
-  const { projects, projectsLoaded, statusMap } = useProjects();
+  const { projects, projectsLoaded, statusMap, reloadProjects } = useProjects();
   const items = useOpenItems(user?.id);
+  const userProjects = useUserProjectsRead(useFlag(FLAGS.userProjects, false) && Boolean(user), reloadProjects);
+  // A checkout's project: its userProjectId, among the person's live projects.
+  const userProjectOf = useMemo(() => {
+    const live = new Map((userProjects.list ?? []).filter(p => !p.archived).map(p => [p.id, { id: p.id, name: p.name }]));
+    const byCheckout = new Map(projects.flatMap(p => {
+      const own = p.userProjectId ? live.get(p.userProjectId) : undefined;
+      return own ? [[p.id, own] as const] : [];
+    }));
+    return (projectId: string): OwnProject | null => byCheckout.get(projectId) ?? null;
+  }, [userProjects.list, projects]);
   const { pathname, search } = useLocation();
   const route = itemForRoute(pathname, search);
   const tab = tabForRoute(search);
@@ -114,10 +195,15 @@ export function SimpleDataProvider({ children }: { children: React.ReactNode }) 
     }));
   }, [rows, routeKey, pageVisible, seenStops]);
 
+  const setUnseen = useCallback((r: Pick<InboxRow, 'projectId' | 'workstream' | 'workstreamId' | 'stoppedAt'>, on: boolean) => {
+    const key = seenStopKey(r.projectId, r.workstream, r.workstreamId);
+    if (key) updateSeen(s => (on ? markUnseen(s, key, r.stoppedAt) : markSeen(s, key, Date.now(), r.stoppedAt)));
+  }, [updateSeen]);
+
   const active = activeTab(items.state, route, tab);
   const value = useMemo<SimpleData>(() => ({
-    items, rows, live, setupOf, spaces, links, activeTab: active, unseen,
-  }), [items, rows, live, setupOf, spaces, links, active, unseen]);
+    items, rows, live, setupOf, spaces, links, activeTab: active, unseen, setUnseen, userProjects, userProjectOf,
+  }), [items, rows, live, setupOf, spaces, links, active, unseen, setUnseen, userProjects, userProjectOf]);
   return <SimpleDataContext.Provider value={value}>{children}</SimpleDataContext.Provider>;
 }
 

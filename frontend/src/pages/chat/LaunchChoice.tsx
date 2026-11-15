@@ -4,7 +4,7 @@
 // A radio card as the box dialog's are (LaunchDrawer.tsx), with an optional
 // line under the name and an optional mark before it. The space dialog marks
 // each row (a space's colour, the dashed square of "none", a "+" for a new one);
-// the box dialog marks only New box, with LaunchPad's sparkle (LaunchDrawer.tsx);
+// the box dialog marks only New box, with a box and a small "+" (LaunchDrawer.tsx);
 // the environment dialog marks none, since an environment has no colour.
 // The selection is the card's checked style (aria-checked), never the mark.
 // The cards are termag's, not LaunchPad's: the drawer's dialogs are all drawn

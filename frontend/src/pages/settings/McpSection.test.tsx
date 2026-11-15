@@ -41,6 +41,18 @@ describe('Settings → MCP catalog', () => {
     expect(el.textContent).toContain('No MCP servers yet.');
   });
 
+  it('shows a connector off the allowlist as blocked, with the reason instead of Connect', async () => {
+    api.list.mockResolvedValue(page({ connectors: [{ ...connector, blocked: "This MCP server isn't on termag's allowlist" }] }));
+    act(() => root.render(<McpSection focus={false} search="" />));
+    await flush();
+    const row = el.querySelector('.mcp-row')!;
+    expect(row.querySelector('.settings-pill')?.textContent).toBe('blocked');
+    expect(row.textContent).toContain("This MCP server isn't on termag's allowlist");
+    const buttons = [...row.querySelectorAll('button')].map(b => b.textContent);
+    expect(buttons).not.toContain('Connect');
+    expect(buttons).toContain('Delete');
+  });
+
   it('shows the connector name under a display name that differs from it, and names the tool prefix on hover', async () => {
     api.list.mockResolvedValue(page({
       connectors: [{ ...connector, name: 'claude-docs', displayName: 'Claude Docs' }],
@@ -113,8 +125,8 @@ describe('Settings → MCP catalog', () => {
     expect(available()).toBeNull();
     const row = el.querySelector('.mcp-row');
     expect(row?.textContent).toContain('acme');
-    expect(row?.textContent).toContain('not authed');
-    expect([...row!.querySelectorAll('button')].map(b => b.textContent)).toContain('Link');
+    expect(row?.textContent).toContain('not connected');
+    expect([...row!.querySelectorAll('button')].map(b => b.textContent)).toContain('Connect');
   });
 });
 
@@ -146,7 +158,7 @@ describe('Settings → MCP scope choice', () => {
     api.startOAuth.mockResolvedValue('https://slack.com/oauth/v2_user/authorize?x=1');
     act(() => root.render(<McpSection focus={false} search="" />));
     await flush();
-    await act(async () => { button(el, 'Link').click(); });
+    await act(async () => { button(el, 'Connect').click(); });
     expect(dialog()?.textContent).toContain('Send messages');
     expect(ticked()).toEqual([]);
     expect(button(dialog()!, 'Continue to sign in').disabled).toBe(true);
@@ -167,7 +179,7 @@ describe('Settings → MCP scope choice', () => {
     api.list.mockResolvedValue(page({ connectors: [slack()] }));
     act(() => root.render(<McpSection focus={false} search="" />));
     await flush();
-    await act(async () => { button(el, 'Link').click(); });
+    await act(async () => { button(el, 'Connect').click(); });
     expect(button(dialog()!, 'Clear').disabled).toBe(true);
     await act(async () => { button(dialog()!, 'Select all').click(); });
     expect(ticked()).toEqual(OPTIONS.map(o => o.name));
@@ -182,7 +194,7 @@ describe('Settings → MCP scope choice', () => {
     api.list.mockResolvedValue(page({ connectors: [slack()] }));
     act(() => root.render(<McpSection focus={false} search="" />));
     await flush();
-    await act(async () => { button(el, 'Link').click(); });
+    await act(async () => { button(el, 'Connect').click(); });
     const list = dialog()!.querySelector('.mcp-scope-list')!;
     expect(list.querySelectorAll('input[type="checkbox"]')).toHaveLength(OPTIONS.length);
     for (const b of ['Select all', 'Clear', 'Cancel', 'Continue to sign in']) expect(list.contains(button(dialog()!, b)), b).toBe(false);
@@ -202,7 +214,7 @@ describe('Settings → MCP scope choice', () => {
     await flush();
     const row = el.querySelector('.mcp-row')!;
     expect(row.textContent).toContain('1 permission');
-    expect([...row.querySelectorAll('button')].map(b => b.textContent)).not.toContain('Re-link');
+    expect([...row.querySelectorAll('button')].map(b => b.textContent)).not.toContain('Reconnect');
     await act(async () => { button(row, 'Change permissions').click(); });
     // The grant, not the larger request.
     expect(ticked()).toEqual(['search:read.public']);
@@ -213,7 +225,7 @@ describe('Settings → MCP scope choice', () => {
     api.startOAuth.mockResolvedValue('https://auth.example/authorize');
     act(() => root.render(<McpSection focus={false} search="" />));
     await flush();
-    await act(async () => { button(el, 'Link').click(); });
+    await act(async () => { button(el, 'Connect').click(); });
     await flush();
     expect(dialog()).toBeNull();
     expect(api.startOAuth).toHaveBeenCalledWith('c1', undefined);

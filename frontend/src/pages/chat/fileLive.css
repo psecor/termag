@@ -33,3 +33,7 @@
 @media (prefers-reduced-motion: reduce) {
   .fv-live-cue { animation: none; }
 }
+/* A conflict with edits not saved (useSpaceFileLive dirty): its words and LaunchPad's buttons on one line. */
+.fv-live-cue .fv-live-conflict { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-ui); }
+/* A deleted file's Close, after its words. */
+.fv-gone-close { margin-left: 8px; vertical-align: middle; }

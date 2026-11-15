@@ -3,7 +3,7 @@
 // browser's tabs through the storage event.
 import { useCallback, useLayoutEffect, useMemo, useState } from 'react';
 import {
-  arrangeItems, dismissItem, duplicateItem, EMPTY_OPEN_ITEMS, newTabId, noteSent, openItem, openItemsKey, parseOpenItems, pickItem, placeUnplacedItems, reconcileItems,
+  arrangeItems, arrangePanel, dismissItem, duplicateItem, EMPTY_OPEN_ITEMS, newTabId, noteSent, openInPanel, openItem, openItemsKey, parseOpenItems, pickItem, placeUnplacedItems, reconcileItems,
   reorderItem, seedItems, serializeOpenItems, type ChatListing, type OpenItem, type OpenItemRef, type OpenItemsState,
 } from './openItems';
 
@@ -57,6 +57,10 @@ export interface OpenItemsApi {
   pick: (ref: OpenItemRef, current: string | null, chatSpace?: string | null, openedIn?: string | null) => string;
   /** A new tab, on top, showing `ref`, opened from `openedIn` (OpenItem.openedIn); returns its id. */
   openNew: (ref: OpenItemRef, openedIn?: string | null) => string;
+  /** File `ref` open in the side panel beside `place` (openItems.openInPanel): its tab there, else a new one at the end; returns its id. */
+  openInPanel: (ref: { space: string; path: string }, place: string) => string;
+  /** Puts `place`'s side panel files in `order`, their ids rearranged (openItems.arrangePanel). */
+  arrangePanel: (place: string, order: readonly string[]) => void;
   /** A copy of tab `id` just below it; returns the copy's id. */
   duplicate: (id: string) => string;
   /** Closes tab `id`, or every tab in `id`. */
@@ -107,6 +111,13 @@ export function useOpenItems(userId: string | null | undefined): OpenItemsApi {
     if (key) update(key, s => openItem(s, ref, id, Date.now(), newTabId, openedIn).state);
     return id;
   }, [key]);
+  const inPanel = useCallback((ref: { space: string; path: string }, place: string) => {
+    if (!key) return newTabId();
+    let id = '';
+    update(key, s => { const r = openInPanel(s, ref, place, Date.now()); id = r.id; return r.state; });
+    return id;
+  }, [key]);
+  const inPanelOrder = useCallback((place: string, order: readonly string[]) => { if (key) update(key, s => arrangePanel(s, place, order)); }, [key]);
   const duplicate = useCallback((id: string) => {
     const copy = newTabId();
     if (key) update(key, s => duplicateItem(s, id, copy, Date.now()));
@@ -120,8 +131,8 @@ export function useOpenItems(userId: string | null | undefined): OpenItemsApi {
   const reconcile = useCallback((live: ReadonlySet<string>) => { if (key) update(key, s => reconcileItems(s, live, Date.now())); }, [key]);
   const place = useCallback((listingOf: Parameters<OpenItemsApi['place']>[0]) => { if (key) update(key, s => placeUnplacedItems(s, listingOf)); }, [key]);
   return useMemo(
-    () => ({ state, open, pick, openNew, duplicate, dismiss, reorder, arrange, noteSent: sent, seed, reconcile, place }),
-    [state, open, pick, openNew, duplicate, dismiss, reorder, arrange, sent, seed, reconcile, place],
+    () => ({ state, open, pick, openNew, openInPanel: inPanel, arrangePanel: inPanelOrder, duplicate, dismiss, reorder, arrange, noteSent: sent, seed, reconcile, place }),
+    [state, open, pick, openNew, inPanel, inPanelOrder, duplicate, dismiss, reorder, arrange, sent, seed, reconcile, place],
   );
 }
 

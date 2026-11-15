@@ -7,14 +7,24 @@
 // (pages/chat/SpacePicker.tsx), the environment (pages/chat/EnvironmentSelect.tsx), when the chosen box already has the
 // repository how the session gets the code (pages/chat/CheckoutPicker.tsx),
 // and the schedule (pages/chat/SchedulePicker.tsx).
+// With box-placement-enabled the box trigger reads
+// "Runs on: Auto", with the box Auto picked and why in its tooltip (a phone,
+// with no hover, sees them in the dialog's Auto row), or the box picked by
+// hand: "Runs on: box-a". Its dialog is pages/chat/PlacementPicker.tsx, and
+// New box's name, size and disk, the checkout and the environment move under
+// an Options disclosure in it.
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { Instance } from '../../types';
 import { Dialog } from '../../components/Dialog';
-import { Focusable, Tooltip, TooltipTrigger } from '@launchpad-ui/components';
+import { Button, Disclosure, DisclosurePanel, Focusable, Heading, Tooltip, TooltipTrigger } from '@launchpad-ui/components';
 import { Icon } from '@launchpad-ui/icons';
-import { LP_THEME } from '../../launchpad/theme';
 import { ensureLaunchPadSprite } from '../../launchpad/sprite';
+import { AUTO, autoLine, pillLabel, type PlacementView } from '../../chat/boxPlacement';
+import { PlacementPicker } from './PlacementPicker';
+import { CompactPlacementPicker } from './CompactPlacementPicker';
+import { FLAGS, useFlag } from '../../flags';
+import { LP_THEME } from '../../launchpad/theme';
 import { boxIsUsableForProject } from '../../utils/projectStart';
 import { canStartBox } from '../../utils/boxPower';
 import { LaunchChoice } from './LaunchChoice';
@@ -91,27 +101,39 @@ export function newBoxDetails(b: NewBoxSummary): string[] {
   return [newBoxNamed(b) ? `${b.name}, a new box` : 'A new box of its own', b.settings, from].filter(Boolean);
 }
 
-/**
- * The mark that says the box is still to be made: LaunchPad's sparkle, beside
- * the name, at the 20 px its artwork is drawn for (gotcha simple-ui-launchpad-controls). Named "New box" for a screen reader only where the text beside it
- * is the box's own name, so "New box" is never read twice.
- */
-function NewBoxMark({ named }: { named: boolean }) {
-  useEffect(() => { void ensureLaunchPadSprite(); }, []);
-  return named
-    ? <Icon name="sparkle" size="medium" className="chat-launch-new-mark" role="img" aria-label="New box" />
-    : <Icon name="sparkle" size="medium" className="chat-launch-new-mark" aria-hidden="true" />;
-}
-
 /** A tooltip's lines, the first one bold, in LaunchPad's Tooltip with termag's colours. */
 function TipLines({ lines }: { lines: readonly string[] }) {
   return <>{lines.map((l, i) => (i === 0 ? <strong key={i}>{l}</strong> : <span key={i}>{l}</span>))}</>;
 }
 
+/** The box: the strip's 14 px line icons are termag's own (the clock, the environment's layers), so this one is too. */
+const BOX_PATH = 'M8 1.8 13.5 4.6v6.8L8 14.2 2.5 11.4V4.6z M2.5 4.6 8 7.4l5.5-2.8 M8 7.4v6.8';
+
 function BoxIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M8 1.8 13.5 4.6v6.8L8 14.2 2.5 11.4V4.6z M2.5 4.6 8 7.4l5.5-2.8 M8 7.4v6.8" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+      <path d={BOX_PATH} fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+/**
+ * The mark that says the box is still to be made: the box with a small "+" on
+ * its lower right corner, in the same muted colour, the "+" ringed in what is
+ * behind it (chat.css --chat-launch-mark-ring) so it reads as over the box.
+ * Drawn here rather than from LaunchPad's package-outline and add: those are
+ * drawn on a 20 px grid and blur at the strip's 14 px (gotcha
+ * simple-ui-launchpad-controls), and at 20 px they would outsize the strip's
+ * other icons. Named "New box" for a screen reader only where the text beside
+ * it is the box's own name, so "New box" is never read twice.
+ */
+function NewBoxMark({ named }: { named: boolean }) {
+  const plus = 'M12.75 10.1v5.3 M10.1 12.75h5.3';
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" className="chat-launch-new-mark" {...(named ? { role: 'img', 'aria-label': 'New box' } : { 'aria-hidden': true })}>
+      <path d={BOX_PATH} fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+      <path d={plus} className="chat-launch-mark-ring" fill="none" strokeWidth="3.6" strokeLinecap="round" />
+      <path d={plus} fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
     </svg>
   );
 }
@@ -126,6 +148,16 @@ export function launchableBoxes(boxes: readonly Instance[]): Instance[] {
   return boxes.filter(b => boxIsUsableForProject(b) || canStartBox(b));
 }
 
+/**
+ * With Runs on: Auto, these and an EC2 box on its way
+ * down (stopping, hibernating), which a session started on it wakes once it's
+ * down.
+ */
+export function placementBoxes(boxes: readonly Instance[]): Instance[] {
+  return boxes.filter(b => boxIsUsableForProject(b) || canStartBox(b)
+    || (b.kind === 'ec2' && !!b.ec2InstanceId && (b.status === 'stopping' || b.status === 'hibernating')));
+}
+
 /** The line under a box's name in the box dialog, ending with its size and disk (utils/boxDisk.ts) when it has them. */
 export function boxLine(b: Pick<Instance, 'status' | 'projects' | 'size' | 'instanceType' | 'diskGiB'>, waking: boolean): string {
   const size = [boxSizeName(b.size, b.instanceType), boxDiskLabel(b.diskGiB)].filter(Boolean).map(t => ` · ${t}`).join('');
@@ -137,7 +169,44 @@ export function boxLine(b: Pick<Instance, 'status' | 'projects' | 'size' | 'inst
   return (n === 0 ? 'Running' : `Running · ${n} ${n === 1 ? 'session' : 'sessions'}`) + size;
 }
 
-export function LaunchDrawer({ boxes, boxChoice, onBoxChoice, wakingId, newBox, space, environment, checkout, schedule, newBoxName, newBoxSize, sessionName, disabled, boxLocked }: {
+/**
+ * The box trigger's tooltip: where the session runs; with Auto the box it
+ * picked and why ("Auto: box-a · Last used · has termag"), since its pill
+ * says only "Runs on: Auto"; then the box's state, or what New box gets.
+ */
+export function boxTipLines(i: {
+  /** Auto is picked and has a placement to go on (or is loading one). */
+  auto: boolean;
+  view: PlacementView | null;
+  /** What Auto resolved to: a box's name, New box's title, or null while that isn't known. */
+  resolvedName: string | null;
+  chosen: Instance | null;
+  waking: boolean;
+  /** New box's lines (newBoxDetails). */
+  details: readonly string[];
+}): string[] {
+  const auto = i.auto ? autoLine({ view: i.view, failed: false, name: i.resolvedName }) : null;
+  return [
+    'Where this session runs',
+    ...(auto ? [`Auto: ${auto}`] : []),
+    ...(i.chosen ? [`${i.chosen.name}: ${boxLine(i.chosen, i.waking)}`] : i.auto && !i.resolvedName ? [] : i.details),
+  ];
+}
+
+/** Runs on: Auto's part of the drawer, with box-placement-enabled. */
+export interface DrawerPlacement {
+  view: PlacementView | null;
+  failed: boolean;
+  onRetry: () => void;
+  /** AUTO, NEW_BOX or a box's id: what the picker shows picked (boxChoice is what that resolves to). */
+  selection: string;
+  /** "has termag", for rows of boxes that have the repository. */
+  repoWords: string | null;
+  /** New box is launched whatever the pool holds: a bigger disk than the pool's, or a type the repository's requirements matched. */
+  newBoxCold?: boolean;
+}
+
+export function LaunchDrawer({ boxes, boxChoice, onBoxChoice, wakingId, newBox, space, environment, checkout, schedule, newBoxName, newBoxSize, sessionName, disabled, boxLocked, placement }: {
   boxes: readonly Instance[];
   boxChoice: string;
   onBoxChoice: (choice: string) => void;
@@ -165,9 +234,20 @@ export function LaunchDrawer({ boxes, boxChoice, onBoxChoice, wakingId, newBox, 
    * still opens for the session name, which may be what was refused.
    */
   boxLocked?: boolean;
+  /** With box-placement-enabled: Auto, its reason and the picker; null keeps the drawer as it was. */
+  placement?: DrawerPlacement | null;
 }) {
   const [boxOpen, setBoxOpen] = useState(false);
   const chosen = boxes.find(b => b.id === boxChoice) ?? null;
+  // Auto with no placement to go on (it failed to load) is New box, and says so.
+  const auto = placement?.selection === AUTO && !placement.failed;
+  // What Auto resolved to: a box, New box, or nothing yet while the placement loads.
+  const resolvedName = chosen ? chosen.name : boxChoice === NEW_BOX ? newBoxTitle(newBox) : null;
+  // The Options disclosure's chevron is LaunchPad's icon, drawn from its sprite.
+  const placementOn = !!placement;
+  // The compact picker rides on user-projects-enabled with the rest of the redesign; without it, as it was.
+  const Picker = useFlag(FLAGS.userProjects, false) ? CompactPlacementPicker : PlacementPicker;
+  useEffect(() => { if (placementOn) void ensureLaunchPadSprite(); }, [placementOn]);
   // A changed new box goes by its name, marked new; what it gets is in the tooltip, never inline.
   const named = newBoxNamed(newBox);
   const details = newBoxDetails(newBox);
@@ -185,22 +265,61 @@ export function LaunchDrawer({ boxes, boxChoice, onBoxChoice, wakingId, newBox, 
               disabled={disabled}
               onClick={() => setBoxOpen(true)}
             >
-              <BoxIcon />
-              <span className="chat-launch-trigger-label">{chosen ? chosen.name : newBoxTitle(newBox)}</span>
-              {!chosen && <NewBoxMark named={named} />}
+              {chosen ? <BoxIcon /> : <NewBoxMark named={named} />}
+              <span className="chat-launch-trigger-label">{placement ? pillLabel({ auto, resolvedName }) : chosen ? chosen.name : newBoxTitle(newBox)}</span>
             </button>
           </Focusable>
           <Tooltip placement="top" className={`${LP_THEME} chat-launch-tip`}>
-            <TipLines lines={['Where this session runs', ...(chosen ? [`${chosen.name}: ${boxLine(chosen, wakingId === chosen.id)}`] : details)]} />
+            <TipLines lines={boxTipLines({ auto, view: placement?.view ?? null, resolvedName, chosen, waking: !!chosen && wakingId === chosen.id, details })} />
           </Tooltip>
         </TooltipTrigger>
         {space}
-        {environment}
-        {checkout}
+        {/* With Runs on: Auto, these two are under the box dialog's Options. */}
+        {!placement && environment}
+        {!placement && checkout}
         {schedule}
       </div>
       {boxOpen && createPortal(
         <Dialog title="Where this session runs" onClose={() => setBoxOpen(false)} className="chat-launch-dialog">
+          {placement ? (
+            <>
+              <div className={`${LP_THEME} chat-launch-boxes chat-placement`}>
+                <Picker
+                  view={placement.view}
+                  failed={placement.failed}
+                  onRetry={placement.onRetry}
+                  boxes={boxes}
+                  selection={placement.selection}
+                  onSelect={onBoxChoice}
+                  autoName={auto ? resolvedName : placement.view?.recommended.kind === 'new' ? 'New box' : boxes.find(b => placement.view?.recommended.kind === 'box' && b.id === placement.view.recommended.instanceId)?.name ?? null}
+                  newBoxTitle={newBoxTitle(newBox)}
+                  newBoxCold={placement.newBoxCold || newBox.poolDiskGiB !== null}
+                  repoWords={placement.repoWords}
+                  locked={boxLocked}
+                  wakingId={wakingId}
+                />
+              </div>
+              <Disclosure className={`${LP_THEME} chat-placement-options`}>
+                {({ isExpanded }) => (
+                  <>
+                    <Heading level={3} className="chat-placement-options-head">
+                      <Button slot="trigger" variant="minimal" size="small">
+                        <Icon name={isExpanded ? 'chevron-down' : 'chevron-right'} size="medium" aria-hidden="true" />
+                        Options
+                      </Button>
+                    </Heading>
+                    <DisclosurePanel>
+                      <div className="chat-placement-options-body">
+                        {boxChoice === NEW_BOX && <div className="chat-placement-newbox">{newBoxName}{newBoxSize}</div>}
+                        {(checkout || environment) && <div className="chat-placement-pickers">{checkout}{environment}</div>}
+                        {boxChoice !== NEW_BOX && !checkout && !environment && <span className="chat-placement-none">Nothing more to set for this box.</span>}
+                      </div>
+                    </DisclosurePanel>
+                  </>
+                )}
+              </Disclosure>
+            </>
+          ) : (
           <div className="chat-launch-boxes" role="radiogroup" aria-label="Box">
             {/* New box and its name are one choice: the name field opens inside it once picked.
                 Marked new, so it never reads as one of the boxes under it; what it gets is in its tooltip. */}
@@ -236,6 +355,7 @@ export function LaunchDrawer({ boxes, boxChoice, onBoxChoice, wakingId, newBox, 
               </button>
             ))}
           </div>
+          )}
           <div className="chat-launch-names">{sessionName}</div>
           <div className="chat-launch-dialog-actions">
             <button type="button" className="btn-primary" onClick={() => setBoxOpen(false)}>Done</button>

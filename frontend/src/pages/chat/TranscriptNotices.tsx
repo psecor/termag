@@ -35,6 +35,19 @@ export function UnsentMessages({ texts, onSend, onDiscard, disabled }: {
   );
 }
 
+/**
+ * The box this session was started on was running hot
+ * : a note, never a gate. The person carries on, or dismisses it.
+ */
+export function HotBoxNotice({ text, onDismiss }: { text: string; onDismiss: () => void }) {
+  return (
+    <div className="sdk-hot-box" role="status">
+      <span>{text}</span>
+      <button type="button" className="btn-tiny" onClick={onDismiss}>OK</button>
+    </div>
+  );
+}
+
 export function ChatError({ text, onRetry }: { text: string; onRetry?: () => void }) {
   const hint = errorHint(text);
   return (

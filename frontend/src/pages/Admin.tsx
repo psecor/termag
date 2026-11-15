@@ -17,6 +17,7 @@ import { AdminSoftware } from './admin/AdminSoftware';
 import { AdminPrs } from './admin/AdminPrs';
 import { AdminSpend } from './admin/AdminSpend';
 import { AdminBugs, BugsBadge } from './admin/AdminBugs';
+import { AdminFeedback, FeedbackBadge } from './admin/AdminFeedback';
 
 const RANGE_KEY = 'termag:adminRange';
 // Absolute paths: a relative `to=""` resolves to the current URL inside the
@@ -33,6 +34,7 @@ const TABS = [
   { to: '/admin/prs', label: 'PRs' },
   { to: '/admin/software', label: 'Software' },
   { to: '/admin/bugs', label: 'Bugs' },
+  { to: '/admin/feedback', label: 'Feedback' },
   { to: '/admin/system', label: 'System' },
   { to: '/admin/settings', label: 'Settings' },
 ];
@@ -64,7 +66,7 @@ export default function Admin() {
           <Link to="/dashboard">← dashboard</Link>
           <Link to="/">workspace</Link>
           <nav className="admin-tabs" aria-label="admin sections">
-            {TABS.map(t => <NavLink key={t.to} to={t.to} end={t.end}>{t.label}{t.to === '/admin/bugs' && <BugsBadge />}</NavLink>)}
+            {TABS.map(t => <NavLink key={t.to} to={t.to} end={t.end}>{t.label}{t.to === '/admin/bugs' && <BugsBadge />}{t.to === '/admin/feedback' && <FeedbackBadge />}</NavLink>)}
           </nav>
         </header>
         {/* The range picker changes the rows of most tabs' tables: every DataTable goes back to page 1. */}
@@ -82,6 +84,7 @@ export default function Admin() {
           <Route path="software" element={<AdminSoftware now={now} />} />
           <Route path="bugs" element={<AdminBugs now={now} />} />
           <Route path="bugs/:id" element={<AdminBugs now={now} />} />
+          <Route path="feedback" element={<AdminFeedback now={now} />} />
           <Route path="system" element={<AdminSystem now={now} />} />
           <Route path="settings" element={<AdminSettings range={range} now={now} onRange={setRange} />} />
           {/* Absolute, like TABS: with v7 path resolution "." inside this splat is the unknown URL itself. */}

@@ -7,9 +7,15 @@ import { usePolled, type Polled, type PolledOptions } from '../dashboard/useDash
 /** After a failed fetch the admin pages re-try this soon, not after the full poll interval. */
 export const ADMIN_RETRY_MS = 15_000;
 
-/** usePolled with a short retry after errors, so one failure doesn't leave a card empty for minutes. */
+/**
+ * usePolled with a short retry after errors, so one failure doesn't leave a card empty for minutes.
+ * It keeps that pace instead of backing off to the poll interval: an admin card (5 min on some
+ * pages) should re-probe a box's agent, or a broken endpoint, every 15 s once it is back.
+ * `retryMs` and `maxRetryMs` may still be given to opt a card into the slower backoff.
+ */
 export function useAdminPolled<T>(fetcher: () => Promise<T>, intervalMs: number, opts: PolledOptions = {}) {
-  return usePolled(fetcher, intervalMs, { retryMs: Math.min(intervalMs, ADMIN_RETRY_MS), ...opts });
+  const retryMs = Math.min(intervalMs, ADMIN_RETRY_MS);
+  return usePolled(fetcher, intervalMs, { retryMs, maxRetryMs: retryMs, ...opts });
 }
 
 /**

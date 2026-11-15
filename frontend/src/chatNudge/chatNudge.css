@@ -1,0 +1,45 @@
+/* Lab's nudge toward termag's chat (ChatNudge.tsx). LaunchPad's snackbar and
+   popover, in termag's colours and the UI font through .lp-theme; Lab's body
+   is monospace, so the font is set here too. */
+.chat-nudge-region,
+.chat-nudge-spotlight {
+  font-family: var(--font-ui);
+}
+
+.chat-nudge-toast .chat-nudge-actions {
+  margin-top: var(--lp-spacing-300);
+}
+
+.chat-nudge-coach {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--lp-spacing-300);
+  max-width: 15rem;
+  padding: var(--lp-spacing-400) var(--lp-spacing-500);
+  outline: none;
+}
+
+.chat-nudge-coach-text {
+  margin: 0;
+  font: var(--lp-text-body-2-regular);
+  color: var(--text-primary);
+}
+
+/* The switch the spotlight points at. */
+[data-chat-nudge-spotlight] {
+  position: relative;
+  z-index: 1;
+  border-radius: 6px;
+  box-shadow: 0 0 0 2px var(--accent), 0 0 0 6px rgba(var(--accent-rgb), 0.28);
+  animation: chat-nudge-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes chat-nudge-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--accent), 0 0 0 6px rgba(var(--accent-rgb), 0.28); }
+  50% { box-shadow: 0 0 0 2px var(--accent), 0 0 0 10px rgba(var(--accent-rgb), 0.08); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-chat-nudge-spotlight] { animation: none; }
+}

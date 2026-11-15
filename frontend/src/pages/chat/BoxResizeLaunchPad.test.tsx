@@ -19,7 +19,7 @@ const { BoxResizeLaunchPad } = await import('./BoxResizeLaunchPad');
 const SIZES = [
   { size: 'small' as const, vcpus: 2, memoryGiB: 8, instanceType: 'm8g.large' },
   { size: 'medium' as const, vcpus: 4, memoryGiB: 16, instanceType: 'm8g.xlarge' },
-  { size: 'large' as const, vcpus: 8, memoryGiB: 32, instanceType: 'm8g.2xlarge' },
+  { size: 'large' as const, vcpus: 4, memoryGiB: 32, instanceType: 'r8g.xlarge' },
 ];
 const info = (box: Partial<BoxResizeInfo['box']> = {}, over: Partial<BoxResizeInfo> = {}): BoxResizeInfo => ({
   box: { id: 'b1', name: 'olive', status: 'ready', size: 'medium', instanceType: 'm8g.xlarge', hibernationConfigured: false, ...box },
@@ -58,7 +58,7 @@ describe('the simple UI Box size… dialog', () => {
     expect(document.querySelector('.chat-resize-dialog h2')?.textContent).toBe('Resize olive');
     expect(text()).toContain('Now: Medium · 4 vCPU, 16 GB RAM');
     // The trigger shows the preselection, the next size up.
-    expect(document.querySelector('.box-size-select-button')?.textContent).toContain('Large · 8 vCPU, 32 GB RAM');
+    expect(document.querySelector('.box-size-select-button')?.textContent).toContain('Large · 4 vCPU, 32 GB RAM');
     expect(text()).toMatch(/two to three minutes/);
   });
 

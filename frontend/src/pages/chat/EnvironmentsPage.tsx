@@ -8,11 +8,13 @@
 // environment is an inline definition (environment.json's JSON, in
 // LaunchPad's TextArea, which has no schema completion; it is checked on blur
 // and on save, never while typing) or a pointer to a file, repo : branch :
-// path. Each is personal (its owner's alone) or shared (everyone's, from a
-// file on its repository's default branch): the list has the caller's
-// personal ones first, a new one is personal unless the form says shared, and
-// its owner switches it from the ⋮ menu, which shows the server's rule when it
-// can't be shared. The full UI's section is pages/Environments.tsx, on the
+// path. Each is personal (its owner's alone) or shared (everyone's to use,
+// only an admin's to change, from a file on its repository's default branch):
+// the list has the caller's personal ones first, a new one is personal unless
+// an admin's form says shared, and an admin switches it from the ⋮ menu, which
+// shows the server's rule when it can't be shared. A non-admin sees a shared
+// one's Edit and Delete… disabled, with why (utils/environments.ts
+// environmentRights). The full UI's section is pages/Environments.tsx, on the
 // same API and utils/environments.ts.
 import React, { useCallback, useEffect, useState } from 'react';
 import { Link, Navigate, useNavigate, useParams } from 'react-router-dom';
@@ -24,11 +26,11 @@ import { LP_THEME } from '../../launchpad/theme';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { useDefinitionCheck } from '../../hooks/useDefinitionCheck';
 import { useEnvironmentPool } from '../../hooks/useEnvironmentPool';
-import { poolFailureLine, poolLine, POOL_READY_HINT, refreshLine } from '../../utils/environmentPool';
+import { onWarmLine, poolFailureLine, poolLine, POOL_READY_HINT, refreshLine } from '../../utils/environmentPool';
 import {
-  ACTION_LABEL, DEFAULT_ENVIRONMENT_FILE, ENVIRONMENTS_DOCS_URL, describeEvent, draftFromEnvironment, draftInput,
-  emptyEnvironmentDraft, environmentCommands, environmentError, personLabel, pointerLabel, repoLabel, shareBlocker, visibilityGroups,
-  whenLabel, VISIBILITY_HINT, VISIBILITY_LABEL, type EnvironmentDraft,
+  ACTION_LABEL, DEFAULT_ENVIRONMENT_FILE, ENVIRONMENTS_DOCS_URL, canCreateShared, describeEvent, draftFromEnvironment, draftInput,
+  emptyEnvironmentDraft, environmentCommands, environmentError, environmentRights, personLabel, pointerLabel, repoLabel, shareBlocker, visibilityGroups,
+  whenLabel, SHARED_CREATE_ADMIN_ONLY, VISIBILITY_HINT, VISIBILITY_LABEL, type EnvironmentDraft,
 } from '../../utils/environments';
 import type { MenuAction } from './ContextMenu';
 import { ChatHistoryButton, ChatMoreButton } from './chatChrome';
@@ -115,6 +117,8 @@ function EnvironmentList() {
 
 function NewEnvironment() {
   const navigate = useNavigate();
+  const { user } = useAuth();
+  const mayShare = canCreateShared(user);
   const [draft, setDraft] = useState<EnvironmentDraft>(emptyEnvironmentDraft);
   const [visibility, setVisibility] = useState<EnvironmentVisibility>('personal');
   const [busy, setBusy] = useState(false);
@@ -143,7 +147,8 @@ function NewEnvironment() {
         <RadioGroup value={visibility} onChange={v => setVisibility(v as EnvironmentVisibility)} isDisabled={busy} className="chat-env-visibility">
           <Label>Who can use it</Label>
           <Radio value="personal">{VISIBILITY_LABEL.personal}: {VISIBILITY_HINT.personal}</Radio>
-          <Radio value="shared">{VISIBILITY_LABEL.shared}: {VISIBILITY_HINT.shared}</Radio>
+          <Radio value="shared" isDisabled={!mayShare}>{VISIBILITY_LABEL.shared}: {VISIBILITY_HINT.shared}</Radio>
+          {!mayShare && <Text slot="description">{SHARED_CREATE_ADMIN_ONLY}</Text>}
           {blocked && <Text slot="description" className="chat-env-error">{blocked}</Text>}
         </RadioGroup>
         {error && error !== blocked && <ChatError text={error} />}
@@ -214,11 +219,14 @@ function EnvironmentDetail({ id }: { id: string }) {
     }
   };
 
-  // The owner's switch. Sharing asks the server, whose refusal says the rule (a file on the repository's default branch).
+  // An admin's switch. Sharing asks the server, whose refusal says the rule (a file on the repository's default branch).
   const switchTo = async (to: EnvironmentVisibility) => {
     setBusy(true); setError(null);
     try {
-      setEnv(await environmentsApi.setVisibility(env.id, to, env.updatedAt));
+      const switched = await environmentsApi.setVisibility(env.id, to, env.updatedAt);
+      // Someone else's environment made personal is theirs alone: this page can no longer show it.
+      if (switched.visibility === 'personal' && switched.owner?.id !== user?.id) { navigate('/chat/environments'); return; }
+      setEnv(switched);
     } catch (err) {
       setError(environmentError(err, to === 'shared' ? 'Could not share the environment' : 'Could not make the environment personal'));
     } finally {
@@ -226,17 +234,18 @@ function EnvironmentDetail({ id }: { id: string }) {
     }
   };
   const isOwner = !!user && env.owner?.id === user.id;
-  const switchAction: MenuAction[] = !isOwner ? []
-    : env.visibility === 'personal'
-      ? [{ label: 'Share with everyone', hint: "Runs from a file on its repository's default branch", onSelect: () => { void switchTo('shared'); }, disabled: busy || !!draft }]
-      : [{ label: 'Make personal', hint: 'Only you see it and use it', onSelect: () => { void switchTo('personal'); }, disabled: busy || !!draft }];
+  const may = environmentRights(env, user);
+  const switchAction: MenuAction[] = [
+    ...(may.share ? [{ label: 'Share with everyone', hint: "Runs from a file on its repository's default branch", onSelect: () => { void switchTo('shared'); }, disabled: busy || !!draft }] : []),
+    ...(may.unshare ? [{ label: 'Make personal', hint: isOwner ? 'Only you see it and use it' : `Only ${personLabel(env.owner)} sees it and uses it`, onSelect: () => { void switchTo('personal'); }, disabled: busy || !!draft }] : []),
+  ];
 
   const menu: MenuAction[] = [
-    { label: 'Edit', onSelect: () => { setDraft(draftFromEnvironment(env)); setError(null); }, disabled: busy || !!draft },
+    { label: 'Edit', ...(may.reason ? { hint: may.reason } : {}), onSelect: () => { setDraft(draftFromEnvironment(env)); setError(null); }, disabled: busy || !!draft || !may.edit },
     ...switchAction,
     { label: 'History', hint: 'Every change, who made it and when', onSelect: () => navigate(`/chat/environments/${encodeURIComponent(env.id)}/history`) },
     ...(ENVIRONMENTS_DOCS_URL ? [{ label: 'About environments', onSelect: openDocs }] : []),
-    { label: 'Delete…', onSelect: () => setConfirmDelete(true), disabled: busy },
+    { label: 'Delete…', ...(may.reason ? { hint: may.reason } : {}), onSelect: () => setConfirmDelete(true), disabled: busy || !may.remove },
   ];
 
   return (
@@ -271,6 +280,7 @@ function EnvironmentDetail({ id }: { id: string }) {
             <p className="chat-auto-dim">
               {VISIBILITY_LABEL[env.visibility]}, {isOwner ? 'yours' : `${personLabel(env.owner)}'s`}. {env.visibility === 'shared' ? VISIBILITY_HINT.shared : 'Only its owner sees it and uses it'}.
             </p>
+            {may.reason && <p className="chat-auto-dim">{may.reason}.</p>}
           </div>
           <EnvironmentPoolCard id={env.id} />
           {resolved && (
@@ -309,6 +319,7 @@ export function EnvironmentPoolCard({ id }: { id: string }) {
   const pool = useEnvironmentPool(id);
   if (!pool) return null;
   const line = poolLine(pool);
+  const warm = onWarmLine(pool);
   const refresh = refreshLine(pool);
   return (
     <div className="chat-auto-card chat-env-pool">
@@ -316,6 +327,13 @@ export function EnvironmentPoolCard({ id }: { id: string }) {
       <p>{line.text}{line.commit && <> <code>{line.commit}</code></>}</p>
       {refresh && <p className="chat-auto-dim chat-env-pool-refresh" title="Boxes whose default branches moved are started, pulled, set up again and stopped; the rest are left as they are">{refresh}</p>}
       <p className="chat-auto-dim">Stopped boxes with its setup already run: a new session starts one ({POOL_READY_HINT}), then pulls and runs it as you.</p>
+      {warm && !warm.failed && <p className="chat-auto-dim">{warm.text}</p>}
+      {warm?.failed && (
+        <>
+          <ChatError text={warm.text} />
+          {pool.onWarm?.log && <pre className="chat-auto-prompt chat-env-pool-log">{pool.onWarm.log}</pre>}
+        </>
+      )}
       {pool.lastFailure && (
         <>
           <ChatError text={poolFailureLine(pool.lastFailure.at)} />

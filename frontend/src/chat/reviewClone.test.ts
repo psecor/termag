@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Instance, Project } from '../types';
 import {
-  cloneFor, cloneForReview, cloneProgressText, isCheckoutNotLanded, reviewCloneBox, reviewProjectName, unreadyCloneOf, untilCheckedOut, type CloneDeps,
+  cloneFor, cloneForReview, cloneProgressText, isCheckoutNotLanded, reviewCloneBox, reviewProjectName, unreadyCloneOf, untilCheckedOut, wakeProjectBox, type CloneDeps,
 } from './reviewClone';
 
 type Box = Pick<Instance, 'id' | 'name' | 'status' | 'kind' | 'ec2InstanceId'>;
@@ -192,5 +192,52 @@ describe('cloneProgressText', () => {
     expect(cloneProgressText({ repo: 'acme/web', box: 'box-1', phase: 'waking' })).toBe('Waking box-1 to clone acme/web…');
     expect(cloneProgressText({ repo: 'acme/web', box: 'box-1', phase: 'cloning', projectName: 'web' })).toBe('Cloning acme/web into web on box-1…');
     expect(cloneProgressText({ repo: 'acme/web', box: '', phase: 'checkout', projectName: 'web' })).toBe('Waiting for web\'s checkout to land…');
+  });
+  it('says a review chat\'s steps: its box waking, then the PR checked out in its project', () => {
+    expect(cloneProgressText({ repo: 'acme/web', box: 'box-1', phase: 'box', number: 12 })).toBe('Waking box-1…');
+    expect(cloneProgressText({ repo: 'acme/web', box: '', phase: 'session', number: 12, projectName: 'web' })).toBe('Checking out web#12 in web…');
+    expect(cloneProgressText({ repo: 'acme/web', box: '', phase: 'session' })).toBe('Checking out acme/web in its project…');
+  });
+});
+
+describe('wakeProjectBox (a review chat in a project that is there)', () => {
+  it('goes on at once for a box that is up, one not listed, or no box', async () => {
+    const startBox = vi.fn(async () => ({}));
+    const onWake = vi.fn();
+    await wakeProjectBox('b1', deps({ startBox, listBoxes: async () => [{ id: 'b1', name: 'box-1', status: 'ready' }] }), onWake);
+    await wakeProjectBox('gone', deps({ startBox, listBoxes: async () => [] }), onWake);
+    await wakeProjectBox(null, deps({ startBox }), onWake);
+    expect(startBox).not.toHaveBeenCalled();
+    expect(onWake).not.toHaveBeenCalled();
+  });
+  it('wakes an asleep box, says so first, and waits until it takes projects', async () => {
+    const startBox = vi.fn(async () => ({}));
+    const states: Instance['status'][] = ['stopped', 'starting', 'ready'];
+    const onWake = vi.fn();
+    await wakeProjectBox('b1', deps({ startBox, listBoxes: async () => [{ id: 'b1', name: 'box-1', status: states.shift() ?? 'ready' }] }), onWake);
+    expect(onWake).toHaveBeenCalledWith('box-1');
+    expect(startBox).toHaveBeenCalledWith('b1');
+  });
+  it('wakes a box still on its way down once it is down, rather than waiting for it forever', async () => {
+    const startBox = vi.fn(async () => ({}));
+    const states: Instance['status'][] = ['stopping', 'stopped', 'starting', 'ready'];
+    const onWake = vi.fn();
+    await wakeProjectBox('b1', deps({ startBox, listBoxes: async () => [{ id: 'b1', name: 'box-1', status: states.shift() ?? 'ready' }] }), onWake);
+    expect(onWake).toHaveBeenCalledWith('box-1');
+    expect(startBox).toHaveBeenCalledTimes(1);
+    expect(startBox).toHaveBeenCalledWith('b1');
+  });
+  it("waits for a box's agent to be in (ready), not just for the box to boot, since the checkout needs it", async () => {
+    const states: Instance['status'][] = ['awaiting-agent', 'awaiting-agent', 'ready'];
+    const listBoxes = vi.fn(async () => [{ id: 'b1', name: 'box-1', status: states.shift() ?? 'ready' }]);
+    const onWake = vi.fn();
+    await wakeProjectBox('b1', deps({ listBoxes }), onWake);
+    expect(onWake).toHaveBeenCalledWith('box-1');
+    expect(listBoxes).toHaveBeenCalledTimes(3);
+  });
+  it('says why when the box fails to come up', async () => {
+    const states: Instance['status'][] = ['hibernated', 'failed'];
+    await expect(wakeProjectBox('b1', deps({ listBoxes: async () => [{ id: 'b1', name: 'box-1', status: states.shift() ?? 'failed' }] }), () => {}))
+      .rejects.toThrow('box-1 failed to start');
   });
 });

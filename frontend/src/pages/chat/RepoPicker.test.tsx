@@ -190,9 +190,19 @@ describe('RepoPicker', () => {
       expect(trigger().textContent).toBe('acme/web');
       await toggle('acme/api');
       expect(listbox()).not.toBeNull();
-      expect(trigger().textContent).toBe('acme/web + api');
+      expect(trigger().textContent).toBe('web + api');
       await toggle('acme/web');
       expect(trigger().textContent).toBe('acme/api');
+    });
+
+    it('names several repositories in full in the pill\'s tooltip once the menu is closed', async () => {
+      await renderMulti();
+      await toggle('acme/web');
+      await toggle('acme/api');
+      await act(async () => { trigger().click(); });
+      expect(listbox()).toBeNull();
+      await act(async () => { trigger().focus(); });
+      await vi.waitFor(() => expect(document.querySelector('.chat-repo-tip')?.textContent).toBe('acme/webacme/api'));
     });
 
     it('pins chosen repositories in a Selected section at the top in the order chosen, and returns an unchosen one to its owner', async () => {
@@ -258,7 +268,7 @@ describe('RepoPicker', () => {
       await toggle('acme/api');
       key(search(), 'Enter');
       expect(listbox()).toBeNull();
-      expect(trigger().textContent).toBe('acme/web + api');
+      expect(trigger().textContent).toBe('web + api');
       expect(document.activeElement).toBe(trigger());
     });
 

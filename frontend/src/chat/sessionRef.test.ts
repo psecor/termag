@@ -9,7 +9,7 @@ const row = (over: Partial<RefRow> = {}): RefRow => ({
 describe('sessionRef', () => {
   it('names the session as the sidebar does, with the termag ask that messages it', () => {
     expect(sessionRef(row(), 'devbox')).toEqual({ text: '@"api" (termag ask devbox/api)' });
-    expect(sessionRef(row({ workstream: 'fix' }), 'devbox')).toEqual({ text: '@"api · fix" (termag ask devbox/api@fix)' });
+    expect(sessionRef(row({ workstream: 'fix' }), 'devbox')).toEqual({ text: '@"fix" (termag ask devbox/api@fix)' });
     // Claude's title leads, as in the sidebar.
     const titled = row({ workstream: 'fix', sessionTitle: 'Fix the "login" redirect' });
     expect(sessionRef(titled, 'devbox')).toEqual({ text: `@"Fix the 'login' redirect" (termag ask devbox/api@fix)` });
@@ -23,7 +23,7 @@ describe('sessionRef', () => {
   });
 
   it('refuses a session whose address a reference would carry characters of a shell', () => {
-    expect(sessionRef(row({ workstream: 'fix$(id)' }), 'devbox')).toEqual({ refusal: "api · fix$(id) has a name a reference can't carry, so it can't be messaged from here." });
+    expect(sessionRef(row({ workstream: 'fix$(id)' }), 'devbox')).toEqual({ refusal: "fix$(id) has a name a reference can't carry, so it can't be messaged from here." });
     expect(sessionRef(row({ projectName: 'a`b`' }), 'devbox')).toMatchObject({ refusal: expect.any(String) });
     // The name is only a label: anything but a `"` is fine there.
     expect(sessionRef(row({ sessionTitle: 'Use $HOME and `ls`', workstream: 'fix' }), 'devbox')).toEqual({ text: '@"Use $HOME and `ls`" (termag ask devbox/api@fix)' });

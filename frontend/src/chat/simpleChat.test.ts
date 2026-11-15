@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { InboxRow } from '../mobile/inbox';
 import type { Project } from '../types';
 import type { Block } from './paneChat';
-import { askPlaceholderProjects, boxLabel, chatHref, chatRowName, chatRows, isAskChatWorkstream, withoutAskPlaceholders, conversationBlocks, fullUiHref, isSdkChat, repoNeedsTrust, repoSlug, repoStartsTrusted, runConversationHref, showAnswerKeys, sidebarLine, statusLine } from './simpleChat';
+import { askPlaceholderProjects, boxLabel, chatHref, chatRowName, chatRows, isAskChatWorkstream, withoutAskPlaceholders, conversationBlocks, fullUiHref, isSdkChat, repoNeedsTrust, repoSlug, repoStartsTrusted, runConversationHref, sessionHasChat, showAnswerKeys, sidebarLine, statusLine, chatAgentOf } from './simpleChat';
 
 function row(over: Partial<InboxRow>): InboxRow {
   return {
@@ -36,7 +36,7 @@ describe('chatRows', () => {
 
 describe('statusLine', () => {
   it('shows setup before anything the agent says', () => {
-    expect(statusLine({ status: 'working', setupLabel: 'cloning' })).toEqual({ tone: 'setup', text: 'Setting up · cloning' });
+    expect(statusLine({ status: 'working', setupLabel: 'cloning' })).toEqual({ tone: 'setup', text: 'Working · setting up · cloning' });
   });
 
   it('says when the box agent is offline', () => {
@@ -45,18 +45,18 @@ describe('statusLine', () => {
 
   it('names the running tool, else the spinner, else just working', () => {
     expect(statusLine({ status: 'working', message: 'Bash(npm test)' }).text).toBe('Working · Bash(npm test)');
-    expect(statusLine({ status: 'working', spinner: '✻ Channeling… (12s)' }).text).toBe('Channeling… (12s)');
+    expect(statusLine({ status: 'working', spinner: '✻ Channeling… (12s)' }).text).toBe('Working · channeling… (12s)');
     expect(statusLine({ status: 'working' }).text).toBe('Working');
   });
 
   it('says what a waiting agent wants', () => {
-    expect(statusLine({ status: 'waiting', waitingReason: 'user_input' }).text).toBe('Asked you a question');
+    expect(statusLine({ status: 'waiting', waitingReason: 'user_input' }).text).toBe('Needs you · a question');
     expect(statusLine({ status: 'waiting', waitingReason: 'approval', message: 'Claude needs your permission to use Bash' }).text)
-      .toBe('Needs approval · Claude needs your permission to use Bash');
+      .toBe('Needs you · approval · Claude needs your permission to use Bash');
   });
 
   it('reads idle as the user’s turn and anything else as not running', () => {
-    expect(statusLine({ status: 'idle' })).toEqual({ tone: 'idle', text: 'Done · your turn' });
+    expect(statusLine({ status: 'idle' })).toEqual({ tone: 'idle', text: 'Idle · your turn' });
     expect(statusLine({ status: 'not_running' }).tone).toBe('off');
     expect(statusLine({ status: undefined }).tone).toBe('off');
   });
@@ -81,9 +81,28 @@ describe('links', () => {
     expect(runConversationHref('p1', 'run-20261020-0900')).toBe('/chat/p/p1?ws=run-20261020-0900');
   });
 
+  it('says which Lab links have a conversation in the chat', () => {
+    const ws = (name: string, archived = false) => ({ id: name, name, archived });
+    const projects = [
+      { id: 'p1', workstreams: [ws('main'), ws('feat'), ws('old', true)] },
+      { id: 'auto', kind: 'automation' as const, workstreams: [ws('main'), ws('run-20261109-0900')] },
+      { id: 'tower', kind: 'metaterm' as const, workstreams: [ws('main')] },
+    ] as unknown as Parameters<typeof sessionHasChat>[0];
+    expect(sessionHasChat(projects, 'p1', 'main')).toBe(true);
+    expect(sessionHasChat(projects, 'p1', 'feat')).toBe(true);
+    expect(sessionHasChat(projects, 'auto', 'run-20261109-0900')).toBe(true);
+    // An automation's main has no agent; MetaTerm isn't a chat.
+    expect(sessionHasChat(projects, 'auto', 'main')).toBe(false);
+    expect(sessionHasChat(projects, 'tower', 'main')).toBe(false);
+    // Not in the list (archived, someone else's, gone), or no such live session.
+    expect(sessionHasChat(projects, 'gone', 'main')).toBe(false);
+    expect(sessionHasChat(projects, 'p1', 'nope')).toBe(false);
+    expect(sessionHasChat(projects, 'p1', 'old')).toBe(false);
+  });
+
   it('builds the full-UI deep link', () => {
-    expect(fullUiHref('p1')).toBe('/?project=p1');
-    expect(fullUiHref('p1', 'tui')).toBe('/?project=p1&ws=tui');
+    expect(fullUiHref('p1')).toBe('/?project=p1&lab=1');
+    expect(fullUiHref('p1', 'tui')).toBe('/?project=p1&ws=tui&lab=1');
     expect(fullUiHref(null)).toBe('/');
   });
 });
@@ -182,15 +201,15 @@ describe('repoStartsTrusted', () => {
 describe('chatRowName', () => {
   const row = { projectName: 'termag', workstream: 'fix-auth', sessionTitle: 'Login rate limiting' };
 
-  it('leads with the title, the project and workstream secondary', () => {
-    expect(chatRowName(row)).toEqual({ title: 'Login rate limiting', where: 'termag · fix-auth', ask: false });
+  it('leads with the title, the project secondary, and never the workstream', () => {
+    expect(chatRowName(row)).toEqual({ title: 'Login rate limiting', where: 'termag', ask: false });
     expect(chatRowName({ ...row, workstream: 'main' })).toEqual({ title: 'Login rate limiting', where: 'termag', ask: false });
   });
 
-  it('names the row after the project before Claude has titled the session', () => {
-    expect(chatRowName({ ...row, sessionTitle: null })).toEqual({ title: null, where: 'termag · fix-auth', ask: false });
-    expect(chatRowName({ ...row, sessionTitle: '   ' }).title).toBeNull();
-    expect(chatRowName({ projectName: 'termag', workstream: 'main' }).title).toBeNull();
+  it('names the row by the fallback before Claude has titled the session: the project for main, else the workstream', () => {
+    expect(chatRowName({ ...row, sessionTitle: null })).toEqual({ title: 'fix-auth', where: 'termag', ask: false });
+    expect(chatRowName({ ...row, sessionTitle: '   ' }).title).toBe('fix-auth');
+    expect(chatRowName({ projectName: 'termag', workstream: 'main' })).toEqual({ title: 'termag', where: null, ask: false });
   });
 
   it("leads an ask with its title, flag or not, and puts Claude's session title second", () => {
@@ -205,15 +224,15 @@ describe('chatRowName', () => {
 describe('sidebarLine', () => {
   it('says what the open chat\'s header says, with Claude\'s last words', () => {
     const r = row({ status: 'working', message: 'Bash(ls -la)' });
-    expect(sidebarLine(r, { tone: 'working', text: 'Running Bash · ls -la', preview: 'Let me look.' }, 'done'))
-      .toEqual({ state: 'Running Bash · ls -la', message: 'Let me look.', glyph: 'working' });
-    expect(sidebarLine(r, { tone: 'setup', text: 'Setting up…', preview: null }, 'done').glyph).toBe('working');
-    expect(sidebarLine(r, { tone: 'error', text: 'Stopped · your turn', preview: null }, 'done').glyph).toBe('idle');
+    expect(sidebarLine(r, { tone: 'working', text: 'Working · Bash · ls -la', preview: 'Let me look.' }, 'done'))
+      .toEqual({ state: 'Working · Bash · ls -la', message: 'Let me look.', glyph: 'working' });
+    expect(sidebarLine(r, { tone: 'setup', text: 'Working · setting up', preview: null }, 'done').glyph).toBe('working');
+    expect(sidebarLine(r, { tone: 'error', text: 'Idle · stopped', preview: null }, 'done').glyph).toBe('idle');
   });
 
   it('says a chat still coming up is setting up, not "Not running"', () => {
-    expect(sidebarLine(row({ status: 'not_running' }), undefined, 'cloning')).toEqual({ state: 'Setting up…', message: null, glyph: 'working' });
-    expect(sidebarLine(row({ status: 'not_running' }), undefined, 'done').state).not.toBe('Setting up…');
+    expect(sidebarLine(row({ status: 'not_running' }), undefined, 'cloning')).toEqual({ state: 'Working · setting up', message: null, glyph: 'working' });
+    expect(sidebarLine(row({ status: 'not_running' }), undefined, 'done').state).not.toBe('Working · setting up');
   });
 
   it('otherwise reads the status pipeline', () => {
@@ -308,5 +327,19 @@ describe('ask placeholders', () => {
     expect(withoutAskPlaceholders([row({ status: 'waiting' })], hosts, new Set())).toHaveLength(1);
     expect(withoutAskPlaceholders([row({ status: 'not_running', sessionTitle: 'Look at logs' })], hosts, new Set())).toHaveLength(1);
     expect(withoutAskPlaceholders([row({ status: 'not_running' })], hosts, new Set(['p|main']))).toHaveLength(1);
+  });
+});
+
+describe('chatAgentOf', () => {
+  const projectOn = (provider: string) => ({
+    workstreams: [{ id: 'w1', name: 'main' }, { id: 'w2', name: 'review' }],
+    workflows: [{ type: 'agent', provider: 'claude', workstreamId: 'w1' }, { type: 'agent', provider, workstreamId: 'w2' }],
+  } as unknown as Parameters<typeof chatAgentOf>[0]);
+  it("is Claude Code for Claude's chat, and the engine's own agent, without Claude's picker, for a Cursor review chat", () => {
+    expect(chatAgentOf(projectOn('claude-chat'), 'review')).toMatchObject({ name: 'Claude', claudeCode: true, readTier: expect.stringContaining('Read, Grep and Glob') });
+    expect(chatAgentOf(projectOn('cursor-chat'), 'review')).toMatchObject({ name: 'Cursor', claudeCode: false, readTier: expect.stringContaining('plan mode') });
+    expect(chatAgentOf(projectOn('cursor-chat'), 'main')).toMatchObject({ name: 'Claude', claudeCode: true });
+    // Devin's review chat names Devin, has no Claude model picker, and its read tier is its ask mode.
+    expect(chatAgentOf(projectOn('devin-chat'), 'review')).toMatchObject({ name: 'Devin', claudeCode: false, readTier: expect.stringContaining('ask mode') });
   });
 });

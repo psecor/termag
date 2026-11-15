@@ -2,7 +2,7 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SoftwareHost, SoftwareMatrix, SoftwareState, SoftwareUpdateRun, ToolUpdatePreview, UpdatableTool } from '../../services/adminApi';
+import type { SoftwareCellPolicy, SoftwareHost, SoftwareMatrix, SoftwareState, SoftwareUpdateRun, ToolUpdatePreview, UpdatableTool } from '../../services/adminApi';
 
 const mocks = vi.hoisted(() => ({
   software: vi.fn(), clientVersions: vi.fn(), softwareHost: vi.fn(), refreshSoftware: vi.fn(),
@@ -13,12 +13,16 @@ vi.mock('../../services/adminApi', () => ({ adminApi: mocks }));
 
 const { AdminSoftware } = await import('./AdminSoftware');
 
-const counts = (over: Partial<Record<SoftwareState, number>>): Record<SoftwareState, number> => ({ current: 0, behind: 0, outdated: 0, ahead: 0, pending: 0, missing: 0, unknown: 0, ...over });
+const counts = (over: Partial<Record<SoftwareState, number>>): Record<SoftwareState, number> => ({ current: 0, 'below-floor': 0, held: 0, behind: 0, outdated: 0, ahead: 0, pending: 0, missing: 0, unknown: 0, ...over });
 const cell = (version: string, state: SoftwareState) => ({ version, raw: version, path: null, state, observedAt: '2026-10-30T10:00:00Z' });
 // Made-up hosts and owners.
 const box = (hostKey: string, name: string, owner: string, claude: string, codex: string): SoftwareHost => ({
   hostKey, kind: 'box', name, owner, boxKind: 'ec2', status: 'ready', connected: true, lastInventoryAt: '2026-10-30T10:00:00Z',
-  cells: { claude: cell(claude, claude === '2.1.314' ? 'current' : 'behind'), codex: cell(codex, codex === '0.165.0' ? 'current' : 'outdated') },
+  // `fleet`: what the backend's selectFleet takes per scope, here every box not on the newest version.
+  cells: {
+    claude: { ...cell(claude, claude === '2.1.314' ? 'current' : 'behind'), fleet: { 'below-floor': false, behind: claude !== '2.1.314' } },
+    codex: { ...cell(codex, codex === '0.165.0' ? 'current' : 'outdated'), fleet: { 'below-floor': false, behind: codex !== '0.165.0' } },
+  },
 });
 const matrix: SoftwareMatrix = {
   components: ['claude', 'codex'],
@@ -100,7 +104,7 @@ describe('the Software tab, per tool', () => {
     await flush();
     const before = buttons(/^Update behind \(/)[0].textContent;
     await openHost('orchestrator');
-    // The pin 2.1.320 would count both boxes as behind; the boxes' latest leaves the matrix's own count.
+    // The pin 2.1.320 would count both boxes as behind; the count is the backend's selection, which the orchestrator's preview doesn't move.
     expect(buttons(/^Update behind \(/)[0].textContent).toBe(before);
     expect(before).toBe('Update behind (1)');
   });
@@ -110,9 +114,9 @@ describe('the Software tab, per tool', () => {
     serve(true);
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-30T11:00:00Z')} />));
     await flush();
-    // One fleet button on each tool's summary row, and a last-update column each.
+    // One fleet button on each tool's summary row; no last-update columns (a cell's badges and hover have the run).
     expect(buttons(/^Update behind \(/)).toHaveLength(2);
-    expect(headers()).toEqual(expect.arrayContaining(['last update', 'last codex update']));
+    expect(headers().some(h => /^last .*update$/.test(h ?? ''))).toBe(false);
     expect(el.textContent).toContain('Recent Claude Code updates');
     expect(el.textContent).toContain('Recent Codex updates');
     expect([...new Set(mocks.softwareUpdates.mock.calls.map(c => c[0]))].sort()).toEqual(['aws', 'claude', 'codex', 'cursor', 'devin', 'docker', 'gh', 'node', 'pi', 'python']);
@@ -147,8 +151,7 @@ describe('the Software tab, per tool', () => {
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-30T11:00:00Z')} />));
     await flush();
     expect(buttons(/^Update behind \(/)).toHaveLength(1);
-    expect(headers()).toContain('last update');
-    expect(headers()).not.toContain('last codex update');
+    expect(headers().some(h => /^last .*update$/.test(h ?? ''))).toBe(false);
     expect(el.textContent).toContain('Recent Claude Code updates');
     expect(el.textContent).not.toContain('Recent Codex updates');
     await openHost('otter-box');
@@ -183,8 +186,6 @@ describe('the Software tab, per tool', () => {
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-30T11:00:00Z')} />));
     await flush();
     expect(buttons(/^Update behind \(/)).toHaveLength(2);
-    expect(headers()).toEqual(expect.arrayContaining(['last update', 'last cursor update']));
-    expect(headers()).not.toContain('last codex update');
     expect(el.textContent).toContain('Recent Cursor agent updates');
     await openHost('otter-box');
     await act(async () => { buttons('Update Cursor agent')[0].click(); });
@@ -204,8 +205,6 @@ describe('the Software tab, per tool', () => {
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-30T11:00:00Z')} />));
     await flush();
     expect(buttons(/^Update behind \(/)).toHaveLength(2);
-    expect(headers()).toEqual(expect.arrayContaining(['last update', 'last devin update']));
-    expect(headers()).not.toContain('last codex update');
     expect(el.textContent).toContain('Recent Devin CLI updates');
     await openHost('otter-box');
     await act(async () => { buttons('Update Devin CLI')[0].click(); });
@@ -225,8 +224,6 @@ describe('the Software tab, per tool', () => {
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-30T11:00:00Z')} />));
     await flush();
     expect(buttons(/^Update behind \(/)).toHaveLength(2);
-    expect(headers()).toEqual(expect.arrayContaining(['last update', 'last pi update']));
-    expect(headers()).not.toContain('last codex update');
     expect(el.textContent).toContain('Recent pi updates');
     await openHost('otter-box');
     await act(async () => { buttons('Update pi')[0].click(); });
@@ -246,7 +243,6 @@ describe('the Software tab, per tool', () => {
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-30T11:00:00Z')} />));
     await flush();
     expect(buttons(/^Update behind \(/)).toHaveLength(2);
-    expect(headers()).toEqual(expect.arrayContaining(['last update', 'last gh update']));
     expect(el.textContent).toContain('Recent GitHub CLI updates');
     await openHost('otter-box');
     const selects = [...el.querySelectorAll('select[aria-label="restart sessions"]')] as HTMLSelectElement[];
@@ -269,7 +265,6 @@ describe('the Software tab, per tool', () => {
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-31T11:00:00Z')} />));
     await flush();
     expect(buttons(/^Update behind \(/)).toHaveLength(2);
-    expect(headers()).toEqual(expect.arrayContaining(['last update', 'last aws update']));
     expect(el.textContent).toContain('Recent AWS CLI updates');
     await openHost('otter-box');
     await act(async () => { buttons('Update AWS CLI')[0].click(); });
@@ -288,7 +283,6 @@ describe('the Software tab, per tool', () => {
     mocks.software.mockResolvedValue(withNode);
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-31T11:00:00Z')} />));
     await flush();
-    expect(headers()).toEqual(expect.arrayContaining(['last update', 'last node update']));
     expect(el.textContent).toContain('Recent Node updates');
     await openHost('otter-box');
     await act(async () => { buttons('Update Node')[0].click(); });
@@ -307,7 +301,6 @@ describe('the Software tab, per tool', () => {
     mocks.software.mockResolvedValue(withPython);
     await act(async () => root.render(<AdminSoftware now={Date.parse('2026-10-31T11:00:00Z')} />));
     await flush();
-    expect(headers()).toEqual(expect.arrayContaining(['last update', 'last python update']));
     expect(el.textContent).toContain('Recent Python updates');
     await openHost('otter-box');
     await act(async () => { buttons('Update Python')[0].click(); });
@@ -494,5 +487,141 @@ describe('the Software tab, its host table', () => {
     expect(hostNames()).toHaveLength(13);
     await type('offline');
     expect(hostNames()).toHaveLength(8);
+  });
+});
+
+describe('the Software tab, graded by policy', () => {
+  // Claude Code pinned to 2.1.314 with floor 2.1.308. kestrel-box is on 2.1.320 by hand: ahead, not the reference.
+  const policy: SoftwareCellPolicy = { mode: 'auto', floor: '2.1.308', target: '2.1.314', reference: '2.1.314' };
+  // What the backend's selectFleet takes per scope for these fixtures (a held box, mode off, neither).
+  const takes = (state: SoftwareState, p: SoftwareCellPolicy) => ({ 'below-floor': state === 'below-floor' && p.mode !== 'off', behind: (state === 'below-floor' || state === 'behind') && p.mode !== 'off' });
+  const graded = (version: string, state: SoftwareState, p: SoftwareCellPolicy = policy) => ({ ...cell(version, state), observedAt: '2026-11-10T10:00:00Z', policy: p, fleet: takes(state, p) });
+  const host = (hostKey: string, name: string, owner: string, c: ReturnType<typeof graded>): SoftwareHost => ({
+    hostKey, kind: 'box', name, owner, boxKind: 'ec2', status: 'ready', connected: true, lastInventoryAt: '2026-11-10T10:00:00Z', cells: { claude: c },
+  });
+  const byPolicy: SoftwareMatrix = {
+    ...matrix,
+    components: ['claude'],
+    summary: [{ component: 'claude', reference: '2.1.314', floor: '2.1.308', referenceNote: '', counts: counts({ current: 1, 'below-floor': 1, behind: 1, ahead: 1, held: 1 }), spread: [] }],
+    hosts: [
+      host('i-01', 'otter-box', 'river', graded('2.1.314', 'current')),
+      host('i-02', 'wren-box', 'moor', graded('2.1.240', 'below-floor')),
+      host('i-03', 'plover-box', 'delta', graded('2.1.310', 'behind')),
+      host('i-04', 'kestrel-box', 'fen', graded('2.1.320', 'ahead')),
+      host('i-05', 'heron-box', 'marsh', graded('2.1.310', 'held', { ...policy, mode: 'off' })),
+    ],
+  };
+  it('shows below floor, held and ahead, the floor, and what each cell was graded against', async () => {
+    serve(false);
+    mocks.software.mockResolvedValue(byPolicy);
+    await act(async () => root.render(<AdminSoftware now={Date.parse('2026-11-10T11:00:00Z')} />));
+    await flush();
+    expect(headers()).toEqual(expect.arrayContaining(['floor', 'below floor', 'held', 'ahead']));
+    const wren = el.querySelector('.admin-sw-matrix .admin-sw--below-floor')!;
+    expect(wren.textContent).toBe('2.1.240');
+    expect(wren.closest('[title]')!.getAttribute('title')).toContain('target 2.1.314 · floor 2.1.308 · mode auto');
+    expect(el.querySelector('.admin-sw-matrix .admin-sw--held')!.closest('[title]')!.getAttribute('title')).toContain('held: mode off, so neither this tab nor the sweep updates it');
+    // The button counts the cells' own states: below floor and behind, not held or ahead (and not the probe's target).
+    expect(buttons(/^Update behind \(/).map(b => b.textContent)).toEqual(['Update behind (2)']);
+  });
+
+  it('counts 0 and says why on the button when the matrix sends no fleet selection (Devin on #1607)', async () => {
+    serve(false);
+    const bare = { ...byPolicy, hosts: byPolicy.hosts.map(h => ({ ...h, cells: { claude: { ...h.cells.claude, fleet: undefined } } })) };
+    mocks.software.mockResolvedValue(bare);
+    await act(async () => root.render(<AdminSoftware now={Date.parse('2026-11-10T11:00:00Z')} />));
+    await flush();
+    const b = buttons(/^Update behind \(/)[0];
+    expect(b.textContent).toBe('Update behind (0)');
+    expect(b.getAttribute('title')).toMatch(/no fleet selection for Claude Code/);
+  });
+
+  it('puts each tool\'s newest run, the sweep\'s block and staleness in its cell, and dims a stale row', async () => {
+    serve(false);
+    const failed: SoftwareUpdateRun = {
+      id: 'r1', hostKey: 'i-02', instanceId: null, component: 'claude', trigger: 'floor', requestedById: null, restart: 'idle',
+      status: 'failed', outcome: 'failed', target: '2.1.314', fromVersion: '2.1.240', toVersion: null, detail: 'claude=2.1.240->FAILED:digest', sessions: null,
+      requestedAt: '2026-11-10T09:00:00Z', startedAt: '2026-11-10T09:00:05Z', finishedAt: '2026-11-10T09:02:00Z',
+    };
+    mocks.softwareUpdates.mockImplementation((c: UpdatableTool) => (c === 'claude' ? Promise.resolve({ runs: [failed] }) : off()));
+    const hosts = byPolicy.hosts.map(h => (h.hostKey === 'i-02' ? { ...h, cells: { claude: { ...h.cells.claude, sweep: { why: 'floor-failing', at: '2026-11-10T09:45:00Z' } } } }
+      : h.hostKey === 'i-03' ? { ...h, cells: { claude: { ...h.cells.claude, observedAt: '2026-11-08T10:00:00Z' } } } : h));
+    mocks.software.mockResolvedValue({ ...byPolicy, hosts });
+    await act(async () => root.render(<AdminSoftware now={Date.parse('2026-11-10T11:00:00Z')} />));
+    await flush();
+    const badges = [...el.querySelectorAll('.admin-sw-matrix .admin-sw-badge')].map(b => b.textContent);
+    expect(badges).toEqual(['failed: digest mismatch', 'floor runs failing', 'stale 2d 1h', 'held: mode off']);
+    const wren = el.querySelector('.admin-sw-matrix .admin-sw--below-floor')!.closest('[title]')!;
+    expect(wren.getAttribute('title')).toContain('last update: failed · 2.1.240');
+    expect(el.querySelectorAll('.admin-sw-matrix .admin-sw-stale')).toHaveLength(1);
+    // The header names what an admin can act on; plover-box's stale behind cell still counts, as it is behind.
+    expect(el.textContent).toContain('1 below floor · 1 behind target · 0 reboot pending · of 5 hosts');
+    // Below a floor, the table shows wren-box alone.
+    const show = el.querySelector('select[aria-label="show hosts"]') as HTMLSelectElement;
+    await act(async () => { show.value = 'below-floor'; show.dispatchEvent(new Event('change', { bubbles: true })); });
+    expect([...el.querySelectorAll('.admin-sw-matrix tbody .admin-link')].map(a => a.textContent)).toEqual(['wren-box']);
+  });
+
+  it('shows a host\'s run for a tool it has no inventory row for, as Recent updates does (Devin on #1608)', async () => {
+    serve(false);
+    const queued: SoftwareUpdateRun = {
+      id: 'r9', hostKey: 'i-01', instanceId: null, component: 'claude', trigger: 'manual', requestedById: null, restart: 'idle',
+      status: 'running', outcome: null, target: 'latest', fromVersion: null, toVersion: null, detail: null, sessions: null,
+      requestedAt: '2026-11-10T10:55:00Z', startedAt: '2026-11-10T10:55:05Z', finishedAt: null,
+    };
+    mocks.softwareUpdates.mockImplementation((c: UpdatableTool) => (c === 'claude' ? Promise.resolve({ runs: [queued] }) : off()));
+    // otter-box has no Claude Code row; heron-box's keeps the column.
+    const hosts = [{ ...byPolicy.hosts[0], cells: {} }, byPolicy.hosts[4]];
+    mocks.software.mockResolvedValue({ ...byPolicy, hosts });
+    await act(async () => root.render(<AdminSoftware now={Date.parse('2026-11-10T11:00:00Z')} />));
+    await flush();
+    // No matrix cell, so no inFlight to say it is on its way: the run's own state, as Recent updates lists it.
+    const badge = [...el.querySelectorAll('.admin-sw-matrix .admin-sw-badge')].find(b => b.textContent === 'last update: running')!;
+    expect(badge).toBeTruthy();
+    expect(badge.closest('[title]')!.getAttribute('title')).toContain('last update: running');
+  });
+
+  it('finds a host by its badges and run versions, and gives a tool with runs but no inventory anywhere its column (Bugbot and Devin on #1608)', async () => {
+    serve(false, true);
+    const failed: SoftwareUpdateRun = {
+      id: 'r1', hostKey: 'i-02', instanceId: null, component: 'claude', trigger: 'floor', requestedById: null, restart: 'idle',
+      status: 'failed', outcome: 'failed', target: 'latest', fromVersion: '2.1.240', toVersion: '2.1.241', detail: 'claude=2.1.240->FAILED:digest', sessions: null,
+      requestedAt: '2026-11-10T09:00:00Z', startedAt: '2026-11-10T09:00:05Z', finishedAt: '2026-11-10T09:02:00Z',
+    };
+    const cursorRun: SoftwareUpdateRun = { ...failed, id: 'r2', hostKey: 'i-03', component: 'cursor', status: 'running', outcome: null, fromVersion: null, toVersion: null, detail: null, finishedAt: null };
+    mocks.softwareUpdates.mockImplementation((c: UpdatableTool) => (c === 'claude' ? Promise.resolve({ runs: [failed] }) : c === 'cursor' ? Promise.resolve({ runs: [cursorRun] }) : off()));
+    // Enough hosts for the table's search field to show.
+    const filler = Array.from({ length: 25 }, (_, i) => host(`i-f${i}`, `filler-${i}`, 'pool', graded('2.1.314', 'current')));
+    mocks.software.mockResolvedValue({ ...byPolicy, hosts: [...byPolicy.hosts, ...filler] });
+    await act(async () => root.render(<AdminSoftware now={Date.parse('2026-11-10T11:00:00Z')} />));
+    await flush();
+    // No host has a cursor-agent row, but a run exists: the column is there, and plover-box's cell shows it.
+    expect(headers()).toContain('cursor');
+    expect([...el.querySelectorAll('.admin-sw-matrix .admin-sw-badge')].map(b => b.textContent)).toContain('last update: running');
+    const hostNames = () => [...el.querySelectorAll('.admin-sw-matrix tbody .admin-link')].map(a => a.textContent);
+    const search = el.querySelector('input[type="search"]') as HTMLInputElement;
+    const type = async (v: string) => {
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      await act(async () => { set.call(search, v); search.dispatchEvent(new Event('input', { bubbles: true })); });
+      await flush();
+    };
+    await type('digest mismatch');
+    expect(hostNames()).toEqual(['wren-box']);
+    await type('2.1.241');
+    expect(hostNames()).toEqual(['wren-box']);
+    await type('last update: running');
+    expect(hostNames()).toEqual(['plover-box']);
+  });
+
+  it('says updating from the matrix\'s inFlight, though the run is not among the runs the tab read (Bugbot on #1608)', async () => {
+    serve(false);
+    // A Docker-style run queued for days: no run in the runs list at all, but the backend's runActive keeps it.
+    const hosts = byPolicy.hosts.map(h => (h.hostKey === 'i-02' ? { ...h, cells: { claude: { ...h.cells.claude, inFlight: { id: 'r-old', status: 'running' as const, requestedAt: '2026-11-07T11:00:00Z' }, sweep: { why: 'floor-failing', at: '2026-11-10T10:45:00Z' } } } } : h));
+    mocks.software.mockResolvedValue({ ...byPolicy, hosts });
+    await act(async () => root.render(<AdminSoftware now={Date.parse('2026-11-10T11:00:00Z')} />));
+    await flush();
+    const badges = [...el.querySelectorAll('.admin-sw-matrix .admin-sw-badge')].map(b => b.textContent);
+    expect(badges).toContain('updating');
+    expect(badges).not.toContain('floor runs failing');
   });
 });

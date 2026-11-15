@@ -5,7 +5,7 @@ import { automationsApi, type AutomationRunView, type AutomationView } from '../
 import { AutomationFields } from '../components/AutomationFields';
 import { draftBody, draftCron, draftFrom, type AutomationDraft } from '../utils/automationDraft';
 import { runConversationHref } from '../chat/simpleChat';
-import { RUN_STATE_LABEL, agoLabel, automationSubtitle, boxStartFailuresLabel, describeSchedule, occurrenceShort, untilLabel } from '../utils/automationSchedule';
+import { RUN_STATE_LABEL, agoLabel, automationSubtitle, boxStartFailuresLabel, lastAlertErrorsLabel, describeSchedule, occurrenceShort, untilLabel } from '../utils/automationSchedule';
 import { runNowRefusal } from '../utils/automationRunNow';
 import { fmtDurationShort } from '../utils/format';
 import { automationModelBody, automationModelId, automationModelOptions } from '../utils/automationModel';
@@ -196,6 +196,7 @@ function AutomationDetail({ id }: { id: string }) {
         <dl className="auto-facts usage-dim">
           <div><dt>Schedule</dt><dd>{describeSchedule(view.schedule, view.timezone)}{view.next[0] && <> · next {occurrenceShort(view.next[0], view.timezone)} ({untilLabel(view.next[0])})</>}</dd></div>
           {boxStartFailuresLabel(view.boxStartFailures) && <div><dt>Box</dt><dd className="error-text">{boxStartFailuresLabel(view.boxStartFailures)}</dd></div>}
+          {lastAlertErrorsLabel(view.lastAlertErrors, view.lastAlertError) && <div><dt>Alerts</dt><dd className="error-text">{lastAlertErrorsLabel(view.lastAlertErrors, view.lastAlertError)}</dd></div>}
           <div><dt>Repository</dt><dd>{view.repoUrl ?? 'none'}{view.defaultBranch && <> · base {view.defaultBranch}</>}</dd></div>
           {view.spaceName && <div><dt>Notes</dt><dd>mirrored to space <code>{view.spaceName}</code> at <code>automations/{view.projectId}/memory/MEMORY.md</code></dd></div>}
           <div><dt>Permissions</dt><dd>{view.tier === 'read' ? 'read-only' : 'full, Claude in auto mode'}{view.prOnChange && view.tier !== 'read' && ' · opens a draft PR when a run committed'}</dd></div>
@@ -250,7 +251,7 @@ function AutomationDetail({ id }: { id: string }) {
       {owner && (
         <section className="dash-card auto-edit">
           <div className="dash-card-head"><span>Schedule and prompt</span></div>
-          <AutomationFields draft={draft} onChange={d => { setDraft(d); setDirty(true); }} showEnabled idPrefix={`auto-${view.id}`} onFullTierTick={view.tier !== 'full' ? setFullTierTicked : undefined} />
+          <AutomationFields draft={draft} onChange={d => { setDraft(d); setDirty(true); }} showEnabled idPrefix={`auto-${view.id}`} webhookHost={view.webhook?.host ?? null} onFullTierTick={view.tier !== 'full' ? setFullTierTicked : undefined} />
           <div className="auto-actions">
             <button type="button" className="btn-primary" disabled={!canSave} onClick={async () => {
               setSaving(true);

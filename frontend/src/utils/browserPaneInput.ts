@@ -144,7 +144,11 @@ export function shouldCaptureKey(e: KeyLike): boolean {
 export function browserPaneCloseMessage(code: number, reason: string): string {
   switch (code) {
     case BROWSER_PANE_CLOSE.DISABLED: return 'Reviewer browsers are switched off right now.';
-    case BROWSER_PANE_CLOSE.UNSUPPORTED: return "This box's agent needs an update before it can run a browser pane.";
+    // The backend's words (routes/browserWs.ts), which its exit frame carries
+    // ahead of the close; its test keeps these in step with them.
+    case BROWSER_PANE_CLOSE.UNSUPPORTED: return reason === 'no chromium'
+      ? "This box has no Chromium, so it can't run a browser pane. To add it, run sudo snap install chromium on the box, then restart its agent with systemctl --user restart termag-agent (a restart ends a chat turn that is still running)."
+      : "This box's agent needs an update before it can run a browser pane.";
     // The backend's own message (the `exit` frame ahead of the close) says
     // whose box it is; this fallback only names its state.
     case BROWSER_PANE_CLOSE.PARKED: return `The box is ${reason.replace(/^box /, '') || 'parked'}.`;

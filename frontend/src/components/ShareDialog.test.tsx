@@ -368,27 +368,59 @@ describe('the delivery choice (preview links)', () => {
     expect(el.querySelector('.share-delivery')).toBeNull();
     expect(el.querySelector('.preview-links')).toBeNull();
     expect(linksApi.list).not.toHaveBeenCalled();
+    // The preview share shows, as it did before the browser delivery was first.
+    expect(el.querySelector('.share-dialog-form')?.closest('[hidden]')).toBeNull();
+    expect(document.activeElement).toBe(el.querySelector('input[type=email]'));
   });
 
   const shown = (sel: string) => { const e = el.querySelector(sel); return !!e && !e.closest('[hidden]'); };
 
-  it('with the flag on, starts in termag and switches to "In your browser", the publish form for this workstream', async () => {
+  const order = () => [...el.querySelectorAll('.share-delivery input[type=radio]')].map(r => r.closest('label')?.textContent?.trim());
+
+  it('with the flag on, lists "In your browser" first and opens on it: the publish form for this workstream', async () => {
     flags.on = { 'preview-links-enabled': true };
     mount();
     await flush();
     expect(el.querySelector('.share-delivery')?.classList.contains('lp-theme')).toBe(true);
-    expect(choice('In termag').checked).toBe(true);
-    expect(shown('.share-dialog-form')).toBe(true);
-    expect(el.querySelector('.preview-links')).toBeNull();
-    act(() => { choice('In your browser').click(); });
-    await flush();
-    expect(shown('.share-dialog-form')).toBe(false);
+    expect(order()).toEqual(['In your browser', 'In termag']);
+    expect(choice('In your browser').checked).toBe(true);
+    expect(choice('In termag').checked).toBe(false);
     expect(shown('.preview-links-publish')).toBe(true);
+    expect(shown('.share-dialog-form')).toBe(false);
     expect(linksApi.list).toHaveBeenCalledWith('p1');
     expect(linksApi.listeners).toHaveBeenCalledWith('p1', 'feature-x');
+    // The hidden termag form doesn't take the focus from under the browser one.
+    expect(document.activeElement?.closest('.share-dialog-form')).toBeFalsy();
+  });
+
+  it('with the flag on, "In termag" picked second shows the preview share, which still shares, and switches back', async () => {
+    flags.on = { 'preview-links-enabled': true };
+    api.create.mockResolvedValue({ id: 's9', renewed: false });
+    mount();
+    await flush();
     act(() => { choice('In termag').click(); });
+    await flush();
+    expect(choice('In termag').checked).toBe(true);
     expect(shown('.share-dialog-form')).toBe(true);
     expect(shown('.preview-links-publish')).toBe(false);
+    type(el.querySelector('.share-dialog-form input') as HTMLInputElement, 'gus@x.test');
+    await act(async () => { button('Share and copy link').click(); });
+    expect(api.create).toHaveBeenCalledWith('p1', expect.objectContaining({ email: 'gus@x.test', workstream: 'feature-x', ttlHours: 24 }));
+    act(() => { choice('In your browser').click(); });
+    expect(shown('.share-dialog-form')).toBe(false);
+    expect(shown('.preview-links-publish')).toBe(true);
+  });
+
+  it('opens on "In your browser" again next time: the last choice is not remembered', async () => {
+    flags.on = { 'preview-links-enabled': true };
+    mount();
+    await flush();
+    act(() => { choice('In termag').click(); });
+    act(() => root.unmount());
+    el.remove();
+    mount();
+    await flush();
+    expect(choice('In your browser').checked).toBe(true);
   });
 
   it('keeps a published link\'s one-time URL across a switch away and back (Bugbot, #1485)', async () => {

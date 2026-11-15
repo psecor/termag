@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { notePageLocation, pageEntry, readUiMode, routerEntry, shouldOpenSimpleUi, simpleUiShareHandoff, UI_MODE_KEY, writeUiMode } from './uiMode';
+import { dropLoginParamsFromAddressBar, LAB_PARAM, notePageLocation, pageEntry, readUiMode, routerEntry, shouldOpenSimpleUi, simpleUiDeepLink, simpleUiShareHandoff, UI_MODE_KEY, withoutLoginParams, writeUiMode } from './uiMode';
 
 function memory(): Storage {
   const m = new Map<string, string>();
@@ -40,6 +40,54 @@ describe('routerEntry', () => {
     expect(routerEntry({ pathname: '/termag/chat', search: '' })).toBe('/chat');
     expect(routerEntry({ pathname: '/termagic/', search: '?' })).toBe('/termagic/');
   });
+
+  it('leaves out what an Okta app tile adds, so its landing is the bare workspace URL', () => {
+    const okta = '?iss=https%3A%2F%2Fexample.okta.com';
+    expect(routerEntry({ pathname: '/termag/', search: okta })).toBe('/');
+    expect(routerEntry({ pathname: '/termag', search: okta })).toBe('/');
+    expect(routerEntry({ pathname: '/termag/', search: `${okta}&project=p1` })).toBe('/?project=p1');
+  });
+});
+
+describe('withoutLoginParams', () => {
+  it('drops the third-party-initiated login parameters and keeps the rest', () => {
+    expect(withoutLoginParams('')).toBe('');
+    expect(withoutLoginParams('?')).toBe('');
+    expect(withoutLoginParams('?iss=https%3A%2F%2Fexample.okta.com')).toBe('');
+    expect(withoutLoginParams('?iss=x&login_hint=a%40b.c&target_link_uri=https%3A%2F%2Fh%2Ftermag%2F')).toBe('');
+    expect(withoutLoginParams('?iss=x&project=p1&ws=main')).toBe('?project=p1&ws=main');
+  });
+
+  it('returns a query with none of them unchanged, encoding and all', () => {
+    expect(withoutLoginParams('?project=p1')).toBe('?project=p1');
+    expect(withoutLoginParams('?browserAt=%2Fprojects%2Fx%3Fenv%3Dprod')).toBe('?browserAt=%2Fprojects%2Fx%3Fenv%3Dprod');
+  });
+});
+
+describe('dropLoginParamsFromAddressBar', () => {
+  function page(search: string, state: unknown = null) {
+    const calls: Array<[unknown, string]> = [];
+    const win = {
+      location: { pathname: '/termag/', search, hash: '' },
+      history: { state, replaceState: (s: unknown, _t: string, url: string) => { calls.push([s, url]); } },
+    } as unknown as Pick<Window, 'location' | 'history'>;
+    return { win, calls };
+  }
+
+  it('rewrites an Okta landing to the bare workspace URL, keeping the history state', () => {
+    const { win, calls } = page('?iss=https%3A%2F%2Fexample.okta.com');
+    dropLoginParamsFromAddressBar(win);
+    expect(calls).toEqual([[null, '/termag/']]);
+    const deep = page('?iss=x&project=p1', { key: 'default' });
+    dropLoginParamsFromAddressBar(deep.win);
+    expect(deep.calls).toEqual([[{ key: 'default' }, '/termag/?project=p1']]);
+  });
+
+  it('leaves every other URL alone', () => {
+    const { win, calls } = page('?project=p1');
+    dropLoginParamsFromAddressBar(win);
+    expect(calls).toEqual([]);
+  });
 });
 
 const base = { mode: 'simple' as const, entry: '/', here: '/', locationKey: 'default' };
@@ -52,6 +100,14 @@ describe('shouldOpenSimpleUi', () => {
 
   it('keeps the workspace when the full UI was last used or the flag is off', () => {
     expect(shouldOpenSimpleUi({ ...base, mode: 'full' })).toBe(false);
+  });
+
+  it('opens /chat for the Okta app tile\'s landing, /?iss=…', () => {
+    // The page entry already leaves the parameter out (routerEntry); the router
+    // location may still carry it if the address bar could not be rewritten.
+    expect(shouldOpenSimpleUi({ ...base, here: '/?iss=https%3A%2F%2Fexample.okta.com' })).toBe(true);
+    expect(shouldOpenSimpleUi({ ...base, mode: 'full', here: '/?iss=https%3A%2F%2Fexample.okta.com' })).toBe(false);
+    expect(shouldOpenSimpleUi({ ...base, entry: '/?project=p1', here: '/?iss=x&project=p1' })).toBe(false);
   });
 
   it('keeps deep links into the workspace', () => {
@@ -94,6 +150,46 @@ describe('simpleUiShareHandoff', () => {
     expect(simpleUiShareHandoff({ ...on, search: '' })).toBeNull();
     expect(simpleUiShareHandoff({ ...on, search: '?project=p1&ws=feature-x' })).toBeNull();
     expect(simpleUiShareHandoff({ ...on, search: '?browser=open&browserShare=cshare0000000001' })).toBeNull();
+  });
+});
+
+describe('simpleUiDeepLink', () => {
+  const loaded = (here: string) => ({ ...base, entry: here, here });
+
+  it('opens the chat of the session a Lab link names, for a page loaded there by a chat person', () => {
+    expect(simpleUiDeepLink(loaded('/?project=p1'))?.href).toBe('/chat/p/p1');
+    expect(simpleUiDeepLink(loaded('/?project=p1&ws=feat'))).toEqual({ projectId: 'p1', workstream: 'feat', href: '/chat/p/p1?ws=feat' });
+    expect(simpleUiDeepLink(loaded('/?project=p1&ws=main'))?.href).toBe('/chat/p/p1');
+    expect(simpleUiDeepLink(loaded('/?project=p1&ws=fix-the-flag'))?.href).toBe('/chat/p/p1?ws=fix-the-flag');
+    expect(simpleUiDeepLink(loaded('/?ws=a%20b&project=p%2F1'))?.href).toBe('/chat/p/p%2F1?ws=a%20b');
+  });
+
+  it('does so for an Okta tile\'s deep link too, the router location still carrying ?iss=', () => {
+    expect(simpleUiDeepLink({ ...base, entry: '/?project=p1', here: '/?iss=x&project=p1' })?.href).toBe('/chat/p/p1');
+  });
+
+  it('keeps Lab when Lab is the person\'s choice', () => {
+    expect(simpleUiDeepLink({ ...loaded('/?project=p1'), mode: 'full' })).toBeNull();
+  });
+
+  it('keeps Lab for a link with no chat equivalent', () => {
+    expect(simpleUiDeepLink(loaded('/'))).toBeNull();
+    expect(simpleUiDeepLink(loaded('/?ws=feat'))).toBeNull();
+    expect(simpleUiDeepLink(loaded('/?project='))).toBeNull();
+    expect(simpleUiDeepLink(loaded('/?project=p1&branchOff=1'))).toBeNull();
+    expect(simpleUiDeepLink(loaded('/settings?project=p1'))).toBeNull();
+    expect(simpleUiDeepLink(loaded('/automations/p1'))).toBeNull();
+  });
+
+  it('keeps Lab for a link that opens it on purpose (Open in Lab)', () => {
+    expect(simpleUiDeepLink(loaded(`/?project=p1&ws=feat&${LAB_PARAM}=1`))).toBeNull();
+  });
+
+  it('never redirects in-app navigation to a session in Lab', () => {
+    // The page was loaded at /chat, and the chat's Open in Lab navigated here.
+    expect(simpleUiDeepLink({ ...base, entry: '/chat', here: '/?project=p1' })).toBeNull();
+    expect(simpleUiDeepLink({ ...base, entry: null, here: '/?project=p1' })).toBeNull();
+    expect(simpleUiDeepLink({ ...loaded('/?project=p1'), locationKey: 'k3x9q2' })).toBeNull();
   });
 });
 

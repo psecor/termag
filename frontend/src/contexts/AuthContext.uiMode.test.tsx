@@ -67,3 +67,55 @@ describe('where termag opens, kept on the user', () => {
     expect(currentUiMode()).toBe('full');
   });
 });
+
+describe('preference saves, one at a time', () => {
+  // Each save answers once the test says so, with the server's whole user.
+  function server(initial: Record<string, unknown>) {
+    const db: Record<string, unknown> = { ...user, ...initial };
+    const waiting: Array<() => void> = [];
+    api.updatePreferences.mockImplementation((patch: Record<string, unknown>) => {
+      Object.assign(db, patch);
+      const answer = { ...db };
+      return new Promise(resolve => { waiting.push(() => resolve(answer)); });
+    });
+    return { answerNext: async () => { await act(async () => { waiting.shift()?.(); }); } };
+  }
+
+  it('sends the next save only once the last one has answered, so the last answer carries both', async () => {
+    api.me.mockResolvedValue({ ...user, uiMode: 'full', chatNudgeDismissed: false });
+    const s = server({ uiMode: 'full', chatNudgeDismissed: false });
+    await mount();
+    // Lab's toast: Switch to chat records the mode, and closing it answers the nudge.
+    await act(async () => { recordUiMode('simple'); void seen!.updatePreferences({ chatNudgeDismissed: true }); });
+    expect(api.updatePreferences).toHaveBeenCalledExactlyOnceWith({ uiMode: 'simple' });
+    await s.answerNext();
+    expect(api.updatePreferences).toHaveBeenLastCalledWith({ chatNudgeDismissed: true });
+    await s.answerNext();
+    expect(seen?.user).toMatchObject({ uiMode: 'simple', chatNudgeDismissed: true });
+  });
+
+  it('still saves a switch back while an earlier answer says the old choice', async () => {
+    api.me.mockResolvedValue({ ...user, uiMode: 'full', chatNudgeDismissed: false });
+    const s = server({ uiMode: 'full', chatNudgeDismissed: false });
+    await mount();
+    await act(async () => { void seen!.updatePreferences({ chatNudgeDismissed: true }); recordUiMode('simple'); });
+    // The answer was made before the switch, so it still says Lab.
+    await s.answerNext();
+    expect(seen?.user?.uiMode).toBe('full');
+    await act(async () => { recordUiMode('full'); });
+    await s.answerNext();
+    await s.answerNext();
+    expect(api.updatePreferences.mock.calls.map(c => c[0])).toEqual([{ chatNudgeDismissed: true }, { uiMode: 'simple' }, { uiMode: 'full' }]);
+    expect(seen?.user).toMatchObject({ uiMode: 'full', chatNudgeDismissed: true });
+  });
+
+  it('sends a choice again after its save failed', async () => {
+    api.me.mockResolvedValue({ ...user, uiMode: 'full' });
+    api.updatePreferences.mockRejectedValueOnce(new Error('offline')).mockResolvedValue({ ...user, uiMode: 'simple' });
+    await mount();
+    await act(async () => { recordUiMode('simple'); });
+    await act(async () => { recordUiMode('simple'); });
+    expect(api.updatePreferences).toHaveBeenCalledTimes(2);
+    expect(seen?.user?.uiMode).toBe('simple');
+  });
+});

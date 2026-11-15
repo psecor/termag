@@ -455,7 +455,7 @@ describe('wizard MCP servers step', () => {
     expect(document.querySelector('[role="status"]')?.textContent).toContain('acme is connected.');
     const yours = document.querySelector('[aria-label="Your servers"]');
     expect(yours?.textContent).toContain('acme');
-    expect(yours?.textContent).toContain('Re-link');
+    expect(yours?.textContent).toContain('Reconnect');
     expect(available()).toBeNull();
   });
 

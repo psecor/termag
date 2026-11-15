@@ -16,7 +16,7 @@ import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { Dialog } from '../../components/Dialog';
 import { announceChatsChanged, archiveBoxNotice, clearRunningBox, dismissRunningBoxNotice, dropLastActiveProject, parkedPowerError, runningBoxFromNotice, saveRunningBox, stillRunningWorkspaceHref } from '../../chat/archive';
 import { LAST_ACTIVE_PROJECT_KEY, useProjects } from '../../contexts/ProjectContext';
-import { chatsApi, heldImageUrl, instancesApi, visitsApi } from '../../services/api';
+import { chatsApi, heldImageUrl, instancesApi, projectsApi, visitsApi } from '../../services/api';
 import { boxFeed } from '../../services/boxFeed';
 import { REPLAY_BLOCK_CLASS } from '../../observability';
 import { Markdown } from '../../chat/Markdown';
@@ -31,9 +31,11 @@ import { SetupSteps } from '../../chat/SetupSteps';
 import { groupToolRuns } from '../../chat/toolRuns';
 import { SkillCard, ToolCard, ToolRun } from './ToolCards';
 import { ReplyMeta } from './ChatTimes';
-import { ChatError, UnsentMessages } from './TranscriptNotices';
-import { ReadOnlyTurnNotice } from './ReadOnlyTurnNotice';
-import { chatHref, chatProvider, fullUiHref, repoSlug } from '../../chat/simpleChat';
+import { ChatError, HotBoxNotice, UnsentMessages } from './TranscriptNotices';
+import { dismissHotBoxNotice, readHotBoxNotice } from '../../chat/hotBoxNotice';
+import { ReadOnlyTurnNoticeFor } from './ReadOnlyTurnNotice';
+import { chatAgentOf, chatHref, chatProvider, fullUiHref, repoSlug } from '../../chat/simpleChat';
+import { recordLabOpened, type LabOpenedFrom } from '../../chat/labOpened';
 import { desktopSessionHref, openDesktopLink } from '../../chat/desktopLinks';
 import { useCapture } from '../../chat/useCapture';
 import { useFollowBottom } from '../../chat/useFollowBottom';
@@ -44,7 +46,7 @@ import type { Project } from '../../types';
 import { FLAGS, useFlag } from '../../flags';
 import { ChatHistoryButton, ChatMoreButton, SidePanelButton, useChatChrome } from './chatChrome';
 import { useProvideScreenCommands } from '../../chat/screenCommands';
-import { SessionHeader } from './SessionHeader';
+import { ProjectCrumb, SessionHeader, useOwnProject } from './SessionHeader';
 import { BoxResizeLaunchPad } from './BoxResizeLaunchPad';
 import { currentSizeLabel, offersResize, resizeBadge } from '../../utils/boxResize';
 import { useResizeSizes } from '../../hooks/useBoxResize';
@@ -53,13 +55,15 @@ import { renderReviewFence, ReviewCardContext, type ReviewCardSession } from './
 import { PostControl } from './PostReviewDialog';
 import { FollowUpCard } from './FollowUpCard';
 import { FollowUpStrip } from './FollowUpStrip';
-import { REVIEW_FORMAT_MARK, TERMAG_NOTE } from '../../chat/reviewCard';
+import { REVIEW_DIFF_MARK, REVIEW_FORMAT_MARK, TERMAG_NOTE } from '../../chat/reviewCard';
 import { approvedSince, type PostedRound } from '../../chat/reviews';
 import type { CodeFence } from '../../chat/codeFence';
 import { SessionContextCard } from './SessionContextCard';
 import type { MenuAction } from './ContextMenu';
 import { AgentIcon } from './OpenItems';
-import { workstreamLabel, workstreamTip } from '../../chat/explorerAgents';
+import { workstreamTip } from '../../chat/explorerAgents';
+import { branchChip, workstreamTitle } from '../../chat/sessionTitle';
+import { useDocumentTitle } from '../../chat/useDocumentTitle';
 import { ChatSpaceChip } from './SpaceSwatch';
 import { ChatBoxTag } from './ChatBoxTag';
 import { SdkComposer } from './SdkComposer';
@@ -100,7 +104,9 @@ const NO_ASKS: ReadonlyMap<string, AskView> = new Map();
 /** The chip a review session's first message shows for the card format it asks for (the text after the mark). */
 function ReviewFormatChip({ text }: { text: string | null | undefined }) {
   if (!text?.includes(REVIEW_FORMAT_MARK)) return null;
-  return <div className="rv-format-chip" title={text.split(REVIEW_FORMAT_MARK)[1]}>and the findings as a review card</div>;
+  // The card's format is the chip's tooltip; a review chat's diff after it (reviewDiffBlock) is only named.
+  const [format, diff] = text.split(REVIEW_FORMAT_MARK)[1].split(REVIEW_DIFF_MARK);
+  return <div className="rv-format-chip" title={format}>and the findings as a review card{diff !== undefined ? ", with the PR's diff" : ''}</div>;
 }
 
 export function ItemView({ item, onRetry, onResume, projectId, workstream }: { item: ChatItem; onRetry?: () => void; onResume?: () => void; projectId: string; workstream: string }) {
@@ -141,7 +147,7 @@ export function ItemView({ item, onRetry, onResume, projectId, workstream }: { i
     case 'note':
       return <div className="sdk-note">{item.text}</div>;
     case 'readonly':
-      return <ReadOnlyTurnNotice reason={item.reason} fix={item.fix} />;
+      return <ReadOnlyTurnNoticeFor projectId={projectId} workstream={workstream} reason={item.reason} fix={item.fix} />;
     case 'command':
       return <div className="sdk-note" data-command={item.name}>{commandLine(item)}</div>;
     case 'divider': {
@@ -200,6 +206,11 @@ const TranscriptGroup = React.memo(function TranscriptGroup({ group: g, projectI
   );
 });
 
+/** A route's refusal as its own words, else the fallback. */
+function apiErrorText(err: unknown, fallback: string): string {
+  return (err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? fallback;
+}
+
 export function SdkChatView({ project, workstream }: { project: Project; workstream: string }) {
   // The chat's own space (chat/chatSpaces.ts chatHomeSpace) is the header chip's, and the server loads its memory.
   const wsRow = project.workstreams.find(w => w.name === workstream);
@@ -208,6 +219,12 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   const repo = repoSlug(project.repoUrl);
   const follow = useRef<() => void>(() => {});
   const s = useSdkChat(project, workstream, follow);
+  // Why Retry or Start on a new box didn't work, for a session whose box wouldn't wake.
+  const [wakeActionError, setWakeActionError] = useState('');
+  // Runs on: Auto's note for a session started on a hot box (chat/hotBoxNotice.ts), until it's dismissed.
+  const hotStore = typeof localStorage !== 'undefined' ? localStorage : null;
+  const [hotBox, setHotBox] = useState(() => readHotBoxNotice(hotStore, chatId));
+  useEffect(() => { setHotBox(readHotBoxNotice(hotStore, chatId)); }, [chatId]); // eslint-disable-line react-hooks/exhaustive-deps
   const {
     contextBusy,
     onResumeCleared,
@@ -233,6 +250,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
     showSteps,
     loading,
     steps,
+    wakeFailed,
     composer,
     setSendError,
     retrying,
@@ -266,6 +284,8 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   const generativeUiOn = generativeUi;
   // A review session: its PR is the one under review, in the panel.
   const review = useReviewOf(project.id, workstream);
+  // Claude, or another engine's agent (a Cursor review chat): what the chat calls it, and whether its composer offers Claude's model and effort.
+  const agent = chatAgentOf(project, workstream);
   const reviews = useReviewsData();
   // Its reviewer answers with a ```review fence, drawn as the review card.
   const drawFence = useMemo(() => {
@@ -441,9 +461,11 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   const archiveNotice = recovery
     ? { message: recovery.message, retry: recovery.retry }
     : null;
-  const leaveArchived = async (to: string) => {
+  // `leaving` runs once the reload is done, just before the navigation: a reload that fails leaves the chat where it is.
+  const leaveArchived = async (to: string, leaving?: () => void) => {
     setArchiveDialog(false);
     await reloadProjects();
+    leaving?.();
     navigate(to);
   };
   // The archived project is absent from the live list and session access
@@ -451,9 +473,9 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   // can stop the box. Forget this chat as last-active or that home restores
   // `/?project=` for it. The recovery stays, so opening the chat again still
   // offers Stop/Hibernate.
-  const openRunningBox = async () => {
+  const openRunningBox = async (from: LabOpenedFrom) => {
     dropLastActiveProject(project.id, typeof localStorage === 'undefined' ? null : localStorage, LAST_ACTIVE_PROJECT_KEY);
-    await leaveArchived(stillRunningWorkspaceHref());
+    await leaveArchived(stillRunningWorkspaceHref(), () => recordLabOpened(from));
   };
   const dismissArchiveDialog = () => {
     setArchiveDialog(false);
@@ -524,14 +546,20 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   // An ask thread's chat is called by the thread's title; its id stays in the tooltip.
   const askThread = project.workstreams?.find(w => w.name === workstream)?.askThread;
   const askNamed = { workstream, askTitle: askThread?.title, askThreadId: askThread?.id };
+  // The session's one title: the sidebar row's, the header's and the browser tab's (chat/sessionTitle.ts).
+  const title = workstreamTitle(project, workstream, wsRow);
+  const branch = branchChip(project, workstream);
+  // Under user-projects-enabled, the checkout's project leads the one-row header: project ▸ title (SessionHeader.tsx).
+  const ownProject = useOwnProject(project.id);
+  useDocumentTitle(title);
   const archiveLabel = archiving ? 'Archiving…' : archiveNotice ? 'Archived' : 'Archive';
   const desktopHref = desktopSessionHref({ projectId: project.id, workstream, shared: project.role === 'collaborator' });
   const phoneActions: MenuAction[] = [
     ...(total != null ? [{ label: `${formatCost(total)} so far`, disabled: true, onSelect: () => {} }] : []),
     ...(canArchive ? [{ label: archiveLabel, disabled: archiving || chat.running || archiveNotice != null, onSelect: () => setConfirmArchive(true) }] : []),
     archiveNotice
-      ? { label: 'Open in Lab', onSelect: () => { void openRunningBox(); } }
-      : { label: opening ? 'Opening…' : 'Open in Lab', disabled: opening, onSelect: () => { void openFull(); } },
+      ? { label: 'Open in Lab', onSelect: () => { void openRunningBox('session-menu'); } }
+      : { label: opening ? 'Opening…' : 'Open in Lab', disabled: opening, onSelect: () => { void openFull('session-menu'); } },
     ...(desktopHref ? [{ label: 'Open in termag desktop', onSelect: () => openDesktopLink(desktopHref) }] : []),
     ...(sidePanel ? [{ label: sidePanel.open ? 'Hide tools' : 'Show tools', onSelect: sidePanel.toggle }] : []),
   ];
@@ -539,7 +567,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
   useProvideScreenCommands(refresh ? [
     {
       id: 'open-in-lab', label: !archiveNotice && opening ? 'Opening…' : 'Open in Lab', icon: 'arrow-up-right', keywords: ['full ui', 'workspace'],
-      disabled: !archiveNotice && opening, suggested: true, run: () => { void (archiveNotice ? openRunningBox() : openFull()); },
+      disabled: !archiveNotice && opening, suggested: true, run: () => { void (archiveNotice ? openRunningBox('command-menu') : openFull('command-menu')); },
     },
     ...(desktopHref ? [{
       id: 'open-in-desktop', label: 'Open in termag desktop', icon: 'device-desktop', keywords: ['desktop', 't3'],
@@ -561,7 +589,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
           {/* The chrome refresh's header on a desktop width (SessionHeader.tsx); the phone keeps its one row. */}
           {refresh && !phone && (
             <SessionHeader project={project} workstream={workstream} repo={repo} box={box} working={claudeWorking}
-              opening={opening} onOpenFull={() => { void (archiveNotice ? openRunningBox() : openFull()); }}
+              opening={opening} onOpenFull={() => { void (archiveNotice ? openRunningBox('session-menu') : openFull('session-menu')); }}
               archive={canArchive ? {
                 label: archiveLabel,
                 disabled: archiving || chat.running || archiveNotice != null,
@@ -575,10 +603,13 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
             {phone
               ? <AgentIcon status={claudeWorking ? 'working' : 'idle'} />
               : <span className="chat-glyph" data-status={claudeWorking ? 'working' : 'idle'} aria-hidden="true">{claudeWorking ? '●' : '○'}</span>}
-            <span className="chat-title-name">{project.name}</span>
-            {workstream !== 'main' && <span className="chat-title-ws" title={workstreamTip(askNamed) ?? undefined}>· {workstreamLabel(askNamed)}</span>}
-            <ChatSpaceChip place={{ instanceId: project.instanceId ?? null, spaceId: wsRow?.spaceId, spaceFixed: wsRow?.spaceFixedAt != null }} />
-            {repo && <span className="chat-title-repo" title={project.repoUrl ?? undefined}>{repo}</span>}
+            {ownProject && <ProjectCrumb project={ownProject} />}
+            <span className="chat-title-name" title={workstreamTip({ ...askNamed, projectName: project.name }) ?? title}>{title}</span>
+            {/* The project and a non-default branch beside the title, as SessionHeader's chips say them; the project, when it leads, says the rest. */}
+            {!ownProject && <ChatSpaceChip place={{ instanceId: project.instanceId ?? null, spaceId: wsRow?.spaceId, spaceFixed: wsRow?.spaceFixedAt != null }} />}
+            {!ownProject && title !== project.name && <span className="chat-title-repo" title="Project">{project.name}</span>}
+            {!ownProject && repo && <span className="chat-title-repo" title={project.repoUrl ?? undefined}>{repo}</span>}
+            {branch && <span className="chat-title-repo" title="Branch">{branch}</span>}
             <ChatBoxTag project={project} box={box} />
           </div>}
           {!(refresh && !phone) && <div className="chat-header-actions">
@@ -596,13 +627,13 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
             )}
             {archiveNotice
               ? (
-                <button type="button" className="btn-ghost chat-full-ui" onClick={() => { void openRunningBox(); }}>
+                <button type="button" className="btn-ghost chat-full-ui" onClick={() => { void openRunningBox('header'); }}>
                   <span className="chat-full-ui-long">Open in Lab</span>
                   <span className="chat-full-ui-short">Lab</span>
                 </button>
               )
               : (
-                <button type="button" className="btn-ghost chat-full-ui" onClick={() => { void openFull(); }} disabled={opening}
+                <button type="button" className="btn-ghost chat-full-ui" onClick={() => { void openFull('header'); }} disabled={opening}
                   title={chat.sessionId ? `Continues this session in the terminal (claude --resume ${chat.sessionId})` : 'Opens this session in Lab'}>
                   {opening ? 'Opening…' : (
                     <>
@@ -635,7 +666,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                 <button type="button" className="confirm-btn confirm-btn-cancel" disabled={stoppingBox} onClick={dismissArchiveDialog}>Keep this session open</button>
                 {archiveNotice.retry
                   ? <button type="button" className="confirm-btn confirm-btn-primary" disabled={stoppingBox} onClick={() => { void retryBoxPower(); }}>{stoppingBox ? 'Stopping…' : archiveNotice.retry === 'hibernate' ? 'Hibernate box' : 'Stop box'}</button>
-                  : <button type="button" className="confirm-btn confirm-btn-primary" onClick={() => { void openRunningBox(); }}>Open in Lab</button>}
+                  : <button type="button" className="confirm-btn confirm-btn-primary" onClick={() => { void openRunningBox('archived'); }}>Open in Lab</button>}
               </div>
             </Dialog>,
             document.body,
@@ -663,7 +694,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                       {stoppingBox ? 'Stopping…' : archiveNotice.retry === 'hibernate' ? 'Hibernate box' : 'Stop box'}
                     </button>
                   )}
-                  <button type="button" className="btn-tiny" disabled={stoppingBox} onClick={() => { void openRunningBox(); }}>Open in Lab</button>
+                  <button type="button" className="btn-tiny" disabled={stoppingBox} onClick={() => { void openRunningBox('archived'); }}>Open in Lab</button>
                   <button type="button" className="btn-tiny" disabled={stoppingBox} onClick={() => { void leaveArchived('/chat'); }}>Back to sessions</button>
                 </div>
               </div>
@@ -675,7 +706,27 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                   <div className="chat-box-says">
                     <div className="chat-box-says-label">Latest from the box</div>
                     <pre className={REPLAY_BLOCK_CLASS}>{boxSays.join('\n')}</pre>
-                    <div className="chat-box-says-hint">Stuck on a question? <Link to={fullUiHref(project.id, workstream)}>Answer it in Lab</Link>.</div>
+                    <div className="chat-box-says-hint">Stuck on a question? <Link to={fullUiHref(project.id, workstream)} onClick={() => recordLabOpened('stuck-hint')}>Answer it in Lab</Link>.</div>
+                  </div>
+                )}
+                {/* Runs on: Auto: the box this session was started on wouldn't wake. */}
+                {wakeFailed && project.instanceId && project.role !== 'collaborator' && (
+                  <div className="chat-setup-actions">
+                    <button type="button" className="btn-tiny" disabled={retrying}
+                      onClick={() => {
+                        setRetrying(true); setWakeActionError('');
+                        void instancesApi.start(project.instanceId!)
+                          .catch(err => setWakeActionError(apiErrorText(err, "Couldn't start the box")))
+                          .then(() => boxFeed.reload()).finally(() => setRetrying(false));
+                      }}>Retry</button>
+                    <button type="button" className="btn-tiny" disabled={retrying}
+                      onClick={() => {
+                        setRetrying(true); setWakeActionError('');
+                        void projectsApi.moveToNewBox(project.id).then(() => Promise.all([reloadProjects(), boxFeed.reload()]))
+                          .catch(err => setWakeActionError(apiErrorText(err, "Couldn't start a new box")))
+                          .finally(() => setRetrying(false));
+                      }}>Start on a new box</button>
+                    {wakeActionError && <span className="chat-setup-error" role="alert">{wakeActionError}</span>}
                   </div>
                 )}
                 {project.role !== 'collaborator' && (setup.retry || setup.startEmpty) && (
@@ -695,7 +746,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
             {loading && !recovery && <TranscriptSkeleton />}
             {runnerReady && chat.items.length === 0 && !queued && !echo && (
               <div className="chat-empty">
-                Ask Claude anything about {repo ?? project.name}.{' '}
+                Ask {agent.name} anything about {repo ?? project.name}.{' '}
                 {trust?.trusted
                   ? 'It works in its own box and can run commands and edit files there.'
                   : `It can read the code and answer, but can't run commands or edit files until the ${trustNoun} is trusted.`}
@@ -745,7 +796,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
                 {(s.queuedImages.length > 0 || queuedParts.files.length > 0 || queuedParts.boxFiles) && <MessageImages images={s.queuedImages} files={queuedParts.files} boxFiles={queuedParts.boxFiles} projectId={project.id} workstream={workstream} />}
                 {queuedParts.text && <div className="sdk-user-bubble"><UserMessageText text={queuedParts.text.split(REVIEW_FORMAT_MARK)[0]} /></div>}
                 <ReviewFormatChip text={splitTextFiles(queued).text} />
-                <div className="sdk-user-note">{queueError ? `not sent: ${queueError}` : 'sent as soon as Claude is ready'}</div>
+                <div className="sdk-user-note">{queueError ? `not sent: ${queueError}` : `sent as soon as ${agent.name} is ready`}</div>
                 {queueError && <button type="button" className="btn-tiny chat-queued-retry" onClick={retryQueued}>Retry</button>}
               </div>
             )}
@@ -762,6 +813,7 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
             })}
             <UnsentMessages texts={unsent} disabled={!canSend} onSend={sendUnsent}
               onDiscard={i => setUnsent(u => u.filter((_, j) => j !== i))} />
+            {hotBox && <HotBoxNotice text={hotBox} onDismiss={() => { dismissHotBoxNotice(hotStore, chatId); setHotBox(null); }} />}
           </div>
         </div>
         <SdkComposer s={s} project={project} workstream={workstream} unseen={unseen} onJump={jumpToBottom}
@@ -773,11 +825,10 @@ export function SdkChatView({ project, workstream }: { project: Project; workstr
             </div>
           ) : agentsUi && keptAgents.length ? <AgentsDrawer list={keptAgents} ui={agentsUi} />
             : asksUi && keptAsks.length ? <AsksDrawer list={keptAsks} ui={asksUi} /> : null}
-          placeholder={review ? 'Ask about this PR, or tell Claude what to change in the review…' : undefined}
-          above={<>
-            <SessionRepoPill project={project} />
-            {review?.section === 'pushed' && <FollowUpStrip item={review} />}
-          </>} />
+          placeholder={review ? `Ask about this PR, or tell ${agent.name} what to change in the review…` : undefined}
+          placeholderWho={agent.claudeCode ? undefined : agent.name} claudeCode={agent.claudeCode} agentName={agent.name}
+          above={review?.section === 'pushed' ? <FollowUpStrip item={review} /> : undefined}
+          statusEnd={<SessionRepoPill project={project} />} />
       </section>
     </div>
   );

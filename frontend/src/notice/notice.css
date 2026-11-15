@@ -1,0 +1,80 @@
+/* The notice banner (NoticeBanner.tsx): LaunchPad's Alert, coloured by termag's
+   --alert-color-* map (launchpad/theme.css). Where it sits is the mount's
+   (pages/chat/chat.css .chat-notice; Lab's App.css). Text is the UI font; only
+   commands are monospace. */
+.notice-slot { flex: none; min-width: 0; font-family: var(--font-ui); text-align: start; }
+.notice-slot .notice-alert { color: var(--text-primary); }
+.notice-slot .notice-text {
+  margin: 0;
+  font: inherit;
+  line-height: 20px;
+  color: var(--text-primary);
+  overflow-wrap: break-word;
+}
+.notice-slot .notice-title { font-weight: 600; }
+
+/* A command: click to copy. Code keeps its LaunchPad look; the button adds the hover and focus. */
+.notice-slot .notice-cmd {
+  position: relative;
+  display: inline;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: copy;
+  border-radius: 4px;
+}
+.notice-slot .notice-cmd code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-primary) 12%, transparent);
+  color: var(--text-primary);
+  white-space: nowrap;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+.notice-slot .notice-cmd:hover code { background: color-mix(in srgb, var(--text-primary) 14%, transparent); }
+.notice-slot .notice-cmd:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.notice-slot .notice-copied {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 4px);
+  transform: translateX(-50%);
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  font: 500 11px/1 var(--font-ui);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.notice-slot .notice-link {
+  font-weight: 500;
+  white-space: nowrap;
+  color: var(--accent);
+}
+
+.notice-slot .notice-more { margin-top: 2px; align-self: flex-start; }
+
+/* The phone (CHAT_NARROW_QUERY): long text folds to three lines, with More. */
+@media (max-width: 767px) {
+  /* A command stays on one line, cut short if it's wider than the banner; a click still copies all of it. */
+  .notice-slot .notice-cmd { display: inline-block; max-width: 100%; vertical-align: bottom; }
+  .notice-slot .notice-cmd code { display: block; overflow: hidden; text-overflow: ellipsis; }
+  .notice-slot:not([data-expanded]) .notice-text {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}

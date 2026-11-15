@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { automationSubtitle, boxStartFailuresLabel, cronToPreset, describeSchedule, occurrenceShort, presetToCron, untilLabel } from './automationSchedule';
+import { automationSubtitle, boxStartFailuresLabel, lastAlertErrorLabel, lastAlertErrorsLabel, cronToPreset, describeSchedule, occurrenceShort, presetToCron, untilLabel } from './automationSchedule';
 
 describe('presets', () => {
   it('turn into 5-field cron, and back', () => {
@@ -45,6 +45,29 @@ describe('labels', () => {
     expect(automationSubtitle({ nextRunAt: null, enabled: true, pausedReason: 'consecutive_failures', lastRun: null }, 'UTC', now)).toBe('paused: kept failing');
     expect(automationSubtitle({ nextRunAt: null, enabled: false, pausedReason: null, lastRun: { state: 'skipped', finishedAt: null, startedAt: null, reasonLabel: 'the box was asleep' } }, 'UTC', now))
       .toBe('off · skipped: the box was asleep');
+  });
+});
+
+describe('lastAlertErrorsLabel', () => {
+  const now = new Date('2026-11-10T12:00:00Z');
+  it('names each failing channel, and nothing while both go', () => {
+    expect(lastAlertErrorsLabel({ slack: { error: 'not_in_channel', at: '2026-11-10T10:00:00Z' }, webhook: { error: 'answered 503', at: '2026-11-10T11:55:00Z' } }, null, now))
+      .toBe('Last Slack send failed 2h ago: not_in_channel · Last webhook send failed 5m ago: answered 503');
+    expect(lastAlertErrorsLabel({ slack: null, webhook: { error: 'answered 503', at: '2026-11-10T11:55:00Z' } }, null, now)).toBe('Last webhook send failed 5m ago: answered 503');
+    expect(lastAlertErrorsLabel({ slack: null, webhook: null }, { error: 'Slack: stale', at: '2026-11-10T10:00:00Z' }, now)).toBeNull();
+  });
+  it("reads the single error from a server before per-channel errors", () => {
+    expect(lastAlertErrorsLabel(undefined, { error: 'Slack: not_in_channel', at: '2026-11-10T10:00:00Z' }, now)).toBe('Last send failed 2h ago: Slack: not_in_channel');
+    expect(lastAlertErrorsLabel(undefined, undefined, now)).toBeNull();
+  });
+});
+
+describe('lastAlertErrorLabel', () => {
+  it('says when the last alert send failed and why, and nothing while sends go', () => {
+    const now = new Date('2026-11-10T12:00:00Z');
+    expect(lastAlertErrorLabel({ error: 'Slack: not_in_channel', at: '2026-11-10T10:00:00Z' }, now)).toBe('Last send failed 2h ago: Slack: not_in_channel');
+    expect(lastAlertErrorLabel(null, now)).toBeNull();
+    expect(lastAlertErrorLabel(undefined, now)).toBeNull();
   });
 });
 

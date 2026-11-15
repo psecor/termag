@@ -30,8 +30,7 @@ import {
 import { groupOpenItems, itemHref, itemKey } from '../../chat/openItems';
 import { chatHomeSpace } from '../../chat/chatSpaces';
 import { awayFailure, dispatchStrip, fileLine, stripModelOf, stripState, useStripModel, useStripsVersion } from '../../chat/fileStrip';
-import { chatRowName, isSdkChat, sidebarLine } from '../../chat/simpleChat';
-import { agentLabel } from '../../chat/explorerAgents';
+import { chatAgentOf, chatRowName, isSdkChat, sidebarLine } from '../../chat/simpleChat';
 import { ComposeLinkContext } from '../../chat/Markdown';
 import { Button, Dialog, DialogTrigger, Menu, MenuItem, MenuTrigger, Popover, Tooltip, TooltipTrigger } from '@launchpad-ui/components';
 import '@launchpad-ui/tokens/index.css';
@@ -72,7 +71,7 @@ export function FileComposeLinks({ space, children }: { space: string; children:
   return allowed && listening ? <ComposeLinkContext.Provider value={fill}>{children}</ComposeLinkContext.Provider> : <>{children}</>;
 }
 
-/** `name` is Claude's title when the sidebar leads with one, `where` the project (and workstream), as on the sidebar's row. */
+/** `name` is the session's title, as on the sidebar's row; `where` its project, shown after it when the title isn't the project's name. */
 interface Target extends FileChatTarget { tab: string; glyph: string; state: string; where: string; titled: boolean }
 
 const fullName = (t: Target) => (t.titled ? `${t.name} · ${t.where}` : t.name);
@@ -103,14 +102,14 @@ export function FileChat({ space, path }: { space: string; path: string }) {
       if (seen.has(k) || !row || !project || !isSdkChat(project, item.workstream)) continue;
       seen.add(k);
       const named = chatRowName(row);
-      // The project (and workstream), whatever the row puts under its title.
-      const where = agentLabel(row);
+      // The project, when the title isn't its name.
+      const where = named.where ?? row.projectName;
       const line = sidebarLine(row, live.get(chatLiveKey(row.projectId, row.workstream)), setupOf.get(row.projectId));
       const updated = row.updatedAt ? Date.parse(row.updatedAt) : NaN;
       out.push({
-        projectId: item.projectId, workstream: item.workstream, name: named.title ?? where, order: out.length,
+        projectId: item.projectId, workstream: item.workstream, name: named.title, order: out.length,
         activeAt: Number.isFinite(updated) ? Math.max(updated, item.openedAt) : item.openedAt,
-        tab: item.id, glyph: line.glyph, state: line.state, where, titled: named.title != null,
+        tab: item.id, glyph: line.glyph, state: line.state, where, titled: named.where != null,
       });
     }
     return out;
@@ -189,6 +188,8 @@ function FileChatSession({ target, project, space, path, agentPicker, away }: {
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const follow = useRef<() => void>(() => {});
+  // The session's agent, as its conversation's composer has it: a Cursor chat shows no Claude model picker here either.
+  const agent = chatAgentOf(project, target.workstream);
   const s = useSdkChat(project, target.workstream, follow, {
     decorate: typed => fileChatMessage(typed, space, path),
     // Into this target's strip even when the person has picked another
@@ -302,7 +303,7 @@ function FileChatSession({ target, project, space, path, agentPicker, away }: {
     <div className="fv-chat-host" {...dropHandlers}>
       {dragging && <div className="chat-drop-overlay" aria-hidden="true">Drop images to attach</div>}
       <SdkComposer s={s} project={project} workstream={target.workstream} className="fv-chat" barStart={agentPicker} statusLine={statusLine}
-        placeholderWho="an agent about this file" noReserve />
+        placeholderWho="an agent about this file" noReserve claudeCode={agent.claudeCode} agentName={agent.name} />
     </div>
   );
 }

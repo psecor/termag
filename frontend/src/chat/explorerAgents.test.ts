@@ -35,6 +35,10 @@ describe('explorerAgents', () => {
     const forest = agentForest([row('review-notes', 'b'), row('notes-kid', 'b'), row('other', 'b')], [link('notes-kid', 'review-notes')]);
     expect(searchAgents(forest, 'notes').map(r => r.projectId)).toEqual(['review-notes', 'notes-kid']);
     expect(searchAgents(forest, 'kid notes').map(r => r.projectId)).toEqual(['notes-kid']);
+    // A titled session is found by its title and still by its project's name.
+    const titled = agentForest([{ projectId: 'api', workstream: 'fix', projectName: 'billing-api', instanceId: 'b', sessionTitle: 'Retry the webhook' }], []);
+    expect(searchAgents(titled, 'webhook').map(r => r.projectId)).toEqual(['api']);
+    expect(searchAgents(titled, 'billing fix').map(r => r.projectId)).toEqual(['api']);
     expect(searchAgents(forest, '  ')).toEqual([]);
   });
 });
@@ -55,7 +59,10 @@ describe('ask thread names', () => {
     expect(agentLabel({ ...ask, askTitle: null })).toBe('ask-cmvpvqxse19rwex4apfh334ld');
     expect(workstreamLabel({ ...ask, askTitle: null })).toBe('ask-cmvpvqxse19rwex4apfh334ld');
     expect(workstreamTip({ ...ask, askTitle: null })).toBe('ask thread cmvpvqxse19rwex4apfh334ld');
-    expect(agentLabel({ projectName: 'termag-3', workstream: 'fix' })).toBe('termag-3 · fix');
+    // Every other session by its one title (chat/sessionTitle.ts), never "project · workstream".
+    expect(agentLabel({ projectName: 'termag-3', workstream: 'fix' })).toBe('fix');
+    expect(agentLabel({ projectName: 'termag-3', workstream: 'main' })).toBe('termag-3');
+    expect(agentLabel({ projectName: 'termag-3', workstream: 'fix', sessionTitle: 'Fix the redirect' })).toBe('Fix the redirect');
     expect(workstreamTip({ workstream: 'fix' })).toBeNull();
   });
 

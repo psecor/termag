@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import { recentOpenItemGroups, type OpenItem } from './openItems';
+import { nestInOrder } from './agentTree';
 import {
   activeTab, arrangeItems, dismissItem, duplicateItem, EMPTY_OPEN_ITEMS, groupOpenItems, folderForRoute, folderHref, itemForRoute, spaceLinkTarget, itemHref, itemKey, openItem,
-  noteActive, noteSent, parseOpenItems, pickItem, placeUnplacedItems, RECENT_TABS_MAX, RECONCILE_GRACE_MS, reconcileItems, reorderItem, seedItems, serializeOpenItems, tabAfterClose, tabForRoute,
+  noteActive, noteSent, openInPanel, panelFileItems, parseOpenItems, pickItem, placeUnplacedItems, RECENT_TABS_MAX, RECONCILE_GRACE_MS, reconcileItems, reorderItem, seedItems, serializeOpenItems, tabAfterClose, tabForRoute,
   type ChatListing, type OpenItemRef, type OpenItemsState } from './openItems';
 
 const chat = (projectId: string, workstream = 'main') => ({ kind: 'chat' as const, projectId, workstream });
@@ -9,6 +11,36 @@ const file = (space: string, path: string) => ({ kind: 'file' as const, space, p
 const explorer = (space: string) => ({ kind: 'explorer' as const, space });
 const keys = (s: OpenItemsState) => s.items.map(itemKey);
 const ids = (s: OpenItemsState) => s.items.map(i => i.id);
+
+describe('recent sidebar order', () => {
+  const c = (id: string): OpenItem => ({ ...chat(id), id, openedAt: 0 });
+  const f = (id: string): OpenItem => ({ ...file('z', id), id, openedAt: 999 });
+  it('sorts spaces and chats by activity, stably, leaving non-chats after chats and No space last', () => {
+    const input = [
+      { space: 'a', items: [c('old')] },
+      { space: 'empty-z', items: [] },
+      { space: 'empty-a', items: [f('only-file')] },
+      { space: null, items: [c('loose')] },
+      { space: 'z', items: [f('file'), c('unknown'), c('old'), c('new'), c('tie'), c('unknown2'), { ...explorer('z'), id: 'explorer', openedAt: 0 }] },
+    ];
+    const before = structuredClone(input);
+    const times: Record<string, number> = { old: 1, new: 3, tie: 3, loose: 100 };
+    const result = recentOpenItemGroups(input, i => times[i.id] ?? null);
+    expect(result.map(g => g.space)).toEqual(['z', 'a', 'empty-a', 'empty-z', null]);
+    expect(result[0].items.map(i => i.id)).toEqual(['new', 'tie', 'old', 'unknown', 'unknown2', 'file', 'explorer']);
+    expect(input).toEqual(before);
+  });
+  it('handles empty groups and invalid activity without losing tabs', () => {
+    expect(recentOpenItemGroups([], () => null)).toEqual([]);
+    const items = [c('a'), c('b'), c('c')];
+    expect(recentOpenItemGroups([{ space: 's', items }], i => i.id === 'a' ? NaN : i.id === 'b' ? Infinity : null)[0].items).toEqual(items);
+  });
+  it('keeps a recent child under its parent while lifting their tree', () => {
+    const ordered = recentOpenItemGroups([{ space: 's', items: [c('other'), c('parent'), c('child')] }], i => i.id === 'child' ? 3 : i.id === 'other' ? 2 : 1)[0].items;
+    const nested = nestInOrder(ordered, i => `${i.id}|main`, [{ projectId: 'child', workstream: 'main', parentProjectId: 'parent', parentWorkstream: 'main' }]);
+    expect(nested.map(n => [n.item.id, n.depth])).toEqual([['parent', 0], ['child', 1], ['other', 0]]);
+  });
+});
 
 /** Ids t1, t2, … in order. */
 function counter(prefix = 't') {
@@ -564,5 +596,53 @@ describe('the tabs shown most recently, through seeding and reconciling', () => 
       s = reconcileItems(s, new Set(), RECONCILE_GRACE_MS + 1);
     }
     expect(s.recent).toEqual(['ta']);
+  });
+});
+
+describe('files open in the side panel (openInPanel)', () => {
+  const ids = () => { let n = 0; return () => `n${++n}`; };
+  const base: OpenItemsState = { seeded: true, items: [{ ...chat('p1'), id: 'c1', openedAt: 1 }, { ...file('notes', 'a.md'), id: 'm1', openedAt: 2 }] };
+
+  it('opens a new file tab last, beside its place, apart from the tabs, and shows the one it has there again', () => {
+    const one = openInPanel(base, { space: 'notes', path: 'a.md' }, 'session:p1|main', 10, ids());
+    expect(one.id).toBe('n1');
+    expect(one.state.items).toBe(base.items);
+    expect(one.state.panel).toEqual([{ kind: 'file', space: 'notes', path: 'a.md', panel: 'session:p1|main', id: 'n1', openedAt: 10 }]);
+    const again = openInPanel(one.state, { space: 'notes', path: 'a.md' }, 'session:p1|main', 20, ids());
+    expect(again).toEqual({ state: one.state, id: 'n1' });
+    // Another place gets its own.
+    const other = openInPanel(one.state, { space: 'notes', path: 'b.md' }, 'space:notes', 30, () => 'x1');
+    expect(panelFileItems(other.state, 'session:p1|main').map(i => i.id)).toEqual(['n1']);
+    expect(panelFileItems(other.state, 'space:notes').map(i => i.id)).toEqual(['x1']);
+    expect(panelFileItems(other.state, null)).toEqual([]);
+  });
+
+  it('is no tab: a route, a pick or the groups never take one, closing one drops only it, and storage keeps them', () => {
+    const { state } = openInPanel(base, { space: 'notes', path: 'b.md' }, 'session:p1|main', 10, () => 'n1');
+    expect(activeTab(state, file('notes', 'b.md'), null)).toBeNull();
+    expect(openItem(state, file('notes', 'b.md'), null, 20, () => 'r1').id).toBe('r1');
+    expect(pickItem(state, file('notes', 'b.md'), 'c1', 30, () => 'k1').id).toBe('k1');
+    expect(groupOpenItems(state.items, ['notes'], () => null).flatMap(g => g.items.map(i => i.id))).toEqual(['m1', 'c1']);
+    const closed = dismissItem(state, 'n1');
+    expect(closed.panel).toEqual([]);
+    expect(closed.items).toBe(state.items);
+    expect(dismissItem(state, 'm1').panel).toBe(state.panel);
+    const back = parseOpenItems(serializeOpenItems(state));
+    expect(back.panel).toEqual(state.panel);
+    expect(back.items).toEqual(state.items);
+    // A kept file tab whose id a tab has, or that names no place, is dropped.
+    const raw = JSON.parse(serializeOpenItems(state));
+    raw.panel.push({ ...raw.panel[0], id: 'm1' }, { ...raw.panel[0], id: 'z9', panel: '' });
+    expect(parseOpenItems(JSON.stringify(raw)).panel?.map(i => i.id)).toEqual(['n1']);
+  });
+
+  it("closes the files of a session's panel once the session is gone, and keeps others", () => {
+    const old = RECONCILE_GRACE_MS + 10;
+    const state: OpenItemsState = { seeded: true, items: [], panel: [
+      { kind: 'file', space: 'notes', path: 'a.md', panel: 'session:p1|main', id: 'n1', openedAt: 1 },
+      { kind: 'file', space: 'notes', path: 'b.md', panel: 'session:p2|main', id: 'n2', openedAt: 1 },
+      { kind: 'file', space: 'notes', path: 'c.md', panel: 'space:notes', id: 'n3', openedAt: 1 },
+    ] };
+    expect(reconcileItems(state, new Set(['chat:p1|main']), old).panel?.map(i => i.id)).toEqual(['n1', 'n3']);
   });
 });

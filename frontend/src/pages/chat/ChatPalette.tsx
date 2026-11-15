@@ -15,7 +15,6 @@ import { Highlight, usePaletteModel, type PaletteViewProps } from '../../compone
 import { LP_THEME } from '../../launchpad/theme';
 import { CHAT_NARROW_QUERY } from '../../chat/chatLayout';
 import { chatLiveKey, type ChatLiveStatus } from '../../chat/chatLiveStatus';
-import { agentLabel } from '../../chat/explorerAgents';
 import { chatRowState, type RowStateKind } from '../../chat/rowState';
 import { chatRowName } from '../../chat/simpleChat';
 import { stateSince, type InboxRow } from '../../mobile/inbox';
@@ -26,6 +25,7 @@ import { hitStatus, type PaletteItem as Item } from '../../utils/searchPalette';
 import { currentSearchShortcut } from '../../utils/workspaceTarget';
 import { useSimpleDataIfAny } from './simpleData';
 import { StatusMark } from './StatusMark';
+import { sessionTitle } from '../../chat/sessionTitle';
 
 const SHORTCUT = currentSearchShortcut();
 const NO_LIVE: ReadonlyMap<string, ChatLiveStatus> = new Map();
@@ -70,6 +70,8 @@ export function ChatPalette(props: PaletteViewProps) {
   const unseen = data?.unseen ?? NO_UNSEEN;
   const narrow = useSyncExternalStore(onNarrowChange, narrowNow, () => false);
   const byKey = useMemo(() => new Map(m.items.map(it => [keyOf(it), it])), [m.items]);
+  // The sidebar's rows by session, so a pane hit is called by its session's one title (chat/sessionTitle.ts).
+  const rowOf = useMemo(() => new Map((data?.rows ?? []).map(r => [r.key, r])), [data?.rows]);
   const of = <K extends Item['kind']>(kind: K) => m.items.filter((it): it is Extract<Item, { kind: K }> => it.kind === kind);
 
   const session = (it: Extract<Item, { kind: 'row' }>) => {
@@ -77,14 +79,14 @@ export function ChatPalette(props: PaletteViewProps) {
     // Its mark and words as the sidebar's row has them, a stop you haven't seen included.
     const state = chatRowState(r, live.get(chatLiveKey(r.projectId, r.workstream)), setupOf.get(r.projectId), unseen.has(r.key));
     const named = chatRowName(r);
-    const name = named.title ?? agentLabel(r);
+    const name = named.title;
     const since = stateSince(r);
     const age = since ? fmtAge(Math.max(0, now - Date.parse(since))) : null;
-    const sub = [named.title ? named.where : null, state.text, r.shared ? 'shared' : null, r.kind === 'cloud' ? 'cloud' : null].filter(Boolean).join(' · ');
+    const sub = [named.where, state.text, r.shared ? 'shared' : null, r.kind === 'cloud' ? 'cloud' : null].filter(Boolean).join(' · ');
     const box = boxNameOf?.(r);
     return (
       <ListBoxItem key={keyOf(it)} id={keyOf(it)} textValue={name} className="chat-palette-item" data-status={state.kind}>
-        <StatusMark kind={state.kind} />
+        <StatusMark kind={state.kind} unseen={state.unseen} />
         <span className="chat-palette-body">
           <span className="chat-palette-title">{name}</span>
           {sub && <span className="chat-palette-sub">{sub}</span>}
@@ -114,8 +116,8 @@ export function ChatPalette(props: PaletteViewProps) {
 
   const hit = (it: Extract<Item, { kind: 'hit' }>) => {
     const h = it.hit;
-    const name = h.workstream === 'main' ? h.projectName : `${h.projectName} · ${h.workstream}`;
-    const sub = [h.role, h.access !== 'owner' ? `shared by ${h.owner}` : null].filter(Boolean).join(' · ');
+    const name = sessionTitle(rowOf.get(`${h.projectId}|${h.workstream}`) ?? h);
+    const sub = [name !== h.projectName ? h.projectName : null, h.role, h.access !== 'owner' ? `shared by ${h.owner}` : null].filter(Boolean).join(' · ');
     return (
       <ListBoxItem key={keyOf(it)} id={keyOf(it)} textValue={name} className="chat-palette-item chat-palette-hit">
         <StatusMark kind={HIT_MARK[hitStatus(h.status)]} />

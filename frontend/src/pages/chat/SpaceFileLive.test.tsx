@@ -10,7 +10,7 @@ import type { SpaceFileHead, SpaceTree, SpaceViewUrl } from '../../services/api'
 import { SpaceFileView } from './SpaceFileView';
 import { ExplorerPanel } from './FileExplorer';
 import { LiveCue, useSpaceFileLive } from './SpaceFileLive';
-import { CUE_MS, spaceFileEvents, type SpaceFileFrame } from '../../chat/spaceFileLive';
+import { CUE_MS, recheckFiles, spaceFileEvents, type SpaceFileFrame } from '../../chat/spaceFileLive';
 
 const MINUTES = 5 * 60_000;
 
@@ -18,11 +18,19 @@ const mocks = vi.hoisted(() => ({
   view: vi.fn<(space: string, path: string) => Promise<SpaceViewUrl>>(),
   tree: vi.fn<(space: string, prefix: string, cursor?: string | null, recursive?: boolean) => Promise<SpaceTree>>(),
   fileHead: vi.fn<(space: string, path: string, etag: string | null) => Promise<SpaceFileHead | null>>(),
+  /** project-files-enabled: the Files tool's new moments to look again. */
+  fresh: false,
+  /** The spaces the sidebar lists: one listed is reachable at once, without asking the server. */
+  spaceList: [] as Array<{ id: string; name: string; role: string }>,
 }));
+vi.mock('../../flags', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../flags')>();
+  return { ...actual, useFlag: <T,>(key: string, fallback: T) => (key === 'project-files-enabled' ? mocks.fresh as T : fallback) };
+});
 vi.mock('./simpleData', () => {
   const data = () => ({
     items: { pick: () => 't1', state: { items: [] } }, rows: [], live: new Map(), setupOf: new Map(), links: [], activeTab: 't1', itemsShown: true,
-    spaces: { loaded: true, spaces: [], index: new Map() },
+    spaces: { loaded: true, spaces: mocks.spaceList, index: new Map() },
   });
   return { WithSimpleData: ({ children }: { children: React.ReactNode }) => children, useSimpleData: data, useSimpleDataIfAny: data };
 });
@@ -69,6 +77,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
   vi.clearAllMocks();
+  mocks.fresh = false;
 });
 
 async function openFile(path = 'pr-outbox.md', space = 'improve-termag') {
@@ -432,3 +441,185 @@ describe('the explorer', () => {
   });
 });
 
+
+// (From review: "agent created this file but i don't see it listed in 'My files'? … i had to manually refresh").
+// Only a shown explorer hears frames, and its listings are kept for the page, so a write while My files wasn't on
+// screen showed only after a reload. Under project-files-enabled the list and the open file look again when they're
+// shown, when the window or tab comes back, and when the open session's turn ends. Still no timer.
+describe('under project-files-enabled: the moments to look again', () => {
+  beforeEach(() => { mocks.fresh = true; });
+  const settle = () => act(async () => { await new Promise(r => setTimeout(r, 350)); });
+  async function openExplorer(space = 'my-files') {
+    await act(async () => { root.render(<MemoryRouter><ExplorerPanel space={space} /></MemoryRouter>); });
+    await flush();
+  }
+
+  it("shows an agent's file after its turn ends, with no frame and no reload, keeping the list in place", async () => {
+    await openExplorer();
+    expect(host.textContent).toContain('f1.md');
+    const body = host.querySelector('.fx-body, .fx-panel, [class^="fx"]');
+    version = 2; // the agent wrote f2.md; its frame was missed
+    await act(async () => { recheckFiles(); });
+    expect(host.textContent).toContain('f1.md'); // kept until the new listing lands
+    await settle();
+    await flush();
+    expect(host.textContent).toContain('f2.md');
+    expect(host.textContent).not.toContain('Loading…');
+    if (body) expect(host.querySelector('.fx-body, .fx-panel, [class^="fx"]')).toBe(body);
+  });
+
+  it('lists afresh in place when shown again (the Files tool opened, or Project files and My files switched)', async () => {
+    await openExplorer();
+    expect(host.textContent).toContain('f1.md');
+    act(() => root.unmount());
+    root = createRoot(host);
+    version = 2; // written while it wasn't shown: no explorer heard the frame
+    await send({ space: 'my-files', kind: 'put', path: 'f2.md' });
+    await openExplorer();
+    await flush();
+    expect(host.textContent).toContain('f2.md');
+    expect(host.textContent).not.toContain('Loading…');
+  });
+
+  // Bugbot on #1874: a first visit's own placeholders read as kept listings, so it listed twice.
+  it('lists a folder once on a first visit, and only refetches what an earlier visit kept', async () => {
+    mocks.spaceList = [{ id: 'sp-first', name: 'first-visit', role: 'owner' }];
+    mocks.tree.mockClear();
+    try {
+      await openExplorer('first-visit');
+      await act(async () => { await new Promise(r => setTimeout(r, 50)); });
+      expect(mocks.tree.mock.calls.filter(c => c[0] === 'first-visit')).toHaveLength(1);
+    } finally {
+      mocks.spaceList = [];
+    }
+  });
+
+  // Devin on #1874: a listing that failed was kept as it was when the Files tool opened again.
+  it('lists again a folder that failed on an earlier visit, when shown again', async () => {
+    mocks.spaceList = [{ id: 'sp-failed', name: 'failed-once', role: 'owner' }];
+    try {
+      mocks.tree.mockRejectedValueOnce(new Error('down'));
+      await openExplorer('failed-once');
+      await act(async () => { await new Promise(r => setTimeout(r, 50)); });
+      expect(host.textContent).not.toContain('f1.md');
+      act(() => root.unmount());
+      root = createRoot(host);
+      await openExplorer('failed-once');
+      await act(async () => { await new Promise(r => setTimeout(r, 50)); });
+      expect(host.textContent).toContain('f1.md');
+    } finally {
+      mocks.spaceList = [];
+    }
+  });
+
+  it('keeps what it kept with the flag off, as before', async () => {
+    mocks.fresh = false;
+    await openExplorer('kept-off');
+    act(() => root.unmount());
+    root = createRoot(host);
+    version = 2;
+    await openExplorer('kept-off');
+    await act(async () => { recheckFiles(); });
+    await settle();
+    expect(host.textContent).toContain('f1.md');
+    expect(host.textContent).not.toContain('f2.md');
+  });
+
+  it('checks the open file when the window comes back, once for focus and visibility together, and reloads it in place', async () => {
+    await openFile();
+    mocks.fileHead.mockClear();
+    version = 2;
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'));
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await flush();
+    expect(mocks.fileHead).toHaveBeenCalledTimes(1);
+    expect(mocks.fileHead).toHaveBeenLastCalledWith('improve-termag', 'pr-outbox.md', '"v1"');
+    expect(md()).toContain('Outbox v2');
+    expect(seenLoading).toBe(false);
+    expect(cue()!.textContent).toBe('Updated');
+  });
+
+  it("says a file deleted meanwhile is gone after a turn ends, and offers to close it in place", async () => {
+    await openFile();
+    mocks.fileHead.mockRejectedValue(notFound());
+    await act(async () => { recheckFiles(); });
+    await flush();
+    expect(host.textContent).toContain("This file isn't in improve-termag anymore: it was moved or deleted.");
+    expect(host.querySelector('.fv-gone-close')?.textContent).toBe('Close');
+  });
+
+  // Bugbot on #1874: a moved file is gone from here too, and its words mustn't say deleted beside "Moved to".
+  it("doesn't call a moved file deleted: the words fit a move, beside its Moved to cue", async () => {
+    await openFile('d/pr-outbox.md');
+    await send({ space: 'improve-termag', kind: 'mv', path: 'd/', to: 'archive/d/' });
+    expect(cue()!.textContent).toBe('Moved to archive/d/pr-outbox.md');
+    expect(host.textContent).toContain('it was moved or deleted');
+    expect(host.textContent).not.toContain('was deleted from');
+  });
+
+  // Bugbot on #1874: a recheck while a files/head was in flight was dropped, so the file could stay stale.
+  it('asks again when a recheck comes while a check is in flight, and shows what the second one finds', async () => {
+    await openFile();
+    let answer: (v: SpaceFileHead | null) => void = () => {};
+    mocks.fileHead.mockClear();
+    mocks.fileHead.mockImplementationOnce(() => new Promise(r => { answer = r; }));
+    await act(async () => { recheckFiles(); }); // the window came back: a check goes out
+    version = 2; // the agent's turn wrote it after that check went out
+    await act(async () => { recheckFiles(); });
+    expect(mocks.fileHead).toHaveBeenCalledTimes(1);
+    await act(async () => { answer(null); }); // the first saw the old version (a 304)
+    await flush();
+    expect(mocks.fileHead).toHaveBeenCalledTimes(2);
+    expect(md()).toContain('Outbox v2');
+  });
+
+  // An editor on the viewer passes `dirty`: a change elsewhere never replaces its edits.
+  it('never clobbers edits not saved: says the file changed, Reload asks first, Keep mine keeps them', async () => {
+    let reloads = 0;
+    function Editing() {
+      const [loaded, setLoaded] = React.useState<{ state: string }>({ state: 'ok' });
+      const live = useSpaceFileLive({ space: 'improve-termag', path: 'pr-outbox.md', loaded, setLoaded, reload: () => { reloads++; }, gone: { state: 'gone' }, dirty: () => true });
+      return <MemoryRouter><LiveCue space="improve-termag" cue={live.cue} onReload={live.applyPending} name="pr-outbox.md" onKeepMine={live.keepMine} /></MemoryRouter>;
+    }
+    await act(async () => { root.render(<Editing />); });
+    await flush();
+    await send({ space: 'improve-termag', kind: 'put', path: 'pr-outbox.md', etag: '"v2"' });
+    await flush();
+    expect(reloads).toBe(0);
+    expect(cue()!.hidden).toBe(false);
+    expect(cue()!.textContent).toContain('pr-outbox.md changed since you opened it');
+    const button = (name: string) => [...cue()!.querySelectorAll('button')].find(b => b.textContent === name)!;
+    await act(async () => { button('Reload').click(); });
+    expect(reloads).toBe(0); // asks first
+    expect(cue()!.textContent).toContain('Drop your unsaved changes?');
+    await act(async () => { button('Cancel').click(); });
+    await act(async () => { button('Keep mine').click(); });
+    expect(cue()!.hidden).toBe(true);
+    expect(reloads).toBe(0);
+    // Another change asks again; this time Reload, confirmed, drops the edits.
+    await send({ space: 'improve-termag', kind: 'put', path: 'pr-outbox.md', etag: '"v3"' });
+    await flush();
+    await act(async () => { button('Reload').click(); });
+    await act(async () => { button('Reload').click(); });
+    expect(reloads).toBe(1);
+  });
+
+  // Devin on #1874: a delete replaced the view even with edits held.
+  it('keeps edits not saved when the file is deleted elsewhere, and says so', async () => {
+    let shown = 'ok';
+    function Editing() {
+      const [loaded, setLoaded] = React.useState<{ state: string }>({ state: 'ok' });
+      shown = loaded.state;
+      const live = useSpaceFileLive({ space: 'improve-termag', path: 'pr-outbox.md', loaded, setLoaded, reload: () => {}, gone: { state: 'gone' }, dirty: () => true });
+      return <MemoryRouter><LiveCue space="improve-termag" cue={live.cue} onReload={live.applyPending} name="pr-outbox.md" onKeepMine={live.keepMine} /></MemoryRouter>;
+    }
+    await act(async () => { root.render(<Editing />); });
+    await flush();
+    await send({ space: 'improve-termag', kind: 'rm', path: 'pr-outbox.md' });
+    await flush();
+    expect(shown).toBe('ok');
+    expect(cue()!.textContent).toContain('pr-outbox.md was deleted since you opened it; your changes are kept');
+  });
+});

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { agoLabel, commitLabel, inLabel, poolFailureLine, poolHasBox, poolLine, refreshLine } from './environmentPool';
+import { agoLabel, commitLabel, inLabel, onWarmLine, poolFailureLine, poolHasBox, poolLine, refreshLine } from './environmentPool';
 
 const NOW = Date.parse('2026-11-06T12:00:00Z');
 const base = { target: 3, ready: 3, preparing: 0, preparedAt: '2026-11-06T11:20:00Z', preparedCommit: { 'e2e-org/envdemo': 'abc1234def'.padEnd(40, '0') }, lastFailure: null, nextRefreshAt: null };
@@ -47,8 +47,18 @@ describe('refreshLine', () => {
   });
 });
 
+describe('onWarmLine', () => {
+  it("says how the newest box's warm-up went", () => {
+    expect(onWarmLine({ ...base, onWarm: { state: 'succeeded', seconds: 41, log: null } })).toEqual({ text: "termag's warm-up done in 41 s", failed: false });
+    expect(onWarmLine({ ...base, onWarm: { state: 'failed', seconds: 5, log: 'x' } })?.failed).toBe(true);
+    expect(onWarmLine({ ...base, onWarm: { state: 'running', seconds: 0, log: null } })?.failed).toBe(true);
+    expect(onWarmLine({ ...base, onWarm: null })).toBeNull();
+    expect(onWarmLine(base)).toBeNull();
+  });
+});
+
 describe('poolFailureLine (Devin on #1453)', () => {
-  it('says what the pool does next: a failed setup waits for a change, anything else is tried again', () => {
-    expect(poolFailureLine('2026-11-06T11:40:00Z', NOW)).toBe('The last prepare failed 20 min ago. A failed setup holds the pool until its setup or a default branch changes; any other failure is tried again 10 minutes after it.');
+  it('says what the pool does next: it waits for a change, or an hour', () => {
+    expect(poolFailureLine('2026-11-06T11:40:00Z', NOW)).toBe('The last prepare failed 20 min ago. The pool waits until its setup or a default branch changes, or an hour after the failure.');
   });
 });

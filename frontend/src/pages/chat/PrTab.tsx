@@ -6,11 +6,13 @@
 // real data. PrDetail reads the PR again each time the list answers, and the
 // gates follow it (onLoaded). With no PR, it says so.
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ProgressBar } from '@launchpad-ui/components';
+import { Button, ProgressBar } from '@launchpad-ui/components';
 import { Icon, type IconName } from '@launchpad-ui/icons';
 import { prsApi, type PrOverview, type PrRow } from '../../services/api';
 import { PRS_CHANGED_EVENT, rowLabel } from '../../utils/prPipeline';
 import { prGates, sessionPr, type GateStatus } from '../../chat/prGates';
+import { useChatAskViews } from '../../chat/askStore';
+import { sessionPrRefs } from '../../chat/sessionPrs';
 import { usePolled } from '../dashboard/useDashboardData';
 import { PrDetail } from '../dashboard/PrOverviewDialog';
 import { ReviewMenu } from './ReviewMenu';
@@ -63,7 +65,15 @@ export function PrTab({ project, workstream }: { project: Project; workstream: s
     window.addEventListener(PRS_CHANGED_EVENT, refresh);
     return () => window.removeEventListener(PRS_CHANGED_EVENT, refresh);
   }, [refresh]);
-  const row = useMemo(() => sessionPr(prs.data, project.id, workstream), [prs.data, project.id, workstream]);
+  const chat = `${project.id}|${workstream}`;
+  const asks = useChatAskViews(chat);
+  const own = useMemo(() => sessionPr(prs.data, project.id, workstream), [prs.data, project.id, workstream]);
+  const loading = prs.data === null && prs.loading && !prs.error;
+  const choices = useMemo(() => sessionPrRefs(own, asks?.values() ?? []), [own, asks]);
+  const [selected, setSelected] = useState<{ chat: string; key: string } | null>(null);
+  const choice = choices.find(p => selected?.chat === chat && p.key === selected.key) ?? choices[0];
+  // An ask's PR may not be in the pipeline yet (or have aged out of it). Read it directly then.
+  const row = choice ? (choice.ask ? rowFor(prs.data, choice.repo, choice.number) : own) : null;
   const [overview, setOverview] = useState<PrOverview | null>(null);
   const shownPr = row?.repo && row.number != null ? `${row.repo}#${row.number}` : null;
   // Which PR the gates are for now, so a late read of one the session has moved on from is dropped.
@@ -88,19 +98,36 @@ export function PrTab({ project, workstream }: { project: Project; workstream: s
     const reviewRow = review.row ?? { ...rowFor(prs.data, review.repo, review.number), title: review.title, author: review.author, url: review.url };
     return <ReviewSessionPr project={project} workstream={workstream} row={reviewRow as PrRow & { repo: string; number: number }} prs={prs.data} onChanged={changed} />;
   }
-  if (!row) {
+  if (loading || !row) {
     return (
       <div className="pr-panel pr-panel-empty">
         <span className="chat-launcher-icon" data-kind="pr" aria-hidden="true"><Icon name="arrow-merge" size="medium" /></span>
-        <span className="chat-launcher-title">{prs.data === null && prs.loading ? 'Looking for its pull request…' : 'No pull request yet'}</span>
-        {!(prs.data === null && prs.loading) && (
-          <span className="chat-launcher-sub">When {project.name} opens a PR from this session, it shows here with its checks and gates.</span>
+        <span className="chat-launcher-title">{loading ? 'Looking for its pull request…' : 'No pull request yet'}</span>
+        {!loading && (
+          <span className="chat-launcher-sub">When {project.name} or one of its asks opens a PR, it shows here with its checks and gates.</span>
         )}
       </div>
     );
   }
   return (
     <div className="pr-panel">
+      {choices.length > 1 && (
+        <div className="pr-panel-picker" role="group" aria-label="Pull requests for this session">
+          {choices.map(p => {
+            const listed = p.ask ? rowFor(prs.data, p.repo, p.number) : own!;
+            return (
+              <Button key={p.key} variant="minimal" className="pr-panel-choice" aria-pressed={p.key === choice?.key} onPress={() => setSelected({ chat, key: p.key })}>
+                <Icon name="arrow-merge" size="medium" aria-hidden="true" />
+                <span className="pr-panel-choice-text">
+                  <span className="pr-panel-choice-title">{listed.title}</span>
+                  <span className="pr-panel-choice-sub">{rowLabel(listed)} · {p.ask?.title ?? 'This session'}</span>
+                </span>
+              </Button>
+            );
+          })}
+        </div>
+      )}
+      {choice?.ask && <p className="pr-panel-source">From ask: {choice.ask.title}</p>}
       <div className="pr-panel-label">
         {rowLabel(row)}
         {/* Self-review: a reviewer reads this session's PR in a pane beside it. */}

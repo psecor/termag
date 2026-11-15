@@ -1,5 +1,7 @@
-// Phone-sized viewport → /m. Pure so the heuristic
-// is unit-testable; the gate component in App.tsx feeds it the live values.
+// Phone-sized viewport → /m, or under chat-phone-home-enabled the chat
+// (§5.1). Pure so the heuristic is unit-testable; the gate
+// component in App.tsx feeds it the live values.
+import { LAB_PARAM, withoutLoginParams } from '../chat/uiMode';
 
 export const MOBILE_OPT_OUT_KEY = 'termag-mobile-opt-out';
 export const MOBILE_MEDIA_QUERY = '(max-width: 767px) and (pointer: coarse)';
@@ -66,6 +68,44 @@ export function mobileHrefFromWorkspaceSearch(search: string): string {
   if (!project) return '/m';
   const ws = sp.get('ws');
   return `/m/p/${encodeURIComponent(project)}${ws && ws !== 'main' ? `?ws=${encodeURIComponent(ws)}` : ''}`;
+}
+
+/**
+ * The session a workspace link names for a phone landing in the chat: a Lab
+ * link to a project's session (`?project=<id>[&ws=<name>]`, Slack's and the
+ * automation reports' links) with nothing the chat has no equivalent for.
+ * Null for the bare workspace URL, a link marked as opening Lab on purpose
+ * (LAB_PARAM), or one with any other parameter (`branchOff`, a share
+ * handoff), which keep today's /m route.
+ */
+export function phoneChatSession(search: string): { projectId: string; workstream: string } | null {
+  const sp = new URLSearchParams(withoutLoginParams(search));
+  const project = sp.get('project');
+  if (!project) return null;
+  if ([...sp.keys()].some(key => key !== 'project' && key !== 'ws')) return null;
+  return { projectId: project, workstream: sp.get('ws') || 'main' };
+}
+
+/**
+ * Where a phone sent off the workspace URL lands (shouldRedirectToMobile).
+ * With `phoneChat` (chat-phone-home-enabled, for a page loaded here): the
+ * bare workspace URL opens the chat, `/chat`, and a link to a session that
+ * session's chat (`/chat/p/<id>[?ws=<name>]`, chatHref) when `hasChat` says
+ * the project list shows it has one (chat/simpleChat.ts sessionHasChat).
+ * Anything else, the flag off included, is today's /m route
+ * (mobileHrefFromWorkspaceSearch): a link with a parameter the chat has no
+ * equivalent for (Lab's `?prs=<view>`, say) isn't the chat's to open.
+ */
+export function phoneLandingHref(i: { search: string; phoneChat: boolean; hasChat: boolean }): string {
+  const mobile = mobileHrefFromWorkspaceSearch(i.search);
+  if (!i.phoneChat) return mobile;
+  const sp = new URLSearchParams(withoutLoginParams(i.search));
+  if (sp.has(LAB_PARAM)) return mobile;
+  if (!sp.get('project')) return [...sp.keys()].length === 0 ? '/chat' : mobile;
+  const session = phoneChatSession(i.search);
+  if (!session || !i.hasChat) return mobile;
+  const base = `/chat/p/${encodeURIComponent(session.projectId)}`;
+  return session.workstream === 'main' ? base : `${base}?ws=${encodeURIComponent(session.workstream)}`;
 }
 
 export function readOptOut(storage: Pick<Storage, 'getItem'> | null | undefined): boolean {
