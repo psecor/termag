@@ -42,18 +42,24 @@ export function localSpaceStorage(): LocalSpaceObjects | null {
 }
 
 let localReady: Promise<string | null> | null = null;
+let localRefusedAt = 0;
+export const LOCAL_RETRY_MS = 30_000;
 
 /**
- * Local storage's prepare() (its root made private), once per process: null
- * when ready, else why spaces refuse to serve from it. index.ts starts it at
- * boot; spaceObjects() waits for it.
+ * Local storage's prepare() (its root made private): null when ready, else
+ * why spaces refuse to serve from it. index.ts starts it at boot; spaceObjects()
+ * and routes/spaceStorage.ts wait for it. A success is kept for the process;
+ * a refusal is tried again after LOCAL_RETRY_MS, so an operator who fixes the
+ * directory's ownership gets spaces back without a restart.
  */
-export function prepareLocalSpaceStorage(): Promise<string | null> {
+export function prepareLocalSpaceStorage(now: () => number = Date.now): Promise<string | null> {
   const objects = localSpaceStorage();
   if (!objects) return Promise.resolve(null);
+  if (localRefusedAt && now() - localRefusedAt >= LOCAL_RETRY_MS) { localReady = null; localRefusedAt = 0; }
   localReady ??= objects.prepare().then(() => null, err => {
     const reason = `local storage refused: ${(err as Error).message}`;
     console.error(`[SPACES] ${reason}`);
+    localRefusedAt = now();
     return reason;
   });
   return localReady;

@@ -309,7 +309,7 @@ app.use(cors({ origin: termagCorsOrigin(), credentials: true }));
 // no session, because the token is the authority (routes/spaceStorage.ts).
 const localSpaces = localSpaceStorage();
 if (localSpaces) {
-  app.use(`${BASE_PATH}/api/space-storage`, spaceStorageRouter(localSpaces));
+  app.use(`${BASE_PATH}/api/space-storage`, spaceStorageRouter(localSpaces, { ready: () => prepareLocalSpaceStorage() }));
   prepareLocalSpaceStorage()
     .then(refused => (refused ? 0 : localSpaces.cleanTmp()))
     .then(n => { if (n) console.log(`[SPACES] removed ${n} abandoned uploads from local storage`); })

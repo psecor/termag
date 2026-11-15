@@ -12,18 +12,21 @@ import { safeInline, spaceStorageRouter } from './spaceStorage';
 let root: string;
 let server: Server;
 let objects: LocalSpaceObjects;
+/** What the storage's prepare() answers: null serves, a string refuses. */
+let refused: string | null = null;
 
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'space-storage-'));
   const app = express();
   // As index.ts mounts it: ahead of the JSON parser, which must never see an upload.
-  app.use('/termag/api/space-storage', (req, res, next) => spaceStorageRouter(objects)(req, res, next));
+  app.use('/termag/api/space-storage', (req, res, next) => spaceStorageRouter(objects, { ready: async () => refused })(req, res, next));
   app.use(express.json());
   await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', () => resolve()); });
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/termag/api/space-storage`;
   objects = new LocalSpaceObjects({ root, baseUrl: base, secret: 'test-secret' });
 });
 afterEach(async () => {
+  refused = null;
   await new Promise<void>(resolve => server.close(() => resolve()));
   rmSync(root, { recursive: true, force: true });
 });
@@ -38,6 +41,22 @@ async function getUrl(key: string, response: { contentDisposition: string; conte
 }
 
 describe('space storage route', () => {
+  it('answers 503 to every signed URL while the storage refuses to serve, then serves again', async () => {
+    await putSigned('sp1/a', 'one');
+    const url = await getUrl('sp1/a');
+    const signed = await objects.presignPut('sp1/b', 3, 'text/plain');
+    refused = 'local storage refused: /x is open to other accounts';
+    const get = await fetch(url);
+    expect(get.status).toBe(503);
+    expect(await get.text()).toContain('<Code>ServiceUnavailable</Code>');
+    const put = await fetch(signed.url, { method: 'PUT', headers: signed.headers, body: 'abc' });
+    expect(put.status).toBe(503);
+    expect(await objects.head('sp1/b')).toBeNull();
+    refused = null;
+    expect((await fetch(url)).status).toBe(200);
+    expect((await fetch(signed.url, { method: 'PUT', headers: signed.headers, body: 'abc' })).status).toBe(200);
+  });
+
   it('stores a signed PUT and answers its ETag', async () => {
     const res = await putSigned('sp1/data.json', '{"a":1}', 'application/json');
     expect(res.status).toBe(200);

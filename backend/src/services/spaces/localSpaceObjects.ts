@@ -674,8 +674,13 @@ export class LocalSpaceObjects implements SpaceObjects {
    * Makes the root private before anything is served: created 0700 when
    * missing, set to 0700 when it is this user's and open to others. Throws
    * when it is open to others and belongs to another user, since every
-   * member's files would then be readable by any account on the host. Only
-   * the root is checked: 0700 there closes everything under it.
+   * member's files would then be readable by any account on the host.
+   *
+   * A root that was open is the sign of a tree written before modes were
+   * set (0755 folders and 0644 files under the service's umask), so the whole
+   * tree is tightened then too: the files' privacy must not rest on the root
+   * bit alone, which a later chmod or copy of the tree would undo. A root
+   * already private is left alone, so a normal start costs one stat.
    */
   async prepare(): Promise<void> {
     await fs.mkdir(this.root, { recursive: true, mode: DIR_MODE });
@@ -687,7 +692,23 @@ export class LocalSpaceObjects implements SpaceObjects {
       throw new Error(`${this.root} is open to other accounts (mode ${mode}) and belongs to uid ${st.uid}, not this process's ${uid}; make it 700 and owned by this user`);
     }
     await fs.chmod(this.root, DIR_MODE);
-    console.warn(`[SPACES] ${this.root} was open to other accounts (mode ${mode}); set it to 700`);
+    const tightened = await this.tighten(this.root);
+    console.warn(`[SPACES] ${this.root} was open to other accounts (mode ${mode}); set it to 700${tightened ? ` and ${tightened} entries under it to owner-only` : ''}`);
+  }
+
+  /** chmods every open entry under `dir` to DIR_MODE or FILE_MODE; answers how many it changed. */
+  private async tighten(dir: string): Promise<number> {
+    let n = 0;
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      const want = entry.isDirectory() ? DIR_MODE : FILE_MODE;
+      const st = await fs.lstat(path).catch(() => null);
+      if (!st) continue;
+      if ((st.mode & 0o777) !== want) { await fs.chmod(path, want); n++; }
+      if (entry.isDirectory()) n += await this.tighten(path);
+    }
+    return n;
   }
 
   /** Removes writes abandoned in tmp/ (a crash mid-upload); for startup. */
