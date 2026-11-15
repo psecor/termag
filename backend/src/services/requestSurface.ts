@@ -1,9 +1,10 @@
 // Where the request being handled came from, for the `surface` attribute on
 // the flag context's user (services/featureFlags.ts): the browser (`web`, or
-// `mobile` on the phone client), the CLI, the TUI, metaterm, or Slack. Held in
-// an AsyncLocalStorage, so a flag read deep in a service sees it without every
-// caller passing it on. Unset outside a request (sweeps, timers, box agent and
-// browser WebSocket messages), and the attribute is then left out.
+// `mobile` on the phone client), the CLI, the TUI, metaterm, the desktop app,
+// or Slack. Held in an AsyncLocalStorage, so a flag read deep in a service sees
+// it without every caller passing it on. Unset outside a request (sweeps,
+// timers, box agent and browser WebSocket messages), and the attribute is then
+// left out.
 import { AsyncLocalStorage } from 'async_hooks';
 import type { NextFunction, Request, Response } from 'express';
 import { clientFromHeaders, type ClientKind } from './software/versions';

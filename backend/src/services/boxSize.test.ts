@@ -31,20 +31,40 @@ beforeEach(() => {
 });
 
 describe('the sizes and their types', () => {
-  it('launches small, medium and large as m8g.large, m8g.xlarge and m8g.2xlarge', () => {
+  it('launches small, medium and large as m8g.large, m8g.xlarge and r8g.xlarge', () => {
     expect(BOX_SIZES).toEqual(['small', 'medium', 'large']);
     expect(instanceTypesForSize('small', {})?.type).toBe('m8g.large');
     expect(instanceTypesForSize('medium', {})?.type).toBe('m8g.xlarge');
-    expect(instanceTypesForSize('large', {})?.type).toBe('m8g.2xlarge');
+    expect(instanceTypesForSize('large', {})?.type).toBe('r8g.xlarge');
     expect(boxSizeSpec('small', {})).toMatchObject({ vcpus: 2, memoryGiB: 8 });
     expect(boxSizeSpec('medium', {})).toMatchObject({ vcpus: 4, memoryGiB: 16 });
-    expect(boxSizeSpec('large', {})).toMatchObject({ vcpus: 8, memoryGiB: 32 });
+    expect(boxSizeSpec('large', {})).toMatchObject({ vcpus: 4, memoryGiB: 32 });
   });
 
   it('falls back within the size: the families beside it at the same vCPU, then the next size up', () => {
     expect(instanceTypesForSize('small', {})?.fallbacks).toEqual(['m7g.large', 'r8g.large', 'r7g.large', 'm8g.xlarge']);
     expect(instanceTypesForSize('medium', {})?.fallbacks).toEqual(['m7g.xlarge', 'r8g.xlarge', 'r7g.xlarge', 'm8g.2xlarge']);
-    expect(instanceTypesForSize('large', {})?.fallbacks).toEqual(['m7g.2xlarge', 'r8g.2xlarge', 'r7g.2xlarge', 'm8g.4xlarge']);
+    expect(instanceTypesForSize('large', {})?.fallbacks).toEqual(['r7g.xlarge', 'm8g.2xlarge', 'm7g.2xlarge']);
+  });
+
+  it('keeps large at 4 vCPU and 32 GiB or more in every type, and within the resize cap of 8 vCPU and 32 GiB', () => {
+    const shapes: Record<string, [number, number]> = {
+      'r8g.xlarge': [4, 32], 'r7g.xlarge': [4, 32], 'm8g.2xlarge': [8, 32], 'm7g.2xlarge': [8, 32],
+    };
+    for (const type of boxSizeSpec('large', {}).types) {
+      const shape = shapes[type];
+      expect(shape, type).toBeDefined();
+      const [vcpus, memoryGiB] = shape!;
+      expect(vcpus, type).toBeGreaterThanOrEqual(4);
+      expect(vcpus, type).toBeLessThanOrEqual(8);
+      expect(memoryGiB, type).toBe(32);
+    }
+  });
+
+  it('still lets BOX_LARGE_INSTANCE_TYPES replace large\'s types', () => {
+    expect(instanceTypesForSize('large', { BOX_LARGE_INSTANCE_TYPES: 'm8g.2xlarge,m7g.2xlarge' }))
+      .toEqual({ type: 'm8g.2xlarge', fallbacks: ['m7g.2xlarge'] });
+    expect(boxSizeSpec('large', { BOX_LARGE_INSTANCE_TYPES: 'm8g.2xlarge' })).toMatchObject({ vcpus: 4, memoryGiB: 32 });
   });
 
   it('is all arm64, which the AMI needs', () => {
@@ -162,14 +182,15 @@ describe('the size order', () => {
 });
 
 describe('largestBoxSize: a multi-repo project\'s size, the most of each across its repositories', () => {
-  it('takes the most vCPUs and the most memory each on its own: 4/32 and 8/16 make 8/32, which is large', () => {
-    expect(largestBoxSize([{ vcpu: 4, memoryGiB: 32 }, { vcpu: 8, memoryGiB: 16 }])).toBe('large');
-    expect(largestBoxSize([{ vcpu: 2, memoryGiB: 32 }, { vcpu: 4, memoryGiB: 8 }])).toEqual({ vcpu: 4, memoryGiB: 32 });
+  it('takes the most vCPUs and the most memory each on its own: 4/32 and 8/16 make 8/32, which no preset is', () => {
+    expect(largestBoxSize([{ vcpu: 4, memoryGiB: 32 }, { vcpu: 8, memoryGiB: 16 }])).toEqual({ vcpu: 8, memoryGiB: 32 });
+    expect(largestBoxSize([{ vcpu: 2, memoryGiB: 32 }, { vcpu: 4, memoryGiB: 8 }])).toBe('large');
   });
 
   it('counts a preset as its shape, and gives a preset back when the result is one', () => {
     expect(largestBoxSize(['small', 'medium'])).toBe('medium');
-    expect(largestBoxSize(['medium', { vcpu: 4, memoryGiB: 32 }])).toEqual({ vcpu: 4, memoryGiB: 32 });
+    expect(largestBoxSize(['medium', { vcpu: 4, memoryGiB: 32 }])).toBe('large');
+    expect(largestBoxSize(['large', { vcpu: 8, memoryGiB: 16 }])).toEqual({ vcpu: 8, memoryGiB: 32 });
     expect(largestBoxSize(['small', { vcpu: 4, memoryGiB: 16 }])).toBe('medium');
     expect(largestBoxSize(['large', { vcpu: 2, memoryGiB: 16 }])).toBe('large');
   });
@@ -194,7 +215,7 @@ describe('what the pickers are told', () => {
       sizes: [
         { size: 'small', vcpus: 2, memoryGiB: 8, instanceType: 'm8g.large' },
         { size: 'medium', vcpus: 4, memoryGiB: 16, instanceType: 'm8g.xlarge' },
-        { size: 'large', vcpus: 8, memoryGiB: 32, instanceType: 'm8g.2xlarge' },
+        { size: 'large', vcpus: 4, memoryGiB: 32, instanceType: 'r8g.xlarge' },
       ],
     });
   });
@@ -202,6 +223,8 @@ describe('what the pickers are told', () => {
 
 describe('coveringPreset', () => {
   it('is the smallest preset with at least the vCPUs and the memory, else large', () => {
+    expect(coveringPreset({ vcpu: 2, memoryGiB: 32 })).toBe('large');
+    expect(coveringPreset({ vcpu: 8, memoryGiB: 32 })).toBe('large');
     expect(coveringPreset({ vcpu: 2, memoryGiB: 8 })).toBe('small');
     expect(coveringPreset({ vcpu: 4, memoryGiB: 16 })).toBe('medium');
     expect(coveringPreset({ vcpu: 4, memoryGiB: 32 })).toBe('large');

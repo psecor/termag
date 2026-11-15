@@ -75,6 +75,18 @@ export async function readCredential(cfg: CredentialStoreConfig, userId: string,
   return row ? openCredential(cfg, userId, provider, row.ciphertext) : null;
 }
 
+const changeListeners = new Set<(userId: string, provider: string) => void>();
+
+/** Called after each write or delete of a user's credential, per provider: a cache of it drops its copy. */
+export function onCredentialChange(listener: (userId: string, provider: string) => void): () => void {
+  changeListeners.add(listener);
+  return () => { changeListeners.delete(listener); };
+}
+
+function notifyChange(userId: string, providers: Iterable<string>): void {
+  for (const provider of providers) for (const listener of changeListeners) listener(userId, provider);
+}
+
 /** A value and its display label to store, or null to delete that provider's row. */
 export type CredentialChange = { value: unknown; label: string } | null;
 
@@ -100,6 +112,7 @@ export async function writeCredentials(
     });
   }));
   if ('github' in changes) notifyGithubCredentialChange(userId);
+  notifyChange(userId, Object.keys(changes));
 }
 
 /**
@@ -110,6 +123,7 @@ export async function writeCredentials(
 export async function deleteCredentials(userId: string, providers: string[]): Promise<void> {
   await prisma.userCredential.deleteMany({ where: { userId, provider: { in: providers } } });
   if (providers.includes('github')) notifyGithubCredentialChange(userId);
+  notifyChange(userId, providers);
 }
 
 export interface GithubSecret {

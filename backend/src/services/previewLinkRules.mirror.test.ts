@@ -4,7 +4,7 @@
 // disagree, so a change to one is made to the other.
 import { join, resolve } from 'path';
 import { describe, expect, it } from 'vitest';
-import { MAX_LINK_LIFETIME_MS, MAX_TTL_HOURS, MIN_TTL_HOURS, RESERVED_PREVIEW_NAMES, nameRefusal, suggestName } from './previewLinkRules';
+import { MAX_LINK_LIFETIME_MS, PREVIEW_EMAIL_RE, MAX_TTL_HOURS, MIN_TTL_HOURS, RESERVED_PREVIEW_NAMES, nameRefusal, suggestName } from './previewLinkRules';
 
 // A computed path, so the backend's tsc doesn't compile the frontend's file.
 const FRONTEND_RULES = join(resolve(__dirname, '../../..'), 'frontend/src/previewLinks/rules.ts');
@@ -27,5 +27,12 @@ describe("the frontend's copy of the preview-link name rules", () => {
     for (const [p, w] of SUGGESTIONS) expect([p, w, fe.suggestName(p, w)]).toEqual([p, w, suggestName(p, w)]);
     expect([fe.MIN_TTL_HOURS, fe.MAX_TTL_HOURS]).toEqual([MIN_TTL_HOURS, MAX_TTL_HOURS]);
     expect(fe.MAX_LINK_LIFETIME_DAYS * 86_400_000).toBe(MAX_LINK_LIFETIME_MS);
+  });
+
+  it('takes the same text as an email', async () => {
+    const fe = await import(FRONTEND_RULES);
+    for (const e of ['ana@x.test', 'a@b', 'ana', '@x.test', 'ana@', 'a b@x.test', 'a@@x', 'Ana@X.test']) {
+      expect([e, fe.PREVIEW_EMAIL_RE.test(e)]).toEqual([e, PREVIEW_EMAIL_RE.test(e)]);
+    }
   });
 });

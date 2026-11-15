@@ -40,6 +40,9 @@ export interface McpAuthzDeps {
   accessToken: (connector: McpConnectorRecord) => Promise<string>;
   termagUrl: string | null;
   allow?: Set<string>;
+  // Why the owner's mcp-upstream-allowlist refuses the connector's URL, or
+  // null when it allows it (services/mcpUpstreamAllowlist.ts upstreamRefusal).
+  upstreamRefusal: (connector: McpConnectorRecord) => Promise<string | null>;
 }
 
 const CONNECTOR_PATH = /^\/c\/([a-z0-9]{1,40})(?:[/?]|$)/;
@@ -53,7 +56,7 @@ const NOT_FOUND = 'No such MCP connector for this box\'s owner';
 /**
  * Order: the box token and a managed box, then a connector the
  * box's owner owns (404 for anyone else's, so its existence never shows),
- * then its headers. No secret or upstream header value reaches an audit line.
+ * then its URL against the owner's allowlist, then its headers. No secret or upstream header value reaches an audit line.
  */
 export async function decideMcpRequest(req: McpAuthzRequest, deps: McpAuthzDeps): Promise<AuthzDecision> {
   const token = boxTokenFrom(req.authorization);
@@ -69,8 +72,13 @@ export async function decideMcpRequest(req: McpAuthzRequest, deps: McpAuthzDeps)
   // An api connector's token is for the API broker's allowlist only
   // (services/apiBroker.ts), never for any path under its upstream.
   if (isApiConnector(connector)) return deny(404, NOT_FOUND, `${who} connector=${id} is an API connector`);
-  const relink = relinkMessage(connector.name, connector.id, deps.termagUrl);
   const at = `${who} connector=${id}`;
+  // Before any token or secret is read, so a connector off the list never refreshes one.
+  const refusal = await deps.upstreamRefusal(connector);
+  if (refusal) {
+    return deny(403, `MCP server "${connector.name}": ${refusal}, so the termag MCP broker does not forward to it`, `${at} upstream refused: ${refusal}`);
+  }
+  const relink = relinkMessage(connector.name, connector.id, deps.termagUrl);
   let headers: Record<string, string>;
   if (connector.authType === 'oauth') {
     try {

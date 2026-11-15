@@ -9,8 +9,8 @@
  *   2. the actor owns the space                       space_not_found, not_owner
  *   4. not a DM, a #proj-… channel, Slack Connect
  *      or archived                                   channel_dm, channel_workstream, channel_ext_shared, channel_archived
- *   3. the actor is in the channel (from Slack, and
- *      for a private channel from anywhere)           not_in_channel, actor_not_in_slack
+ *   3. the actor is in the channel, from every entry
+ *      point, public or private                      not_in_channel, actor_not_in_slack
  *   5. not linked to another space                    channel_linked (the same space: a no-op)
  *   6. under channelsPerSpace, private allowed        too_many_channels, private_not_allowed
  *   7. termag is in the channel or can join           needs_invite
@@ -452,12 +452,15 @@ async function linkExisting(deps: LinkDeps, input: LinkInput, o: OwnerCheck): Pr
   let joined = false;
   if (visible) {
     ({ members, joined } = await readMembers(deps.slack, info!, channelId, !linkedHere && !linkedElsewhere));
-    if (SLACK_ENTRY_POINTS.has(input.via) || isPrivate) {
-      const slackId = await actorSlackId(deps, input.actor);
-      if (!slackId) return refuse('actor_not_in_slack');
-      if (!members) return refuse('slack_error', { error: 'members_unreadable' });
-      if (!members.includes(slackId)) return refuse('not_in_channel');
-    }
+    // From every entry point, public or private (product owner, 2026-11-06):
+    // linking from termag needs the same channel membership as from Slack.
+    // A join the S2 fallback made to read the members is not undone: leaving
+    // could race a concurrent link of the same channel and pull termag out of
+    // it. termag in an unlinked public channel does nothing.
+    const slackId = await actorSlackId(deps, input.actor);
+    if (!slackId) return refuse('actor_not_in_slack');
+    if (!members) return refuse('slack_error', { error: 'members_unreadable' });
+    if (!members.includes(slackId)) return refuse('not_in_channel');
   }
 
   // 5: one space per channel; the same space again is a no-op, whose commit

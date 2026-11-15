@@ -10,13 +10,14 @@ import {
   getCredentialStoreConfig, openCredential, readCredential, sealCredential, writeCredentials, deleteCredentials,
 } from './credentialStore';
 import { API_BROKER_FLAG } from './apiBroker';
-import { boolVariation, jsonVariation } from './featureFlags';
+import { boolVariation, jsonVariation, jsonVariationOrUnknown } from './featureFlags';
 import type { FlagUser } from './featureFlags';
 import { loopbackAllowed, LOOPBACK_SERVERS_FLAG } from './mcpOAuthLoopback';
 import { asSecrets, defaultConnectors, mcpCredentialProvider, MCP_DEFAULTS_FLAG, type DefaultConnector, type Secrets } from './mcpConnectors';
 import { forgetOAuth, freshAccessToken, refreshTokens, revokeToken, type DiscoveredOAuth, type OAuthLockIo, type StoredOAuth } from './mcpOAuth';
 import { safeOAuthHttp } from './mcpOAuthHttp';
 import { MCP_SCOPE_LABELS_FLAG, parseScopeLabels, type ScopeLabels } from './mcpOAuthScopes';
+import { MCP_UPSTREAM_ALLOWLIST_FLAG, parseUpstreamAllowlist, UNLOADED_ALLOWLIST, type UpstreamAllowlist } from './mcpUpstreamAllowlist';
 
 const LD_USER_SELECT = { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true } as const;
 
@@ -25,9 +26,58 @@ export async function scopeLabelsForUser(user: FlagUser): Promise<ScopeLabels> {
   return parseScopeLabels(await jsonVariation(MCP_SCOPE_LABELS_FLAG, user, null));
 }
 
+/**
+ * The MCP server URLs this user's connectors may use (the mcp-upstream-allowlist
+ * flag, from TERMAG_FLAGS). Unset, it is the fallback [], which allows nothing:
+ * a deployment lists the MCP servers its connectors may use.
+ */
+export async function upstreamAllowlistForUser(user: FlagUser): Promise<UpstreamAllowlist> {
+  const served = await jsonVariationOrUnknown(MCP_UPSTREAM_ALLOWLIST_FLAG, user, []);
+  return served ? parseUpstreamAllowlist(served.value) : UNLOADED_ALLOWLIST;
+}
+
+/** upstreamAllowlistForUser for a connector's owner, by id; nothing is allowed when there is no such user. */
+export async function upstreamAllowlistForUserId(userId: string): Promise<UpstreamAllowlist> {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: LD_USER_SELECT });
+  return user ? upstreamAllowlistForUser(user) : { loaded: true, entries: [] };
+}
+
 /** The catalog of MCP servers this user is offered (the mcp-default-connectors flag); empty while it is off. */
 export async function catalogForUser(user: FlagUser): Promise<DefaultConnector[]> {
   return defaultConnectors(await jsonVariation(MCP_DEFAULTS_FLAG, user, null));
+}
+
+// The flag context for a user id, for agent.mcp.used (services/mcpUseEvent.ts),
+// which arrives on every MCP tool call: a user row per call would be too many,
+// and a rename can take this long to reach the context. Only the row is kept:
+// the flags themselves are read per call (in memory), so a catalog change or
+// the off switch takes effect at once, and a call made while the flag source is
+// still connecting doesn't pin the fallback's empty catalog for the TTL.
+const LD_USER_TTL_MS = 5 * 60_000;
+const ldUserCache = new Map<string, { user: FlagUser | null; at: number }>();
+
+/** The user's flag context, cached; null for no user, an unknown id, or a failed lookup (not cached). Never throws. */
+export async function ldUserForId(userId: string | undefined, now: number = Date.now()): Promise<FlagUser | null> {
+  if (!userId) return null;
+  const hit = ldUserCache.get(userId);
+  if (hit && now - hit.at < LD_USER_TTL_MS) return hit.user;
+  try {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: LD_USER_SELECT });
+    if (ldUserCache.size > 1000) ldUserCache.clear();
+    ldUserCache.set(userId, { user, at: now });
+    return user;
+  } catch {
+    return null;
+  }
+}
+
+/** The names the catalog offers this user, read now; empty on any failure. Never throws. */
+export async function catalogNamesForUser(user: FlagUser): Promise<string[]> {
+  try {
+    return (await catalogForUser(user)).map(d => d.name);
+  } catch {
+    return [];
+  }
 }
 
 /**

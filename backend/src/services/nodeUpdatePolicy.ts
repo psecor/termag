@@ -8,9 +8,16 @@
  *
  * The defaults are the safe side:
  *
- *   * floor 24.22.1, the newest security release on the 24.x line (nodejs.org
+ *   * floor 24.22.3, the newest security release on the 24.x line (nodejs.org
  *     marks each release's `security`; doc/changelogs/CHANGELOG_V24.md lists
  *     the CVEs), fixing every 2026 Node security release's CVEs before it:
+ *       - 24.22.3 (2026-11-11): CVE-2026-123863, CVE-2026-123865,
+ *         CVE-2026-123866, CVE-2026-123874 (http2, high), CVE-2026-123864
+ *         (tls,http: nested parser execution, high), CVE-2026-123872 (tls:
+ *         resumption and SNI, high), CVE-2026-126051 (tls: a remotely
+ *         reachable server crash, high), CVE-2026-123828, CVE-2026-123867,
+ *         CVE-2026-123868, CVE-2026-123871, CVE-2026-123875, CVE-2026-123877
+ *         (medium), CVE-2026-123829, CVE-2026-123862, CVE-2026-123873 (low).
  *       - 24.22.1 (2026-10-20): CVE-2026-105481 (http agent data guard),
  *         CVE-2026-105482 (dns: null bytes in resolve inputs), CVE-2026-105483
  *         and CVE-2026-106069 (tls: IP normalization, non-canonical IPs),
@@ -29,8 +36,8 @@
  *         (medium), CVE-2026-21716, CVE-2026-21715 (low).
  *       - 24.13.0 (2026-01-12): CVE-2025-59465, CVE-2025-55132,
  *         CVE-2025-55130, CVE-2025-59466, CVE-2025-55131, CVE-2026-21637.
- *     The fleet ran 24.22.1 on 2026-10-30 (24.22.2, the newest, is not a
- *     security release), so this floor installs nothing on a box on its own.
+ *     The flag's floor went to 24.22.3 the day it shipped, when the fleet ran
+ *     24.22.1 and 24.22.2, so every box below it gets a floor run.
  *   * target latest: the newest release of the box's own major.
  *   * restart none: the agent is restarted on the new Node, and no session.
  *     A run's restart is the admin's choice for it (run.ts): idle or force
@@ -44,7 +51,7 @@ export const NODE_TARGET_TAGS: readonly string[] = ['latest'];
 
 export const DEFAULT_NODE_UPDATE_POLICY: ClaudeUpdatePolicy = {
   mode: 'off',
-  floor: '24.22.1',
+  floor: '24.22.3',
   target: 'latest',
   restart: 'none',
   drainSec: 600,

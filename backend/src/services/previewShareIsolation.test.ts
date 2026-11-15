@@ -32,7 +32,9 @@ describe('preview shares stay on the guest path', () => {
   it('the share service is used only by its routes, the browser socket, the two lifecycle hooks, and the link shares\' GitHub half', () => {
     const importing = files.filter((f) => /from '(?:\.\.\/services|\.)\/previewShares'/.test(f.text)).map((f) => f.path).sort();
     // The desktop's CLI mirror imports the owner's route handlers (routes/previewShares.ts), never the service itself.
-    expect(importing).toEqual(['routes/browserWs.ts', 'routes/cliPreviewSharesPrisma.ts', 'routes/previewShares.ts', 'routes/projects.ts', 'routes/workstreams.ts', 'services/previewShareLinks.ts']);
+    expect(importing).toEqual(['routes/browserWs.ts', 'routes/cliPreviewSharesPrisma.ts', 'routes/previewShares.ts', 'routes/projects.ts', 'routes/workstreams.ts', 'services/previewLinkWake.ts', 'services/previewShareLinks.ts']);
+    // Preview links' wake (row 6b) takes the owner's one guest wake budget, nothing else of the share service.
+    expect(files.find((f) => f.path === 'services/previewLinkWake.ts')!.text.match(/import \{([^}]*)\} from '\.\/previewShares'/)?.[1].trim()).toBe('claimGuestWake');
     expect(files.find((f) => f.path === 'routes/cliPreviewSharesPrisma.ts')!.text).not.toMatch(/services\/previewShares'/);
     // Phase 2's GitHub half (the comment, the sweep) is reached from the share routes and index.ts's startup only.
     const links = files.filter((f) => /from '(?:\.\.\/services|\.\/services|\.)\/previewShareLinks'/.test(f.text)).map((f) => f.path).sort();

@@ -3,7 +3,7 @@
 // and termag's own pages. Pins SR3 (the dispatch never calls next(), and a
 // preview's /termag/api/* is relayed to the app), SR4 (the pre-auth
 // surface, fuzzed), SR10, SR12, SR17 and A2/A3/A4.
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'crypto';
 import {
   CHECKOUT, cookieFor, DOMAIN, landingCode, openWs, previewFixture, previewHeaders, rawRequest, request, signIn, SITE, type Fixture,
@@ -11,6 +11,12 @@ import {
 import { codeHash, newSecret, PREVIEW_COOKIE, sessionIdHash } from './previewHostRules';
 import { makeClosers, startHttpEcho } from './tunnelTestHarness';
 import { linkTokenHash } from './previewLinkRules';
+
+/** Where a clean step's 302 will go: its `next` (signed) or the root; null when the location isn't the clean step. */
+const cleanNext = (loc: string | undefined): string | null => {
+  const u = new URL(loc ?? '', 'https://x.test');
+  return u.pathname === '/__termag/clean' ? (u.searchParams.get('next') ?? '/') : null;
+};
 
 const closers = makeClosers();
 afterAll(() => closers.closeAll());
@@ -92,21 +98,23 @@ describe('the code exchange (SR10, SR12)', () => {
     f.mem.share('proj-1', 'viewer');
     const a = await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
     expect(a.status).toBe(302);
-    expect(a.headers.location).toBe('/dashboard?x=1');
+    // A browser's first session on the link: the clean step first (SR19), then where it was headed.
+    expect(cleanNext(a.headers.location)).toBe('/dashboard?x=1');
+    expect(a.headers.location).toMatch(/&exp=\d+&sig=[A-Za-z0-9_-]{43}$/);
     expect(a.headers['referrer-policy']).toBe('no-referrer');
     const set = ([] as string[]).concat(a.headers['set-cookie'] ?? []);
-    // The session, and on a browser's first session on the link its clear marker (SR19).
-    expect(set).toHaveLength(2);
-    expect(set[1]).toMatch(/^__Host-termag-preview-link=/);
+    // The session alone: the clear's marker comes with the clear.
+    expect(set).toHaveLength(1);
     expect(set[0]).toMatch(new RegExp(`^${PREVIEW_COOKIE}=[A-Za-z0-9_-]{43}\\.[A-Za-z0-9_-]{43}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=\\d+$`));
     const [session] = [...f.mem.sessions.values()];
     expect(session).toMatchObject({ linkId: 'link-my-app', userId: 'viewer', basis: 'collaborator', revokedAt: null });
     expect(session.expiresAt.getTime() - f.now.t).toBe(8 * 3600_000);
-    // Used once: the same code again goes back through sign-in.
+    // Used once: the same code again makes no session (its rebound, below, is a ticket back through the landing).
     const again = await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
     expect(again.status).toBe(302);
-    expect(again.headers.location).toBe(`${SITE}/previews/my-app`);
+    expect(again.headers.location).toMatch(new RegExp(`^${SITE}/previews/my-app/reverify\\?ticket=`));
     expect(again.headers['set-cookie']).toBeUndefined();
+    expect(f.mem.sessions.size).toBe(1);
   });
 
   it('a HEAD of the exchange never uses the code up: the viewer\'s GET still signs in', async () => {
@@ -135,6 +143,33 @@ describe('the code exchange (SR10, SR12)', () => {
     expect(f.mem.sessions.size).toBe(0);
   });
 
+  it('a used code from a browser that already holds the session goes on to next, not round the landing page again (bug cmwe2jg59)', async () => {
+    const { f } = await withApp();
+    const code = await landingCode(f, 'my-app', 'owner', 'owner', { next: '/deep?a=1' });
+    const first = await request(f.port, `/__termag/auth?code=${code}&next=${encodeURIComponent('/deep?a=1')}`, { headers: previewHeaders() });
+    expect(first.status).toBe(302);
+    const cookie = ([] as string[]).concat(first.headers['set-cookie'] ?? [])[0].split(';')[0];
+    // Continue clicked while the app's first answer was still on its way: the same URL again, now with the cookie.
+    // Where the code itself was headed, through the clean step (no marker yet), whatever the URL's `next` says:
+    // any site can send a browser with a session here (Cursor Security, #1745).
+    const again = await request(f.port, `/__termag/auth?code=${code}&next=${encodeURIComponent('/admin/delete')}`, { headers: previewHeaders('my-app', { cookie }) });
+    expect(again.status).toBe(302);
+    expect(cleanNext(again.headers.location)).toBe('/deep?a=1');
+    expect(again.headers['set-cookie']).toBeUndefined();
+    expect(f.mem.sessions.size).toBe(1);
+    // Its rebound used, or a code nobody minted: the app's root, never the URL's `next`, safe or not.
+    for (const c of [code, newSecret()]) {
+      const evil = await request(f.port, `/__termag/auth?code=${c}&next=${encodeURIComponent('//evil.example')}`, { headers: previewHeaders('my-app', { cookie }) });
+      expect(cleanNext(evil.headers.location)).toBe('/');
+    }
+    // A session for another link's host, or a forged one, is no session here: back through sign-in.
+    f.mem.addLink({ name: 'other-app', port: 1 });
+    const other = await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders('other-app', { cookie }) });
+    expect(other.headers.location).toBe(`${SITE}/previews/other-app`);
+    const forged = await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders('my-app', { cookie: cookieFor('my-app', newSecret()) }) });
+    expect(forged.headers.location).toBe(`${SITE}/previews/my-app`);
+  });
+
   it('never redeems a reverify ticket as a code: the ticket has to go back through the main host', async () => {
     const { f } = await withApp();
     const ticket = newSecret();
@@ -157,7 +192,7 @@ describe('the code exchange (SR10, SR12)', () => {
     f.mem.unshare('proj-1', 'viewer');
     expect((await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() })).status).toBe(404);
     // A token code after the token rotated.
-    f.mem.links.get('link-my-app')!.link.audience = 'link';
+    Object.assign(f.mem.links.get('link-my-app')!.link, { audience: 'link', linkTokenHash: 'h'.repeat(64) });
     f.mem.links.get('link-my-app')!.link.linkTokenHash = linkTokenHash('A'.repeat(22));
     const tokenCode = await landingCode(f, 'my-app', 'viewer', 'token', { tokenHash: linkTokenHash('B'.repeat(22)) });
     expect((await request(f.port, `/__termag/auth?code=${tokenCode}`, { headers: previewHeaders() })).status).toBe(404);
@@ -326,43 +361,178 @@ describe('a reused name starts clean (SR19)', () => {
   const setCookies = (a: { headers: Record<string, unknown> }) => ([] as string[]).concat((a.headers['set-cookie'] as string[] | undefined) ?? []);
   const marker = (a: { headers: Record<string, unknown> }) => setCookies(a).find(c => c.startsWith('__Host-termag-preview-link='))?.split(';')[0];
 
-  it('a browser\'s first session on a link clears the origin and sets an HttpOnly marker, never clearing cookies', async () => {
+  it('the exchange sets the session on a response with no Clear-Site-Data; the clean step clears and sets the marker alone', async () => {
+    // Chrome holds a redirect with Clear-Site-Data until its clear is done and stores none of its cookies if the
+    // navigation is dropped meanwhile (a click on the hand-off page): the session's cookie never waits on it.
     const { f } = await withApp();
-    const a = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders() });
+    const a = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner', 'owner', { next: '/x' })}`, { headers: previewHeaders() });
     expect(a.status).toBe(302);
-    expect(a.headers['clear-site-data']).toBe('"storage", "cache"');
-    expect(a.headers['clear-site-data']).not.toMatch(/cookies|\*/);
+    expect(a.headers['clear-site-data']).toBeUndefined();
+    expect(setCookies(a)).toHaveLength(1);
     expect(setCookies(a)[0]).toMatch(/^__Host-termag-preview=/);
-    expect(setCookies(a)[1]).toMatch(/^__Host-termag-preview-link=link-my-app\.[A-Za-z0-9_-]{43}; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=34560000$/);
+    expect(cleanNext(a.headers.location)).toBe('/x');
+    const session = setCookies(a)[0].split(';')[0];
+    // Without the session the exchange just set, nobody is cleared: back through sign-in (Cursor Security, #1745).
+    const anon = await request(f.port, a.headers.location!, { headers: previewHeaders() });
+    expect(anon.status).toBe(302);
+    expect(anon.headers.location).toBe(`${SITE}/previews/my-app`);
+    expect(anon.headers['clear-site-data']).toBeUndefined();
+    expect(anon.headers['set-cookie']).toBeUndefined();
+    const c = await request(f.port, a.headers.location!, { headers: previewHeaders('my-app', { cookie: session }) });
+    expect(c.status).toBe(302);
+    expect(c.headers.location).toBe('/x');
+    // Storage alone (2026-11-12): a new link's origin has no HTTP cache, and Chrome's cache clear is the slow part.
+    expect(c.headers['clear-site-data']).toBe('"storage"');
+    expect(c.headers['clear-site-data']).not.toMatch(/cookies|\*/);
+    expect(setCookies(c)).toHaveLength(1);
+    expect(setCookies(c)[0]).toMatch(/^__Host-termag-preview-link=link-my-app\.[A-Za-z0-9_-]{43}; Path=\/; Secure; HttpOnly; SameSite=Lax; Max-Age=34560000$/);
+    // Nowhere but the app's own paths, on the link's own host; a HEAD clears nothing.
+    expect((await request(f.port, '/__termag/clean?next=%2F%2Fevil.test', { headers: previewHeaders('my-app', { cookie: session }) })).headers.location).toBe('/');
+    expect((await request(f.port, '/__termag/clean?next=%2F__termag%2Fclean', { headers: previewHeaders('my-app', { cookie: session }) })).headers.location).toBe('/');
+    const bare = await request(f.port, '/__termag/clean', { headers: previewHeaders('my-app', {}, null) });
+    expect(bare.headers.location).toBe(`${SITE}/previews/my-app`);
+    expect(bare.headers['clear-site-data']).toBeUndefined();
+    const head = await request(f.port, '/__termag/clean', { method: 'HEAD', headers: previewHeaders() });
+    expect(head.status).toBe(204);
+    expect(head.headers['clear-site-data']).toBeUndefined();
+    // Anyone can be sent here: a browser already cleared for this link is never cleared again (Devin, #1745).
+    const marker = setCookies(c)[0].split(';')[0];
+    // Only a `next` termag signed for this link and session, in its minute: anything else is the root, so no other
+    // site can send a viewer through this same-origin 302 to a path it chose (Cursor Security, #1745).
+    const signed = new URL(a.headers.location!, 'https://x.test');
+    const sig = signed.searchParams.get('sig')!;
+    const exp = signed.searchParams.get('exp')!;
+    for (const forged of [
+      '/__termag/clean?next=%2Fadmin%2Fdelete',
+      `/__termag/clean?next=%2Fadmin%2Fdelete&exp=${exp}&sig=${sig}`,
+      `/__termag/clean?next=%2Fx&exp=${Number(exp) + 1}&sig=${sig}`,
+      `/__termag/clean?next=%2Fx&exp=${exp}&sig=${'A'.repeat(43)}`,
+    ]) {
+      expect((await request(f.port, forged, { headers: previewHeaders('my-app', { cookie: session }) })).headers.location, forged).toBe('/');
+    }
+    // Another session's signed `next` is no use either, and a minute later neither is this one's.
+    const other = setCookies(await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders() }))[0].split(';')[0];
+    expect((await request(f.port, a.headers.location!, { headers: previewHeaders('my-app', { cookie: other }) })).headers.location).toBe('/');
+    f.now.t += 61_000;
+    expect((await request(f.port, a.headers.location!, { headers: previewHeaders('my-app', { cookie: session }) })).headers.location).toBe('/');
+    const crafted = await request(f.port, '/__termag/clean?next=%2Fy', { headers: previewHeaders('my-app', { cookie: `${session}; ${marker}` }) });
+    expect(crafted.status).toBe(302);
+    expect(crafted.headers.location).toBe('/');
+    expect(crafted.headers['clear-site-data']).toBeUndefined();
+    expect(crafted.headers['set-cookie']).toBeUndefined();
   });
 
   it('decides per browser: the same browser with its marker clears nothing more; another browser of the same viewer clears', async () => {
     const { f } = await withApp();
-    const first = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders() });
-    const m = marker(first)!;
+    const { cookie } = await signIn(f, 'my-app', 'owner');
+    const m = cookie.split('; ')[1];
+    expect(m).toMatch(/^__Host-termag-preview-link=/);
     const again = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders('my-app', { cookie: m }) });
-    expect(again.headers['clear-site-data']).toBeUndefined();
-    expect(marker(again)).toBeUndefined();
+    expect(again.headers.location).toBe('/');
     // A code redeemed in some other browser (an old Service Worker's thief, say) never stops this one's clear.
     const elsewhere = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders() });
-    expect(elsewhere.headers['clear-site-data']).toBe('"storage", "cache"');
+    expect(elsewhere.headers.location).toBe('/__termag/clean');
   });
 
-  it('a marker for another link, a forged one, or another name\'s clears again; a reverify never does', async () => {
-    const { f } = await withApp();
-    const { idHash } = await signIn(f, 'my-app', 'owner');
-    for (const cookie of ['__Host-termag-preview-link=link-old.' + 'A'.repeat(43), '__Host-termag-preview-link=link-my-app.' + 'B'.repeat(43), '__Host-termag-preview-link=link-my-app']) {
-      const a = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders('my-app', { cookie }) });
-      expect(a.headers['clear-site-data'], cookie).toBe('"storage", "cache"');
+  it('a marker for another link, a forged one, or another name\'s clears again, and so does a navigation that never got one', async () => {
+    const { f, app } = await withApp();
+    const { cookie } = await signIn(f, 'my-app', 'owner');
+    const session = cookie.split('; ')[0];
+    for (const m of ['__Host-termag-preview-link=link-old.' + 'A'.repeat(43), '__Host-termag-preview-link=link-my-app.' + 'B'.repeat(43), '__Host-termag-preview-link=link-my-app']) {
+      const a = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders('my-app', { cookie: m }) });
+      expect(a.headers.location, m).toBe('/__termag/clean');
     }
-    const re = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner', 'owner', { sessionIdHash: idHash })}`, { headers: previewHeaders() });
-    expect(re.status).toBe(302);
-    expect(re.headers['clear-site-data']).toBeUndefined();
+    // The session without its marker (the clean step's navigation was dropped): no app until the clear.
+    const before = app.connections();
+    // From another site (or no Sec-Fetch-Site), the clear and then the root, never the path it asked for (Cursor
+    // Security). A sibling preview's (same-site) is refused before this, as always (SR13).
+    for (const site of ['cross-site', null]) {
+      const nav = await request(f.port, '/page?a=1', { headers: previewHeaders('my-app', { cookie: session, 'sec-fetch-mode': 'navigate', ...(site ? { 'sec-fetch-site': site } : {}) }) });
+      expect(nav.status, String(site)).toBe(302);
+      expect(nav.headers.location, String(site)).toBe('/__termag/clean');
+    }
+    // The viewer's own address bar or a page of this origin: the clear, then where it asked.
+    const nav = await request(f.port, '/page?a=1', { headers: previewHeaders('my-app', { cookie: session, 'sec-fetch-mode': 'navigate', 'sec-fetch-site': 'none' }) });
+    expect(cleanNext(nav.headers.location)).toBe('/page?a=1');
+    expect(app.connections()).toBe(before);
+    expect((await request(f.port, '/page', { headers: previewHeaders('my-app', { cookie, 'sec-fetch-mode': 'navigate' }) })).status).toBe(200);
     // A new link on the same name: the old marker names the old link, so it clears.
-    const old = marker(await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders() }))!;
     f.mem.addLink({ name: 'my-app', id: 'link-my-app-2', audienceId: 'aud-my-app-2', port: f.mem.links.get('link-my-app')!.link.port });
-    const renewed = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders('my-app', { cookie: old }) });
-    expect(renewed.headers['clear-site-data']).toBe('"storage", "cache"');
+    const renewed = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders('my-app', { cookie }) });
+    expect(renewed.headers.location).toBe('/__termag/clean');
+  });
+});
+
+describe('a used code (the hand-off page\'s second navigation)', () => {
+  const bounceLines = (log: { mock: { calls: unknown[][] } }) => log.mock.calls.flat().map(String).filter(l => l.includes('handoff_bounce'));
+
+  it('counts a bounce only when the used code comes back without a session the browser kept (pl-bounce, Devin)', async () => {
+    const { f } = await withApp();
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      // Opened again in another tab moments later: a code of its own, so no bounce.
+      const one = await request(f.port, `/__termag/auth?code=${await landingCode(f, 'my-app', 'owner')}`, { headers: previewHeaders() });
+      const kept = await landingCode(f, 'my-app', 'owner');
+      await request(f.port, `/__termag/auth?code=${kept}`, { headers: previewHeaders() });
+      // A code again from a browser that kept its session: on to the app, no bounce.
+      const session = ([] as string[]).concat(one.headers['set-cookie'] ?? [])[0]?.split(';')[0] ?? '';
+      expect(bounceLines(log)).toEqual([]);
+      await request(f.port, `/__termag/auth?code=${kept}`, { headers: previewHeaders('my-app', { cookie: session }) });
+      expect(bounceLines(log)).toEqual([]);
+      const code = await landingCode(f, 'my-app', 'owner');
+      await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
+      // The same code from a browser with no session: the exchange's session never stuck. Ids alone (SR21).
+      await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
+      // Again, or a stale bookmark, or a code nobody minted: no rebound left, so not a hand-off (Devin, #1745).
+      await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
+      await request(f.port, `/__termag/auth?code=${newSecret()}`, { headers: previewHeaders() });
+      expect(bounceLines(log)).toEqual(['[PREVIEW-LINK] handoff_bounce viewer=owner@example.com link=link-my-app name=my-app box=box-1']);
+    } finally { log.mockRestore(); }
+  });
+
+  it('a repeat that lands while the first exchange is still checking access already finds its rebound (Devin, #1745)', async () => {
+    const { f } = await withApp();
+    Object.assign(f.mem.links.get('link-my-app')!.link, { audience: 'link', linkTokenHash: 'h'.repeat(64) });
+    const code = await landingCode(f, 'my-app', 'viewer', 'token', { tokenHash: 'h'.repeat(64) });
+    // The first exchange stalls after it took the code; the repeat comes in meanwhile.
+    const user = f.mem.store.user.bind(f.mem.store);
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let stalled = false;
+    f.mem.store.user = async (id) => { if (!stalled) { stalled = true; await gate; } return user(id); };
+    const first = request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
+    while (!stalled) await new Promise(r => setTimeout(r, 5));
+    const repeat = await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
+    release();
+    await first;
+    expect(repeat.headers.location).toMatch(new RegExp(`^${SITE}/previews/my-app/reverify\\?ticket=`));
+  });
+
+  it('without that session, buys one ticket back through the landing page, in the code\'s minute, never a session', async () => {
+    const { f } = await withApp();
+    Object.assign(f.mem.links.get('link-my-app')!.link, { audience: 'link', linkTokenHash: 'h'.repeat(64) });
+    const code = await landingCode(f, 'my-app', 'viewer', 'token', { tokenHash: 'h'.repeat(64), next: '/x' });
+    await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
+    const tickets = () => [...f.mem.codes.values()].filter(c => c.sessionIdHash === null && c.basis === 'token');
+    const again = await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
+    expect(again.status).toBe(302);
+    const to = new URL(again.headers.location!);
+    expect(`${to.origin}${to.pathname}`).toBe(`${SITE}/previews/my-app/reverify`);
+    // The ticket is a fresh secret, never the code or the link's token, and it carries what the code was granted on.
+    expect(to.searchParams.get('ticket')).not.toBe(code);
+    expect(again.headers.location).not.toContain('h'.repeat(22));
+    const t = f.mem.codes.get(codeHash('ticket', to.searchParams.get('ticket')!)!)!;
+    expect(t).toMatchObject({ linkId: 'link-my-app', userId: 'viewer', basis: 'token', tokenHash: 'h'.repeat(64), sessionIdHash: null, next: '/x' });
+    expect(tickets()).toHaveLength(1);
+    expect(f.mem.sessions.size).toBe(1);
+    // Once: the third time is a plain bounce.
+    const third = await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders() });
+    expect(third.headers.location).toBe(`${SITE}/previews/my-app`);
+    // And only in the code's minute.
+    const late = await landingCode(f, 'my-app', 'viewer', 'token', { tokenHash: 'h'.repeat(64) });
+    await request(f.port, `/__termag/auth?code=${late}`, { headers: previewHeaders() });
+    f.now.t += 61_000;
+    expect((await request(f.port, `/__termag/auth?code=${late}`, { headers: previewHeaders() })).headers.location).toBe(`${SITE}/previews/my-app`);
   });
 });
 

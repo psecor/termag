@@ -60,8 +60,8 @@ export const PRODUCT_EVENTS = [
   'box.resize',
   'environment.setup',
   // Preview links
-  // (services/previewLinkTelemetry.ts). requested_by_agent comes with
-  // `termag preview request` (phase 3).
+  // (services/previewLinkTelemetry.ts). requested_by_agent: `termag preview
+  // request` (services/previewLinkRequests.ts).
   'preview_link.published',
   'preview_link.opened',
   'preview_link.refused',
@@ -83,9 +83,22 @@ export const PRODUCT_EVENTS = [
   // A file an agent wrote or edited, by the top two directories of its path
   // in the checkout (routes/status.ts, POST /api/status/edit).
   'agent.file.edited',
+  // An MCP tool call, by server (a known one, else other) and outcome
+  // (routes/status.ts, POST /api/status/mcp; services/mcpUseEvent.ts).
+  'agent.mcp.used',
   // A chat's session title, generated or a person's, where its owner leaves
   // Settings > Telemetry on (services/sessionTitleEvent.ts).
   'session.titled',
+  // Where agents and people save files: one per
+  // upload signed, under project-files-enabled (services/projectFiles.ts recordFilesSaved).
+  'files.saved',
+  // A file moved between Project files and My files (routes/spaces.ts files/move-to).
+  'files.moved',
+  // A New session's start, create to first assistant text, by phase (services/sessionStartTiming.ts).
+  'session.start.timed',
+  // The desktop app in use, at most once every four hours per user
+  // (services/software/clients.ts). The browser sends its own client.opened.
+  'client.opened',
 ] as const;
 export type ProductEventName = typeof PRODUCT_EVENTS[number];
 

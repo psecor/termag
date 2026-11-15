@@ -19,11 +19,24 @@ export const BROWSER_PANE_PROFILES_CAPABILITY = 'browser-pane-profiles-v1';
 export const BROWSER_PANE_GUEST_CAPABILITY = 'browser-pane-guest-v1';
 /** A box agent that answers `browser-guest-check`: a guest attach's dev-stack check, for the owner before sharing. */
 export const BROWSER_GUEST_CHECK_CAPABILITY = 'browser-guest-check-v1';
+/**
+ * A box agent that answers `browser-chromium`: it looks for a Chromium again,
+ * and installs one when asked (agent/browser-pane.js createChromiumProbe).
+ * Announced whether or not the box has one.
+ */
+export const BROWSER_PANE_CHROMIUM_CAPABILITY = 'browser-pane-chromium-v1';
+/** The pane opens when the box has a Chromium (agent/browser-pane.js); read for the project's owner and box. */
+export const BROWSER_PANE_CHROMIUM_FLAG = 'browser-pane-chromium-enabled';
 
 /** The flag is off for this viewer and box. */
 export const BROWSER_PANE_DISABLED_CLOSE_CODE = 4403;
-/** The box's agent predates the browser pane (or the box has no Chromium). */
+/**
+ * The box can't run a pane: it has no Chromium, or its agent predates the
+ * pane. The close reason says which (`BROWSER_PANE_NO_CHROMIUM_REASON`, else
+ * `browser pane unsupported`), for a pane that missed the `exit` frame's words.
+ */
 export const BROWSER_PANE_UNSUPPORTED_CLOSE_CODE = 4501;
+export const BROWSER_PANE_NO_CHROMIUM_REASON = 'no chromium';
 /**
  * The box's agent is not connected right now ("try again later"): the pane
  * redials, since the agent reconnects on its own within seconds and may still
@@ -126,6 +139,51 @@ export function agentSupportsGuests(capabilities: readonly string[]): boolean {
 
 export function agentSupportsStackCheck(capabilities: readonly string[]): boolean {
   return capabilities.includes(BROWSER_GUEST_CHECK_CAPABILITY);
+}
+
+export function agentChecksChromium(capabilities: readonly string[]): boolean {
+  return capabilities.includes(BROWSER_PANE_CHROMIUM_CAPABILITY);
+}
+
+/** The pane's capabilities an agent may gain after its hello, from a `browser-chromium` answer. */
+const CHROMIUM_GAINED_CAPABILITIES: ReadonlySet<string> = new Set([BROWSER_PANE_CAPABILITY, BROWSER_PANE_GUEST_CAPABILITY, BROWSER_PANE_PROFILES_CAPABILITY]);
+
+export interface BrowserChromiumAnswer {
+  /** The Chromium the agent runs now, or null. */
+  chromium: string | null;
+  /** A `snap install chromium` is running on the box. */
+  installing: boolean;
+  /** The last install's failure, while it is fresh; null otherwise. */
+  error: string | null;
+  /** The pane's capabilities as of now: only the three a Chromium brings, whatever else the agent says. */
+  capabilities: string[];
+}
+
+/** A `browser-chromium` answer, or null when it isn't one. */
+export function parseBrowserChromiumAnswer(raw: unknown): BrowserChromiumAnswer | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const chromium = typeof r.chromium === 'string' && r.chromium ? r.chromium.slice(0, 300) : null;
+  const caps = Array.isArray(r.capabilities) ? r.capabilities.filter((c): c is string => typeof c === 'string' && CHROMIUM_GAINED_CAPABILITIES.has(c)) : [];
+  return {
+    chromium,
+    installing: r.installing === true,
+    error: typeof r.error === 'string' && r.error ? r.error.slice(0, 300) : null,
+    capabilities: chromium ? [...new Set(caps)] : [],
+  };
+}
+
+/**
+ * Why an agent that doesn't announce the pane can't run one. Every agent with
+ * the pane's code announces `browser-guest-check-v1` whether or not the box
+ * has a Chromium (agent/browser-guest.js, since 2026-10-29), and announces
+ * `browser-pane-v1` beside it only when it found one at start. So the first
+ * without the second is a box with no Chromium; neither is an agent too old
+ * for the pane (or one from the ten days before the check, which an update
+ * fixes either way).
+ */
+export function browserPaneUnsupportedReason(capabilities: readonly string[]): 'no-chromium' | 'agent-outdated' {
+  return agentSupportsStackCheck(capabilities) ? 'no-chromium' : 'agent-outdated';
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {

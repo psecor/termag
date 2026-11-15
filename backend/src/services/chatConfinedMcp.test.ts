@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CATALOG_READ_TOOLS, CHAT_CONFINED_MCP_CAPABILITY, automationStaysWithOwner, brokerMcpFor, readToolRules, type AutomationOutputs, type BrokerMcpDeps, type BrokerMcpTarget, type SpaceReaders } from './chatConfinedMcp';
+import { CATALOG_READ_TOOLS, CHAT_CONFINED_MCP_CAPABILITY, alertsLeaveOwner, automationStaysWithOwner, brokerMcpFor, readToolRules, type AutomationOutputs, type BrokerMcpDeps, type BrokerMcpTarget, type SpaceReaders } from './chatConfinedMcp';
 import { chatResumeClaimPayload, chatSendRpcPayload } from './chatRunner';
 
 const BROKER = 'https://mcp-broker.example.test';
@@ -147,6 +147,20 @@ describe('the frames carry brokerMcp only to an agent that reads it', () => {
 const readers = (over: Partial<SpaceReaders> = {}): SpaceReaders => ({ memberIds: ['u1'], pendingInvites: 0, slackLinked: false, fileShares: 0, ...over });
 const outputs = (over: Partial<AutomationOutputs> = {}): AutomationOutputs => ({ spaceNames: ['mine'], notifySlack: false, workstreamSlack: false, projectSharees: 0, ...over });
 
+describe('alertsLeaveOwner', () => {
+  const a = (over: Record<string, unknown> = {}) => ({ alertPrefix: null, alertRegex: null, alertTarget: 'dm', webhookHost: null, ...over });
+  it('a keyword alert to the owner\'s DM, or none, stays with the owner; health alerts carry no run words', () => {
+    expect(alertsLeaveOwner(a())).toBe(false);
+    expect(alertsLeaveOwner(a({ alertPrefix: 'BLOCKER:' }))).toBe(false);
+    expect(alertsLeaveOwner(a({ alertTarget: 'C0123456789' }))).toBe(false);
+  });
+  it('a keyword alert to a channel, or any webhook, does not', () => {
+    expect(alertsLeaveOwner(a({ alertPrefix: 'BLOCKER:', alertTarget: 'project' }))).toBe(true);
+    expect(alertsLeaveOwner(a({ alertRegex: 'fail', alertTarget: 'C0123456789' }))).toBe(true);
+    expect(alertsLeaveOwner(a({ webhookHost: 'hooks.example.com' }))).toBe(true);
+  });
+});
+
 describe('automationStaysWithOwner', () => {
   it('a private space of the owner\'s, or no space, with nothing sent to Slack and the project shared with nobody', async () => {
     expect(await automationStaysWithOwner(outputs(), 'u1', async () => readers())).toBe(true);
@@ -163,7 +177,7 @@ describe('automationStaysWithOwner', () => {
 
   it('not with the run report on, a Slack channel on the run\'s workstream, or the project shared, space or no space', async () => {
     for (const spaceNames of [['mine'], []]) {
-      for (const over of [{ notifySlack: true }, { workstreamSlack: true }, { projectSharees: 1 }]) {
+      for (const over of [{ notifySlack: true }, { alertsLeaveOwner: true }, { workstreamSlack: true }, { projectSharees: 1 }]) {
         expect(await automationStaysWithOwner(outputs({ spaceNames, ...over }), 'u1', async () => readers()), `${spaceNames} ${JSON.stringify(over)}`).toBe(false);
       }
     }

@@ -164,7 +164,11 @@ describe("the audit log, with other people's personal environments in it", () =>
 describe('the environment routes, personal and shared', () => {
   const setup = () => {
     const store = memoryStore();
-    const act = environmentActions({ store, people: async () => [], github: github({ 'acme/web': 'main' }, { [`acme/web:main:${FILE}`]: '{"repos":[{"repo":"acme/web"}]}' }) });
+    // ada is an admin, bob and cy aren't.
+    const act = environmentActions({
+      store, people: async () => [], github: github({ 'acme/web': 'main' }, { [`acme/web:main:${FILE}`]: '{"repos":[{"repo":"acme/web"}]}' }),
+      isAdmin: async id => id === 'ada',
+    });
     return { store, act };
   };
   const inline = { name: 'mine', kind: 'inline', definition: { repos: [{ repo: 'acme/web' }], setup: 'make' } };
@@ -202,21 +206,67 @@ describe('the environment routes, personal and shared', () => {
     expect((await act.events('bob', null)).body).toEqual({ events: [] });
     expect((await act.events('ada', null)).body).toMatchObject({ events: [expect.objectContaining({ environmentName: 'mine' })] });
   });
-  it('lets anyone edit a shared one, so long as the file pointer keeps to the rules', async () => {
+  it('lets an admin edit a shared one, so long as the file pointer keeps to the rules', async () => {
     const { act } = setup();
     await act.create('ada', sharedPointer);
-    expect(await act.update('bob', 'ours', { ...sharedPointer, name: 'shop' })).toMatchObject({ status: 200, body: { environment: { name: 'shop', visibility: 'shared' } } });
-    expect(await act.update('bob', 'shop', { ...sharedPointer, name: 'shop', file: { repo: 'acme/web', branch: 'feature' } })).toMatchObject({ status: 400, body: { code: 'environment_not_shareable' } });
-    expect(await act.update('bob', 'shop', { name: 'shop', kind: 'inline', definition: { repos: [{ repo: 'acme/web' }] } })).toMatchObject({ status: 400, body: { code: 'environment_not_shareable' } });
+    expect(await act.update('ada', 'ours', { ...sharedPointer, name: 'shop' })).toMatchObject({ status: 200, body: { environment: { name: 'shop', visibility: 'shared' } } });
+    expect(await act.update('ada', 'shop', { ...sharedPointer, name: 'shop', file: { repo: 'acme/web', branch: 'feature' } })).toMatchObject({ status: 400, body: { code: 'environment_not_shareable' } });
+    expect(await act.update('ada', 'shop', { name: 'shop', kind: 'inline', definition: { repos: [{ repo: 'acme/web' }] } })).toMatchObject({ status: 400, body: { code: 'environment_not_shareable' } });
   });
-  it('lets only the owner switch it between personal and shared, checking the rules to share', async () => {
+  it("refuses a non-admin every change to a shared environment with 403, and changes nothing", async () => {
+    const { act, store } = setup();
+    const refused = { status: 403, body: { code: 'environment_admin_only', error: 'Only admins can change shared environments; make a personal one' } };
+    expect(await act.create('bob', sharedPointer)).toMatchObject(refused);
+    // Refused before the fields are checked: an inline one asked for shared is told it needs an admin, not how to fix it.
+    expect(await act.create('bob', { ...inline, visibility: 'shared' })).toMatchObject(refused);
+    await act.create('ada', sharedPointer);
+    expect(await act.update('bob', 'ours', { ...sharedPointer, name: 'ours', file: { repo: 'acme/web', path: 'other.json' } })).toMatchObject(refused);
+    expect(await act.update('bob', 'ours', { ...sharedPointer, name: 'renamed' })).toMatchObject(refused);
+    expect(await act.setVisibility('bob', 'ours', 'personal')).toMatchObject(refused);
+    expect(await act.remove('bob', 'ours', undefined)).toMatchObject(refused);
+    await act.create('bob', { name: 'bobs', kind: 'pointer', file: { repo: 'acme/web' } });
+    expect(await act.setVisibility('bob', 'bobs', 'shared')).toMatchObject(refused);
+    expect(store.rows.map(r => `${r.visibility}:${r.name}:${r.kind === 'pointer' ? r.file.path : ''}`)).toEqual([`shared:ours:${FILE}`, `personal:bobs:${FILE}`]);
+    expect(store.log.map(e => `${e.actorUserId}:${e.action}`)).toEqual(['ada:environment.create', 'bob:environment.create']);
+  });
+  it("refuses a non-admin's malformed change to a shared environment with the same 403, before reading the body", async () => {
+    const { act, store } = setup();
+    const refused = { status: 403, body: { code: 'environment_admin_only' } };
+    await act.create('ada', sharedPointer);
+    expect(await act.update('bob', 'ours', { name: 'INVALID', kind: 'pointer' })).toMatchObject(refused);
+    expect(await act.update('bob', 'ours', { ...sharedPointer, updatedAt: 'not a time' })).toMatchObject(refused);
+    expect(await act.setVisibility('bob', 'ours', 'public' as never)).toMatchObject(refused);
+    expect(await act.setVisibility('bob', 'ours', 'personal', 'not a time')).toMatchObject(refused);
+    expect(await act.remove('bob', 'ours', 'not a time')).toMatchObject(refused);
+    // Someone else's personal one, or none, is still 404 whatever the body; the owner's malformed edit still 400.
+    await act.create('cy', inline);
+    expect(await act.update('bob', 'mine', { name: 'INVALID', kind: 'pointer' })).toMatchObject({ status: 404 });
+    expect(await act.update('bob', 'nope', { name: 'INVALID', kind: 'pointer' })).toMatchObject({ status: 404 });
+    expect(await act.update('cy', 'mine', { name: 'INVALID', kind: 'pointer' })).toMatchObject({ status: 400, body: { code: 'invalid_environment' } });
+    expect(await act.setVisibility('ada', 'ours', 'public' as never)).toMatchObject({ status: 400 });
+    expect(await act.remove('ada', 'ours', 'not a time')).toMatchObject({ status: 400, body: { code: 'invalid_request' } });
+    expect(store.log.map(e => e.action)).toEqual(['environment.create', 'environment.create']);
+  });
+  it('leaves a personal one wholly its owner\'s, admin or not', async () => {
+    const { act } = setup();
+    await act.create('bob', inline);
+    expect(await act.update('bob', 'mine', { ...inline, definition: { repos: [{ repo: 'acme/web' }], setup: 'make test' } })).toMatchObject({ status: 200 });
+    expect(await act.setVisibility('bob', 'mine', 'personal')).toMatchObject({ status: 200 });
+    expect(await act.remove('bob', 'mine', undefined)).toMatchObject({ status: 200 });
+  });
+  it('lets an admin switch it between personal and shared, checking the rules to share, and unshare anyone\'s', async () => {
     const { act } = setup();
     await act.create('ada', inline);
     expect(await act.setVisibility('ada', 'mine', 'shared')).toMatchObject({ status: 400, body: { code: 'environment_not_shareable' } });
     await act.create('ada', { name: 'ptr', kind: 'pointer', file: { repo: 'acme/web' } });
     expect(await act.setVisibility('ada', 'ptr', 'shared')).toMatchObject({ status: 200, body: { environment: { visibility: 'shared' } } });
-    expect(await act.setVisibility('bob', 'ptr', 'personal')).toMatchObject({ status: 403, body: { code: 'environment_not_owner' } });
     expect(await act.setVisibility('ada', 'ptr', 'personal')).toMatchObject({ status: 200, body: { environment: { visibility: 'personal' } } });
     expect(await act.setVisibility('ada', 'ptr', 'public' as never)).toMatchObject({ status: 400 });
+    // A shared one an admin didn't create (one shared before admins alone could): unsharing it leaves it its owner's.
+    const { store, act: act2 } = setup();
+    store.rows.push(rec('legacy', 'legacy', 'shared', 'cy'));
+    expect(await act2.setVisibility('ada', 'legacy', 'personal')).toMatchObject({ status: 200, body: { environment: { visibility: 'personal' } } });
+    expect(store.rows[0]).toMatchObject({ visibility: 'personal', ownerUserId: 'cy' });
+    expect(await act2.get('cy', 'legacy')).toMatchObject({ status: 200 });
   });
 });

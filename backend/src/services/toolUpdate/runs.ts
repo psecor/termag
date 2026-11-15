@@ -116,8 +116,17 @@ export async function runInFlightFor(hostKey: string, component: ToolComponent, 
     where: { hostKey, component, status: { in: ['requested', 'running'] } },
     orderBy: { requestedAt: 'desc' },
   });
-  return rows.find(r => queued.has(r.id) || isInFlight(r, now)) ?? null;
+  return rows.find(r => runActive(r, now)) ?? null;
 }
+
+/**
+ * Whether a requested or running run still holds its box, as runInFlightFor and so the fleet update's
+ * run_in_flight decide it: one the pacer holds, whatever its age, or one isInFlight keeps. Also for the
+ * Software tab's matrix (services/software/queries.ts), which reads every box's runs at once. `component`
+ * is required: isInFlight keeps an at-start tool's (Docker's) requested run for its own, longer expiry
+ * (Devin on #1607).
+ */
+export const runActive = (r: { id: string; status: string; requestedAt: Date; startedAt: Date | null; component: string }, now: number): boolean => queued.has(r.id) || isInFlight(r, now);
 
 /** Runs in flight across the fleet, every component: the pacing is about boxes, not tools. The pacer's queue is not in it (queuedRuns). */
 export async function fleetInFlight(now: number): Promise<number> {
@@ -265,15 +274,21 @@ async function inventoryVersions(tool: ToolDescriptor, hostKeys: string[]): Prom
  */
 async function inventoryFacts(tool: ToolDescriptor, hostKeys: string[], now: number): Promise<Map<string, { version: string | null; inventory: InventoryState; read: string | null }>> {
   const rows = await prisma.hostSoftware.findMany({ where: { hostKey: { in: hostKeys }, component: tool.inventoryName }, select: { hostKey: true, version: true, ok: true, path: true, observedAt: true } });
-  // `read`: the version as the row has it, stale or not, for the fleet's reference (behindReference), which
-  // takes every box's inventory as the matrix does: a parked box on the newest version still sets latest
-  // (Bugbot on #1211). Only the host's own comparison drops a stale row.
-  return new Map(rows.map((r): [string, { version: string | null; inventory: InventoryState; read: string | null }] => {
-    const read = r.ok ? r.version : null;
-    if (now - r.observedAt.getTime() > INVENTORY_STALE_MS) return [r.hostKey, { version: null, inventory: 'no_inventory', read }];
-    if (r.ok && r.version) return [r.hostKey, { version: r.version, inventory: 'ok', read }];
-    return [r.hostKey, { version: null, inventory: r.path ? 'version_unreadable' : 'not_installed', read }];
-  }));
+  return new Map(rows.map(r => [r.hostKey, inventoryFact(r, now)]));
+}
+
+/**
+ * One inventory row as the fleet update reads it: its version, what the row says (InventoryState), and
+ * `read`, the version as the row has it, stale or not, for the fleet's reference (behindReference),
+ * which takes every box's inventory as the matrix does: a parked box on the newest version still sets
+ * latest (Bugbot on #1211). Only the host's own comparison drops a stale row. Also for the Software
+ * tab's matrix, so a cell and the update read a row alike.
+ */
+export function inventoryFact(r: { version: string | null; ok: boolean; path: string | null; observedAt: Date }, now: number): { version: string | null; inventory: InventoryState; read: string | null } {
+  const read = r.ok ? r.version : null;
+  if (now - r.observedAt.getTime() > INVENTORY_STALE_MS) return { version: null, inventory: 'no_inventory', read };
+  if (r.ok && r.version) return { version: r.version, inventory: 'ok', read };
+  return { version: null, inventory: r.path ? 'version_unreadable' : 'not_installed', read };
 }
 
 /** `policy`: the tool's, already read for the box's owner and the box (boxPolicyOf); it decides `enabled` too. */

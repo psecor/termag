@@ -21,7 +21,8 @@ function makeDeps(over: Partial<PushRouteDeps> = {}) {
     remove: vi.fn<PushRouteStore['remove']>(async () => 1),
   };
   const send = vi.fn<PushRouteDeps['send']>(async () => ({ sent: 2, failed: 1, removed: 1 }));
-  return { store, send, vapid: () => VAPID, baseUrl: () => 'https://example.com/termag', ...over };
+  const phoneChat = vi.fn<PushRouteDeps['phoneChat']>(async () => false);
+  return { store, send, phoneChat, vapid: () => VAPID, baseUrl: () => 'https://example.com/termag', ...over };
 }
 
 describe('GET /config', () => {
@@ -96,9 +97,11 @@ describe('DELETE /subscriptions', () => {
 });
 
 describe('POST /test', () => {
+  const USER = { id: 'u1', googleEmail: 'u1@example.com', displayName: 'U One', unixUsername: 'u1', defaultAgentProvider: 'claude' };
   it("sends the test notification to the caller's devices and reports sent/failed", async () => {
     const d = makeDeps();
-    expect(await sendTest('u1', d)).toEqual({ status: 200, body: { sent: 2, failed: 1 } });
+    expect(await sendTest(USER, d)).toEqual({ status: 200, body: { sent: 2, failed: 1 } });
+    expect(d.phoneChat).toHaveBeenCalledWith(USER);
     expect(d.send).toHaveBeenCalledWith('u1', {
       web_push: 8030,
       mutable: true,
@@ -108,9 +111,19 @@ describe('POST /test', () => {
       },
     });
   });
+  it('opens the chat with chat-phone-home-enabled on for the caller', async () => {
+    const d = makeDeps({ phoneChat: vi.fn(async () => true) });
+    await sendTest(USER, d);
+    expect(d.send.mock.calls[0][1].notification.navigate).toBe('https://example.com/termag/chat');
+  });
+  it('opens the phone inbox when the flag cannot be read', async () => {
+    const d = makeDeps({ phoneChat: vi.fn(async () => { throw new Error('ld down'); }) });
+    expect((await sendTest(USER, d)).status).toBe(200);
+    expect(d.send.mock.calls[0][1].notification.navigate).toBe('https://example.com/termag/m');
+  });
   it('is a 409 with push off', async () => {
     const d = makeDeps({ vapid: () => null });
-    expect((await sendTest('u1', d)).status).toBe(409);
+    expect((await sendTest(USER, d)).status).toBe(409);
     expect(d.send).not.toHaveBeenCalled();
   });
 });

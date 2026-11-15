@@ -7,7 +7,8 @@ import { instanceAgentTransport, isInstanceAgentConnected, sendToInstanceAgent }
 import { findUserByEmail } from '../services/userByEmail';
 import { discardRunnerStart, recordRunnerStart } from '../services/claudeRunnerSessions';
 import { recordSessionEvent } from '../services/claudeSessionEvents';
-import { boolVariation } from '../services/featureFlags';
+import { boolVariation, numberVariation } from '../services/featureFlags';
+import { REFUSAL_TEXTS } from '../services/claudeRunnerSpawn';
 import { isBoxProvisioningConfigured, provisionNewBox } from '../services/boxProvisioner';
 import { requestPower } from '../services/boxPower';
 import { claimWarmBox } from '../services/warmPoolClaim';
@@ -24,7 +25,10 @@ import { getCredentialStoreConfig, githubStoreDeps } from '../services/credentia
 import { getGithubBrokerUrl } from '../services/githubBroker';
 
 vi.mock('../db', () => ({ prisma: { instance: { findMany: vi.fn(), findUnique: vi.fn() } } }));
-vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
+vi.mock('../services/featureFlags', () => ({
+  boolVariation: vi.fn(async () => false),
+  numberVariation: vi.fn(async (_key: string, _user: unknown, fallback: number) => fallback),
+}));
 vi.mock('../services/boxProvisioner', () => ({
   isBoxProvisioningConfigured: vi.fn(() => true),
   provisionNewBox: vi.fn(async (_user: unknown, base: string) => base),
@@ -73,7 +77,7 @@ const body = { orderId: 'ord.1', sessionId: 'sess-1', accountEmail: 'ada@example
 interface RouteLayer { route?: { path: string; methods: Record<string, boolean>; stack: { handle: RequestHandler }[] } }
 
 /** Runs POST /spawn and resolves with the response once the handler has answered. */
-async function spawn(opts: { token?: string; peer?: string; gone?: boolean; serving?: boolean; budgetMs?: number; body?: typeof body } = {}) {
+async function spawn(opts: { token?: string; peer?: string; gone?: boolean; serving?: boolean; budgetMs?: number; body?: typeof body; onRes?: (res: EventEmitter) => void } = {}) {
   const layer = (claudeRunnerRouter(TOKEN, () => opts.serving ?? true, { placementBudgetMs: opts.budgetMs }).stack as RouteLayer[]).find(l => l.route?.path === '/spawn')!;
   let answered!: () => void;
   const done = new Promise<void>(r => { answered = r; });
@@ -84,6 +88,7 @@ async function spawn(opts: { token?: string; peer?: string; gone?: boolean; serv
     json: vi.fn(function (this: { writableFinished: boolean }) { this.writableFinished = true; answered(); return this; }),
   });
   if (opts.gone) setImmediate(() => res.emit('close'));
+  opts.onRes?.(res);
   const req = {
     body: opts.body ?? body, socket: { remoteAddress: opts.peer ?? '127.0.0.1' },
     headers: { authorization: `Bearer ${opts.token ?? TOKEN}` },
@@ -615,6 +620,266 @@ describe('POST /internal/claude-runner/spawn, owner with no box', () => {
       expect(res.status).toHaveBeenCalledWith(502);
       expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('refused the launch'), code: 'agent-launch-failed' });
       expect(events().map(e => e[0])).toEqual(['agent-failed']);
+    });
+  });
+});
+
+describe('POST /internal/claude-runner/spawn, every ready box full', () => {
+  const today = `claude-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
+  const user = { id: 'u1', googleEmail: 'ada@example.com', unixUsername: 'ada', displayName: 'Ada' };
+  const FULL = ['ada-claude-runner-s2-x-r', 'ada-claude-runner-s3-y-r', 'ada-claude-runner-s4-z-r'];
+  /** A box as the auto-box path reads the owner's rows (services/ownedBoxRow.ts). */
+  const row = (id: string, over: Record<string, unknown> = {}) => ({
+    id, name: id, kind: 'ec2', status: 'ready', ec2InstanceId: `i-${id}`,
+    lastConnectedAt: new Date('2026-10-06T10:00:00Z'), createdAt: new Date(0), ...over,
+  });
+  // The owner's ready boxes (the placement read) and every non-terminated one (autoBoxPlan's).
+  let ready: ReturnType<typeof box>[];
+  let owned: Record<string, unknown>[];
+  const flags = (on: Record<string, boolean>) =>
+    vi.mocked(boolVariation).mockImplementation(async (key: string) => on[key] ?? false);
+  /** `ids` ready, each running three sessions. */
+  const fullBoxes = (...ids: string[]) => {
+    ready = ids.map(id => box(id));
+    owned = ids.map(id => row(id));
+    agents(Object.fromEntries(ids.map(id => [id, FULL])));
+  };
+
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    flags({});
+    vi.mocked(numberVariation).mockImplementation(async (_key, _user, fallback) => fallback);
+    vi.mocked(poolSpecHashOrNull).mockResolvedValue(null);
+    vi.mocked(deliveryInFlight).mockReturnValue(null);
+    vi.mocked(findUserByEmail).mockResolvedValue(user as never);
+    vi.mocked(prisma.instance.findMany).mockImplementation((async (args: { where: { status?: unknown }; select?: { createdAt?: boolean } }) => {
+      if (args.where.status === 'ready') return ready;
+      if (args.select?.createdAt) return owned;
+      return owned.map(b => ({ name: b.name }));
+    }) as never);
+    vi.mocked(isInstanceAgentConnected).mockReturnValue(true);
+    vi.mocked(instanceAgentTransport).mockReturnValue({ conn: {} as never, capabilities: ['tmux-create-command-v1'] });
+    vi.mocked(provisionNewBox).mockImplementation(async (_u, base) => {
+      owned.push(row('new', { name: base, status: 'provisioning', ec2InstanceId: null, lastConnectedAt: null, createdAt: new Date() }));
+      return base;
+    });
+    fullBoxes('box-a');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('answers boxes-full as before while the auto-box flag is off, and gets no box', async () => {
+    const res = await spawn();
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith({ error: REFUSAL_TEXTS.boxesFull(1, 3), code: 'boxes-full' });
+    expect(numberVariation).not.toHaveBeenCalled();
+    for (const fn of [requestPower, claimWarmBox, provisionNewBox]) expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("starts the owner's stopped box when every ready one is full (the 11-09 refusals)", async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    const stopped = row('autofac', { status: 'stopped', lastConnectedAt: new Date('2026-10-05T10:00:00Z'), userId: 'u1' });
+    owned.push(stopped);
+    vi.mocked(prisma.instance.findUnique).mockResolvedValue(stopped as never);
+    const res = await spawn();
+    expect(requestPower).toHaveBeenCalledWith(stopped, 'start', { markInUse: true, startedBy: 'cloud' });
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('starting box "autofac"'), code: 'box-starting' });
+    expect(calls('tmux-create')).toEqual([]);
+    expect(provisionNewBox).not.toHaveBeenCalled();
+  });
+
+  it('cold-provisions another box when no other box is there, and the write re-checks without waiting on the full one', async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    const res = await spawn();
+    expect(provisionNewBox).toHaveBeenCalledTimes(1);
+    expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining(`provisioning termag box "${today}"`), code: 'box-provisioning' });
+    expect(outcomeLines()).toEqual([
+      `[CLAUDE-RUNNER] order ord.1: every ready box of ada (1, at most 5) is full; getting another`,
+      `[CLAUDE-RUNNER] order ord.1: cold-provisioning box ${today} for ada`,
+      expect.stringContaining('[CLAUDE-RUNNER] order ord.1 for ada: 503 provisioning'),
+    ]);
+    // Inside the create's transaction: the full ready box is not one to wait for, a box on its way is.
+    const stillNeeded = vi.mocked(provisionNewBox).mock.calls[0][2];
+    expect(stillNeeded([row('box-a')] as never)).toBe(true);
+    expect(stillNeeded([row('box-a'), row('other', { status: 'provisioning' })] as never)).toBe(false);
+  });
+
+  it('places the session on a warm box claimed in the same request', async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    vi.mocked(poolSpecHashOrNull).mockResolvedValue('hash');
+    const claimed = { id: 'w1', name: today, kind: 'ec2', status: 'ready', hostHome: '/home/termag', hostUnixUser: 'termag', lastConnectedAt: new Date(), userId: 'u1' };
+    vi.mocked(claimWarmBox).mockResolvedValue({ claimed: true, instance: claimed, candidatesTried: 1 } as never);
+    const res = await spawn();
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(calls('tmux-create').map(c => c[0])).toEqual(['w1']);
+    expect(vi.mocked(claimWarmBox).mock.calls[0][0].stillNeeded!([row('box-a')] as never)).toBe(true);
+    expect(events()).toEqual([['placed', `${today} slot 2`, 'w1']]);
+  });
+
+  it('gets a burst of sessions one box, and the rest wait on it', async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    const [a, b] = await Promise.all([spawn(), spawn()]);
+    expect(provisionNewBox).toHaveBeenCalledTimes(1);
+    expect(a.json).toHaveBeenCalledWith({ error: expect.stringContaining(`provisioning termag box "${today}"`), code: 'box-provisioning' });
+    expect(b.json).toHaveBeenCalledWith({ error: expect.stringContaining('provisioning; retried'), code: 'box-wait' });
+  });
+
+  it('gets no box once the owner has as many ready boxes as the ceiling, 5 by default', async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    fullBoxes('box-a', 'box-b', 'box-c', 'box-d', 'box-e');
+    const res = await spawn();
+    expect(numberVariation).toHaveBeenCalledWith('claude-runner-auto-box-max-boxes', expect.objectContaining({ id: 'u1' }), 5);
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith({ error: REFUSAL_TEXTS.boxesFull(5, 3, 5), code: 'boxes-full' });
+    for (const fn of [requestPower, claimWarmBox, provisionNewBox]) expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('takes the ceiling from the flag, clamped', async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    fullBoxes('box-a', 'box-b');
+    vi.mocked(numberVariation).mockResolvedValue(2);
+    expect((await spawn()).json).toHaveBeenCalledWith({ error: REFUSAL_TEXTS.boxesFull(2, 3, 2), code: 'boxes-full' });
+    expect(provisionNewBox).not.toHaveBeenCalled();
+    // 0 is clamped to 1, never "no box at all"; 3 lets a third box come.
+    vi.mocked(numberVariation).mockResolvedValue(0);
+    expect((await spawn()).json).toHaveBeenCalledWith({ error: REFUSAL_TEXTS.boxesFull(2, 3, 1), code: 'boxes-full' });
+    vi.mocked(numberVariation).mockResolvedValue(3);
+    await spawn();
+    expect(provisionNewBox).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['provisioning a cold box', null],
+    ['starting a stopped one', row('old', { status: 'stopped', userId: 'u1' })],
+  ])('takes a slot that freed while it looked for a box, instead of %s (Devin on #1592)', async (_what, stopped) => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    if (stopped) {
+      owned.push(stopped);
+      vi.mocked(prisma.instance.findUnique).mockResolvedValue(stopped as never);
+    }
+    // The first listing finds three runners; by the one right before the buy, slot 2's has ended.
+    let lists = 0;
+    vi.mocked(sendToInstanceAgent).mockImplementation(async (_id: string, type: string) => {
+      if (type === 'tmux-list') return { sessions: lists++ === 0 ? FULL : FULL.slice(1) };
+      if (type === 'tmux-create') return { ok: true, created: true };
+      return { ok: true };
+    });
+    const res = await spawn();
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(calls('tmux-create')).toEqual([['box-a', 'tmux-create', expect.objectContaining({ sessionName: 'ada-claude-runner-s2-ord_d1-r' })]]);
+    for (const fn of [requestPower, claimWarmBox, provisionNewBox]) expect(fn).not.toHaveBeenCalled();
+    expect(events()).toEqual([['placed', 'box-a slot 2', 'box-a']]);
+  });
+
+  it('buys nothing when the hook stops waiting during the freed-slot listing (Devin on #1592)', async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    let hook!: EventEmitter;
+    let lists = 0;
+    vi.mocked(sendToInstanceAgent).mockImplementation(async (_id: string, type: string) => {
+      // The second listing is the one right before the buy: the hook gives up while it runs.
+      if (type === 'tmux-list' && lists++ === 1) hook.emit('close');
+      if (type === 'tmux-list') return { sessions: FULL };
+      return { ok: true };
+    });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = await spawn({ onRes: r => { hook = r; } });
+    expect(lists).toBe(2);
+    expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('no box started'), code: 'hook-gave-up' });
+    for (const fn of [requestPower, claimWarmBox, provisionNewBox]) expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("gets another box when a boxless owner's burst has filled the one it just got", async () => {
+    // The spawn saw no ready box before the lock; by the time it holds it, an
+    // earlier session's claimed box is ready and running three.
+    flags({ 'claude-runner-auto-box-enabled': true });
+    let reads = 0;
+    vi.mocked(prisma.instance.findMany).mockImplementation((async (args: { where: { status?: unknown }; select?: { createdAt?: boolean } }) => {
+      if (args.where.status === 'ready') return reads++ === 0 ? [] : ready;
+      if (args.select?.createdAt) return owned;
+      return owned.map(b => ({ name: b.name }));
+    }) as never);
+    const res = await spawn();
+    expect(provisionNewBox).toHaveBeenCalledTimes(1);
+    expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining(`provisioning termag box "${today}"`), code: 'box-provisioning' });
+  });
+
+  it('still places on a ready box with a free slot before getting one', async () => {
+    flags({ 'claude-runner-auto-box-enabled': true });
+    ready = [box('box-a', { lastConnectedAt: new Date('2026-10-06T12:00:00Z') }), box('box-b')];
+    agents({ 'box-a': FULL });
+    const res = await spawn();
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(calls('tmux-create')[0][0]).toBe('box-b');
+    expect(boolVariation).not.toHaveBeenCalledWith('claude-runner-auto-box-enabled', expect.anything(), false);
+    expect(provisionNewBox).not.toHaveBeenCalled();
+  });
+
+  describe('boxes made for a termag ask (isAskBox)', () => {
+    // A box `termag ask --new-box` made, connected more recently than the owner's own.
+    const askBox = (id: string, over: Record<string, unknown> = {}) =>
+      box(id, { createdFor: 'ask', hostHome: '/home/termag', hostUnixUser: 'termag', lastConnectedAt: new Date('2026-10-06T12:00:00Z'), ...over });
+
+    it("places a new session on the owner's own box, not on a more recently connected ask box", async () => {
+      ready = [askBox('rv-spend'), box('box-a')];
+      agents({});
+      const res = await spawn();
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(calls('tmux-create').map(c => c[0])).toEqual(['box-a']);
+    });
+
+    it('still finds an order already running on an ask box, rather than starting a second runner', async () => {
+      ready = [askBox('rv-spend'), box('box-a')];
+      agents({ 'rv-spend': ['termag-claude-runner-s2-ord_d1-r'] });
+      const res = await spawn();
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ instanceId: 'rv-spend', alreadyRunning: true }));
+      expect(calls('tmux-create')).toEqual([]);
+    });
+
+    it('answers no-box for an owner whose only ready boxes are ask boxes, while the auto-box flag is off', async () => {
+      ready = [askBox('rv-spend')];
+      owned = [row('rv-spend', { createdFor: 'ask' })];
+      agents({});
+      const res = await spawn();
+      expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('start or add a box'), code: 'no-box' });
+      expect(calls('tmux-create')).toEqual([]);
+      expect(provisionNewBox).not.toHaveBeenCalled();
+    });
+
+    it('gets an owner whose only ready boxes are ask boxes a box of their own, starting no stopped ask box', async () => {
+      flags({ 'claude-runner-auto-box-enabled': true });
+      ready = [askBox('rv-spend')];
+      owned = [row('rv-spend', { createdFor: 'ask' }), row('rb-release', { status: 'stopped', createdFor: 'ask' })];
+      agents({});
+      const res = await spawn();
+      expect(calls('tmux-create')).toEqual([]);
+      expect(requestPower).not.toHaveBeenCalled();
+      expect(provisionNewBox).toHaveBeenCalledTimes(1);
+      expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining(`provisioning termag box "${today}"`), code: 'box-provisioning' });
+    });
+
+    it("answers agent-too-old when the owner's own box needs a newer agent and only an ask box can run a runner (Bugbot on #1597)", async () => {
+      flags({ 'claude-runner-auto-box-enabled': true });
+      ready = [askBox('rv-spend'), box('box-a')];
+      owned = [row('rv-spend', { createdFor: 'ask' }), row('box-a')];
+      vi.mocked(instanceAgentTransport).mockImplementation(((id: string) =>
+        ({ conn: {} as never, capabilities: id === 'box-a' ? ['credentials-v1'] : ['tmux-create-command-v1'] })) as never);
+      agents({});
+      const res = await spawn();
+      expect(res.json).toHaveBeenCalledWith({ error: expect.stringContaining('agent too old'), code: 'agent-too-old' });
+      expect(calls('tmux-create')).toEqual([]);
+      for (const fn of [requestPower, claimWarmBox, provisionNewBox]) expect(fn).not.toHaveBeenCalled();
+    });
+
+    it('does not count ask boxes toward the ceiling', async () => {
+      flags({ 'claude-runner-auto-box-enabled': true });
+      vi.mocked(numberVariation).mockResolvedValue(2);
+      ready = [box('box-a'), askBox('ask-1'), askBox('ask-2'), askBox('ask-3')];
+      owned = [row('box-a'), ...['ask-1', 'ask-2', 'ask-3'].map(id => row(id, { createdFor: 'ask' }))];
+      agents({ 'box-a': FULL });
+      await spawn();
+      expect(provisionNewBox).toHaveBeenCalledTimes(1);
+      expect(outcomeLines()[0]).toBe('[CLAUDE-RUNNER] order ord.1: every ready box of ada (1, at most 2, and 3 ask box(es)) is full; getting another');
     });
   });
 });

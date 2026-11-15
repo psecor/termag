@@ -115,9 +115,11 @@ const user = { id: 'u1', unixUsername: 'alice', googleEmail: 'alice@example.com'
 const WEBAPP = 'https://github.com/example-org/webapp';
 const TINY = 'https://github.com/acme/tiny';
 const BROKEN = 'https://github.com/acme/broken';
-const BIG_MEMORY = 'https://github.com/acme/big-memory';
+const BIG_CPU = 'https://github.com/acme/big-cpu';
+const LARGE_SHAPE = 'https://github.com/acme/large-shape';
 const MEDIUM_SHAPE = 'https://github.com/acme/medium-shape';
-const R8G = { ok: true, choice: { type: 'r8g.xlarge', fallbacks: ['r7g.xlarge', 'm8g.2xlarge'] }, preset: null };
+const M8G = { ok: true, choice: { type: 'm8g.2xlarge', fallbacks: ['m7g.2xlarge'] }, preset: null };
+const R8G = { ok: true, choice: { type: 'r8g.xlarge', fallbacks: ['r7g.xlarge', 'm8g.2xlarge', 'm7g.2xlarge'] }, preset: 'large' };
 
 beforeEach(() => {
   flag.fallthrough = '';
@@ -139,11 +141,12 @@ beforeEach(() => {
     [WEBAPP]: { sizes: { size: 'medium' }, warnings: [] },
     [TINY]: { sizes: { size: 'small' }, warnings: [] },
     [BROKEN]: { sizes: { size: null }, warnings: ['acme/broken\'s .termag/environment.json: "resources" is "huge", not one of small, medium, large, so it was ignored'] },
-    [BIG_MEMORY]: { sizes: { size: { vcpu: 4, memoryGiB: 32 } }, warnings: [] },
-    [`${TINY}+${BIG_MEMORY}`]: { sizes: { size: { vcpu: 4, memoryGiB: 32 } }, warnings: [] },
+    [BIG_CPU]: { sizes: { size: { vcpu: 8, memoryGiB: 32 } }, warnings: [] },
+    [`${TINY}+${BIG_CPU}`]: { sizes: { size: { vcpu: 8, memoryGiB: 32 } }, warnings: [] },
+    [LARGE_SHAPE]: { sizes: { size: { vcpu: 2, memoryGiB: 32 } }, warnings: [] },
     [MEDIUM_SHAPE]: { sizes: { size: { vcpu: 4, memoryGiB: 16 } }, warnings: [] },
   };
-  resolutions.byKey = { '4/32': R8G, '4/16': { ok: true, choice: { type: 'm8g.xlarge', fallbacks: ['m7g.xlarge'] }, preset: 'medium' } };
+  resolutions.byKey = { '8/32': M8G, '4/32': R8G, '2/32': R8G, '4/16': { ok: true, choice: { type: 'm8g.xlarge', fallbacks: ['m7g.xlarge'] }, preset: 'medium' } };
   vi.clearAllMocks();
   claimWarmBox.mockResolvedValue({ claimed: false, reason: 'no-warm-box', candidatesTried: 0 });
   vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -192,7 +195,7 @@ describe('a new box with box-default-size on', () => {
     flag.userTargets = { u1: 'large' };
     await createBox(user, { name: 'dev1', kind: 'ec2' });
     expect(created[0]).toMatchObject({ size: 'large' });
-    expect(launchedTypes()?.type).toBe('m8g.2xlarge');
+    expect(launchedTypes()?.type).toBe('r8g.xlarge');
   });
 
   it('takes the repo file\'s size: a webapp project\'s box is medium', async () => {
@@ -258,7 +261,7 @@ describe('a box made for an ask (createdFor ask), sized like any other', () => {
   it('takes the owner\'s default with no repo file: no small-for-asks', async () => {
     await createBox(user, { name: 'ask1', kind: 'ec2' }, { createdFor: 'ask' });
     expect(created[0]).toMatchObject({ size: 'large' });
-    expect(launchedTypes()?.type).toBe('m8g.2xlarge');
+    expect(launchedTypes()?.type).toBe('r8g.xlarge');
   });
 
   it('takes the repo file\'s size, and an explicit size still wins', async () => {
@@ -272,14 +275,14 @@ describe('a box made for a multi-repo project', () => {
   beforeEach(() => { flag.fallthrough = 'small'; vi.spyOn(console, 'warn').mockImplementation(() => {}); });
 
   it('reads every repository\'s file and takes the largest, resolved as usual', async () => {
-    await createBox(user, { name: 'mr', kind: 'ec2', repo: [TINY, BIG_MEMORY] });
-    expect(repoFiles.read).toEqual([TINY, BIG_MEMORY]);
-    expect(created[0]).toMatchObject({ size: '4vcpu-32gib' });
-    expect(launchedTypes()?.type).toBe('r8g.xlarge');
+    await createBox(user, { name: 'mr', kind: 'ec2', repo: [TINY, BIG_CPU] });
+    expect(repoFiles.read).toEqual([TINY, BIG_CPU]);
+    expect(created[0]).toMatchObject({ size: '8vcpu-32gib' });
+    expect(launchedTypes()?.type).toBe('m8g.2xlarge');
   });
 
   it('lets an explicit size win, without reading the files when the disk is asked for too', async () => {
-    await createBox(user, { name: 'mr', kind: 'ec2', size: 'large', diskGiB: 120, repo: [TINY, BIG_MEMORY] });
+    await createBox(user, { name: 'mr', kind: 'ec2', size: 'large', diskGiB: 120, repo: [TINY, BIG_CPU] });
     expect(repoFiles.read).toEqual([]);
     expect(created[0]).toMatchObject({ size: 'large' });
   });
@@ -369,12 +372,20 @@ describe('the warm pool holds each size apart', () => {
 describe('a repo file asking for requirements ({ vcpu, memoryGiB })', () => {
   beforeEach(() => { flag.fallthrough = 'small'; vi.spyOn(console, 'warn').mockImplementation(() => {}); });
 
-  it('launches EC2\'s match, r8g.xlarge first, records 4vcpu-32gib, and skips the warm pool', async () => {
-    const result = await createBox(user, { name: 'g1', kind: 'ec2', repo: BIG_MEMORY });
+  it('launches EC2\'s match for 8 vCPU / 32 GB, m8g.2xlarge first, records 8vcpu-32gib, and skips the warm pool', async () => {
+    const result = await createBox(user, { name: 'g1', kind: 'ec2', repo: BIG_CPU });
     expect(result.status).toBe(201);
-    expect(created[0]).toMatchObject({ size: '4vcpu-32gib' });
-    expect(launchedTypes()).toEqual({ type: 'r8g.xlarge', fallbacks: ['r7g.xlarge', 'm8g.2xlarge'] });
+    expect(created[0]).toMatchObject({ size: '8vcpu-32gib' });
+    expect(launchedTypes()).toEqual({ type: 'm8g.2xlarge', fallbacks: ['m7g.2xlarge'] });
     expect(claimWarmBox).not.toHaveBeenCalled();
+  });
+
+  it('is large when its match starts with large\'s r8g.xlarge, which the pool can hold: 2 vCPU / 32 GB', async () => {
+    flag.fallthrough = 'large';
+    await createBox(user, { name: 'g1b', kind: 'ec2', repo: LARGE_SHAPE });
+    expect(claimWarmBox).toHaveBeenCalledWith(expect.objectContaining({ size: 'large' }), {});
+    expect(created[0]).toMatchObject({ size: 'large' });
+    expect(launchedTypes()).toEqual({ type: 'r8g.xlarge', fallbacks: ['r7g.xlarge', 'm8g.2xlarge', 'm7g.2xlarge'] });
   });
 
   it('is the preset its match starts with, which the pool can hold: 4 vCPU / 16 GB is medium', async () => {
@@ -387,21 +398,21 @@ describe('a repo file asking for requirements ({ vcpu, memoryGiB })', () => {
 
   it('falls back to the default with a warning when EC2 has no match, never failing the create', async () => {
     resolutions.byKey = {};
-    const result = await createBox(user, { name: 'g3', kind: 'ec2', repo: BIG_MEMORY });
+    const result = await createBox(user, { name: 'g3', kind: 'ec2', repo: BIG_CPU });
     expect(result.status).toBe(201);
     expect(created[0]).toMatchObject({ size: 'small' });
     expect(result.body).toMatchObject({ warnings: [expect.stringContaining('no m8g/r8g/m7g/r7g type has that; launching small instead')] });
   });
 
   it('lets an explicit size win', async () => {
-    await createBox(user, { name: 'g4', kind: 'ec2', size: 'large', repo: BIG_MEMORY });
+    await createBox(user, { name: 'g4', kind: 'ec2', size: 'large', repo: BIG_CPU });
     expect(created[0]).toMatchObject({ size: 'large' });
   });
 
   it('keeps a relaunched requirements box at its requirements', async () => {
-    await createBox(user, { name: 'g5', kind: 'ec2' }, { relaunchSize: '4vcpu-32gib' });
-    expect(created[0]).toMatchObject({ size: '4vcpu-32gib' });
-    expect(launchedTypes()?.type).toBe('r8g.xlarge');
+    await createBox(user, { name: 'g5', kind: 'ec2' }, { relaunchSize: '8vcpu-32gib' });
+    expect(created[0]).toMatchObject({ size: '8vcpu-32gib' });
+    expect(launchedTypes()?.type).toBe('m8g.2xlarge');
   });
 
   it("never relaunches a requirements box smaller when EC2 can't match them again: the smallest preset that covers them (Bugbot, #985)", async () => {
@@ -410,9 +421,17 @@ describe('a repo file asking for requirements ({ vcpu, memoryGiB })', () => {
     resolutions.byKey = {};
     const result = await createBox(user, { name: 'g6', kind: 'ec2' }, { relaunchSize: '4vcpu-32gib' });
     expect(result.status).toBe(201);
-    // 4 vCPU / 32 GB: medium (4/16) lacks the memory, so large (8/32), never the owner's small.
+    // 4 vCPU / 32 GB: medium (4/16) lacks the memory, so large (4/32), never the owner's small.
     expect(created[0]).toMatchObject({ size: 'large' });
-    expect(launchedTypes()?.type).toBe('m8g.2xlarge');
+    expect(launchedTypes()?.type).toBe('r8g.xlarge');
+    expect(result.body).toMatchObject({ warnings: [expect.stringContaining('launching large instead')] });
+  });
+
+  it("relaunches 8 vCPU / 32 GB as large, the biggest preset, when EC2 can't match them again", async () => {
+    resolutions.byKey = {};
+    const result = await createBox(user, { name: 'g7', kind: 'ec2' }, { relaunchSize: '8vcpu-32gib' });
+    expect(created[0]).toMatchObject({ size: 'large' });
+    expect(launchedTypes()?.type).toBe('r8g.xlarge');
     expect(result.body).toMatchObject({ warnings: [expect.stringContaining('launching large instead')] });
   });
 });
@@ -468,8 +487,8 @@ describe('a new box made from an environment', () => {
   });
 
   it('keeps the largest-across-repositories size for several repositories and no environment', async () => {
-    await createBox(user, { name: 'dev1', kind: 'ec2', repo: [TINY, BIG_MEMORY] });
-    expect(repoFiles.read).toEqual([TINY, BIG_MEMORY]);
+    await createBox(user, { name: 'dev1', kind: 'ec2', repo: [TINY, BIG_CPU] });
+    expect(repoFiles.read).toEqual([TINY, BIG_CPU]);
   });
 });
 

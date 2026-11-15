@@ -86,6 +86,20 @@ export interface SpacesRouterDeps {
   uploadSecret?: () => string;
   /** The file-sharing kill switch (services/spaces/sharedFiles.ts); defaults to SPACE_FILE_SHARING_DISABLED. */
   sharingDisabled?: () => boolean;
+  /**
+   * An upload was signed (services/projectFiles.ts recordFilesSaved, the `files.saved` event): who, which space,
+   * the path (for its extension only; never sent on), and whether the CLI named the space or defaulted it.
+   * Called after the answer is ready, never awaited.
+   */
+  onUploadSigned?: (upload: { caller: SpaceCaller; spaceId: string; path: string; chosen: 'default' | 'explicit' | null }) => void;
+  /**
+   * A file moved to another space (`files/move-to`; services/projectFiles.ts recordFilesMoved, the `files.moved`
+   * event): who moved it, from and to which space, and the newest write of it before the move (who saved it, when).
+   * Called after the answer is ready, never awaited.
+   */
+  onFileMoved?: (move: { caller: SpaceCaller; fromSpaceId: string; toSpaceId: string; saved: { byBox: boolean; at: Date } | null }) => void;
+  /** project-files-enabled for the caller (services/projectFiles.ts), which `files/move-to` is behind; unset, it's off. */
+  moveToEnabled?: (caller: SpaceCaller) => Promise<boolean>;
   now?: () => number;
 }
 
@@ -476,6 +490,9 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     const contentType = uploadContentType(body.contentType);
     // The version the writer read: checked here, signed into the PUT, and checked again on the confirm.
     const condition = putConditionOf(body);
+    // `termag space put`'s `chosen` (cli/src/space.ts resolveSpace): the space was named, or defaulted to Project files or the only one.
+    const chosen = body.chosen === 'default' || body.chosen === 'explicit' ? body.chosen : null;
+    const signed = () => { try { deps.onUploadSigned?.({ caller, spaceId: space.id, path, chosen }); } catch { /* telemetry never fails an upload */ } };
     const key = objectKey(space.id, path);
     throttle(caller);
     const objects = await objectsFor(res);
@@ -488,11 +505,13 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
       await event(res, space, access, 'file.put.signed', { path, bytes: size });
       // `conditional` tells the CLI this orchestrator signed the condition; an older one ignores it and writes blind.
       res.json({ kind: 'single', path, ...put, ...(condition ? { conditional: true } : {}) });
+      signed();
       return;
     }
     const uploadId = await objects.createMultipart(key, contentType);
     // A multipart upload's condition goes again with its complete, where S3 assembles the object.
     res.json({ kind: 'multipart', path, uploadId, partBytes: PART_BYTES, partCount: Math.ceil(size / PART_BYTES), ...(condition ? { conditional: true } : {}) });
+    signed();
   }));
 
   router.post('/:space/files/uploaded', handler(async (req, res) => {
@@ -643,6 +662,81 @@ export function spacesRouter(deps: SpacesRouterDeps): Router {
     await store.removeFileShares(space.id, isDir ? { prefix: from } : { path: from });
     await event(res, space, access, 'file.mv', { path: `${from} -> ${to}`, bytes: total });
     res.json({ ok: failed.length === 0, moved: moved.length, failed: failed.map(k => pathOfKey(space.id, k)) });
+  }));
+
+  // POST /:space/files/move-to {path, toSpace, toPath?, ifMatch?, force?} → {ok, moved, to: {space, path}}
+  // (Move to My files / Move to Project files), behind
+  // project-files-enabled (404 project_files_disabled): one file into
+  // another space, at the same path unless `toPath` says otherwise: a copy within the bucket, then the delete.
+  // Editor on both (a space the caller has no role in is a 404, as everywhere); 409 `exists` when the target
+  // has the path and `force` isn't set, checked again by S3 as it copies; 412 `changed` when `ifMatch` is
+  // stale. Only the version that was copied is deleted: one written meanwhile stays, and the answer is 409
+  // `changed_while_moving`; a delete S3 refuses answers `ok: false` with both copies there. Charged to the
+  // target's quota, as an upload is. The old path's share link goes, as a move within a space drops it; a forced
+  // replace of a shared file is refused (409 `destination_shared`).
+  router.post('/:space/files/move-to', handler(async (req, res) => {
+    const caller = callerOf(res);
+    if (!await deps.moveToEnabled?.(caller)) fail(404, 'Moving files between spaces is not on for you', 'project_files_disabled');
+    const { space, access } = await load(req, res, 'editor');
+    const body = bodyOf(req);
+    const path = normalizeFilePath(body.path);
+    if (typeof body.toSpace !== 'string' || !body.toSpace) fail(400, 'toSpace (a space name) is required', 'invalid_space');
+    const target = await ops.load(caller, body.toSpace, 'editor');
+    if (target.space.id === space.id) fail(400, 'That is the same space; move it with files/move', 'same_space');
+    const toPath = body.toPath === undefined || body.toPath === null ? path : normalizeFilePath(body.toPath);
+    // A space's .termag/ is its agents' shared memory, which the CLI checks for secrets before a put: nothing
+    // crosses into (or out of) another space's that way.
+    if (path.startsWith('.termag/') || toPath.startsWith('.termag/')) fail(400, 'A space\'s memory (.termag/) isn\'t moved between spaces', 'memory_path');
+    const condition = putConditionOf({ ifMatch: body.ifMatch });
+    throttle(caller);
+    const objects = await objectsFor(res);
+    const fromKey = objectKey(space.id, path);
+    const toKey = objectKey(target.space.id, toPath);
+    const head = await objects.head(fromKey);
+    if (!head) fail(404, `No file ${path} in ${space.name}`, 'file_not_found');
+    if (condition) await refuseIfChanged({ space, access }, path, condition, head);
+    const force = body.force === true;
+    const exists = () => fail(409, `${target.space.name} already has ${toPath}`, 'exists', { space: target.space.name, path: toPath });
+    if (!force && await objects.head(toKey)) exists();
+    if (head.size > MAX_FILE_BYTES) fail(413, 'Moving files over 5 GiB is not supported yet', 'move_too_large');
+    // A share is of a path and shows whatever is saved there, so a forced move onto a shared file would publish
+    // the moved one: refused, with the share left as it is (no unshare-and-restore to race an unshare or a copy).
+    // Every refusal comes before the charge, so a refused move never holds the target's quota.
+    if (force && await store.fileShare(target.space.id, toPath)) {
+      fail(409, `${target.space.name}:${toPath} is shared with everyone on termag; make it private before replacing it`, 'destination_shared', { space: target.space.name, path: toPath });
+    }
+    // Exactly the version checked above is what moves: the copy is of it, and the delete only of it.
+    const moving = condition?.ifMatch ?? head.etag ?? null;
+    // Who saved it, and when, before the move's own events: files.moved's savedBy and ageHours.
+    const saved = await store.lastWrite(space.id, path);
+    await charge(target.space, head.size, MOVE_CHARGE_S, null);
+    try {
+      // Without force, S3 refuses the copy if the destination appeared since the check (If-None-Match: *).
+      await objects.copy(fromKey, toKey, { sourceIfMatch: moving, destNew: !force });
+    } catch (err) {
+      if (!preconditionFailed(err)) throw err;
+      if (!force && await objects.head(toKey)) exists();
+      await failChanged({ space, access }, path, condition ?? { ifMatch: moving ?? '' }, (await objects.head(fromKey))?.etag ?? null);
+    }
+    await event(res, target.space, target.access, 'file.put', { path: toPath, bytes: head.size, note: `moved from ${space.name}:${path}` });
+    // The source goes only while it's still the version that was copied: a write that landed since stays.
+    const removed = moving ? await objects.deleteIfMatch(fromKey, moving) : (await objects.deleteKeys([fromKey])).length === 0 ? 'deleted' : 'failed';
+    const to = { space: target.space.name, path: toPath };
+    if (removed === 'changed') {
+      fail(409, `${path} changed while it moved: the version you moved is in ${target.space.name}:${toPath}, and the newer one stayed in ${space.name}`, 'changed_while_moving', { to });
+    }
+    if (removed === 'failed') {
+      // Copied but not removed: both spaces hold it, and nothing says it left this one.
+      res.json({ ok: false, moved: 0, to, failed: [path] });
+      return;
+    }
+    await store.removeFileShares(space.id, { path });
+    // It left one space and arrived in the other: a removal here, after the put there, for the history and the live views.
+    await event(res, space, access, 'file.rm', { path, bytes: head.size, note: `moved to ${target.space.name}:${toPath}` });
+    res.json({ ok: true, moved: 1, to });
+    try {
+      deps.onFileMoved?.({ caller, fromSpaceId: space.id, toSpaceId: target.space.id, saved: saved ? { byBox: !!saved.actorInstanceId, at: saved.at } : null });
+    } catch { /* telemetry never fails a move */ }
   }));
 
   router.delete('/:space/files', handler(async (req, res) => {

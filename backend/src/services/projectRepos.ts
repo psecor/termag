@@ -35,6 +35,27 @@ export function isWorkspace(project: { layout?: string | null }): boolean {
 }
 
 /**
+ * The project list's `repoKeys` (routes/projects.ts listProjectsFor): each
+ * repository's lowercased `owner/name` (repoKey), a workspace's in its
+ * checkout order, `[]` for a project with none. The chat's Projects view
+ * groups sessions by this set,
+ * so two checkouts of one repository on two boxes are one group. A URL that
+ * isn't a GitHub one (none is accepted on create) keeps its own lowercased
+ * spelling, without `.git`, rather than dropping out to No repo.
+ */
+export function projectRepoKeys(project: {
+  repoUrl: string | null;
+  layout?: string | null;
+  repos?: ReadonlyArray<{ url: string; position: number }>;
+}): string[] {
+  const keyOf = (url: string) => repoKey(url) ?? url.trim().toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '');
+  if (isWorkspace(project)) {
+    return [...(project.repos ?? [])].sort((a, b) => a.position - b.position).map(r => keyOf(r.url));
+  }
+  return project.repoUrl?.trim() ? [keyOf(project.repoUrl)] : [];
+}
+
+/**
  * Whether a failed project-clone RPC is the box refusing the request (its
  * reply starts `project-clone:`, agent/project-clone.js), which sending it
  * again would not change, rather than a timeout or a dropped connection.

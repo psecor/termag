@@ -21,7 +21,7 @@ vi.mock('../services/boxProvisioner', () => ({
 }));
 const requestPower = vi.fn(async (_box: unknown, action: string) => (action === 'start' ? 'starting' : action === 'stop' ? 'stopping' : 'hibernating'));
 vi.mock('../services/boxPower', () => ({ requestPower, PowerRequestConflict: class extends Error {} }));
-vi.mock('../services/boxLifecycle', () => ({ recentAutoTerminations: vi.fn(), setBoxLifecycle: vi.fn(), lifecycleViewFor: vi.fn() }));
+vi.mock('../services/boxLifecycle', () => ({ recentAutoTerminations: vi.fn(), setBoxLifecycle: vi.fn(), lifecycleViewFor: vi.fn(), liveRunnerSessions: vi.fn(async () => new Map()) }));
 vi.mock('../services/featureFlags', () => ({
   boolVariation: vi.fn(async (_key: string, _user: unknown, fallback: boolean) => fallback),
 }));

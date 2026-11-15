@@ -15,8 +15,8 @@
  * saved; a pointer's file when it is read, where anything it can't use is a
  * warning, never a failure.
  *
- * Shared: anyone signed in can see, use and edit every environment, so every
- * create, edit and delete writes an EnvironmentEvent (who, when, the stored
+ * Shared: anyone signed in can see and use a shared environment, and an admin
+ * changes it (sharedNeedsAdmin), so every create, edit and delete writes an EnvironmentEvent (who, when, the stored
  * fields before and after) in the same transaction as the change. The events
  * have no foreign key and are never pruned, so a deleted environment's
  * history stays readable.
@@ -53,7 +53,10 @@ export type EnvironmentFields =
   | { name: string; kind: 'inline'; definition: Record<string, unknown> }
   | { name: string; kind: 'pointer'; file: EnvironmentFile };
 
-/** Personal: only its owner sees, uses, edits or deletes it. Shared: everyone signed in sees and uses it (sharedRuleError). */
+/**
+ * Personal: only its owner sees, uses, edits or deletes it. Shared: everyone signed in sees and uses it
+ * (sharedRuleError), and only an admin creates, edits, shares, unshares or deletes one (sharedNeedsAdmin).
+ */
 export type EnvironmentVisibility = 'personal' | 'shared';
 
 export type EnvironmentRecord = EnvironmentFields & {
@@ -63,7 +66,7 @@ export type EnvironmentRecord = EnvironmentFields & {
   createdByUserId: string | null;
   updatedByUserId: string | null;
   visibility: EnvironmentVisibility;
-  /** Its creator; the one who switches it between personal and shared, and the only one who sees a personal one. */
+  /** Its creator; the only one who sees a personal one (and, if an admin, the one who shares it). */
   ownerUserId: string | null;
 };
 
@@ -193,7 +196,7 @@ export interface EnvironmentStore {
   byName(name: string): Promise<EnvironmentRecord | null>;
   /** The actor owns what they create; personal unless `visibility` says shared (checked first, sharedRuleError). */
   create(actorUserId: string, fields: EnvironmentFields, visibility?: EnvironmentVisibility): Promise<EnvironmentWrite>;
-  /** Personal or shared: the owner's switch (the routes check who may, and the shared rules). */
+  /** Personal or shared (the routes check who may: an admin, sharing their own or unsharing any; and the shared rules). */
   setVisibility(actorUserId: string, id: string, visibility: EnvironmentVisibility, expectedUpdatedAt?: Date): Promise<EnvironmentWrite>;
   update(actorUserId: string, id: string, fields: EnvironmentFields, expectedUpdatedAt?: Date): Promise<EnvironmentWrite>;
   remove(actorUserId: string, id: string, expectedUpdatedAt?: Date): Promise<EnvironmentWrite>;
@@ -422,6 +425,19 @@ export async function usableEnvironment(
   if (!('environment' in found) || found.environment.visibility !== 'shared') return found;
   const broken = await sharedRuleError(viewerId, found.environment, github ?? repoEnvironment);
   return broken ? { status: 400, body: { error: `${found.environment.name}: ${broken}`, code: 'environment_not_shareable' } } : found;
+}
+
+/** What a non-admin is told when a change would touch a shared environment (sharedNeedsAdmin). */
+export const SHARED_ADMIN_ONLY = 'Only admins can change shared environments; make a personal one';
+
+/**
+ * Whether a change needs an admin: it touches a shared environment, one that is shared before it (an edit, a
+ * delete, making it personal) or after it (creating one shared, sharing a personal one). A shared environment's steps
+ * run on every box made from it, and its pool fetches its repositories with the pool's credential before anyone
+ * claims a box, so what one runs, and which repositories, is an admin's decision. A personal one is its owner's.
+ */
+export function sharedNeedsAdmin(before: EnvironmentVisibility | null, after: EnvironmentVisibility | null): boolean {
+  return before === 'shared' || after === 'shared';
 }
 
 /** Whether `userId` sees, and may use, an environment: a shared one, or their own personal one. */

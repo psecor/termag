@@ -17,7 +17,7 @@ vi.mock('./sshKeySync', () => ({ syncBoxAuthorizedKeys: async () => {} }));
 const noteBoxActivity = vi.fn();
 vi.mock('./boxActivity', () => ({ noteBoxActivity, isTerminalReport: () => false }));
 
-const { registerAgent, requestBrowserStream, sendBrowserMessage, closeBrowserStream } = await import('./agentRegistry');
+const { registerAgent, requestBrowserStream, sendBrowserMessage, closeBrowserStream, requestBrowserChromium, projectAgentCapabilities } = await import('./agentRegistry');
 
 // The real socket's close event arrives later, after the close handshake, so
 // a replacement for the same key is in the registry before the old socket's
@@ -120,5 +120,53 @@ describe('browser streams in the agent registry', () => {
     sendBrowserMessage(streamId, { type: 'browser-resize', width: 640, height: 480 });
     sendBrowserMessage(streamId, { type: 'browser-frame-ack' });
     expect(noteBoxActivity).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe('a Chromium the agent found after its hello', () => {
+  const hello = (caps: string[]) => ({ type: 'hello', unixUser: 'dev', home: '/home/dev', capabilities: caps });
+  const answerOf = (ws: FakeAgentSocket) => {
+    const ask = ws.sent.find((m) => m.type === 'browser-chromium');
+    ws.fromAgent({ requestId: ask.requestId, data: { chromium: '/snap/bin/chromium', installing: false, error: null, capabilities: ['browser-pane-v1'] } });
+    return ask;
+  };
+
+  it('asks the box with browser-chromium, and adds what it gained to the connection that answered', async () => {
+    const ws = new FakeAgentSocket();
+    const host = { userId: user.id, instanceId: 'inst_chromium' };
+    registerAgent(user, ws as any, box('inst_chromium'));
+    ws.fromAgent(hello(['browser-guest-check-v1', 'browser-pane-chromium-v1']));
+    await settle();
+    const asked = requestBrowserChromium(host, true);
+    expect(answerOf(ws)).toMatchObject({ install: true });
+    const reply = await asked;
+    expect(reply.answer).toMatchObject({ chromium: '/snap/bin/chromium' });
+    reply.adopt(['browser-pane-v1', 'browser-guest-check-v1']);
+    expect(projectAgentCapabilities(host)).toEqual(['browser-guest-check-v1', 'browser-pane-chromium-v1', 'browser-pane-v1']);
+  });
+
+  it('never marks a connection that replaced the one asked, nor one that has not said hello', async () => {
+    const host = { userId: user.id, instanceId: 'inst_replaced' };
+    const first = new FakeAgentSocket();
+    registerAgent(user, first as any, box('inst_replaced'));
+    first.fromAgent(hello(['browser-guest-check-v1', 'browser-pane-chromium-v1']));
+    await settle();
+    const asked = requestBrowserChromium(host, true);
+    // The box's agent reconnects (a box update) before the first socket's answer lands.
+    const second = new FakeAgentSocket();
+    registerAgent(user, second as any, box('inst_replaced'));
+    second.fromAgent(hello(['browser-guest-check-v1', 'browser-pane-chromium-v1']));
+    await settle();
+    answerOf(first);
+    (await asked).adopt(['browser-pane-v1']);
+    expect(projectAgentCapabilities(host)).toEqual(['browser-guest-check-v1', 'browser-pane-chromium-v1']);
+
+    const third = new FakeAgentSocket();
+    const host3 = { userId: user.id, instanceId: 'inst_nohello' };
+    registerAgent(user, third as any, box('inst_nohello'));
+    const early = requestBrowserChromium(host3, false);
+    answerOf(third);
+    (await early).adopt(['browser-pane-v1']);
+    expect(projectAgentCapabilities(host3)).toEqual([]);
   });
 });

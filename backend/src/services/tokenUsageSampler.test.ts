@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeScanResponse, resolveRows, buildUsageResponse, emptyDay, UsageRowAgg } from './tokenUsageSampler';
+import { normalizeScanResponse, resolveRows, buildUsageResponse, emptyDay, UsageRowAgg, nextDueAt, createLimiter, lastByKey, newestScanAt, dayUpsertSql, modelUpsertSql } from './tokenUsageSampler';
 
 const day = (input: number, calls = 1) => ({ input, output: 0, cacheRead: 0, cacheCreate: 0, reasoning: 0, calls });
 const tok = (d: { input: number; output: number; cacheRead: number; cacheCreate: number }) => d.input + d.output + d.cacheRead + d.cacheCreate;
@@ -121,5 +121,115 @@ describe('buildUsageResponse', () => {
     expect(buildUsageResponse([], projects, { providerIds: [], days: {} }, [], new Date(now - 16 * 60_000), now).staleSince).toBe(new Date(now - 16 * 60_000).toISOString());
     expect(buildUsageResponse([], projects, { providerIds: [], days: {} }, [], null, now).staleSince).toBeNull();
     expect(emptyDay()).toEqual(day(0, 0));
+  });
+});
+
+describe('nextDueAt', () => {
+  const I = 300_000;
+  it('is always after now, within one interval, on the same phase of the cycle for a user', () => {
+    for (const user of ['u1', 'cmabc123', 'someone-else']) {
+      const phase = nextDueAt(user, 0, I) % I;
+      for (const now of [0, 1, 299_999, 300_000, 1_763_000_000_123]) {
+        const next = nextDueAt(user, now, I);
+        expect(next).toBeGreaterThan(now);
+        expect(next - now).toBeLessThanOrEqual(I);
+        expect(next % I).toBe(phase);
+      }
+    }
+  });
+  it('does not depend on when the last scan ended: two users that end together keep their own slots', () => {
+    const end = 1_763_000_000_000;
+    const a = nextDueAt('alice', end, I), b = nextDueAt('bob', end, I);
+    expect(a % I).toBe(nextDueAt('alice', end + 4_000, I) % I);
+    expect(a % I).not.toBe(b % I);
+  });
+});
+
+describe('createLimiter', () => {
+  it('runs at most max at once and the rest in arrival order', async () => {
+    const limit = createLimiter(3);
+    let active = 0, peak = 0;
+    const order: number[] = [];
+    const releases: Array<() => void> = [];
+    const runs = Array.from({ length: 8 }, (_, i) => limit(async () => {
+      active++; peak = Math.max(peak, active); order.push(i);
+      await new Promise<void>(r => releases.push(r));
+      active--;
+      return i;
+    }));
+    for (let k = 0; k < 8; k++) {
+      await new Promise(r => setTimeout(r, 0));
+      expect(active).toBeLessThanOrEqual(3);
+      releases.shift()?.();
+    }
+    expect(await Promise.all(runs)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(peak).toBe(3);
+    expect(order).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+  });
+  it('frees the slot when a run throws', async () => {
+    const limit = createLimiter(1);
+    await expect(limit(async () => { throw new Error('boom'); })).rejects.toThrow('boom');
+    expect(await limit(async () => 'next')).toBe('next');
+  });
+  it('does not admit a caller that arrives before a woken waiter resumes', async () => {
+    const limit = createLimiter(1);
+    let active = 0, peak = 0;
+    const never = new Promise<void>(() => {});
+    const track = (gate: Promise<void>) => limit(async () => {
+      active++; peak = Math.max(peak, active);
+      await gate;
+      active--;
+    });
+    let open!: () => void;
+    track(new Promise<void>(r => { open = r; })); // takes the only slot
+    track(never);                                 // waits behind it
+    open();                                       // its release wakes the waiter
+    // Two chained microtasks land this caller after the release continuation
+    // but before the woken waiter's continuation (queued by that release)
+    // resumes: the window in which decrementing first admits both.
+    Promise.resolve().then(() => Promise.resolve().then(() => { track(never); }));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(peak).toBe(1);
+  });
+});
+
+describe('lastByKey', () => {
+  it('keeps one row per key, the last reported', () => {
+    const rows = [{ k: 'a', v: 1 }, { k: 'b', v: 2 }, { k: 'a', v: 3 }];
+    expect(lastByKey(rows, r => r.k)).toEqual([{ k: 'b', v: 2 }, { k: 'a', v: 3 }]);
+  });
+});
+
+describe('newestScanAt (the usage page\'s staleness)', () => {
+  const row = new Date('2026-11-13T10:00:00Z');
+  it('falls back to the table after a restart, when this process has not scanned yet', () => {
+    expect(newestScanAt(null, row)).toBe(row);
+    expect(newestScanAt(null, null)).toBeNull();
+  });
+  it('takes the last successful run once there is one, even when no row changed since', () => {
+    const run = Date.parse('2026-11-13T12:00:00Z');
+    expect(newestScanAt(run, row)?.toISOString()).toBe('2026-11-13T12:00:00.000Z');
+    expect(newestScanAt(run, null)?.toISOString()).toBe('2026-11-13T12:00:00.000Z');
+  });
+  it('keeps a newer row (another orchestrator scanned during an overlapping deploy)', () => {
+    expect(newestScanAt(Date.parse('2026-11-13T09:00:00Z'), row)).toBe(row);
+  });
+});
+
+describe('dayUpsertSql / modelUpsertSql', () => {
+  const r = { provider: 'claude', date: '2026-11-04', sourceKey: 'd', cwdHint: null, dir: 'd', agentSchema: 2 as const, projectId: 'p1', workstream: 'main', day: day(5) };
+  it('is one statement for every row, rewriting a row only when its values differ', () => {
+    const q = dayUpsertSql('u1', 'h1', [r, { ...r, date: '2026-11-05' }], new Date('2026-11-05T00:00:00Z'), () => 'id');
+    expect(q.sql.match(/INSERT INTO/g)).toHaveLength(1);
+    expect(q.sql).toContain('ON CONFLICT ("userId", "hostKey", "provider", "date", "sourceKey") DO UPDATE');
+    expect(q.sql).toContain('IS DISTINCT FROM');
+    expect(q.values).toContain('2026-11-05');
+    expect(q.values.filter(v => v === 'id')).toHaveLength(2);
+    expect(q.values).toContain('2026-11-05T00:00:00.000Z');
+  });
+  it('the model statement conflicts on the model key', () => {
+    const q = modelUpsertSql('u1', 'h1', [{ ...r, model: 'opus', backend: '' }], new Date(), () => 'id');
+    expect(q.sql).toContain('ON CONFLICT ("userId", "hostKey", "provider", "date", "sourceKey", "backend", "model") DO UPDATE');
+    expect(q.sql).toContain('IS DISTINCT FROM');
   });
 });

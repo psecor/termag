@@ -42,7 +42,10 @@ describe('the preview audience core and the link tables stay where they belong',
     // Row 2b (on #1180):
     // - previewLinkAdmin.ts: an admin ends one link (SR15), so it finds that link by id or by the name serving it;
     //   the end itself goes through the core's endPreviewAudience.
-    expect(touching(/\.previewLink(?:Name|Code|Session|Request)?\s*\./)).toEqual(['services/previewHostStore.ts', 'services/previewLinkAdmin.ts', 'services/previewLinkSweep.ts', 'services/previewLinks.ts']);
+    // Row 6a:
+    // - previewLinkRequests.ts: an agent's ask (`termag preview request`) counts, finds and creates request rows,
+    //   the requests table only; publishing one still goes through previewLinks.ts.
+    expect(touching(/\.previewLink(?:Name|Code|Session|Request)?\s*\./)).toEqual(['services/previewHostStore.ts', 'services/previewLinkAdmin.ts', 'services/previewLinkRequests.ts', 'services/previewLinkSweep.ts', 'services/previewLinks.ts']);
     // previewLinkConfirmations.ts: the box-made confirms (SR5), its own table only.
     expect(touching(/\.previewLinkConfirmation\s*\./)).toEqual(['services/previewLinkConfirmations.ts']);
   });
@@ -51,10 +54,14 @@ describe('the preview audience core and the link tables stay where they belong',
     // PR 2 (#1180): the host store reads a viewer's standing, records an open and writes events through the
     // core's own functions (audienceStandingOf, audienceViewerSeen, noteAudienceViewer, prismaAudienceOps);
     // the sweep ends audiences with endPreviewAudience; row 2b's admin end-link (previewLinkAdmin.ts) does too.
+    // Row 6b: a link's wake records and refunds its `woke` event (previewLinkWake.ts), and the owner's one guest
+    // wake budget, in previewShares.ts, counts links' wakes beside shares' (linkWakesSince). Neither reads access.
     expect(importing('previewAudience')).toEqual([
       'routes/projects.ts', 'routes/workstreams.ts',
-      'services/previewHostStore.ts', 'services/previewLinkAccess.ts', 'services/previewLinkAdmin.ts', 'services/previewLinkConfirmations.ts', 'services/previewLinkRules.ts', 'services/previewLinkSweep.ts', 'services/previewLinks.ts', 'services/previewLinksTestStore.ts',
+      'services/previewHostStore.ts', 'services/previewLinkAccess.ts', 'services/previewLinkAdmin.ts', 'services/previewLinkConfirmations.ts', 'services/previewLinkRules.ts', 'services/previewLinkSweep.ts', 'services/previewLinkWake.ts', 'services/previewLinks.ts', 'services/previewLinksTestStore.ts', 'services/previewShares.ts',
     ]);
+    expect(files.find((f) => f.path === 'services/previewShares.ts')!.text.match(/import \{([^}]*)\} from '\.\/previewAudience'/)?.[1].trim()).toBe('linkWakesSince');
+    expect(files.find((f) => f.path === 'services/previewLinkWake.ts')!.text.match(/import \{([^}]*)\} from '\.\/previewAudience'/)?.[1].trim()).toBe('dropLinkWake, recordLinkWake');
     // The lifecycle hooks only end audiences; they never read one as access.
     for (const hook of ['routes/projects.ts', 'routes/workstreams.ts']) {
       const text = files.find((f) => f.path === hook)!.text;
@@ -70,13 +77,15 @@ describe('the preview audience core and the link tables stay where they belong',
   it('the link service is used only by its routes and index.ts', () => {
     // PR 2 (#1180): its host store and the test store take the PreviewLinkRow type, nothing else.
     expect(importing('previewLinks')).toEqual([
-      'index.ts', 'routes/cliPreviewLinksPrisma.ts', 'routes/previewLinks.ts', 'services/previewHostStore.ts', 'services/previewHostTestStore.ts', 'services/previewLinkConfirmations.ts', 'services/previewLinksTestStore.ts',
+      'index.ts', 'routes/cliPreviewLinksPrisma.ts', 'routes/previewLinks.ts', 'services/previewHostStore.ts', 'services/previewHostTestStore.ts', 'services/previewLinkConfirmations.ts', 'services/previewLinkRequests.ts', 'services/previewLinksTestStore.ts',
     ]);
-    for (const typeOnly of ['services/previewHostStore.ts', 'services/previewHostTestStore.ts']) {
+    // Row 6a: the agent's ask takes the PreviewLinkProject type, nothing else.
+    for (const typeOnly of ['services/previewHostStore.ts', 'services/previewHostTestStore.ts', 'services/previewLinkRequests.ts']) {
       expect(files.find((f) => f.path === typeOnly)!.text, typeOnly).toMatch(/import type \{[^}]*\} from '\.\/previewLinks'/);
     }
-    // The confirms (SR5) are reached from the CLI routes, the confirm page and index.ts only.
-    expect(importing('previewLinkConfirmations')).toEqual(['index.ts', 'routes/cliPreviewLinksPrisma.ts', 'routes/previewLinkConfirm.ts', 'services/previewLinksTestStore.ts']);
+    // The confirms (SR5) are reached from the CLI routes, the confirm page and index.ts only; and, row 6a, an
+    // agent's ask, which holds its owner's one-click confirm (askForAgentRequest).
+    expect(importing('previewLinkConfirmations')).toEqual(['index.ts', 'routes/cliPreviewLinksPrisma.ts', 'routes/previewLinkConfirm.ts', 'services/previewLinkRequests.ts', 'services/previewLinksTestStore.ts']);
   });
 
   it('no session, terminal, chat, status or MetaTerm access check mentions them', () => {

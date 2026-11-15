@@ -14,6 +14,13 @@ const state = vi.hoisted(() => ({
   orgAccess: {} as Record<string, unknown> | null,
   orgReads: 0,
   recheckError: null as Error | null,
+  fireworksConfigured: true,
+  fireworksRequired: false,
+  fireworksStatus: null as unknown,
+  fireworksReadError: null as Error | null,
+  fireworksConnect: null as unknown,
+  fireworksConnected: [] as unknown[],
+  revalidated: [] as string[],
   credentialsUser: {
     claudeGatewayEnabled: false,
     credentials: [] as Array<{ provider: string; label: string; updatedAt: Date }>,
@@ -45,9 +52,28 @@ vi.mock('../services/credentialStore', () => ({
   readGithubOrgAccess: async () => { state.orgReads += 1; return state.orgAccess; },
 }));
 vi.mock('../services/githubCredential', () => ({
-  CredentialInputError: class CredentialInputError extends Error { readonly status = 400; },
+  CredentialInputError: class CredentialInputError extends Error {
+    constructor(message: string, readonly status: number = 400) { super(message); }
+  },
   connectGithub: async () => ({ label: '@alice' }),
   recheckGithub: async () => { if (state.recheckError) throw state.recheckError; },
+}));
+vi.mock('../services/fireworksGateway', () => ({
+  getFireworksGatewayConfig: () => (state.fireworksConfigured ? { baseUrl: 'https://gateway.example/fireworks' } : null),
+}));
+vi.mock('../services/featureFlags', () => ({
+  boolVariation: async (key: string) => key === 'fireworks-own-key-required-enabled' && state.fireworksRequired,
+}));
+vi.mock('../services/fireworksKey', () => ({
+  FIREWORKS_PROVIDER: 'fireworks',
+  fireworksStoreDeps: () => ({}),
+  readFireworksKeyStatus: async () => { if (state.fireworksReadError) throw state.fireworksReadError; return state.fireworksStatus; },
+  revalidateFireworksKey: async (userId: string) => { state.revalidated.push(userId); return 'valid'; },
+  connectFireworksKey: async (key: unknown) => {
+    state.fireworksConnected.push(key);
+    if (state.fireworksConnect instanceof Error) throw state.fireworksConnect;
+    return state.fireworksConnect;
+  },
 }));
 vi.mock('../services/boxCreationGate', () => ({
   readBoxCreationFacts: async () => ({ required: false, hasGithubCredential: false }),
@@ -81,6 +107,13 @@ beforeEach(() => {
   state.orgAccess = {};
   state.orgReads = 0;
   state.recheckError = null;
+  state.fireworksConfigured = true;
+  state.fireworksRequired = false;
+  state.fireworksStatus = null;
+  state.fireworksReadError = null;
+  state.fireworksConnect = null;
+  state.fireworksConnected = [];
+  state.revalidated = [];
   state.credentialsUser = { claudeGatewayEnabled: false, credentials: [] };
 });
 
@@ -169,6 +202,7 @@ describe('PUT /api/credentials/github', () => {
         },
         boxGate: 'off',
       },
+      fireworks: { available: true, required: false, key: null, unreadable: false },
     });
 
     state.orgAccess = null;
@@ -189,5 +223,76 @@ describe('PUT /api/credentials/github', () => {
     });
     expect(await res.json()).toEqual({ label: '@alice' });
     expect(state.delivered).toEqual([USER]);
+  });
+});
+
+describe('the Fireworks key', () => {
+  const STATUS = {
+    label: 'alice@example.com', hint: 'fw_3Zt…', owner: 'alice@example.com', account: 'Acme',
+    expireTime: '2027-05-01T00:00:00.000Z', expiresSoon: false, invalid: null, updatedAt: '2026-11-09T00:00:00.000Z',
+  };
+  const withRow = () => {
+    state.credentialsUser = { claudeGatewayEnabled: false, credentials: [{ provider: 'fireworks', label: 'alice@example.com', updatedAt: new Date() }] };
+  };
+  const put = (key: unknown) => fetch(`${base}/fireworks`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key }),
+  });
+
+  it('GET shows the stored key (never the key itself) and whether one is required, and re-checks it', async () => {
+    withRow();
+    state.fireworksStatus = STATUS;
+    state.fireworksRequired = true;
+    const body = await (await fetch(base)).json();
+    expect(body.fireworks).toEqual({ available: true, required: true, key: STATUS, unreadable: false });
+    expect(state.revalidated).toEqual([USER]);
+  });
+
+  it('GET re-checks no key already marked invalid, and says when the stored one cannot be read', async () => {
+    withRow();
+    state.fireworksStatus = { ...STATUS, invalid: { reason: 'rejected', at: '2026-11-09T00:00:00.000Z' } };
+    expect((await (await fetch(base)).json()).fireworks.key.invalid).toEqual({ reason: 'rejected', at: '2026-11-09T00:00:00.000Z' });
+    expect(state.revalidated).toEqual([]);
+    state.fireworksReadError = new Error('KMS is unavailable');
+    expect((await (await fetch(base)).json()).fireworks).toEqual({ available: true, required: false, key: null, unreadable: true });
+  });
+
+  it('GET: not available without the credential store or the Fireworks gateway', async () => {
+    withRow();
+    state.fireworksConfigured = false;
+    state.fireworksRequired = true;
+    expect((await (await fetch(base)).json()).fireworks).toEqual({ available: false, required: false, key: null, unreadable: false });
+    state.fireworksConfigured = true;
+    state.configured = false;
+    expect((await (await fetch(base)).json()).fireworks.available).toBe(false);
+  });
+
+  it('PUT stores a checked key and answers who owns it; boxes get nothing', async () => {
+    state.fireworksConnect = { owner: 'alice@example.com', accountName: 'Acme', accountId: 'acme', expireTime: null };
+    const res = await put('fw_key');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ owner: 'alice@example.com', account: 'Acme', expireTime: null });
+    expect(state.fireworksConnected).toEqual(['fw_key']);
+    expect(state.delivered).toEqual([]);
+  });
+
+  it("PUT returns the check's refusal, and 503 without the store or the gateway", async () => {
+    state.fireworksConnect = new CredentialInputError('Fireworks rejected that key (HTTP 401).');
+    let res = await put('fw_key');
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'Fireworks rejected that key (HTTP 401).' });
+    state.fireworksConnect = new CredentialInputError('Could not check the key with Fireworks (HTTP 500).', 502);
+    expect((await put('fw_key')).status).toBe(502);
+    state.fireworksConfigured = false;
+    expect((await put('fw_key')).status).toBe(503);
+    state.fireworksConfigured = true;
+    state.configured = false;
+    expect((await put('fw_key')).status).toBe(503);
+  });
+
+  it("DELETE removes termag's copy only", async () => {
+    const res = await fetch(`${base}/fireworks`, { method: 'DELETE' });
+    expect(res.status).toBe(204);
+    expect(state.deleted).toEqual([{ userId: USER, providers: ['fireworks'] }]);
+    expect(state.delivered).toEqual([]);
   });
 });

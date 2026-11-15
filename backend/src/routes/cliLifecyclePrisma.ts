@@ -10,7 +10,8 @@ import { prisma } from '../db';
 import { pickTarget } from '../services/agentMessages';
 import { instanceAgentTransport, sendToInstanceAgent } from '../services/agentRegistry';
 import { ownerBoxCostToday } from '../services/boxCost/owner';
-import { applyAskBoxPolicy } from '../services/boxLifecycle';
+import { applyAskBoxPolicy, openRunnerSessionsWhere } from '../services/boxLifecycle';
+import { countLiveCloudSessions } from '../services/claudeRunnerSpawn';
 import { isBoxProvisioningConfigured } from '../services/boxProvisioner';
 import { powerStateError } from '../services/boxPowerPolicy';
 import type { CliUser } from '../services/cliStore';
@@ -159,6 +160,19 @@ export const prismaCliLifecycle: CliLifecycle = {
     return box ? box.parentInstanceId : undefined;
   },
 
+  async liveCloudSessions(user, boxId) {
+    const box = await prisma.instance.findFirst({ where: { id: boxId, userId: user.id }, select: { id: true } });
+    if (!box) return 0;
+    return countLiveCloudSessions(boxId, {
+      openRows: id => prisma.claudeRunnerSession.count({ where: openRunnerSessionsWhere([id]) }),
+      tmuxSessions: async id => {
+        if (!instanceAgentTransport(id)) return null;
+        const reply = await sendToInstanceAgent(id, 'tmux-list', {});
+        return Array.isArray(reply?.sessions) ? reply.sessions : null;
+      },
+    });
+  },
+
   async projectRepoUrl(user, box, project) {
     const rows = await prisma.project.findMany({
       where: {
@@ -199,9 +213,9 @@ export const prismaCliLifecycle: CliLifecycle = {
     }
   },
 
-  async powerBox(user, boxId, action) {
+  async powerBox(user, boxId, action, opts = {}) {
     if (action === 'hibernate' && await desktopOff(user, boxId)) return DESKTOP_OFF;
-    const result = await powerOwnedBox(await fullUser(user), boxId, action);
+    const result = await powerOwnedBox(await fullUser(user), boxId, action, opts);
     if (result.status !== 202) return cliErrorResult(result);
     return { status: 202, body: { box: await boxView(user.id, boxId) } };
   },

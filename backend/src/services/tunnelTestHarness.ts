@@ -54,8 +54,11 @@ export interface FakeBoxAgent {
  * A box agent answering `tunnel-open` for `port` and `preview` targets: the
  * connect, then the dial-back to `base()`, piped both ways. `refuse` answers a
  * target with an agent refusal instead (the guard's port_refused, say).
+ * `closeDelayMs` holds the dial-back's close that long after the app hangs up,
+ * as the box's path through the load balancer and nginx can: until then the
+ * relay sees a tunnel that looks open but leads to nothing.
  */
-export function fakeBoxAgent(base: () => string, opts: { refuse?: (target: any) => { code: string; reason: string } | null } = {}): FakeBoxAgent {
+export function fakeBoxAgent(base: () => string, opts: { refuse?: (target: any) => { code: string; reason: string } | null; closeDelayMs?: number } = {}): FakeBoxAgent {
   const opened: unknown[] = [];
   let live = 0;
   const send: AgentTunnelDeps['send'] = async (_boxId, type, payload) => {
@@ -78,7 +81,9 @@ export function fakeBoxAgent(base: () => string, opts: { refuse?: (target: any) 
       done = true;
       live--;
       sock.destroy();
-      try { ws.close(1000); } catch { /* closing */ }
+      const close = () => { try { ws.close(1000); } catch { /* closing */ } };
+      if (opts.closeDelayMs && ws.readyState === WebSocket.OPEN) setTimeout(close, opts.closeDelayMs).unref();
+      else close();
     };
     sock.on('data', chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
@@ -90,6 +95,8 @@ export function fakeBoxAgent(base: () => string, opts: { refuse?: (target: any) 
       }
     });
     ws.on('message', data => {
+      // As the agent's pipe: once the app has hung up, what arrives is dropped.
+      if (done) return;
       if (!sock.write(data as Buffer)) { ws.pause(); sock.once('drain', () => ws.resume()); }
     });
     sock.on('end', end);

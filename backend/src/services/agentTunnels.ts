@@ -110,11 +110,38 @@ function refusalError(reply: { code?: unknown; reason?: unknown }): TunnelError 
 /**
  * A Duplex over a WebSocket, with the socket methods http and ws call on what
  * createConnection gives them, so either can run over a tunnel.
+ *
+ * `setTimeout` is a real idle timer, as net.Socket's: 'timeout' once nothing
+ * has been read or written for that long (0 turns it off). A keep-alive
+ * http.Agent relies on it to drop a free connection a second before the
+ * app's `Keep-Alive: timeout=` runs out. Without it the pool kept a tunnel
+ * the app had already hung up on, whose close the box's path through the
+ * load balancer brings late, and the next request on it got a 502.
  */
 export function socketLikeStream(ws: WebSocket): Duplex {
   const stream = createWebSocketStream(ws) as Duplex & Record<string, unknown>;
   const self = () => stream;
-  stream.setTimeout = self;
+  let idleMs = 0;
+  let timer: NodeJS.Timeout | null = null;
+  const arm = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (idleMs > 0 && !stream.destroyed) {
+      timer = setTimeout(() => { timer = null; stream.emit('timeout'); }, idleMs);
+      timer.unref();
+    }
+  };
+  stream.setTimeout = (ms: number, cb?: () => void) => {
+    idleMs = ms > 0 ? ms : 0;
+    stream.timeout = idleMs;
+    if (cb) { if (idleMs) stream.once('timeout', cb); else stream.removeListener('timeout', cb); }
+    arm();
+    return stream;
+  };
+  stream.timeout = 0;
+  ws.on('message', () => { if (idleMs) arm(); });
+  const write = stream.write.bind(stream) as (...args: unknown[]) => boolean;
+  stream.write = ((...args: unknown[]) => { if (idleMs) arm(); return write(...args); }) as Duplex['write'];
+  ws.once('close', () => { idleMs = 0; arm(); });
   stream.setNoDelay = self;
   stream.setKeepAlive = self;
   stream.ref = self;

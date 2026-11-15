@@ -13,6 +13,7 @@
  * same row.
  */
 
+import { noteBoxUp, noteSetupDone } from './sessionStartTiming';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import {
@@ -42,6 +43,7 @@ import {
   type SetupStatus,
   type SetupWrite,
   toSetupStatus,
+  GOING_DOWN_BOX_STATUSES,
 } from './projectSetup';
 import type { SetupAdmission } from './sessionGate';
 import * as tmux from './tmux';
@@ -170,6 +172,8 @@ export async function applySetupEvent(target: SetupTarget, event: SetupEvent, op
     await waitForPaneDelivery(target, event);
   }
   const outcome = await serialize(target.projectId, () => applyNow(target, event));
+  // The checkout is set up: a session's start timing marks it (services/sessionStartTiming.ts).
+  if (outcome.kind === 'applied' && (outcome.to === 'ready' || outcome.to === 'none')) noteSetupDone(target.projectId);
   if (outcome.kind === 'ignored') {
     console.log(`[CLONE] ${target.projectId}: ${event.kind} ignored: ${outcome.why}`);
   }
@@ -412,6 +416,10 @@ export async function launchProjectSessions(target: SetupTarget, admission: Setu
  */
 export async function redispatchClones(ev: BoxAgentHelloEvent): Promise<void> {
   await ev.settled;
+  // A box on its way down whose agent reconnected: that agent is about to go, so its waiting checkouts
+  // wait for the hello after it's started again.
+  const box = await prisma.instance.findUnique({ where: { id: ev.instance.id }, select: { status: true } });
+  if (box && GOING_DOWN_BOX_STATUSES.includes(box.status)) return;
   const rows = await prisma.project.findMany({
     where: {
       instanceId: ev.instance.id, userId: ev.user.id, archived: false,
@@ -458,6 +466,7 @@ function onCloneStatus({ instance, msg }: BoxAgentFrame): void {
  */
 export function startProjectClone(): () => void {
   const offHello = onBoxAgentHello(ev => {
+    noteBoxUp(ev.instance.id);
     redispatchClones(ev).catch(err => {
       console.error(`[CLONE] redispatch on ${ev.instance.id} failed:`, (err as Error).message);
     });

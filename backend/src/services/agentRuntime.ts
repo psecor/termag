@@ -2,6 +2,7 @@ import * as tmux from './tmux';
 import { instanceAgentTransport, isProjectAgentConnected, sendForProject } from './agentRegistry';
 import { launchCommandFor, PANE_KIND_ENV } from './launchCommand';
 import { claimSpawnLaunch, isParkedSpawn, releaseSpawnLaunch, spawnTelemetryFor, unparkOnLaunch } from './agentSpawnStore';
+import { paneFilesFor } from './projectFiles';
 import { watchLaunchedSpawn } from './spawnStatusLog';
 import { spawnFolderTrust } from './agentSpawn';
 import { claimHandoffLaunch, releaseHandoffLaunch } from './agentHandoffStore';
@@ -373,9 +374,13 @@ async function launchUnlocked({
       // types it for the other providers): agent.js puts it in the bridge's
       // environment as TERMAG_SPAWN_*; an older agent ignores the field.
       const spawn = await spawnTelemetryFor({ userId, projectId: setup?.id ?? null, workstream });
+      // Its Project files and My files (project-files-v1): the bridge puts them in the app server's environment
+      // (agent/codex-resource-env.js), as a typed launch's filesEnvPrefix does.
+      const bridgeFiles = await paneFilesFor(setup?.id, instanceId ? instanceAgentTransport(instanceId)?.capabilities ?? [] : []);
       await sendForProject(project, 'codex-session-start', {
         sessionName: mainSession, cwd: projDir, project: projectName, workstream,
         ...(spawn ? { spawn } : {}),
+        ...(bridgeFiles ? { files: bridgeFiles } : {}),
         ...(resume && resumeSessionId ? { resumeSessionId } : {}),
         // An older agent ignores it, and the pane relaunches without the line.
         ...(notice ? { notice } : {}),
@@ -406,8 +411,10 @@ async function launchUnlocked({
       const on = await resolveLaunch(provider, row.backend, row.model, userId, instanceId);
       // A spawned workstream's every launch names its spawn on the resource (termag.spawn.*).
       const spawn = await spawnTelemetryFor({ userId, projectId: setup?.id ?? null, workstream });
+      // Its Project files and My files on a box that can address them (project-files-enabled), granted first.
+      const files = await paneFilesFor(setup?.id, capabilities);
       const launch = on.refusal
-        ?? launchCommandFor(spawned?.command ?? handedOff?.command ?? prompted ?? fresh, { replaySessionId, capabilities, provider, project: projectName, workstream, spawn, ...on });
+        ?? launchCommandFor(spawned?.command ?? handedOff?.command ?? prompted ?? fresh, { replaySessionId, capabilities, provider, project: projectName, workstream, spawn, files, ...on });
       const launched = preLaunch ? `${preLaunch} && ${launch}` : launch;
       const keys = notice ? `${refusalLine(notice)}; ${launched}` : launched;
       // A spawned child's status history from its first turn on (services/spawnStatusLog.ts).
@@ -613,7 +620,8 @@ async function reconstructAgentSessions(
             const handedOff = claim;
             const on = await resolveLaunch(provider, wf.backend, wf.model, userId, instanceId);
             const spawn = await spawnTelemetryFor({ userId, projectId: project.id, workstream: wsName });
-            const opts = { capabilities, provider, project: project.name, workstream: wsName, spawn, ...on };
+            const files = await paneFilesFor(project.id, capabilities);
+            const opts = { capabilities, provider, project: project.name, workstream: wsName, spawn, files, ...on };
             const brief = spawned?.command ?? handedOff?.command;
             // A resume that needs a conversation the cwd may not have
             // (Claude Code's --continue) falls back to a fresh launch, so a
@@ -629,7 +637,7 @@ async function reconstructAgentSessions(
 
             await watchLaunchedSpawn({ userId, projectId: project.id, workstream: wsName, session: mainSession, instanceId });
             if (config?.needsBridge) {
-              await sendForProject(projectHost, 'codex-session-start', { sessionName: mainSession, cwd: projDir, project: project.name, workstream: wsName, ...(spawn ? { spawn } : {}) });
+              await sendForProject(projectHost, 'codex-session-start', { sessionName: mainSession, cwd: projDir, project: project.name, workstream: wsName, ...(spawn ? { spawn } : {}), ...(files ? { files } : {}) });
             } else {
               try {
                 await sendForProject(projectHost, 'tmux-send-keys', { sessionName: mainSession, keys: launchCmd, withEnter: true });

@@ -5,9 +5,15 @@
  * almost all under a Savings Plan plus the enterprise discount, about 40% of
  * on demand, and that ratio moves when the plan is renewed. Until the daily
  * Cost Explorer pull (phase 3) learns them, these are the October 2026 bill's.
+ * A type the bill had no hours of is its us-east-2 on-demand price times the
+ * bill's ratio to on demand for m8g.2xlarge (ON_DEMAND_RATIO).
  */
 
 export const HOURS_PER_MONTH = 730;
+
+function round5(usd: number): number {
+  return Math.round(usd * 1e5) / 1e5;
+}
 
 export interface BoxRates {
   /** Where the numbers came from, shown beside them. */
@@ -20,7 +26,10 @@ export interface BoxRates {
   gp3PerGbMonth: number;
 }
 
-/** Cost Explorer net amortized cost ÷ usage, Termag account us-east-2, 2026-10-01..25. */
+/** m8g.2xlarge's billed rate over its us-east-2 on-demand $0.35904/h. */
+const ON_DEMAND_RATIO = 0.14567 / 0.35904;
+
+/** Cost Explorer net amortized cost ÷ usage, Termag account us-east-2, 2026-10-01..25; r8g/r7g from on demand. */
 export const DEFAULT_RATES: BoxRates = {
   source: 'Cost Explorer net amortized, us-east-2, 2026-10-01 to 10-25',
   perHour: {
@@ -28,6 +37,9 @@ export const DEFAULT_RATES: BoxRates = {
     'm9g.4xlarge': 0.31801,
     'm8g.2xlarge': 0.14567,
     'm8g.4xlarge': 0.29134,
+    // The large size's types: us-east-2 on demand, scaled to what the bill charges.
+    'r8g.xlarge': round5(0.23564 * ON_DEMAND_RATIO),
+    'r7g.xlarge': round5(0.2142 * ON_DEMAND_RATIO),
     't4g.medium': 0.01336,
   },
   perVcpuHour: 0.01988, // m9g.2xlarge / 8

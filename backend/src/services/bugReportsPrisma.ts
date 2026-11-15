@@ -3,8 +3,8 @@
  */
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../db';
-import { getInstanceAgent } from './agentRegistry';
-import { threadIdOf, type BugFilter, type BugReportEventRow, type BugReportRow, type BugReportStore, type BugStatus } from './bugReports';
+import { reporterNames, resolveCliReporter } from './cliReporterPrisma';
+import { type BugFilter, type BugReportEventRow, type BugReportRow, type BugReportStore, type BugStatus } from './bugReports';
 
 type Row = Prisma.BugReportGetPayload<Record<string, never>>;
 
@@ -37,35 +37,7 @@ export const prismaBugReports: BugReportStore = {
     });
   },
 
-  async resolveReporter(base, claimed) {
-    let boxId = base.boxId;
-    let projectId: string | null = null;
-    let workstream: string | null = null;
-    let threadId: string | null = null;
-    if (claimed.projectId) {
-      const project = await prisma.project.findFirst({
-        where: { id: claimed.projectId, userId: base.reporterUserId },
-        select: { id: true, instanceId: true },
-      });
-      // A box credential speaks only for its own box's projects.
-      if (project && (!base.boxId || project.instanceId === base.boxId)) {
-        projectId = project.id;
-        boxId = boxId ?? project.instanceId;
-        workstream = claimed.workstream;
-        const thread = threadIdOf(claimed.workstream);
-        if (thread) {
-          const t = await prisma.agentThread.findFirst({ where: { id: thread, originUserId: base.reporterUserId }, select: { id: true } });
-          threadId = t?.id ?? null;
-        }
-      }
-    }
-    const agent = boxId ? getInstanceAgent(boxId) : null;
-    return {
-      ...base, boxId, projectId, workstream, threadId,
-      boxAgentCommit: agent?.agentCommit ?? null,
-      boxAgentCapabilities: agent ? [...agent.capabilities].sort() : [],
-    };
-  },
+  resolveReporter: resolveCliReporter,
 
   async create(input, reporter) {
     const { projectId: _p, workstream: _w, ...fields } = input;
@@ -134,16 +106,5 @@ export const prismaBugReports: BugReportStore = {
     return Object.fromEntries(rows.map(r => [r.status, r._count._all]));
   },
 
-  async names({ users, boxes, projects }) {
-    const [u, b, p] = await Promise.all([
-      users.length ? prisma.user.findMany({ where: { id: { in: users } }, select: { id: true, googleEmail: true } }) : [],
-      boxes.length ? prisma.instance.findMany({ where: { id: { in: boxes } }, select: { id: true, name: true } }) : [],
-      projects.length ? prisma.project.findMany({ where: { id: { in: projects } }, select: { id: true, name: true } }) : [],
-    ]);
-    return {
-      users: Object.fromEntries(u.map(x => [x.id, x.googleEmail])),
-      boxes: Object.fromEntries(b.map(x => [x.id, x.name])),
-      projects: Object.fromEntries(p.map(x => [x.id, x.name])),
-    };
-  },
+  names: reporterNames,
 };

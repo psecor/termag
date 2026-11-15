@@ -11,6 +11,11 @@ import type { ProductEventDetail } from './productEvents';
 const COMMAND = /^[a-z][a-z0-9-]{0,30}( [a-z][a-z0-9-]{0,30})?$/;
 const VERSION = /^[0-9A-Za-z.+-]{1,40}$/;
 const PHASES = ['started', 'finished'] as const;
+/**
+ * Which implementation of the CLI ran the command: the Node one (`cli/`) or the
+ * Go binary. Absent from CLIs older than the marker, all of them Node.
+ */
+export const CLI_RUNTIMES = ['node', 'go'] as const;
 /** A day: longer is a clock jump, not a run. */
 const MAX_DURATION_MS = 24 * 60 * 60 * 1000;
 
@@ -27,6 +32,9 @@ export function parseCliUsage(body: unknown): CliUsageResult {
   if (b.durationMs !== undefined && !(typeof b.durationMs === 'number' && b.durationMs >= 0 && b.durationMs <= MAX_DURATION_MS)) {
     return { error: 'durationMs must be a number of milliseconds' };
   }
+  if (b.runtime !== undefined && !CLI_RUNTIMES.includes(b.runtime as typeof CLI_RUNTIMES[number])) {
+    return { error: 'runtime must be node or go' };
+  }
   for (const key of ['interactive', 'claudeCode'] as const) {
     if (b[key] !== undefined && typeof b[key] !== 'boolean') return { error: `${key} must be a boolean` };
   }
@@ -39,6 +47,7 @@ export function parseCliUsage(body: unknown): CliUsageResult {
       durationMs: typeof b.durationMs === 'number' ? Math.round(b.durationMs) : undefined,
       interactive: b.interactive as boolean | undefined,
       claudeCode: b.claudeCode as boolean | undefined,
+      runtime: b.runtime as string | undefined,
     },
   };
 }

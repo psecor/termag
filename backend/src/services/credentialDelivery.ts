@@ -18,7 +18,9 @@ import { otlpDestinationFromEnv, type OtlpDestination } from '../config/env';
 import { connectedOwnedBoxIds, instanceAgentTransport, sendToInstanceAgent } from './agentRegistry';
 import { isManagedBox, type AgentConnection } from './instanceLifecycle';
 import { isSetupOff } from './boxSetup';
-import { getClaudeGatewayConfig, gatewaySettings } from './claudeGateway';
+import { autoCompactWindow, CLAUDE_CONTEXT_TOKENS_FLAG, DEFAULT_CLAUDE_CONTEXT_TOKENS, getClaudeGatewayConfig, gatewaySettings } from './claudeGateway';
+import { numberVariation } from './featureFlags';
+import type { FlagUser } from './featureFlags';
 import { FIREWORKS_CAPABILITY, fireworksDelivery, getFireworksGatewayConfig } from './fireworksGateway';
 import { getCredentialStoreConfig, githubStoreDeps } from './credentialStore';
 import { getGithubBrokerUrl } from './githubBroker';
@@ -271,8 +273,14 @@ export function refusalFor(agent: RequestingAgent): string | null {
 }
 
 async function deliveryInputFor(userId: string, instanceId: string): Promise<{ input: DeliveryInput; githubError: Error | null }> {
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { claudeGatewayEnabled: true } });
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true, claudeGatewayEnabled: true },
+  });
   const gateway = getClaudeGatewayConfig();
+  const claudeSettings = gateway && user?.claudeGatewayEnabled
+    ? gatewaySettings(gateway, { compactWindow: await compactWindowFor(user, instanceId) })
+    : null;
   const store = getCredentialStoreConfig();
   const brokerUrl = getGithubBrokerUrl();
   let githubBroker: DeliveryInput['githubBroker'] = null;
@@ -292,7 +300,7 @@ async function deliveryInputFor(userId: string, instanceId: string): Promise<{ i
   const fireworks = fireworksInputFor();
   return {
     input: {
-      claudeSettings: gateway && user?.claudeGatewayEnabled ? gatewaySettings(gateway) : null,
+      claudeSettings,
       claudeOffReason: !gateway ? REASONS.noGateway : REASONS.gatewayOff,
       githubBroker,
       githubOffReason,
@@ -304,6 +312,17 @@ async function deliveryInputFor(userId: string, instanceId: string): Promise<{ i
     },
     githubError,
   };
+}
+
+/**
+ * claude-context-tokens for the box's owner and the box, as the gateway
+ * settings' auto-compact window (claudeGateway.ts autoCompactWindow); null is
+ * the model's full window.
+ */
+async function compactWindowFor(user: FlagUser, instanceId: string): Promise<number | null> {
+  const box = await prisma.instance.findUnique({ where: { id: instanceId }, select: { id: true, name: true, kind: true } });
+  const ctx = box && { id: box.id, name: box.name, kind: box.kind };
+  return autoCompactWindow(await numberVariation(CLAUDE_CONTEXT_TOKENS_FLAG, user, DEFAULT_CLAUDE_CONTEXT_TOKENS, ctx));
 }
 
 async function mcpInputFor(userId: string, instanceId: string): Promise<Pick<DeliveryInput, 'mcp' | 'mcpOffReason' | 'mcpUnknown'>> {

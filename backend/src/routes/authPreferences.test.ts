@@ -6,10 +6,12 @@ import { DEFAULT_THEME } from '../theme/schema';
 import { forgetUserTimeZones } from '../services/userTimeZone';
 
 vi.mock('../db', () => ({ prisma: { user: { upsert: vi.fn(), update: vi.fn() } } }));
-const ld = vi.hoisted(() => ({ on: false }));
+const ld = vi.hoisted(() => ({ on: false, nudge: false, placement: false, policy: 'reuse-first' }));
 vi.mock('../services/featureFlags', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/featureFlags')>()),
-  boolVariation: vi.fn(async (key: string) => key === 'onboarding-refresh-enabled' && ld.on),
+  boolVariation: vi.fn(async (key: string) => (key === 'onboarding-refresh-enabled' && ld.on) || (key === 'chat-ui-nudge-enabled' && ld.nudge)
+    || (key === 'box-placement-enabled' && ld.placement)),
+  stringVariation: vi.fn(async (key: string, _u: unknown, fallback: string) => (key === 'box-placement-policy' ? ld.policy : fallback)),
 }));
 
 interface RouteLayer { route?: { path: string; stack: { handle: RequestHandler }[] } }
@@ -24,6 +26,7 @@ const storedUser = {
   id: 'u1', googleId: 'g1', googleEmail: 'e2e@termag.local', unixUsername: 'e2e', displayName: 'E2E',
   defaultAgentProvider: 'codex', claudeGatewayEnabled: true, dotfilesRepoUrl: null,
   slackUserId: null, discordUserId: null, createdAt: new Date(0), theme: {}, pushMutesChat: false, uiMode: null as string | null,
+  chatNudgeDismissedAt: null as Date | null, boxPlacement: null as string | null,
 };
 
 // `user: null` means no session (a default parameter would swallow an explicit undefined).
@@ -46,6 +49,9 @@ describe('PUT /auth/me/preferences', () => {
     put = handler(router, '/me/preferences');
     me = handler(router, '/me');
     ld.on = false;
+    ld.nudge = false;
+    ld.placement = false;
+    ld.policy = 'reuse-first';
     vi.mocked(prisma.user.update).mockReset();
     vi.mocked(prisma.user.update).mockImplementation(async ({ data }) => ({ ...storedUser, ...(data as object) }) as never);
   });
@@ -69,6 +75,77 @@ describe('PUT /auth/me/preferences', () => {
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ uiMode: 'full' }));
     const after = await call(me, undefined, req.user!);
     expect(after.res.json).toHaveBeenCalledWith(expect.objectContaining({ uiMode: 'full' }));
+  });
+
+  it('leaves the chat nudge out of /me, and refuses to answer it, with chat-ui-nudge-enabled off', async () => {
+    const { res } = await call(me, undefined);
+    expect(res.json.mock.calls[0][0]).not.toHaveProperty('chatNudgeDismissed');
+    const put1 = await call(put, { chatNudgeDismissed: true });
+    expect(put1.res.status).toHaveBeenCalledWith(403);
+    expect(put1.res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'chat_nudge_disabled' }));
+    expect(prisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('keeps an answered chat nudge on the user with the flag on, and offers it again on false', async () => {
+    ld.nudge = true;
+    const before = await call(me, undefined);
+    expect(before.res.json).toHaveBeenCalledWith(expect.objectContaining({ chatNudgeDismissed: false }));
+    const { req, res } = await call(put, { chatNudgeDismissed: true });
+    const data = vi.mocked(prisma.user.update).mock.calls[0][0].data as { chatNudgeDismissedAt: unknown };
+    expect(data.chatNudgeDismissedAt).toBeInstanceOf(Date);
+    expect(req.user?.chatNudgeDismissedAt).toBeInstanceOf(Date);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ chatNudgeDismissed: true }));
+    const after = await call(me, undefined, req.user!);
+    expect(after.res.json).toHaveBeenCalledWith(expect.objectContaining({ chatNudgeDismissed: true }));
+    await call(put, { chatNudgeDismissed: false });
+    expect(prisma.user.update).toHaveBeenLastCalledWith({ where: { id: 'u1' }, data: { chatNudgeDismissedAt: null } });
+  });
+
+  it('leaves where new sessions run out of /me, and refuses to set it, with box-placement-enabled off', async () => {
+    const { res } = await call(me, undefined);
+    expect(res.json.mock.calls[0][0]).not.toHaveProperty('boxPlacement');
+    expect(res.json.mock.calls[0][0]).not.toHaveProperty('boxPlacementOrg');
+    const put1 = await call(put, { boxPlacement: 'fresh-first' });
+    expect(put1.res.status).toHaveBeenCalledWith(403);
+    expect(put1.res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'box_placement_disabled' }));
+    expect(prisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('keeps where new sessions run on the user with the flag on, beside the org default, and null goes back to it', async () => {
+    ld.placement = true;
+    ld.policy = 'fresh-first';
+    const before = await call(me, undefined);
+    expect(before.res.json).toHaveBeenCalledWith(expect.objectContaining({ boxPlacement: null, boxPlacementOrg: 'fresh-first' }));
+    const { req, res } = await call(put, { boxPlacement: 'reuse-first' });
+    expect(prisma.user.update).toHaveBeenCalledWith({ where: { id: 'u1' }, data: { boxPlacement: 'reuse-first' } });
+    expect(req.user?.boxPlacement).toBe('reuse-first');
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ boxPlacement: 'reuse-first', boxPlacementOrg: 'fresh-first' }));
+    const after = await call(me, undefined, req.user!);
+    expect(after.res.json).toHaveBeenCalledWith(expect.objectContaining({ boxPlacement: 'reuse-first' }));
+    await call(put, { boxPlacement: null });
+    expect(prisma.user.update).toHaveBeenLastCalledWith({ where: { id: 'u1' }, data: { boxPlacement: null } });
+  });
+
+  it('takes only a policy or null for where new sessions run', async () => {
+    ld.placement = true;
+    for (const bad of ['newest', true, 3]) {
+      const { res } = await call(put, { boxPlacement: bad });
+      expect(res.status).toHaveBeenCalledWith(400);
+    }
+    expect(prisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('reads a stored value that is not a policy as unset', async () => {
+    ld.placement = true;
+    const { res } = await call(me, undefined, { ...storedUser, boxPlacement: 'something-old' } as unknown as Express.User);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ boxPlacement: null, boxPlacementOrg: 'reuse-first' }));
+  });
+
+  it('takes only a boolean for the chat nudge', async () => {
+    ld.nudge = true;
+    const { res } = await call(put, { chatNudgeDismissed: 'yes' });
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(prisma.user.update).not.toHaveBeenCalled();
   });
 
   it("keeps the zone the browser sends at sign-in (GET /me?tz=) as User.timeZone, and ignores one that is not a zone", async () => {

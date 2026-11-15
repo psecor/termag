@@ -98,7 +98,12 @@ export function newSecret(random: (n: number) => Buffer = randomBytes): string {
 
 const SECRET_RE = /^[A-Za-z0-9_-]{43}$/;
 
-export type CodeKind = 'code' | 'ticket';
+/**
+ * `rebound`: the stand-in a used code leaves behind for the rest of its minute. The same code
+ * presented again (the browser dropped the navigation that carried its session) can't make a
+ * session, only one ticket back through the landing page, for the same termag user.
+ */
+export type CodeKind = 'code' | 'ticket' | 'rebound';
 
 /**
  * How a code or ticket is stored (PreviewLinkCode.codeHash). Each kind hashes
@@ -171,6 +176,22 @@ export const PREVIEW_LINK_MARKER = '__Host-termag-preview-link';
  * viewer back after their 8 h session ended keeps the same app's storage.
  */
 const MARKER_MAX_AGE_SEC = 400 * 24 * 3600;
+
+/**
+ * The clean step's `next`, bound to the link, the session and a minute (Cursor Security, #1745): only termag's
+ * own redirect mints one, so another site can't send a viewer with a session through the clean step's
+ * same-origin 302 to a path it chose. Constant time on the MAC.
+ */
+export function cleanNextSig(secret: Buffer, linkId: string, sessionIdHash: string, next: string, exp: number): string {
+  return createHmac('sha256', secret).update(`termag-preview-clean-next:v1:${linkId}:${sessionIdHash}:${exp}:${next}`).digest('base64url');
+}
+
+export function cleanNextValid(secret: Buffer, linkId: string, sessionIdHash: string, next: string, exp: number, sig: string, now: number): boolean {
+  if (!Number.isSafeInteger(exp) || exp <= now) return false;
+  const got = Buffer.from(sig);
+  const want = Buffer.from(cleanNextSig(secret, linkId, sessionIdHash, next, exp));
+  return got.length === want.length && timingSafeEqual(got, want);
+}
 
 function markerMac(secret: Buffer, name: string, linkId: string): string {
   return createHmac('sha256', secret).update(`termag-preview-link-marker:v1:${name}:${linkId}`).digest('base64url');

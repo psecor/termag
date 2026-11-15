@@ -21,6 +21,7 @@
  * | G0FAKESEC1  | secret-private   | private, termag not in: hidden; needs_invite by id     |
  * | C0FAKEPROJ  | proj-demo-main   | a workstream channel: disabled                         |
  * | C0FAKEEXT1  | partner-shared   | Slack Connect: disabled                                |
+ * | C0FAKEOUT1  | outsiders        | public, termag and you not in: disabled in the picker; not_in_channel by id, nothing joined |
  */
 import { randomBytes } from 'node:crypto';
 import type { LinkSlackClient } from './link';
@@ -42,6 +43,7 @@ const SEED = [
   { id: 'G0FAKESEC1', name: 'secret-private', is_private: true, is_member: false, everyone: true, extra: bystanders(2, 'SEC') },
   { id: 'C0FAKEPROJ', name: 'proj-demo-main', is_member: true, everyone: true, extra: [] },
   { id: 'C0FAKEEXT1', name: 'partner-shared', is_ext_shared: true, everyone: true, extra: bystanders(6, 'EXT') },
+  { id: 'C0FAKEOUT1', name: 'outsiders', everyone: false, extra: bystanders(5, 'OUT') },
 ];
 
 export function fakeSlackId(userId: string): string {

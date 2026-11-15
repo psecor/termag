@@ -107,7 +107,12 @@ export interface NoticeItem {
   replyBytes: number | null;
   /** A follow-up that went into this message's turn and finished it (superseded, answered together). */
   answeredWith?: string | null;
+  /** What its turn ran on (AgentMessage.model): a Claude tier or `fireworks:<id>`; none for the box's default. */
+  model?: string | null;
 }
+
+/** A model as the notice names it: the characters a tier or a Fireworks id has, nothing a shell or a prompt could act on. */
+const NOTICE_MODEL_RE = /^[A-Za-z0-9._:/-]{1,200}$/;
 
 /** One line, no control characters, at most `max` characters: text that came from a caller or a box. */
 function oneLine(s: string, max: number): string {
@@ -134,6 +139,7 @@ function itemText(i: NoticeItem, withError: boolean): string {
   const title = i.title ? quotedTitle(i.title) : '';
   const name = title ? `ask "${title}"` : `ask ask-${i.thread}`;
   const parts = [withError && i.error ? `${i.status} (${oneLine(i.error, NOTICE_ERROR_CHARS)})` : i.status];
+  if (i.model && NOTICE_MODEL_RE.test(i.model)) parts.push(`on ${i.model}`);
   if (i.answeredWith) parts.push(`answered together with follow-up ${i.answeredWith}`);
   if (i.prUrl) parts.push(`PR ${i.prUrl}${i.morePrs > 0 ? ` and ${i.morePrs} more` : ''}`);
   if (i.publish) parts.push(`publish ${i.publish}`);

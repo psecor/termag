@@ -413,6 +413,8 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
           .catch(err => {
             console.error(`[POOL] Failed to record on-warm status for instance ${instance.id}:`, err.message);
           });
+        // An environment pool box runs the hook during its prepare: its pool code records it (services/envPool.ts).
+        if (agent.conn.kind === 'warm-box') emitPoolBox('on-warm-status', { instance, capabilities: agent.capabilities, msg }, label);
         return;
       }
 
@@ -430,12 +432,19 @@ export function registerAgent(user: User | null, ws: WebSocket, instance: Instan
         return;
       }
 
-      // Streaming terminal data from agent
-      if (msg.type === 'terminal-data' && msg.streamId) {
+      // Streaming terminal data from agent, and the pane's exit (agent/agent.js term.onExit),
+      // which the viewer's socket turns into {type:'exit'} (index.ts). Before this the exit
+      // reached no stream, so a viewer on a pane that ended (tmux's "no sessions" on a box
+      // just up) never heard it.
+      if ((msg.type === 'terminal-data' || msg.type === 'terminal-exit') && msg.streamId) {
         const stream = terminalStreams.get(msg.streamId);
         // Stream ids are guessable, so only the agent that holds a stream may feed it.
         if (stream && stream.agent === agent) {
+          // The agent let go of an exited stream already: so does the registry.
+          if (msg.type === 'terminal-exit') terminalStreams.delete(msg.streamId);
           stream.onData(msg);
+        } else if (msg.type === 'terminal-exit') {
+          // An exit for a stream nobody here reads: the agent has dropped it itself.
         } else {
           // Nobody here reads this stream, e.g. the agent spawned it after the
           // attach RPC timed out. Only the backend knows that, so it closes it.
@@ -1053,6 +1062,32 @@ export function closeBrowserStream(streamId: string): void {
 /** Ask the project's agent which web apps listen on the box. */
 export function requestBrowserSuggestions(host: ProjectHost, cwd: string | null): Promise<unknown> {
   return sendForProject(host, 'browser-suggest', { cwd }, 15000);
+}
+
+/**
+ * Does the project's box have a Chromium now (`browser-chromium`,
+ * docs/browser-pane.md)? With `install`, the agent starts installing one
+ * when it doesn't. It answers at once; a Chromium it finds also asks the
+ * guest launcher (up to 10 s), hence the wait.
+ *
+ * `adopt` adds capabilities the answer says the agent gained (the browser
+ * pane's, which its next hello carries anyway) to the connection that was
+ * asked, and only while that connection is still the box's and has said
+ * hello: a reply that a replaced socket delivers late never marks the
+ * replacement, which looked for its own Chromium at start.
+ */
+export async function requestBrowserChromium(host: ProjectHost, install: boolean): Promise<{ answer: unknown; adopt(capabilities: readonly string[]): void }> {
+  const asked = host.instanceId ? getInstanceAgent(host.instanceId) : getAgent(host.userId);
+  const answer = await sendForProject(host, 'browser-chromium', { install }, 15000);
+  return {
+    answer,
+    adopt(capabilities) {
+      const now = host.instanceId ? getInstanceAgent(host.instanceId) : getAgent(host.userId);
+      if (!asked || now !== asked || !asked.helloReceived) return;
+      const gained = capabilities.filter(c => !asked.capabilities.includes(c));
+      if (gained.length) asked.capabilities = [...asked.capabilities, ...gained];
+    },
+  };
 }
 
 /**

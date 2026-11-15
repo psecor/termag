@@ -18,6 +18,7 @@ import type { AgentStatus } from '../types';
 import { statusKey } from './statusKey';
 import { sessionName } from './tmux';
 import { projectKindTraits } from './projectKind';
+import { sessionTitleOf } from './sessionTitle';
 
 /** A workstream as listProjectsFor (routes/projects.ts) shapes it. */
 export interface ChatSourceWorkstream {
@@ -77,7 +78,7 @@ export interface ChatSessionRow {
   kind: 'normal' | 'automation';
   /** The agent: a chat runner's (claude-chat, pi-chat) or a pane provider's. */
   provider: string | null;
-  /** What the row leads with, and under it, as chatRowName decides. */
+  /** What the row leads with, and under it, as chatRowName decides: the session's one title (services/sessionTitle.ts), and its project when the title isn't the project's name. */
   title: string | null;
   where: string | null;
   ask: boolean;
@@ -117,7 +118,7 @@ export interface ChatSessionRow {
   holder: 'runner' | 't3';
   /** The desktop's thread for the session, once one started it or took it. */
   t3ThreadId: string | null;
-  /** The Claude session the box last named for it on a hand-over (Workstream.chatSessionId). */
+  /** The Claude session the box last named for it: its runner turn's init, or a hand-over (Workstream.chatSessionId, services/chatHolder.ts). */
   sessionId: string | null;
   /** Whose checkout its turns run in: its own workstream's, or for an ask the asked one's (routes/chat.ts chatTarget). */
   checkout: { workstream: string; repo: string | null };
@@ -159,13 +160,22 @@ interface Built extends ChatSessionRow {
   askTitle: string | null;
 }
 
-/** chatRowName: an ask leads with its title (else ask-<id>); else Claude's title when shown; else the project. */
+/**
+ * chatRowName: the session's one title (sessionTitleOf, the browser's
+ * sessionTitle); under it the project when the title isn't its name, or for
+ * an ask its own session title when that says something else. Never
+ * "project · workstream".
+ */
 function rowName(row: Built): Pick<ChatSessionRow, 'title' | 'where' | 'ask'> {
-  const session = row.sessionTitle?.trim() || null;
-  const askName = row.askThreadId ? row.askTitle?.trim() || row.workstream : null;
-  if (askName) return { title: askName, where: session && session !== askName ? session : null, ask: true };
-  const label = row.workstream === 'main' ? row.projectName : `${row.projectName} · ${row.askTitle?.trim() || row.workstream}`;
-  return { title: session, where: label, ask: false };
+  const title = sessionTitleOf({
+    projectName: row.projectName, workstream: row.workstream, sessionTitle: row.sessionTitle,
+    sessionTitleSource: row.titleSource, askTitle: row.askTitle, askThreadId: row.askThreadId,
+  });
+  if (row.askThreadId) {
+    const own = row.sessionTitle?.trim() || null;
+    return { title, where: own && own !== title ? own : null, ask: true };
+  }
+  return { title, where: title !== row.projectName ? row.projectName : null, ask: false };
 }
 
 type StatusMap = ReadonlyMap<string, AgentStatus> | Record<string, AgentStatus | undefined>;

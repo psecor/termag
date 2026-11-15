@@ -470,6 +470,14 @@ export async function autoUpdateSummary(now: number = Date.now()) {
   };
 }
 
+/**
+ * The last full sweep pass, read-only, for the Software tab's cells (services/software/queries.ts):
+ * why a box and tool got no run. In this process's memory, so null after a restart until a pass runs.
+ */
+export function lastAutoPass(): { at: string; entries: readonly PassEntry[] } | null {
+  return lastPass;
+}
+
 /** Tests: forget the last pass. */
 export function resetAutoUpdateForTests(): void {
   helloAt.clear();

@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
-  AUTO_BOX_FAILURE_HOLD_MS, MAX_RUNNERS_PER_BOX, PROVISIONING_FAILURE_WINDOW_MS, REFUSAL, REFUSAL_CODES, allocateSlot, autoBoxName, autoBoxPlan, bearerToken, githubGate,
+  AUTO_BOX_FAILURE_HOLD_MS, AUTO_BOX_MAX_BOXES_FALLBACK, MAX_RUNNERS_PER_BOX, PROVISIONING_FAILURE_WINDOW_MS, REFUSAL, REFUSAL_CODES, allocateSlot, autoBoxName, autoBoxPlan, bearerToken, githubGate,
   parseRunnerSessions, parseSpawnBody, placeRunner, refusalStatus, runnerBoxes, runnerLaunch, runnerSessionName, serializeByKey,
   tmuxSafe, tokensEqual, isRunnerSessionOf, isOwnRunnerSessionStatus, isRunnerSessionShaped, claudeFloorDecision,
+  REFUSAL_TEXTS, clampAutoBoxMaxBoxes, isAskBox, countLiveCloudSessions,
 } from './claudeRunnerSpawn';
 
 const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcmRlciJ9.c2lnbmF0dXJl'; // gitleaks:allow
@@ -399,6 +400,15 @@ describe('autoBoxPlan', () => {
     expect(autoBoxPlan([box({ id: 'sp', status: 'stopping' })], now)).toMatchObject({ kind: 'wait' });
   });
 
+  it('neither waits for nor starts a box made for a termag ask, but a failed one still holds off a new box', () => {
+    const ask = { createdFor: 'ask' };
+    expect(autoBoxPlan([box({ id: 'p', status: 'provisioning', ...ask }), box({ id: 'r', status: 'ready', ...ask })], now)).toEqual({ kind: 'acquire' });
+    expect(autoBoxPlan([box({ id: 's', status: 'stopped', ...ask })], now)).toEqual({ kind: 'acquire' });
+    expect(autoBoxPlan([box({ id: 's', status: 'stopped', ...ask }), box({ id: 'mine', status: 'stopped' })], now)).toMatchObject({ kind: 'start', box: { id: 'mine' } });
+    expect(autoBoxPlan([box({ id: 'f', status: 'failed', createdAt: new Date(now), ...ask })], now)).toMatchObject({ kind: 'hold' });
+    expect([{ createdFor: 'ask' }, { createdFor: null }, {}].map(isAskBox)).toEqual([true, false, false]);
+  });
+
   it('never starts a stopped box without an EC2 instance id', () => {
     expect(autoBoxPlan([box({ id: 'noid', status: 'stopped', ec2InstanceId: null })], now)).toEqual({ kind: 'acquire' });
   });
@@ -422,6 +432,40 @@ describe('autoBoxPlan', () => {
     expect(autoBoxPlan([createdAgo(AUTO_BOX_FAILURE_HOLD_MS + 1)], now)).toMatchObject({ kind: 'hold' });
     expect(autoBoxPlan([createdAgo(AUTO_BOX_FAILURE_HOLD_MS + PROVISIONING_FAILURE_WINDOW_MS - 1)], now)).toMatchObject({ kind: 'hold' });
     expect(autoBoxPlan([createdAgo(AUTO_BOX_FAILURE_HOLD_MS + PROVISIONING_FAILURE_WINDOW_MS + 1)], now)).toEqual({ kind: 'acquire' });
+  });
+});
+
+describe('countLiveCloudSessions', () => {
+  const tmux = ['ada-bob-agent', 'termag-claude-runner-s2-ord_d1-r', 'termag-claude-runner-s3-ord_d2-r', 'claude-runner-notes'];
+  const rows = (n: number) => async () => n;
+
+  it('counts the runner tmux sessions, which a runner whose start row failed to write still has (Devin on #1597)', async () => {
+    expect(await countLiveCloudSessions('b1', { openRows: rows(0), tmuxSessions: async () => tmux })).toBe(2);
+    expect(await countLiveCloudSessions('b1', { openRows: rows(1), tmuxSessions: async () => tmux })).toBe(2);
+  });
+
+  it('falls back to the open rows when the agent cannot be asked, and keeps the larger count', async () => {
+    expect(await countLiveCloudSessions('b1', { openRows: rows(3), tmuxSessions: async () => null })).toBe(3);
+    expect(await countLiveCloudSessions('b1', { openRows: rows(1), tmuxSessions: async () => { throw new Error('agent timed out'); } })).toBe(1);
+    expect(await countLiveCloudSessions('b1', { openRows: rows(3), tmuxSessions: async () => tmux })).toBe(3);
+  });
+});
+
+describe('clampAutoBoxMaxBoxes', () => {
+  it('serves a whole number from 1 to 20, and 5 for anything that is not a number', () => {
+    expect([3, 2.7, 0, -4, 99, 20].map(clampAutoBoxMaxBoxes)).toEqual([3, 2, 1, 1, 20, 20]);
+    expect([undefined, null, '7', Number.NaN, Number.POSITIVE_INFINITY].map(clampAutoBoxMaxBoxes)).toEqual([5, 5, 5, 5, 5]);
+    expect(AUTO_BOX_MAX_BOXES_FALLBACK).toBe(5);
+  });
+});
+
+describe('REFUSAL.boxesFull at the ceiling', () => {
+  it('says the ceiling, and keeps the prefix the admin report matches on', () => {
+    const r = REFUSAL.boxesFull(5, MAX_RUNNERS_PER_BOX, 5);
+    expect(r).toEqual({ code: 'boxes-full', text: REFUSAL_TEXTS.boxesFull(5, 3, 5) });
+    expect(r.text).toBe("every box of the session owner (5) already runs 3 cloud sessions, and termag gets one owner's cloud sessions no more than 5 boxes; it is retried when one ends");
+    expect(r.text.startsWith(REFUSAL_TEXTS.boxesFullPrefix)).toBe(true);
+    expect(REFUSAL.boxesFull(2, 3).text).toBe('every box of the session owner (2) already runs 3 cloud sessions; it is retried when one ends');
   });
 });
 

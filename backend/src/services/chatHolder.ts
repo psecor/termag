@@ -54,6 +54,45 @@ export async function saveChatHolder(projectId: string, workstreamId: string, ch
 }
 
 /**
+ * The Claude session a runner turn runs on, from its `init` event (the first
+ * line Claude Code writes on every turn, which the box relays as it is), or
+ * null for any other event. Another engine's init names its own session
+ * (`engine: 'pi'` from agent/pi-events.js, `'cursor'` from cursor-events.js,
+ * `'devin'` from devin-events.js),
+ * which nothing can import as a Claude one: only an init with no engine, or
+ * Claude's, counts.
+ */
+export function runnerSessionOf(event: unknown): string | null {
+  if (!event || typeof event !== 'object') return null;
+  const e = event as { type?: unknown; subtype?: unknown; engine?: unknown; session_id?: unknown };
+  const claude = e.engine === undefined || e.engine === null || e.engine === 'claude';
+  return e.type === 'system' && e.subtype === 'init' && claude && isChatSessionId(e.session_id) ? e.session_id : null;
+}
+
+/**
+ * Record the session a runner turn started on as soon as Claude names it,
+ * rather than once the turn's transcript is stored at its end: the desktop
+ * imports a chat by its session (GET /api/cli/v1/chats `sessionId`), so a chat
+ * opened mid-way through its first turn can come over, and the write's
+ * workspace push tells the desktop at once. Left alone while the desktop's
+ * thread holds the chat: a runner turn takes the session back first, and that
+ * hand-over names the session itself. True when it changed.
+ */
+export async function saveRunnerSession(projectId: string, workstreamId: string, sessionId: string): Promise<boolean> {
+  const { count } = await prisma.workstream.updateMany({
+    where: {
+      id: workstreamId, projectId,
+      AND: [
+        { OR: [{ chatSessionId: null }, { chatSessionId: { not: sessionId } }] },
+        { OR: [{ chatHolder: null }, { chatHolder: 'runner' }] },
+      ],
+    },
+    data: { chatSessionId: sessionId },
+  });
+  return count > 0;
+}
+
+/**
  * The Claude session a desktop-held chat now has (the box took it from the
  * thread), read as of `askedAt`: dropped when a hand-over recorded since then
  * may name a newer one.

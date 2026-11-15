@@ -9,6 +9,7 @@ import {
   isWorkspace,
   planAddedRepo,
   planWorkspaceRepos,
+  projectRepoKeys,
   repoCheckoutDir,
   settledSetup,
   repoSlug,
@@ -184,6 +185,32 @@ it('reads the layout, defaulting to a single repository', () => {
   expect(isWorkspace({ layout: 'workspace' })).toBe(true);
   expect(isWorkspace({ layout: 'repo' })).toBe(false);
   expect(isWorkspace({})).toBe(false);
+});
+
+describe('projectRepoKeys', () => {
+  it("is a repo project's one repository, lowercased owner/name", () => {
+    expect(projectRepoKeys({ repoUrl: 'https://github.com/Example-Org/Termag.git', layout: 'repo' })).toEqual(['example-org/termag']);
+    expect(projectRepoKeys({ repoUrl: 'git@github.com:example-org/termag.git' })).toEqual(['example-org/termag']);
+  });
+
+  it("is a workspace's repositories in checkout order, whatever order the rows come in", () => {
+    const repos = [{ url: B, position: 1 }, { url: 'git@github.com:E2E-org/Sample.git', position: 0 }];
+    expect(projectRepoKeys({ repoUrl: null, layout: 'workspace', repos })).toEqual(['e2e-org/sample', 'e2e-org/sample-api']);
+  });
+
+  it('is empty for a project with no repository', () => {
+    expect(projectRepoKeys({ repoUrl: null, layout: 'repo' })).toEqual([]);
+    expect(projectRepoKeys({ repoUrl: '  ' })).toEqual([]);
+    expect(projectRepoKeys({ repoUrl: null, layout: 'workspace', repos: [] })).toEqual([]);
+  });
+
+  it("reads a workspace's rows, not a stray repoUrl", () => {
+    expect(projectRepoKeys({ repoUrl: A, layout: 'workspace', repos: [{ url: B, position: 0 }] })).toEqual(['e2e-org/sample-api']);
+  });
+
+  it('keeps a URL that is not a GitHub one, lowercased and without .git', () => {
+    expect(projectRepoKeys({ repoUrl: 'https://git.example.com/Team/App.git/' })).toEqual(['https://git.example.com/team/app']);
+  });
 });
 
 describe('repoSlug / repoCheckoutDir', () => {

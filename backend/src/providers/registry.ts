@@ -94,9 +94,11 @@ export interface ProviderConfig {
    *  reconnect, and the pane stays a shell. */
   chatRunner?: boolean;
   /** The headless agent the chat runner drives for this provider's turns:
-   *  'claude' = `claude -p` stream-json, 'pi' = pi's JSON mode. Set on every
+   *  'claude' = `claude -p` stream-json, 'pi' = pi's JSON mode, 'cursor' =
+   *  `cursor-agent -p` stream-json (agent chat-cursor-v1), 'devin' = the
+   *  Devin CLI's ACP server (agent chat-devin-v1). Set on every
    *  chatRunner entry (registry.test.ts). */
-  chatEngine?: 'claude' | 'pi';
+  chatEngine?: ChatEngine;
   /** The chatRunner provider an automation on this user-facing provider runs
    *  as (an automation run is a chat-runner turn).
    *  Absent = no automation can use it. */
@@ -294,6 +296,30 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
     usagePrecision: 'estimated',
   },
 
+  // cursor-agent driven headless by the chat runner (agent chat-cursor-v1): one
+  // `cursor-agent -p --output-format stream-json` turn per message, resumed by
+  // the session Cursor names. Never offered in a picker: Review with Cursor
+  // asks for it by id, with simple-ui-review-chat-enabled (routes/prs.ts).
+  'cursor-chat': {
+    id: 'cursor-chat',
+    displayName: 'Cursor (chat)',
+    selectable: false,
+    badge: 'CR',
+    color: { base: 'rgba(160, 80, 220, 0.6)', bright: 'rgba(200, 140, 255, 0.9)' },
+    lightColor: { base: 'rgba(130, 80, 223, 0.6)', bright: 'rgba(102, 57, 186, 0.9)' },
+    launchCommand: '',
+    processNames: [],
+    statusSources: ['chat-runner'],
+    chatRunner: true,
+    chatEngine: 'cursor',
+    // The box's Cursor config is the pane's (~/.cursor/mcp.json); a chat turn approves no server in it
+    // (agent/chat-runner.js cursorTurnArgs passes no --approve-mcps).
+    mcpConfig: 'cursor',
+    // Cursor reports no cost or token totals to scan.
+    usageMethod: 'none',
+    usagePrecision: 'estimated',
+  },
+
   gemini: {
     id: 'gemini',
     displayName: 'Gemini',
@@ -390,6 +416,30 @@ export const PROVIDERS: Record<string, ProviderConfig> = {
       statusBarParser: parseDevinStatusBar,
     },
     mcpConfig: 'devin',
+    usageMethod: 'none',
+    usagePrecision: 'estimated',
+  },
+
+  // The Devin CLI's ACP server driven by the chat runner (agent chat-devin-v1): one
+  // `devin acp` session per chat, a session/prompt per message, loaded again by the
+  // session Devin names. Never offered in a picker: Review with Devin asks for it by
+  // id, with simple-ui-review-chat-enabled (routes/prs.ts).
+  'devin-chat': {
+    id: 'devin-chat',
+    displayName: 'Devin (chat)',
+    selectable: false,
+    badge: 'DV',
+    color: { base: 'rgba(236, 72, 153, 0.6)', bright: 'rgba(244, 114, 182, 0.9)' },
+    lightColor: { base: 'rgba(191, 57, 137, 0.6)', bright: 'rgba(153, 40, 110, 0.9)' },
+    launchCommand: '',
+    processNames: [],
+    statusSources: ['chat-runner'],
+    chatRunner: true,
+    chatEngine: 'devin',
+    // A read-only turn runs under a HOME of its own with no MCP config, and every turn passes none
+    // (agent/devin-acp.js session/new mcpServers: []); a full-access one is the box's own Devin.
+    mcpConfig: 'devin',
+    // Devin reports no cost or token totals to scan.
     usageMethod: 'none',
     usagePrecision: 'estimated',
   },
@@ -497,6 +547,8 @@ export function isSelectableProvider(id: string | null | undefined): boolean {
   return !!id && SELECTABLE_PROVIDER_IDS.includes(id);
 }
 export type AgentProvider = string;
+/** The engines a chat-runner provider's turns can run on (agent/chat-engines.js). */
+export type ChatEngine = 'claude' | 'pi' | 'cursor' | 'devin';
 
 /** The simple UI's chat provider: accepted on create although no picker offers it. */
 export const CHAT_PROVIDER_ID = 'claude-chat';
@@ -504,12 +556,12 @@ export function isChatRunnerProvider(id: string | null | undefined): boolean {
   return !!id && PROVIDERS[id]?.chatRunner === true;
 }
 /** The engine a chat-runner provider's turns run on; undefined for any other provider. */
-export function chatEngineOf(id: string | null | undefined): 'claude' | 'pi' | undefined {
+export function chatEngineOf(id: string | null | undefined): ChatEngine | undefined {
   return isChatRunnerProvider(id) ? PROVIDERS[id!].chatEngine : undefined;
 }
 /** The engines the box's chat runner can drive today. A2 (the pi engine,
  *  agent capability chat-pi-v1) adds 'pi'; until then a pi chat would run Claude. */
-export const SUPPORTED_CHAT_ENGINES: ReadonlySet<'claude' | 'pi'> = new Set(['claude'] as const);
+export const SUPPORTED_CHAT_ENGINES: ReadonlySet<ChatEngine> = new Set<ChatEngine>(['claude']);
 /** A chat-runner provider a new chat or automation may be created on: its engine is supported. */
 export function isLaunchableChatProvider(id: string | null | undefined): boolean {
   const engine = chatEngineOf(id);

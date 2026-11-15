@@ -67,6 +67,25 @@ describe('confirmPushes', () => {
     expect(calls).toContain(`/repos/org/api/pulls?head=org%3A${encodeURIComponent(own)}&state=all&per_page=10`);
   });
 
+  // Report cmw5g0ltlc4lra4ivxbchulaj: a follow-up pushed onto a thread whose PR the asker had
+  // closed, and the notice said "publish published".
+  it('flags a push onto a closed PR, but not a branch re-reported at the head already recorded', async () => {
+    const { cfg } = github({ [own]: SHA('e'), old: SHA('f') }, { [own]: [{ number: 7, state: 'closed' }], old: [{ number: 3, state: 'closed' }] });
+    const out = await confirmPushes(cfg, {
+      repo: 'org/api', token: 'gho_x', ownBranch: own, prefix: own,
+      rows: [{ key: '', branch: own, headSha: SHA('c') }, { key: 'old', branch: 'old', headSha: SHA('f') }],
+      pushes: [{ branch: own, sha: SHA('e') }, { branch: 'old', sha: SHA('f') }],
+    });
+    expect(out).toEqual([
+      { kind: 'recorded', branch: own, key: '', headSha: SHA('e'), prNumber: 7, prUrl: 'https://github.com/org/api/pull/7', state: 'closed', notOpen: true },
+      { kind: 'recorded', branch: 'old', key: 'old', headSha: SHA('f'), prNumber: 3, prUrl: 'https://github.com/org/api/pull/3', state: 'closed' },
+    ]);
+    expect(pushSummary(out, 2)).toEqual({
+      publish: 'partial',
+      detail: `${own}: pushed at ${SHA('e').slice(0, 12)}, but PR #7 is closed, so no open PR shows it (reopen it, or open a new draft with termag-pr-create) | old: PR #3 (closed)`,
+    });
+  });
+
   it("sends the asker's token, never the box's", async () => {
     const { cfg, fetch } = github({ [own]: SHA('c') }, {});
     await confirmPushes(cfg, { repo: 'org/api', token: 'gho_x', ownBranch: own, prefix: own, rows: [], pushes: [{ branch: own, sha: SHA('c') }] });

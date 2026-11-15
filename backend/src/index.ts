@@ -21,6 +21,8 @@ import { stashPostLoginReturn } from './auth/postLoginReturn';
 import { sessionCookieOptions, clearLegacySessionCookie } from './auth/sessionCookie';
 import { PREVIEW_SIGN_IN_MAX_MS, signedInWithin } from './auth/signInAge';
 import { projectsRouter } from './routes/projects';
+import { userProjectsRouter } from './routes/userProjects';
+import { sessionPinsRouter } from './routes/sessionPins';
 import { chatRouter } from './routes/chat';
 import { chatAsksRouter } from './routes/chatAsks';
 import { chatPaneSubagentsRouter } from './routes/chatPaneSubagents';
@@ -30,6 +32,7 @@ import { chatsRouter } from './routes/chats';
 import { claudeLoginRouter } from './routes/claudeLogin';
 import { chatPushRoute, mayReceiveChat, setChatPushCallback, startChatRelay, startChatStatusSweep, stopChatStatusSweep } from './services/chatRunner';
 import { startChatTranscriptSync } from './services/chatTranscriptSync';
+import { projectFilesEnabledForCaller, recordFilesMoved, recordFilesSaved, startProjectFilesGrants } from './services/projectFiles';
 import { startChatResumeRestores } from './services/chatNewBox';
 import { startHeldDelivery } from './services/chatHeld';
 import { deliverHeldMessage, sendAskNotice } from './routes/chat';
@@ -51,6 +54,7 @@ import { contextRouter } from './routes/context';
 import { reviewRouter } from './routes/review';
 import { terminalSlotsRouter } from './routes/terminalSlots';
 import { instancesRouter } from './routes/instances';
+import { boxPlacementRouter } from './routes/boxPlacement';
 import { sshKeysRouter } from './routes/sshKeys';
 import { warmPoolRouter } from './routes/warmPool';
 import { apiErrorHandler } from './middleware/errors';
@@ -149,6 +153,7 @@ import { collabRouter } from './routes/collab';
 import { registerCollabSlackActions } from './slack/collab';
 import { startCollabNudgeSweep, stopCollabNudgeSweep } from './services/collabSweep';
 import { initOtel, shutdownOtel } from './services/otel';
+import { registerDbPoolGauges } from './services/dbPoolMetrics';
 import { installOperationSpans } from './services/tracing/prismaSpans';
 import { serverSpanMiddleware, setServerSpanAttributes } from './services/tracing/requestSpan';
 import { tracingRegistered } from './services/tracing/state';
@@ -237,6 +242,7 @@ import { spaceStorageRouter } from './routes/spaceStorage';
 import { ltsRouter } from './slack/lts';
 import { publishHomeView } from './slack/homeView';
 import { prismaBugReports } from './services/bugReportsPrisma';
+import { prismaFeedback } from './services/feedbackPrisma';
 import { getActiveHomeViewers } from './slack/events';
 
 const app = express();
@@ -279,6 +285,13 @@ app.use(BASE_PATH || '/', serverSpanMiddleware);
 // everything, the bearer-only relay and forward routers below included, and
 // again after the session middleware.
 app.use(BASE_PATH || '/', surfaceMiddleware);
+// Which client build each user runs, and the
+// desktop app's client.opened. Ahead of every /api/cli/v1 router, the
+// desktop's box relay and forward probe below included, since they finish
+// their requests: it only reads headers here and looks up the user (req.user
+// or res.locals.cliAuth) when the response finishes, so it needs nothing
+// mounted before it.
+app.use(`${BASE_PATH}/api`, clientVersionMiddleware);
 
 // The desktop app's box relay (routes/cliT3.ts):
 // ahead of cors and the body parsers, because it hands the t3 client's
@@ -295,8 +308,10 @@ app.use(`${BASE_PATH}/api/cli/v1/boxes/:id/t3/relay`, cliT3RelayRouter({ bearer:
 // The native port forward (routes/cliForward.ts): the
 // probe here, the forward socket in the upgrade dispatch below.
 const forwardWss = new WebSocketServer(forwardServerOptions());
+// One access decision for the forward.
+const forwardBoxes = createPrismaForwardBoxes();
 const cliForward = createCliForward({
-  bearer: cliWsDeps, boxes: createPrismaForwardBoxes(), tunnels: agentTunnels, wss: forwardWss,
+  bearer: cliWsDeps, boxes: forwardBoxes, tunnels: agentTunnels, wss: forwardWss,
   isServing: () => drain.isServing(), maxConcurrent: forwardMaxConcurrent(process.env),
   // Not startHeartbeat: a leg the relay has paused for backpressure can't read its pong.
   heartbeat: (ws) => tunnelHeartbeat(ws, WS_HEARTBEAT_MS),
@@ -369,12 +384,6 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
   }
 }
 
-// Which client build each user runs. Ahead of the
-// /api/cli/v1 routers, which finish every CLI and TUI request: it only reads
-// headers here and looks up the user (req.user or res.locals.cliAuth) when the
-// response finishes, so it needs nothing mounted before it.
-app.use(`${BASE_PATH}/api`, clientVersionMiddleware);
-
 // termag doctor's SSH-key and GitHub routes: part of the same bearer-only CLI
 // API, so mounted ahead of the cookie stack too (routes/cliCredentials.ts).
 app.use(`${BASE_PATH}/api/cli/v1`, cliCredentialsRouter({ store: prismaCliStore, jwt: cliJwt, credentials: prismaCliCredentials }));
@@ -394,6 +403,9 @@ app.use(`${BASE_PATH}/api/cli/v1/spaces`, (_req, res, next) => { res.set('Cache-
   spacesRouter({
     store: spaceStore, objects: spaceObjects, onMemberChanged: recheckMirrorsForMember,
     onFileChange: notifySpaceFileChange,
+    onUploadSigned: upload => { void recordFilesSaved(upload); },
+    onFileMoved: move => { void recordFilesMoved(move); },
+    moveToEnabled: projectFilesEnabledForCaller,
     caller: (_req, res) => {
       const auth = res.locals.cliAuth as CliAuth | undefined;
       return auth ? spaceCallerFromCli(auth) : null;
@@ -409,6 +421,7 @@ app.use(`${BASE_PATH}/api/cli/v1`, cliApiRouter({
   worktime: createPrismaCliWorktime(),
   sessionSearch: createPrismaCliSessionSearch(),
   bugReports: { store: prismaBugReports, adminBox: prismaCliAdminBox }, mcpConnectors: prismaCliMcpConnectors,
+  feedback: { store: prismaFeedback },
   briefings: createPrismaCliBriefings(),
   environments: true,
   chats: createPrismaCliChats(),
@@ -494,6 +507,10 @@ app.use(`${BASE_PATH}/api/projects`, chatAsksRouter());
 app.use(`${BASE_PATH}/api/projects`, chatPaneSubagentsRouter());
 app.use(`${BASE_PATH}/api/projects`, chatNoticesRouter());
 app.use(`${BASE_PATH}/api/chats`, chatsRouter());
+// The project record, behind user-projects-enabled.
+app.use(`${BASE_PATH}/api/user-projects`, userProjectsRouter());
+// The chat sidebar's Pinned sessions, on every client, behind user-projects-enabled.
+app.use(`${BASE_PATH}/api/session-pins`, sessionPinsRouter());
 app.use(`${BASE_PATH}/api/projects`, claudeLoginRouter());
 app.use(`${BASE_PATH}/api/status`, statusRouter());
 // A box reports the end of a Claude Code cloud session the spawn route started
@@ -528,12 +545,17 @@ app.use(`${BASE_PATH}/api/visits`, visitsRouter());
 app.use(`${BASE_PATH}/api/warp`, warpRouter());
 app.use(`${BASE_PATH}/api/context`, contextRouter());
 app.use(`${BASE_PATH}/api/instances`, instancesRouter());
+// Runs on: Auto's placement for New session, beside the box routes.
+app.use(`${BASE_PATH}/api/boxes`, boxPlacementRouter());
 app.use(`${BASE_PATH}/api/spaces`, requireAuth, spaceSlackRouter({
   services: spaceSlackManageDeps, slackMode: spaceSlackMode, via: 'web',
   caller: req => (req.user ? { kind: 'user', userId: req.user.id } : null),
 }), spacesRouter({
   store: spaceStore, objects: spaceObjects, onMemberChanged: recheckMirrorsForMember,
   onFileChange: notifySpaceFileChange,
+  onUploadSigned: upload => { void recordFilesSaved(upload); },
+  onFileMoved: move => { void recordFilesMoved(move); },
+  moveToEnabled: projectFilesEnabledForCaller,
   caller: req => (req.user ? { kind: 'user', userId: req.user.id } : null),
   fileLink: (space, path) => `${FRONTEND_URL}${spaceFileLinkPath(BASE_PATH, space, path)}`,
 }));
@@ -1375,6 +1397,8 @@ startChatRelay();
 // Every process: a turn end and a box's connect arrive where the box's socket is.
 startChatTranscriptSync();
 startChatResumeRestores();
+// Project files and My files on each capable box's hello.
+startProjectFilesGrants();
 startHeldDelivery(deliverHeldMessage);
 // The ask finish notice reaches a chat through the chat send path (services/askNoticeSweep.ts).
 setAskNoticeChatSender(sendAskNotice);
@@ -1484,7 +1508,7 @@ loadUserTimeZones()
   // ready and on a new generation.
   startBazelCacheDelivery();
   // OpenTelemetry metrics and logs, when there is somewhere to send them (services/otel.ts).
-  if (initOtel()) { registerSpawnGauges(); }
+  if (initOtel()) { registerSpawnGauges(); registerDbPoolGauges(getPool); }
   syncAdminBootstrap().catch(err => console.error('[ADMIN] bootstrap failed:', err));
 }));
 

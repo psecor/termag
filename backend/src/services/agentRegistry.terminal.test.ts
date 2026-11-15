@@ -76,6 +76,41 @@ describe('terminal data from agents', () => {
     expect(owner.ws.closesFor(streamId)).toHaveLength(0);
   });
 
+  it("delivers the pane's exit to its stream, then lets the stream go", async () => {
+    const { user, ws } = connectAgent();
+    const onData = vi.fn();
+    const attach = requestTerminalStream(user.id, 'dev-proj-agent', 80, 24, onData);
+    const { requestId, streamId } = ws.sent.find(m => m.type === 'terminal-attach');
+    ws.fromAgent({ requestId, data: { ok: true, streamId } });
+    await attach;
+
+    ws.fromAgent({ type: 'terminal-data', streamId, data: 'no sessions' });
+    ws.fromAgent({ type: 'terminal-exit', streamId });
+    // Anything after the exit reaches no one: the stream is gone, and the agent is told so.
+    ws.fromAgent({ type: 'terminal-data', streamId, data: 'late' });
+
+    expect(onData.mock.calls.map(([m]) => m.type)).toEqual(['terminal-data', 'terminal-exit']);
+    expect(ws.closesFor(streamId)).toHaveLength(1);
+  });
+
+  it("drops an exit for a stream nobody reads, or that another agent holds", async () => {
+    const owner = connectAgent();
+    const other = connectAgent();
+    const onData = vi.fn();
+    const attach = requestTerminalStream(owner.user.id, 'dev-proj-agent', 80, 24, onData);
+    const { requestId, streamId } = owner.ws.sent.find(m => m.type === 'terminal-attach');
+    owner.ws.fromAgent({ requestId, data: { ok: true, streamId } });
+    await attach;
+
+    other.ws.fromAgent({ type: 'terminal-exit', streamId });
+    owner.ws.fromAgent({ type: 'terminal-exit', streamId: 'not-a-stream' });
+
+    expect(onData).not.toHaveBeenCalled();
+    // No terminal-close for an exit: the agent already dropped its stream.
+    expect(other.ws.closesFor(streamId)).toHaveLength(0);
+    expect(owner.ws.closesFor('not-a-stream')).toHaveLength(0);
+  });
+
   it('re-sends close for output that was in flight when the browser closed', async () => {
     const { user, ws } = connectAgent();
     const attach = requestTerminalStream(user.id, 'dev-proj-agent', 80, 24, () => {});

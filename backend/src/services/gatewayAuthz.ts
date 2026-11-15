@@ -5,6 +5,8 @@
  * message go back to the box's client as they are.
  */
 
+import type { FlagBox, FlagUser } from './featureFlags';
+
 export interface AuthzBox {
   userId: string;
   instanceId: string;
@@ -23,6 +25,8 @@ export interface AuthzBox {
    * broker's pool rule reads in place of resolving the environment again.
    */
   pool?: { status: string; environmentId: string | null; repos?: readonly string[] | null };
+  /** An owned box's owner and box rows, for a check that reads a flag for them (fireworksAuthz.ts). */
+  ld?: { user: FlagUser; box: FlagBox };
 }
 
 export type AuthzDecision =

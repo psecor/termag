@@ -627,7 +627,7 @@ describe('the replay the create came from', () => {
     expect(project().launchReplaySessionId).toBe(RID);
 
     expect(await applySetupEvent(target, report(0, 'ready', { branch: 'trunk' }))).toEqual({ kind: 'applied', from: 'cloning', to: 'ready' });
-    expect(keysSent()).toEqual([`TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=widget TERMAG_WORKSTREAM=main termag-credentials telemetry-launch ${RID})"`]);
+    expect(keysSent()).toEqual([`TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=widget TERMAG_WORKSTREAM=main TERMAG_INFERENCE_BACKEND=default termag-credentials telemetry-launch ${RID})"`]);
     expect(project()).toMatchObject({ setupStatus: 'ready', launchReplaySessionId: null });
   });
 

@@ -76,6 +76,14 @@ vi.mock('../middleware/auth', () => ({ requireAuth: vi.fn(), requireAuthOrAgentT
 vi.mock('../slack/channels', () => ({ createProjectChannel: vi.fn(async () => null) }));
 vi.mock('../slack/lts', () => ({ setNotificationTarget: vi.fn() }));
 vi.mock('../services/status', () => ({ deleteStatus: vi.fn(), setStatus: vi.fn(), notifyStatusChange: vi.fn() }));
+// The project record is off unless a test turns it on.
+const record = vi.hoisted(() => ({ on: false }));
+vi.mock('../services/userProjects', async importOriginal => ({
+  ...(await importOriginal<object>()),
+  userProjectsEnabled: vi.fn(async () => record.on),
+  checkRequestedUserProject: vi.fn(async (_u: string, id: string) => ({ ok: true, id })),
+  attachCheckout: vi.fn(async (_u: string, _c: string, requested: string | null) => requested),
+}));
 vi.mock('../services/agentRegistry', () => ({
   isAgentConnected: vi.fn(() => true),
   isProjectAgentConnected: vi.fn(() => true),
@@ -119,6 +127,7 @@ async function findProject(args: { where: Record<string, unknown> }) {
 }
 
 beforeEach(() => {
+  record.on = false;
   state.workflows = [];
   state.project = null;
   state.box = null;
@@ -398,6 +407,53 @@ describe('repo create checkout', () => {
     expect(result.body).toMatchObject({ restored: true });
     expect(prisma.project.update.mock.calls[0][0]).toMatchObject({ where: { id: 'old' }, data: { archived: false, instanceId: 'box1' } });
     expect(prisma.project.create).not.toHaveBeenCalled();
+  });
+
+  it('never brings an archived checkout back for a create that names a project: its name is taken, for New session to retry past', async () => {
+    record.on = true;
+    state.box = box('ec2');
+    prisma.project.findFirst.mockImplementation(async (args: { where: Record<string, unknown> }) =>
+      (args.where.archived === true ? archivedWidget() : findProject(args)));
+    const repo = await createProjectFor(user, { ...widgetRepoCreate(), userProjectId: 'up1' });
+    expect(repo).toEqual({ status: 409, body: { error: 'An archived checkout is named widget', code: 'checkout_name_taken' } });
+    // A no-repo create would un-archive it, from any box: with a project named, it's taken too.
+    const blank = await createProjectFor(user, { name: 'widget', instanceId: 'box1', initialAgent: { enabled: true, provider: 'claude' }, userProjectId: 'up1' });
+    expect(blank).toEqual({ status: 409, body: { error: 'An archived checkout is named widget', code: 'checkout_name_taken' } });
+    // An answer to the archived name (unarchive, rename-aside) doesn't bring it back either.
+    for (const archivedName of ['unarchive', 'rename-aside'] as const) {
+      expect((await createProjectFor(user, { ...widgetRepoCreate(), userProjectId: 'up1', archivedName })).body).toMatchObject({ code: 'checkout_name_taken' });
+    }
+    expect(prisma.project.update).not.toHaveBeenCalled();
+    expect(prisma.project.create).not.toHaveBeenCalled();
+  });
+
+  it("looks for a fresh checkout's archived name only on its own box", async () => {
+    record.on = true;
+    state.box = box('ec2');
+    await createProjectFor(user, { name: 'widget', instanceId: 'box1', initialAgent: { enabled: true, provider: 'claude' }, userProjectId: 'up1' });
+    const lookups = prisma.project.findFirst.mock.calls.map(c => c[0].where).filter(w => w.archived === true);
+    expect(lookups).toEqual([{ userId: 'u1', name: 'widget', archived: true, instanceId: 'box1' }]);
+    expect(prisma.project.create).toHaveBeenCalled();
+    // The set it was checked on goes to the attach, so a repository added to the project meanwhile keeps the checkout there.
+    const { attachCheckout } = await import('../services/userProjects');
+    expect(attachCheckout).toHaveBeenCalledWith('u1', 'p1', 'up1', '');
+  });
+
+  it('still un-archives for a plain no-repo create, as before', async () => {
+    record.on = true;
+    state.box = box('ec2');
+    prisma.project.findFirst.mockImplementation(async (args: { where: Record<string, unknown> }) =>
+      (args.where.archived === true ? { ...archivedWidget(), repoUrl: null } : findProject(args)));
+    const result = await createProjectFor(user, { name: 'widget', instanceId: 'box1', initialAgent: { enabled: true, provider: 'claude' } });
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ restored: true });
+  });
+
+  it('says a live name clash is checkout_name_taken', async () => {
+    state.box = box('ec2');
+    prisma.project.create.mockRejectedValueOnce(Object.assign(new Error('unique'), { code: 'P2002' }));
+    const result = await createProjectFor(user, widgetRepoCreate());
+    expect(result).toEqual({ status: 409, body: { error: 'Project name already exists', code: 'checkout_name_taken' } });
   });
 
   it('refuses an archivedName that is not a choice', async () => {

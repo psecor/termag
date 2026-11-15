@@ -187,6 +187,16 @@ async function runInFlight(now: number, db: Pick<typeof prisma, 'softwareUpdateR
   return rows.find(r => isInFlight(r, now)) ?? null;
 }
 
+/**
+ * The orchestrator host's Claude Code run in flight, as its host panel shows it: the root helper's finished
+ * records imported first (syncOrchestratorRuns), then the run runInFlight keeps. orchestratorPreview and
+ * the Software tab's matrix (services/software/queries.ts) both read it here.
+ */
+export async function orchestratorRunInFlight(now: number = Date.now()): Promise<SoftwareUpdateRun | null> {
+  await syncOrchestratorRuns();
+  return runInFlight(now);
+}
+
 /** As runs.ts claims a box's run: under the same advisory lock, at most one in flight. */
 async function claimRun(trigger: RunTrigger, target: string | null, requestedById: string | null, now: number): Promise<SoftwareUpdateRun | null> {
   return prisma.$transaction(async tx => {
@@ -304,9 +314,8 @@ async function startRun(trigger: RunTrigger, policy: OrchestratorPolicy, request
 export async function orchestratorPreview(tool: ToolDescriptor, admin: User, current: string | null, now: number = Date.now()): Promise<OrchestratorAnswer> {
   const flags = await orchestratorFlags(tool, admin);
   if (!await orchestratorUpdateEnabled(tool, admin, flags)) return OFF;
-  await syncOrchestratorRuns();
   const policy = orchestratorPolicyFrom(flags);
-  const run = await runInFlight(now);
+  const run = await orchestratorRunInFlight(now);
   return {
     status: 200,
     body: {

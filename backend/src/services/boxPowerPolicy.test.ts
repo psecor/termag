@@ -5,6 +5,7 @@ import {
   hibernationRefreshDue,
   hibernationRefreshMsFromEnv,
   isHibernateRefusal,
+  liveCloudSessionRefusal,
   PARKED_STATUSES,
   PowerRequestBox,
   powerRequestError,
@@ -100,6 +101,33 @@ describe('powerRequestError', () => {
   it('names the status it refused', () => {
     expect(powerRequestError(box({ status: 'stopping' }), 'u1', 'start', true))
       .toEqual({ status: 409, error: "Can't start a box that is stopping" });
+  });
+});
+
+describe('liveCloudSessionRefusal', () => {
+  const ready = { name: 'rb-release', status: 'ready' };
+
+  it('lets a box with no cloud session stop, and a box that is not up has none to end', () => {
+    expect(liveCloudSessionRefusal(ready, 0)).toBe(null);
+    expect(liveCloudSessionRefusal({ ...ready, status: 'starting' }, 1)).toBe(null);
+  });
+
+  it('refuses a stop that would end a cloud session, and says force would go ahead', () => {
+    expect(liveCloudSessionRefusal(ready, 1)).toEqual({
+      status: 409,
+      code: 'box_busy',
+      error: 'rb-release is running a Claude Code cloud session, and stopping it ends it. Stop it anyway to end it.',
+      blockers: [{ check: 'claude-runner', reason: 'rb-release is running a Claude Code cloud session, and stopping it ends it', forceable: true }],
+      forceable: true,
+    });
+    expect(liveCloudSessionRefusal(ready, 3)?.error).toMatch(/^rb-release is running 3 Claude Code cloud sessions, and stopping it ends them/);
+  });
+
+  it('lets a person force it, never a box credential', () => {
+    expect(liveCloudSessionRefusal(ready, 1, { force: true })).toBe(null);
+    const agent = liveCloudSessionRefusal(ready, 1, { force: true, boxCredential: true });
+    expect(agent).toMatchObject({ status: 409, code: 'box_busy', forceable: false, blockers: [{ forceable: false }] });
+    expect(agent?.error).toMatch(/A stop sent from a box can't end a cloud session; its owner can, from termag or a `termag login` off the box\.$/);
   });
 });
 

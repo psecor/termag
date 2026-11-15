@@ -28,6 +28,11 @@ describe('hourlyRate', () => {
     expect(hourlyRate('m9g.2xlarge')).toEqual({ usd: 0.15902, known: true });
   });
 
+  it('rates large\'s types at their on-demand price scaled by the bill\'s m8g.2xlarge ratio', () => {
+    expect(hourlyRate('r8g.xlarge')).toEqual({ usd: 0.0956, known: true });
+    expect(hourlyRate('r7g.xlarge')).toEqual({ usd: 0.08691, known: true });
+  });
+
   it('falls back to the vCPU rate', () => {
     expect(hourlyRate('m9g.8xlarge').usd).toBeCloseTo(32 * DEFAULT_RATES.perVcpuHour);
     expect(hourlyRate('m9g.8xlarge').known).toBe(true);

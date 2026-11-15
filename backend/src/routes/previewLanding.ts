@@ -3,7 +3,8 @@
  * server-rendered:
  *
  *   GET /previews/:name[/:token][?next=]   who may open it, then a one-time code and the hand-off
- *   GET /previews/:name/reverify?ticket=   the hourly re-check a preview host sends a navigation through
+ *   GET /previews/:name/reverify?ticket=   the hourly re-check a preview host sends a navigation through,
+ *                                          or a rebound: a used code's way back to a fresh one (no session yet)
  *
  * Mounted like any termag page, after the session middleware and
  * albSessionBridge: only a termag user reaches it (A2). In okta mode the
@@ -15,7 +16,8 @@
  *
  * Minimal on purpose: PR 3 gives it termag's look.
  */
-import { Router, type Request, type Response } from 'express';
+import express, { Router, type Request, type Response } from 'express';
+import { createHmac, timingSafeEqual } from 'crypto';
 import { asyncHandler } from '../middleware/errors';
 import { takeToken, type Bucket } from '../middleware/rateLimit';
 import { decide, basisHolds, isAccessBasis } from '../services/previewLinkAccess';
@@ -23,7 +25,8 @@ import { LINK_TOKEN_RE, PREVIEW_NAME_RE, previewHostLabel } from '../services/pr
 import { CODE_TTL_MS, codeHash, newSecret, safeNext } from '../services/previewHostRules';
 import type { PreviewHostDeps } from '../services/previewHost';
 import { accessAudienceOf, served, type HostLinkContext } from '../services/previewHostStore';
-import { pageHeaders, renderHandoff, renderLandingRefusal } from '../previewPages';
+import { pageHeaders, renderAsleep, renderHandoff, renderLandingRefusal, renderWaking } from '../previewPages';
+import { defaultLinkWakeDeps, LINK_WAKE_MESSAGES, linkWakeRefusal, wakeLinkBox, type LinkWakeDeps } from '../services/previewLinkWake';
 import { audit, linkOpened, linkRefused } from '../services/previewLinkTelemetry';
 
 const PARKED = new Set(['stopping', 'stopped', 'starting', 'hibernating', 'hibernated']);
@@ -43,6 +46,8 @@ export interface PreviewLandingDeps extends Pick<PreviewHostDeps, 'store' | 'dom
    */
   signInFresh?(req: Request): boolean;
   boxStatus(boxId: string): Promise<string | null>;
+  /** Waking a parked box (row 6b, services/previewLinkWake.ts); unset: the real one. */
+  wake?: LinkWakeDeps;
 }
 
 function page(res: Response, kind: 'not_found' | 'asleep' | 'off'): void {
@@ -101,11 +106,27 @@ export function previewLandingRouter(deps: PreviewLandingDeps): Router {
     const t = now();
     const ticket = hash ? await deps.store.takeCode(hash, t) : null;
     const ctx = served(await deps.store.resolveName(name));
-    // A ticket is one session's, redeemed only by that session's termag user (SR10).
-    if (!ticket || !ticket.sessionIdHash) return refuse(res, ctx, name, who, 'no_ticket', 'reverify');
+    // A ticket is one session's or one code's, redeemed only by its termag user (SR10).
+    if (!ticket) return refuse(res, ctx, name, who, 'no_ticket', 'reverify');
     if (!ctx || ctx.link.id !== ticket.linkId) return refuse(res, ctx, name, who, 'wrong_host', 'reverify');
     if (ticket.userId !== who.id) return refuse(res, ctx, name, who, 'other_user', 'reverify');
     if (!deps.allowed(who.googleEmail)) return refuse(res, ctx, name, who, 'termag_access', 'reverify');
+    if (!ticket.sessionIdHash) {
+      // A rebound: the browser lost the session a code of this viewer's made seconds ago. The basis that code
+      // was granted on, a link token's hash included, must still hold; then a fresh code, as the landing gives.
+      if (!isAccessBasis(ticket.basis)) return refuse(res, ctx, name, who, 'bad_basis', 'reverify');
+      const [facts, flags] = await Promise.all([deps.store.viewer(ctx.link, who.id, t), deps.flags(ctx.project.owner, ctx.project.instance)]);
+      const held = basisHolds(ticket.basis, ticket.tokenHash, accessAudienceOf(ctx.link), ctx.link, { isProjectOwner: ctx.project.userId === who.id, ...facts }, flags, t);
+      if (!held.ok) return refuse(res, ctx, name, who, held.reason, 'reverify');
+      const code = newSecret(deps.random);
+      await deps.store.createCode({
+        codeHash: codeHash('code', code)!, linkId: ctx.link.id, userId: who.id, basis: ticket.basis, tokenHash: ticket.tokenHash,
+        sessionIdHash: null, next: safeNext(ticket.next), expiresAt: new Date(t.getTime() + CODE_TTL_MS),
+      });
+      audit({ step: 'reverify', decision: 'grant', reason: `rebound:${ticket.basis}`, viewer: who.googleEmail, linkId: ctx.link.id, name, boxId: ctx.project.instanceId });
+      res.redirect(302, handoffUrl(ctx.link, domain, code, safeNext(ticket.next)));
+      return;
+    }
     const session = await deps.store.findSession(ticket.sessionIdHash);
     if (!session || session.revokedAt || session.expiresAt.getTime() <= t.getTime() || session.userId !== who.id || session.linkId !== ctx.link.id) {
       return refuse(res, ctx, name, who, 'session_gone', 'reverify');
@@ -121,29 +142,71 @@ export function previewLandingRouter(deps: PreviewLandingDeps): Router {
       sessionIdHash: session.idHash, next: safeNext(ticket.next), expiresAt: new Date(t.getTime() + CODE_TTL_MS),
     });
     audit({ step: 'reverify', decision: 'grant', reason: session.basis, viewer: who.googleEmail, linkId: ctx.link.id, name, boxId: ctx.project.instanceId });
-    res.redirect(302, handoffUrl(ctx.link, domain, code));
+    // `next` in the URL as well as the code: a repeat of this URL from a browser that holds the session goes
+    // there, and the used code can't say where it was headed any more (Devin, #1742).
+    res.redirect(302, handoffUrl(ctx.link, domain, code, safeNext(ticket.next)));
   }));
+
+  const wakeDeps = deps.wake ?? defaultLinkWakeDeps;
+  /** The wake form's CSRF token: this viewer, this link, this server (SameSite cookies are the first line). */
+  const wakeCsrf = (userId: string, linkId: string) => createHmac('sha256', String(deps.cookieSecret())).update(`preview-wake:${userId}:${linkId}`).digest('base64url');
+  const wakeCsrfOk = (userId: string, linkId: string, token: unknown) => {
+    const want = Buffer.from(wakeCsrf(userId, linkId));
+    const got = Buffer.from(typeof token === 'string' ? token : '');
+    return got.length === want.length && timingSafeEqual(got, want);
+  };
+  /** The landing URL a wake form posts to and the waking page refreshes to: the path the viewer opened, `next` kept. */
+  const landingPath = (req: Request) => `${req.baseUrl}${req.path}${typeof req.query.next === 'string' ? `?next=${encodeURIComponent(req.query.next)}` : ''}`;
+
+  /**
+   * Who may open it, as the landing decides: the context and the decision, or
+   * the refusal already sent (the same 404 for every reason, A4). A wake goes
+   * through this first, so a viewer without access never wakes a box.
+   */
+  async function admitted(req: Request, res: Response, who: { id: string; googleEmail: string }) {
+    const name = req.params.name;
+    const token = (req.params as { token?: string }).token ?? null;
+    const domain = deps.domain();
+    if (!domain || !deps.cookieSecret()) { page(res, 'off'); return null; }
+    if (!PREVIEW_NAME_RE.test(name) || (token !== null && !LINK_TOKEN_RE.test(token))) { page(res, 'not_found'); return null; }
+    const ctx = served(await deps.store.resolveName(name));
+    if (!ctx) { refuse(res, null, name, who, 'no_link', 'landing'); return null; }
+    if (!deps.allowed(who.googleEmail)) { refuse(res, ctx, name, who, 'termag_access', 'landing'); return null; }
+    const t = now();
+    const [facts, flags] = await Promise.all([deps.store.viewer(ctx.link, who.id, t), deps.flags(ctx.project.owner, ctx.project.instance)]);
+    const decision = decide(accessAudienceOf(ctx.link), ctx.link, { isProjectOwner: ctx.project.userId === who.id, ...facts }, token, flags, t);
+    if (!decision.ok) { refuse(res, ctx, name, who, decision.reason, 'landing'); return null; }
+    return { ctx, decision, domain, name, t };
+  }
+
+  /** A parked box's page: waking (it's starting), "Wake it" where this viewer may, else asleep and why. */
+  async function asleep(req: Request, res: Response, ctx: HostLinkContext, who: { id: string; googleEmail: string }, status: string): Promise<void> {
+    const ownerName = ctx.project.owner.displayName || ctx.project.owner.googleEmail;
+    if (status === 'starting') { const p = renderWaking(ownerName, landingPath(req)); res.status(p.status).set(p.headers).send(p.html); return; }
+    // Asked first, so a box still going down promises nothing to a viewer who could never wake it: its owner, or
+    // the wake flag off (Bugbot, #1570).
+    const refusal = await linkWakeRefusal(wakeDeps, ctx, who.id);
+    // Still going down: look again until it has stopped; whether this stop may be undone is known only then.
+    if (refusal === null && (status === 'stopping' || status === 'hibernating')) { const p = renderWaking(ownerName, landingPath(req), 'settling'); res.status(p.status).set(p.headers).send(p.html); return; }
+    const p = renderAsleep({
+      ownerName,
+      wake: refusal === null ? { action: landingPath(req), csrf: wakeCsrf(who.id, ctx.link.id) } : null,
+      message: refusal === null ? null : LINK_WAKE_MESSAGES[refusal],
+    });
+    res.status(p.status).set(p.headers).send(p.html);
+  }
 
   const open = asyncHandler(async (req: Request, res: Response) => {
     // The token never leaves in a Referer (SR11), and nothing here is cached.
     res.set('Cache-Control', 'no-store').set('Referrer-Policy', 'no-referrer');
     const who = await viewer(req, res);
     if (!who) return;
-    const name = req.params.name;
-    const token = (req.params as { token?: string }).token ?? null;
-    const domain = deps.domain();
-    if (!domain || !deps.cookieSecret()) { page(res, 'off'); return; }
-    if (!PREVIEW_NAME_RE.test(name) || (token !== null && !LINK_TOKEN_RE.test(token))) { page(res, 'not_found'); return; }
-    const ctx = served(await deps.store.resolveName(name));
-    if (!ctx) return refuse(res, null, name, who, 'no_link', 'landing');
-    if (!deps.allowed(who.googleEmail)) return refuse(res, ctx, name, who, 'termag_access', 'landing');
-    const t = now();
-    const [facts, flags] = await Promise.all([deps.store.viewer(ctx.link, who.id, t), deps.flags(ctx.project.owner, ctx.project.instance)]);
-    const decision = decide(accessAudienceOf(ctx.link), ctx.link, { isProjectOwner: ctx.project.userId === who.id, ...facts }, token, flags, t);
-    if (!decision.ok) return refuse(res, ctx, name, who, decision.reason, 'landing');
-    // Asleep: wake from here is phase 3 (preview-links-wake-enabled, PR 6).
+    const a = await admitted(req, res, who);
+    if (!a) return;
+    const { ctx, decision, domain, name, t } = a;
+    // Asleep (U4): woken from here where the viewer may (row 6b).
     const status = ctx.project.instanceId ? await deps.boxStatus(ctx.project.instanceId) : null;
-    if (status && PARKED.has(status)) { page(res, 'asleep'); return; }
+    if (status && PARKED.has(status)) { await asleep(req, res, ctx, who, status); return; }
 
     const code = newSecret(deps.random);
     await deps.store.createCode({
@@ -165,5 +228,27 @@ export function previewLandingRouter(deps: PreviewLandingDeps): Router {
   });
   router.get('/:name', open);
   router.get('/:name/:token', open);
+
+  // "Wake it" (row 6b): the same access decision as opening, then the wake, then back to the landing,
+  // which shows the waking page until the box is up and then hands off as usual.
+  const wake = asyncHandler(async (req: Request, res: Response) => {
+    res.set('Cache-Control', 'no-store').set('Referrer-Policy', 'no-referrer');
+    const who = await viewer(req, res);
+    if (!who) return;
+    const a = await admitted(req, res, who);
+    if (!a) return;
+    if (!wakeCsrfOk(who.id, a.ctx.link.id, (req.body as { csrf?: unknown } | undefined)?.csrf)) {
+      res.status(403).set(pageHeaders()).send('<!doctype html><title>Refused</title><p>This page is out of date. Go back, reload it and try again.</p>');
+      return;
+    }
+    const result = await wakeLinkBox(wakeDeps, { link: a.ctx.link, project: a.ctx.project }, who);
+    audit({ step: 'landing', decision: result.ok ? 'grant' : 'deny', reason: result.ok ? 'woke' : `wake_${result.reason}`, viewer: who.googleEmail, linkId: a.ctx.link.id, name: a.name, boxId: a.ctx.project.instanceId });
+    if (result.ok) { res.redirect(303, landingPath(req)); return; }
+    const p = renderAsleep({ ownerName: a.ctx.project.owner.displayName || a.ctx.project.owner.googleEmail, wake: null, message: result.message });
+    res.status(p.status).set(p.headers).send(p.html);
+  });
+  const form = express.urlencoded({ extended: false, limit: '2kb' });
+  router.post('/:name', form, wake);
+  router.post('/:name/:token', form, wake);
   return router;
 }

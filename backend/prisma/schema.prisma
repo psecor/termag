@@ -43,14 +43,28 @@ model User {
   // onboarding-refresh-enabled.
   // NULL: not chosen, and each browser keeps its own.
   uiMode               String?
+  // When this person answered Lab's toast recommending termag's chat, by
+  // taking it or dismissing it, under chat-ui-nudge-enabled
+  // ; it isn't shown again. NULL: not answered.
+  chatNudgeDismissedAt DateTime?
+  // Where this person's New sessions run when they don't pick a box, under
+  // box-placement-enabled: reuse-first (one of their
+  // boxes) or fresh-first (New box). NULL: the org default, box-placement-policy.
+  boxPlacement         String?
   /// The IANA zone this person's termag clients last reported, so working
   /// time (work_time_entries) is banked by their local day, not the
   /// orchestrator's. NULL until a client reports one: the orchestrator's own.
   timeZone             String?
 
   projects             Project[]
+  /// What the person calls their projects: each a name and its repositories.
+  userProjects         UserProject[]
+  /// The images their projects' icons can be: read from their repositories, or uploaded.
+  projectIcons         ProjectIcon[]
   agentTokens          AgentToken[]
   sharedWithMe         ProjectShare[]        @relation("sharedWithMe")
+  /// The sessions pinned in their chat sidebar, on every client.
+  sessionPins          SessionPin[]
   previewAudiencesOwned PreviewAudience[]    @relation("previewAudiencesOwned")
   previewAudienceGrants PreviewAudienceGrantee[]
   previewAudienceViews PreviewAudienceViewer[]
@@ -108,8 +122,20 @@ model User {
   // of this person's boxes on its own (services/boxIdleNotices.ts). On until
   // they turn it off, here or with the DM's "Stop these messages".
   boxIdleNotify        Boolean               @default(true)
+  /// Their My files: one space,
+  /// made the first time it's needed, or one they chose. Null until then, and
+  /// set null with the space. Not @unique: a unique index on an existing table
+  /// is a change the boot-time additive db:push refuses, so services/projectFiles.ts
+  /// keeps one space to one role (a project's files or someone's My files) under a lock.
+  myFilesSpaceId       String?
+  myFilesSpace         Space?                @relation("myFiles", fields: [myFilesSpaceId], references: [id], onDelete: SetNull)
+  /// Settings > My files, "Put My files on my boxes": while on, My files is
+  /// granted to every box they own whose agent can address it. Off removes
+  /// those grants and keeps the files. On until they turn it off.
+  myFilesOnBoxes       Boolean               @default(true)
   pushSubscriptions    PushSubscription[]
 
+  @@index([myFilesSpaceId])
   @@map("users")
 }
 
@@ -427,6 +453,11 @@ model Project {
   instanceId String?
   instance   Instance? @relation(fields: [instanceId], references: [id], onDelete: SetNull)
 
+  /// The user-level project this checkout belongs to.
+  /// Null for MetaTerm, automations, space orchestrators and checkouts the backfill hasn't reached.
+  userProjectId String?
+  userProject   UserProject? @relation(fields: [userProjectId], references: [id], onDelete: SetNull)
+
   repoUrl           String?
   repoDefaultBranch String?
   // none | pending | cloning | ready | failed (services/projectSetup.ts). Only
@@ -510,6 +541,7 @@ model Project {
   @@unique([userId, instanceId, name])
   @@index([userId, archived])
   @@index([instanceId])
+  @@index([userProjectId])
   @@map("projects")
 }
 
@@ -666,6 +698,8 @@ model Workstream {
   askThread      AgentThread?   @relation("AskChat")
   previewAudiences PreviewAudience[]
   previewShares  PreviewShare[]
+  /// Who pinned this session in their sidebar; deleted with it.
+  sessionPins    SessionPin[]
   chatTranscripts ChatTranscript[]
   chatResumes     ChatResume[]
   chatHeldMessages ChatHeldMessage[]
@@ -697,6 +731,103 @@ model ProjectRepo {
   @@unique([projectId, name])
   @@index([projectId])
   @@map("project_repos")
+}
+
+/// What people call a project: a name and
+/// its repositories, with a checkout on each box it runs on (Project.userProjectId).
+/// The pure rules (repo sets, names, grouping, the lookup) are services/userProjects.ts.
+model UserProject {
+  id                String            @id @default(cuid())
+  userId            String
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Its name in the UI, 1–60 characters, trimmed.
+  name              String
+  /// The name lowercased: unique per user, archived projects included.
+  nameKey           String
+  /// The project's repo set: each repository's owner/name, lowercased, sorted,
+  /// joined by ","; "" for none. Kept in step with `repos`. A checkout clones
+  /// this set when it's made; its own set can drift after (a repository added
+  /// to the project or to the checkout). How the backfill and a checkout made
+  /// without a userProjectId find the project.
+  repoSetKey        String
+  /// The sets this project had before a repository was added to it (never ""),
+  /// so a checkout of an old set still finds it.
+  formerRepoSetKeys String[]          @default([])
+  /// Its Project files (milestone 8). Null until then.
+  filesSpaceId      String?           @unique
+  filesSpace        Space?            @relation(fields: [filesSpaceId], references: [id], onDelete: SetNull)
+  /// How it was made: "backfill", "checkout" (a checkout made without one) or
+  /// "person" (+ New project, milestone 6).
+  origin            String            @default("checkout")
+  /// Its icon: null is automatic, each
+  /// repository's detected icon else its letter; "letter" is the letter tiles
+  /// whatever was detected; "image" is `iconId`'s image (automatic once that's gone).
+  iconChoice        String?
+  /// The image it shows when `iconChoice` is "image": a detected one or an upload.
+  iconId            String?
+  icon              ProjectIcon?      @relation(fields: [iconId], references: [id], onDelete: SetNull)
+  archivedAt        DateTime?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  repos             UserProjectRepo[]
+  checkouts         Project[]
+
+  @@unique([userId, nameKey])
+  @@index([userId, repoSetKey])
+  @@map("user_projects")
+}
+
+/// One repository of a UserProject. A new checkout clones every one of them.
+model UserProjectRepo {
+  id            String      @id @default(cuid())
+  userProjectId String
+  userProject   UserProject @relation(fields: [userProjectId], references: [id], onDelete: Cascade)
+  /// owner/name, lowercased (services/projectTemplates.ts repoKey).
+  repoKey       String
+  /// The clone URL, as the checkout that brought it had it.
+  url           String
+  defaultBranch String?
+  position      Int         @default(0)
+  /// Its detected icon (the best of the repository's candidates), drawn when the
+  /// project's icon is automatic; null: none found, or not looked yet.
+  iconId        String?
+  icon          ProjectIcon? @relation(fields: [iconId], references: [id], onDelete: SetNull)
+  /// When the repository was last read for icons; null: never. Read again after a week.
+  iconsCheckedAt DateTime?
+  createdAt     DateTime    @default(now())
+
+  @@unique([userProjectId, repoKey])
+  @@index([userProjectId])
+  @@map("user_project_repos")
+}
+
+/// An image a person's project icon can be:
+/// a favicon or app icon read from one of their repositories, or one they
+/// uploaded. The orchestrator's own copy, served only to its owner
+/// (GET /api/user-projects/icons/:id), never hot-linked from GitHub.
+model ProjectIcon {
+  id        String            @id @default(cuid())
+  userId    String
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// The repository it was read from (owner/name, lowercased, as
+  /// UserProjectRepo.repoKey); "" for an upload.
+  repoKey   String            @default("")
+  /// The path in that repository it was read from; null for an upload.
+  path      String?
+  /// sha256 of `data`, hex: an image is one row per repository (or upload) per person.
+  sha256    String
+  /// Sniffed from its bytes, never taken from a name or a header: image/svg+xml
+  /// (checked against an allowlist), image/png, image/x-icon, image/gif,
+  /// image/jpeg or image/webp.
+  mimeType  String
+  /// The image, at most 32 KiB (services/projectIcons.ts ICON_MAX_BYTES).
+  data      Bytes
+  createdAt DateTime          @default(now())
+  projects  UserProject[]
+  repos     UserProjectRepo[]
+
+  @@unique([userId, repoKey, sha256])
+  @@map("project_icons")
 }
 
 model Workflow {
@@ -1048,10 +1179,15 @@ model Instance {
   updatePushedAt    DateTime?
 
   securityGroupId       String? // per-box egress-only SG (also gets an ALB ingress rule)
-  iamRoleName            String? // per-box role (== instance-profile name)
+  iamRoleName            String? // the box's role: its own (== instance-profile name), or the shared one
   // The instance profile, recorded once it exists. The role is created first,
   // so iamRoleName alone cannot tell teardown whether the profile came after.
   iamInstanceProfileName String?
+  // The box launched with the shared role and instance profile
+  // (BOX_SHARED_ROLE_NAME, BOX_INSTANCE_PROFILE_NAME; services/boxSharedRole.ts):
+  // iamRoleName and iamInstanceProfileName then hold the shared names, and
+  // teardown never deletes them. False: the box has a role of its own.
+  iamRoleShared          Boolean @default(false)
 
   // Logical status — set by the backend's box-CRUD path. The EC2 instance
   // has its own state ("running", "stopped", etc.) that we query on demand
@@ -1090,7 +1226,9 @@ model Instance {
   //   env-stopping   — `setup` succeeded; StopInstances sent
   //   env-stopped    — stopped, prepared, claimable
   //   env-starting   — taken by a claim; StartInstances sent, waiting for the agent
-  //   env-failed     — the clone or `setup` failed; kept for its log, then terminated
+  // A failed prepare or refresh is `terminated` at once, keeping its
+  // provisioningError, poolLog, poolSetupHash and preparedCommit: it holds its
+  // pool at that hash and heads for ENV_POOL_RETRY_MS (services/envPool.ts).
   status            String    @default("provisioning")
   provisioningError String? // populated when status flips to failed
   createdAt         DateTime  @default(now())
@@ -1129,8 +1267,8 @@ model Instance {
   // type, cloud-init shape) and the size and disk. preparedCommit is
   // {"owner/name": sha} for each repository as `setup` last succeeded on it,
   // poolRepos the repositories resolved at launch ([{repo, branch, dir}]),
-  // which the broker's pool rule reads instead of GitHub. poolLog is the last
-  // prepare failure's log tail (env-failed), shown on the environment's page.
+  // which the broker's pool rule reads instead of GitHub. poolLog is a failed
+  // prepare's log tail (on its terminated row), shown on the environment's page.
   poolSetupHash         String?
   preparedCommit        Json?
   preparedAt            DateTime?
@@ -1143,8 +1281,11 @@ model Instance {
   // the row, so a stopped box is checked once each ENV_POOL_REFRESH_MINUTES.
   refreshStartedAt      DateTime?
   refreshCheckedAt      DateTime?
-  // An env-failed row whose setup ran and failed, which holds the pool at its hash and heads; any other failure
-  // (its launch, the image, a clone, a timeout) only delays the next launch for the same hash and heads.
+  // Unused since the one-failure rule (#1464); nothing reads or writes it. It stays
+  // declared because every row holds a value, so dropping it here makes boot-time
+  // `db:push` (DB_PUSH_MODE=additive) refuse the whole push, and every additive
+  // change after it is never applied. Drop it as its own reviewed step
+  // (decision 4), then remove it here.
   poolSetupFailed       Boolean   @default(false)
   // Where EC2 put the box: a stopped box can't change zone, so a claim refused
   // for capacity in one takes a pool box in another. Recorded for every launch.
@@ -1159,6 +1300,7 @@ model Instance {
   agentDisconnectedAt   DateTime?
   onWarmStatus          String? // pending | running | succeeded | failed
   onWarmLog             String? // last 4 KB of the on-warm runner's log, for the failure case
+  onWarmSeconds         Int? // an environment pool box's on-warm run: its scripts' total time (services/envPool.ts)
   onClaimStatus         String? // pending | running | succeeded | failed | skipped
   onClaimError          String? // one line, shown in a UI badge tooltip
   // A claim's update to the orchestrator's commit before its first launch
@@ -2203,6 +2345,25 @@ model PrGroupSuggestionDismissal {
 }
 
 /// A shared file store across boxes. The files live in S3
+/// A session a person pinned in the chat sidebar: it
+/// sits in Pinned on every browser, the phone and the desktop app. Keyed by the
+/// workstream, whose id survives a project or session rename, and deleted with
+/// it (or its project, or the person). An archived session keeps its pin, so
+/// an archive's Undo or a reopen brings it back pinned; the list leaves it out
+/// while it is archived, or while the person can no longer see it.
+model SessionPin {
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workstreamId String
+  workstream   Workstream @relation(fields: [workstreamId], references: [id], onDelete: Cascade)
+  /// When it was pinned: the Pinned section's order, oldest first.
+  createdAt    DateTime   @default(now())
+
+  @@id([userId, workstreamId])
+  @@index([workstreamId])
+  @@map("session_pins")
+}
+
 /// under `<id>/`; this row is the name, the quota and the lifecycle.
 model Space {
   id          String           @id @default(cuid())
@@ -2231,6 +2392,10 @@ model Space {
   workstreams Workstream[]
   /// Slack for the space: its linked channels and orchestrator.
   slack       SpaceSlack?
+  /// The project whose Project files this space is (UserProject.filesSpaceId, milestone 8).
+  userProject UserProject?
+  /// The person whose My files this space is (User.myFilesSpaceId, milestone 8): one at most.
+  myFilesOf   User[]           @relation("myFiles")
 
   @@map("spaces")
 }
@@ -2374,6 +2539,9 @@ model SpaceEvent {
   onBehalfOfUserId String?
 
   @@index([spaceId, at])
+  /// lastPutAt / lastWrite (spaceStorePrisma.ts): a path's newest put, filtered by action. Without it the planner walks the
+  /// space's whole history. Also built by hand in production (2026-11-13 hotfix) under this name; `db:push` drops indexes it does not know.
+  @@index([spaceId, path, action, at])
   @@map("space_events")
 }
 
@@ -2930,6 +3098,29 @@ model Automation {
   mirrorGrantBoxId    String?
   /// Post each finished run's report to the project's Slack channel (services/automations/report.ts).
   notifySlack         Boolean   @default(false)
+  /// Keyword alert (services/automations/alerts.ts): a finished run whose STATUS summary starts with alertPrefix,
+  /// or matches alertRegex (`source` or `/source/flags`, checked on save), pings alertTarget. Null = off.
+  alertPrefix         String?
+  alertRegex          String?
+  /// Where keyword and health alerts go: `dm` (the owner's Slack DM), `project` (the project's Slack channel),
+  /// or a Slack channel id (C…/G…).
+  alertTarget         String    @default("dm")
+  /// Health alerts: every pause the scheduler makes (its cause named) and the first box_unavailable skip of a streak go to alertTarget.
+  healthAlerts        Boolean   @default(true)
+  /// The outbound webhook's host, for display; null = no webhook. Its URL and signing secret are sealed in the
+  /// owner's credential store as `awh-<id>` (services/automations/webhook.ts), never here.
+  webhookHost         String?
+  /// Replaced by lastSlackError / lastWebhookError below (one per channel): written only by orchestrators before
+  /// them, and read only alongside them (store.ts alertErrorsView: the newer per channel). Drop in a later release (expand, then contract).
+  lastAlertError      String?
+  lastAlertErrorAt    DateTime?
+  /// Each channel's last failed alert send (`not_in_channel`, `answered 503`) and when; cleared only by the next send
+  /// on the same channel that goes, which keeps its own time in the At column so an older failure can't return
+  /// (notices.ts noteSend: conditional on the send's finish time). Written without touching updatedAt.
+  lastSlackError      String?
+  lastSlackErrorAt    DateTime?
+  lastWebhookError    String?
+  lastWebhookErrorAt  DateTime?
   /// Why the scheduler stopped starting runs; null = fine. Cleared by a PATCH.
   pausedReason        String?
   consecutiveFailures Int       @default(0)
@@ -2943,11 +3134,41 @@ model Automation {
   lastOccurrence      DateTime?
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
+  notices             AutomationNotice[]
   runs                AutomationRun[]
 
   @@index([userId])
   @@index([enabled, nextRunAt])
   @@map("automations")
+}
+
+/// One alert or webhook delivery for an automation (services/automations/notices.ts): an outbox row,
+/// written when the event happens and delivered right away and again by the scheduler's sweep with
+/// backoff until it goes or runs out of attempts. A failed delivery never touches the run.
+model AutomationNotice {
+  id            String     @id @default(cuid())
+  automationId  String
+  automation    Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  runId         String?
+  /// slack | webhook
+  channel       String
+  /// keyword | health | run.done | run.failed | automation.paused
+  kind          String
+  /// One notice per event: `<run>:keyword`, `<run>:webhook:run.done`, `<automation>:paused:<iso>`.
+  dedupeKey     String     @unique
+  /// slack: `{ target, text }`; webhook: the JSON body that is signed and sent.
+  payload       Json
+  attempts      Int        @default(0)
+  nextAttemptAt DateTime   @default(now())
+  deliveredAt   DateTime?
+  /// Gave up after the last attempt, or nowhere to send it (no Slack user, no channel, the webhook removed).
+  failedAt      DateTime?
+  lastError     String?
+  createdAt     DateTime   @default(now())
+
+  @@index([deliveredAt, failedAt, nextAttemptAt])
+  @@index([automationId, createdAt])
+  @@map("automation_notices")
 }
 
 /// One occurrence of an automation: a run (its workstream and chat turn), or
@@ -3358,7 +3579,8 @@ model PreviewLinkRequest {
   port         Int
   /// What the agent said the port is, shown as untrusted text (≤ 200 chars).
   note         String?
-  /// pending | approved | declined | expired
+  /// pending | approved | declined | expired | withdrawn (the owner was never told: an ask that failed, taken
+  /// back so a retry asks afresh; not counted toward a box's hourly limit)
   state        String    @default("pending")
   createdAt    DateTime  @default(now())
   decidedAt    DateTime?
@@ -3522,4 +3744,64 @@ model BugReportEvent {
 
   @@index([reportId, createdAt])
   @@map("bug_report_events")
+}
+
+/// Feedback about termag itself that a person gave in a chat, logged by their
+/// agent with `termag feedback`. Reporter and context as on
+/// a BugReport (services/cliReporter.ts); what was sent is never edited. Only
+/// status, seenAt and seenById change, from /admin/feedback. No foreign keys
+/// on the reporter or the box: feedback outlives both.
+model Feedback {
+  id                   String    @id @default(cuid())
+  /// The caller: a box credential's owner, or the signed-in person.
+  reporterUserId       String
+  /// `box` (the box's own credential) or `device` (a `termag login`).
+  credential           String
+  boxId                String?
+  projectId            String?
+  workstream           String?
+  threadId             String?
+  agentProvider        String?
+  agentModel           String?
+  agentVersion         String?
+  cliVersion           String?
+  boxAgentCommit       String?
+  boxAgentCapabilities String[]  @default([])
+  /// What the person said, plain text or Markdown.
+  body                 String
+  /// praise | problem | idea | other
+  kind                 String    @default("other")
+  /// The kinds of secret-shaped strings replaced before storing (secretPatterns.ts).
+  redacted             String[]  @default([])
+  /// new | seen
+  status               String    @default("new")
+  seenAt               DateTime?
+  seenById             String?
+  createdAt            DateTime  @default(now())
+
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@index([boxId, createdAt])
+  @@index([reporterUserId, createdAt])
+  @@map("feedback")
+}
+
+// The quarantine deny list on the shared box role (services/boxSharedRole.ts):
+// one row per quarantined instance whose sessions termag-quarantine-deny-instances
+// denies. This table is the list; every write puts the whole of it on the role,
+// so a stale IAM read never drops an entry. releaseAfter is set once EC2 reports
+// the instance terminated, to that time plus the retention, past the life of any
+// credential the instance was issued; the provisioning sweep removes the entry
+// after it. Null: held.
+model SharedRoleDeny {
+  roleName      String
+  ec2InstanceId String
+  // The box quarantined; kept as text so the entry outlives the row.
+  boxId         String
+  createdAt     DateTime  @default(now())
+  releaseAfter  DateTime?
+
+  @@id([roleName, ec2InstanceId])
+  @@index([releaseAfter])
+  @@map("shared_role_denies")
 }

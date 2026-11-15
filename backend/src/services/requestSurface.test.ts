@@ -67,6 +67,8 @@ describe('surfaceMiddleware', () => {
     expect(await get({ 'User-Agent': 'termag-cli/1.4.0' })).toEqual({ surface: 'cli', context: 'cli' });
     expect(await get({ 'User-Agent': 'termag-tui/1.4.0' })).toEqual({ surface: 'tui', context: 'tui' });
     expect(await get({ 'User-Agent': 'metaterm/0.9.1' })).toEqual({ surface: 'metaterm', context: 'metaterm' });
+    expect(await get({ 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) termagBeta/0.1.252 Chrome/152.0.0.0 Electron/44.0.0 Safari/537.36' }))
+      .toEqual({ surface: 'desktop', context: 'desktop' });
   });
 
   it('leaves an unrecognised client without a surface, not with one inherited from elsewhere', async () => {

@@ -62,9 +62,20 @@ export type Fetch = typeof fetch;
 
 const verified = new Map<string, { roleArn: string; at: number }>();
 
+// STS answers these when it, not the proof, is the problem: a retry may pass.
+const TRANSIENT_STS_CODES = new Set([
+  'Throttling', 'ThrottlingException', 'RequestLimitExceeded', 'TooManyRequestsException',
+  'ServiceUnavailable', 'InternalFailure', 'InternalError', 'RequestTimeout',
+]);
+
+/** STS couldn't check the proof just now (throttled or failing); the caller should answer a retryable 503, not a refusal. */
+export class StsUnavailableError extends Error {}
+
 /**
  * The caller's role ARN if STS accepts the proof and the role is allowed, else
- * null. Never throws for a bad proof; network errors propagate.
+ * null. Never throws for a bad proof. Network errors propagate, and so does
+ * STS throttling or a 5xx (StsUnavailableError): those say nothing about the
+ * proof, and a 403 for them reads as a final refusal to the box's agent.
  */
 export async function verifyCallerProof(
   incoming: Headers,
@@ -83,8 +94,17 @@ export async function verifyCallerProof(
     headers: { ...headers, 'content-type': headers['content-type'] ?? CONTENT_TYPE },
     body: GET_CALLER_IDENTITY_BODY,
   });
-  if (!res.ok) return null;
-  const arn = /<Arn>([^<]+)<\/Arn>/.exec(await res.text())?.[1];
+  const text = await res.text();
+  if (!res.ok) {
+    const code = /<Code>([^<]+)<\/Code>/.exec(text)?.[1] ?? '-';
+    if (res.status >= 500 || res.status === 429 || TRANSIENT_STS_CODES.has(code)) {
+      throw new StsUnavailableError(`STS ${res.status} ${code}`);
+    }
+    // Only the status and STS's error code: never the proof's headers.
+    console.log(`[caller-proof] STS refused the proof: ${res.status} ${code}`);
+    return null;
+  }
+  const arn = /<Arn>([^<]+)<\/Arn>/.exec(text)?.[1];
   if (!arn) return null;
   const roleArn = roleArnOf(arn);
   if (!cfg.allowedRoleArns.includes(roleArn)) return null;

@@ -3,6 +3,38 @@ import type { Instance } from '@prisma/client';
 
 // ── An in-memory Instance table with the Prisma semantics the provisioner uses ──
 
+/** An in-memory `shared_role_denies` table, with the Prisma calls boxSharedRole makes. */
+const sharedRoleDenyTable = vi.hoisted(() => function sharedRoleDenyTable() {
+  const rows: Array<Record<string, any>> = [];
+  const hit = (r: Record<string, any>, where: Record<string, any>) => Object.entries(where).every(([k, v]) => {
+    if (v && typeof v === 'object' && !(v instanceof Date)) {
+      if ('in' in v) return v.in.includes(r[k]);
+      if ('lte' in v) return r[k] != null && r[k] <= v.lte;
+    }
+    return (r[k] ?? null) === v;
+  });
+  const delegate = {
+    findMany: async ({ where }: any) => rows.filter(r => hit(r, where)).map(r => ({ ...r })),
+    upsert: async ({ where: { roleName_ec2InstanceId: key }, create, update }: any) => {
+      const row = rows.find(r => r.roleName === key.roleName && r.ec2InstanceId === key.ec2InstanceId);
+      if (row) Object.assign(row, update); else rows.push({ releaseAfter: null, ...create });
+      return {};
+    },
+    updateMany: async ({ where, data }: any) => {
+      const hits = rows.filter(r => hit(r, where));
+      for (const r of hits) Object.assign(r, data);
+      return { count: hits.length };
+    },
+    deleteMany: async ({ where }: any) => {
+      const gone = rows.filter(r => hit(r, where));
+      for (const r of gone) rows.splice(rows.indexOf(r), 1);
+      return { count: gone.length };
+    },
+  };
+  return { rows, delegate };
+});
+const denies = vi.hoisted(() => ({ table: null as null | { rows: Array<Record<string, any>>; delegate: any } }));
+
 const rows = new Map<string, Record<string, any>>();
 /** Makes prisma.instance.update throw for the data it matches. */
 let failUpdate: ((data: Record<string, any>) => boolean) | null = null;
@@ -47,6 +79,9 @@ vi.mock('../db', () => ({
       findMany: async ({ where, take }: any) =>
         [...rows.values()].filter(r => matches(r, where)).sort(byAttemptThenCreated).slice(0, take).map(r => ({ ...r })),
     },
+    // The shared role's deny list (boxSharedRole.withSharedRoleLock) and its table.
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({ $executeRaw: async () => 0, sharedRoleDeny: denies.table!.delegate }),
+    get sharedRoleDeny() { return denies.table!.delegate; },
   },
 }));
 vi.mock('./sshKeySync', () => ({ ownerAuthorizedKeyLines: async () => [] }));
@@ -64,6 +99,8 @@ const aws = {
   before: new Map<string, () => unknown>(), // command name -> runs (and is awaited) once, before it is handled
   refuseRun: null as ((input: any) => string | null) | null, // RunInstances input -> error name it throws
   runs: [] as { type: string; subnet: string }[],
+  launchedProfiles: [] as (string | undefined)[], // IamInstanceProfile.Name of each RunInstances
+  policyDocs: new Map<string, string>(), // `<role>/<policy>` -> inline policy document
   named: new Map<string, string>(), // Name tag -> a live instance RunInstances made without termag hearing back
   sent: [] as string[],
   seq: 0,
@@ -92,6 +129,7 @@ vi.mock('@aws-sdk/client-ec2', () => {
         case 'CreateSecurityGroup': { const id = `sg-${++aws.seq}`; aws.sgs.add(id); return { GroupId: id }; }
         case 'RunInstances': {
           aws.runs.push({ type: i.InstanceType, subnet: i.SubnetId });
+          aws.launchedProfiles.push(i.IamInstanceProfile?.Name);
           const refused = aws.refuseRun?.(i);
           if (refused) throw awsError(refused);
           const id = `i-${++aws.seq}`; aws.instances.set(id, 'running'); return { Instances: [{ InstanceId: id }] }; }
@@ -121,7 +159,7 @@ vi.mock('@aws-sdk/client-ec2', () => {
 });
 
 vi.mock('@aws-sdk/client-iam', () => {
-  const names = ['CreateRole', 'AttachRolePolicy', 'DetachRolePolicy', 'PutRolePolicy', 'DeleteRolePolicy', 'ListRolePolicies',
+  const names = ['CreateRole', 'AttachRolePolicy', 'DetachRolePolicy', 'PutRolePolicy', 'GetRolePolicy', 'DeleteRolePolicy', 'ListRolePolicies',
     'CreateInstanceProfile', 'AddRoleToInstanceProfile', 'RemoveRoleFromInstanceProfile', 'DeleteInstanceProfile', 'DeleteRole'];
   const mod: Record<string, unknown> = Object.fromEntries(names.map(n => [`${n}Command`, command(n)]));
   mod.IAMClient = class {
@@ -146,8 +184,12 @@ vi.mock('@aws-sdk/client-iam', () => {
         case 'CreateRole': aws.roles.set(i.RoleName, { inline: new Set(), attached: new Set() }); return {};
         case 'AttachRolePolicy': role().attached.add(i.PolicyArn); return {};
         case 'DetachRolePolicy': if (!role().attached.delete(i.PolicyArn)) throw awsError('NoSuchEntityException'); return {};
-        case 'PutRolePolicy': role().inline.add(i.PolicyName); return {};
-        case 'DeleteRolePolicy': if (!role().inline.delete(i.PolicyName)) throw awsError('NoSuchEntityException'); return {};
+        case 'PutRolePolicy': role().inline.add(i.PolicyName); aws.policyDocs.set(`${i.RoleName}/${i.PolicyName}`, i.PolicyDocument); return {};
+        case 'GetRolePolicy': {
+          if (!role().inline.has(i.PolicyName)) throw awsError('NoSuchEntityException');
+          return { PolicyDocument: encodeURIComponent(aws.policyDocs.get(`${i.RoleName}/${i.PolicyName}`) ?? '{}') };
+        }
+        case 'DeleteRolePolicy': if (!role().inline.delete(i.PolicyName)) throw awsError('NoSuchEntityException'); aws.policyDocs.delete(`${i.RoleName}/${i.PolicyName}`); return {};
         case 'ListRolePolicies': return { PolicyNames: [...role().inline], IsTruncated: false };
         case 'CreateInstanceProfile': aws.profiles.set(i.InstanceProfileName, new Set()); return {};
         case 'AddRoleToInstanceProfile': role(); profile().add(i.RoleName); return {};
@@ -167,7 +209,9 @@ vi.mock('@aws-sdk/client-iam', () => {
   return mod;
 });
 
-const { terminateBox, sweepUncleanedTeardowns, sweepFailedLaunches, provisionPoolBox, resetSubnetRotationForTests } = await import('./boxProvisioner');
+const { terminateBox, sweepUncleanedTeardowns, sweepFailedLaunches, sweepExpiredSharedRoleDenies, provisionPoolBox, resetSubnetRotationForTests } = await import('./boxProvisioner');
+const { denySharedRoleInstance, sweepSharedRoleDenies } = await import('./boxSharedRole');
+const { IAMClient } = await import('@aws-sdk/client-iam');
 
 const PREFIX = 'termag-e2e-box';
 const ENV = {
@@ -216,7 +260,8 @@ beforeEach(() => {
   rows.clear();
   failUpdate = null;
   aws.instances.clear(); aws.sgs.clear(); aws.roles.clear(); aws.profiles.clear(); aws.fail.clear(); aws.before.clear();
-  aws.refuseRun = null; aws.runs = []; aws.named.clear();
+  denies.table = sharedRoleDenyTable();
+  aws.refuseRun = null; aws.runs = []; aws.launchedProfiles = []; aws.named.clear(); aws.policyDocs.clear();
   aws.sent = []; aws.seq = 0;
   resumed.length = 0;
   for (const k of Object.keys(process.env)) if (k.startsWith('BOX_') || k === 'HOST_SECURITY_GROUP_ID') delete process.env[k];
@@ -648,5 +693,144 @@ describe('launchBox falls back on capacity refusals', () => {
     expect(await pool('a')).toBe(false);
     expect(aws.runs).toHaveLength(6);
     expect(rows.get('a')).toMatchObject({ status: 'failed', provisioningError: 'InsufficientInstanceCapacity' });
+  });
+});
+
+describe('the shared box role (BOX_SHARED_ROLE_NAME, BOX_INSTANCE_PROFILE_NAME)', () => {
+  const SHARED_ROLE = 'termag-termag-box-instance';
+  const SHARED_PROFILE = 'termag-termag-box-instance';
+  const DENY = 'termag-quarantine-deny-instances';
+  /** The shared role and profile, as terraform makes them, and the config that names them. */
+  const shareRole = () => {
+    process.env.BOX_SHARED_ROLE_NAME = SHARED_ROLE;
+    process.env.BOX_INSTANCE_PROFILE_NAME = SHARED_PROFILE;
+    aws.roles.set(SHARED_ROLE, { inline: new Set(), attached: new Set([SSM]) });
+    aws.profiles.set(SHARED_PROFILE, new Set([SHARED_ROLE]));
+  };
+  const sharedIntact = () => {
+    expect(aws.roles.get(SHARED_ROLE)?.attached.has(SSM)).toBe(true);
+    expect(aws.profiles.get(SHARED_PROFILE)?.has(SHARED_ROLE)).toBe(true);
+  };
+  const pool = (id: string) => provisionPoolBox({
+    instance: seed(id, { status: 'warming', userId: null, terminatedAt: null, region: null }) as Instance,
+    token: 'tmag_test',
+    poolSpecHash: 'hash',
+  });
+  /** A terminated box launched on the shared role, its instance and SG still up. */
+  const sharedBox = (id: string, ec2InstanceId: string, extra: Record<string, any> = {}) => {
+    aws.instances.set(ec2InstanceId, 'running');
+    aws.sgs.add(`sg-${id}`);
+    return seed(id, { ec2InstanceId, securityGroupId: `sg-${id}`, iamRoleShared: true, iamRoleName: SHARED_ROLE, iamInstanceProfileName: SHARED_PROFILE, ...extra });
+  };
+  const denied = () => {
+    const doc = aws.policyDocs.get(`${SHARED_ROLE}/${DENY}`);
+    return doc ? JSON.parse(doc).Statement[0].Condition.StringLike['aws:userid'] : [];
+  };
+
+  it('launches with the shared instance profile and creates no role or profile', async () => {
+    shareRole();
+    expect(await pool('a')).toBe(true);
+    expect(aws.launchedProfiles).toEqual([SHARED_PROFILE]);
+    expect(aws.sent.filter(n => ['CreateRole', 'AttachRolePolicy', 'PutRolePolicy', 'CreateInstanceProfile', 'AddRoleToInstanceProfile'].includes(n))).toEqual([]);
+    expect(rows.get('a')).toMatchObject({ iamRoleShared: true, iamRoleName: SHARED_ROLE, iamInstanceProfileName: SHARED_PROFILE, ec2InstanceId: 'i-2' });
+    expect(aws.roles.size).toBe(1);
+    expect(aws.profiles.size).toBe(1);
+  });
+
+  it('keeps making a role of its own per box when only one of the two names is set', async () => {
+    process.env.BOX_SHARED_ROLE_NAME = SHARED_ROLE;
+    expect(await pool('a')).toBe(true);
+    expect(aws.launchedProfiles).toEqual([`${PREFIX}-a`]);
+    expect(rows.get('a')!.iamRoleShared).toBeUndefined();
+    expect(aws.roles.has(`${PREFIX}-a`)).toBe(true);
+  });
+
+  it('never deletes the shared role or profile when a box on it is torn down', async () => {
+    shareRole();
+    const box = sharedBox('a', 'i-0aaaaaaaaaaaaaaa1');
+    expect(await terminateBox(box)).toBe(true);
+    sharedIntact();
+    expect(aws.sgs.size).toBe(0);
+    expect(aws.instances.get('i-0aaaaaaaaaaaaaaa1')).toBe('terminated');
+    expect(aws.sent.filter(n => ['RemoveRoleFromInstanceProfile', 'DeleteInstanceProfile', 'DetachRolePolicy', 'DeleteRolePolicy', 'DeleteRole'].includes(n))).toEqual([]);
+    expect(rows.get('a')!.cleanedUpAt).toBeInstanceOf(Date);
+  });
+
+  it('spares the shared role even if the box is torn down with the shared config gone', async () => {
+    shareRole();
+    delete process.env.BOX_SHARED_ROLE_NAME;
+    delete process.env.BOX_INSTANCE_PROFILE_NAME;
+    expect(await terminateBox(sharedBox('a', 'i-0aaaaaaaaaaaaaaa1'))).toBe(true);
+    sharedIntact();
+  });
+
+  it('spares a role under the shared names even on a row that lost its mark', async () => {
+    shareRole();
+    expect(await terminateBox(sharedBox('a', 'i-0aaaaaaaaaaaaaaa1', { iamRoleShared: false }))).toBe(true);
+    sharedIntact();
+  });
+
+  it('still deletes the own role of a box launched before the shared role was configured', async () => {
+    const old = liveBox('old');
+    shareRole();
+    expect(await terminateBox(old)).toBe(true);
+    expect(aws.roles.has(`${PREFIX}-old`)).toBe(false);
+    expect(aws.profiles.has(`${PREFIX}-old`)).toBe(false);
+    sharedIntact();
+  });
+
+  it('releases a failed launch on the shared role without touching the role', async () => {
+    shareRole();
+    aws.fail.set('RunInstances', 'VcpuLimitExceeded');
+    await provisionPoolBox({
+      instance: seed('a', { status: 'warming', userId: null, terminatedAt: null, region: null, createdAt: minutesAgo(120) }) as Instance,
+      token: 'tmag_test',
+      poolSpecHash: 'hash',
+    });
+    aws.fail.clear();
+    expect(rows.get('a')).toMatchObject({ status: 'failed', iamRoleShared: true, ec2InstanceId: null });
+    expect(await sweepFailedLaunches(NOW)).toBe(1);
+    expect(aws.sgs.size).toBe(0);
+    sharedIntact();
+  });
+
+  it("keeps a quarantined box's deny for the retention after its instance is gone, then the sweep drops only that entry", async () => {
+    shareRole();
+    // Two quarantined boxes on the shared role, denied the way the quarantine does it.
+    await denySharedRoleInstance(new IAMClient({}), SHARED_ROLE, 'i-0aaaaaaaaaaaaaaa1');
+    await denySharedRoleInstance(new IAMClient({}), SHARED_ROLE, 'i-0bbbbbbbbbbbbbbb2');
+    const box = sharedBox('a', 'i-0aaaaaaaaaaaaaaa1', { quarantinedAt: minutesAgo(90) });
+    expect(await terminateBox(box)).toBe(true);
+    // Credentials copied off the box before the deny landed stay refused after the terminate.
+    expect(denied()).toEqual(['*:i-0aaaaaaaaaaaaaaa1', '*:i-0bbbbbbbbbbbbbbb2']);
+
+    const terminated = denies.table!.rows.find(r => r.ec2InstanceId === 'i-0aaaaaaaaaaaaaaa1')!.releaseAfter as Date;
+    expect(await sweepSharedRoleDenies(new IAMClient({}), SHARED_ROLE, new Date(terminated.getTime() - 1))).toBe(0);
+    expect(denied()).toEqual(['*:i-0aaaaaaaaaaaaaaa1', '*:i-0bbbbbbbbbbbbbbb2']);
+    expect(await sweepSharedRoleDenies(new IAMClient({}), SHARED_ROLE, terminated)).toBe(1);
+    expect(denied()).toEqual(['*:i-0bbbbbbbbbbbbbbb2']);
+    sharedIntact();
+  });
+
+  it('the provisioning sweep takes off only entries past their retention', async () => {
+    shareRole();
+    await denySharedRoleInstance(new IAMClient({}), SHARED_ROLE, 'i-0aaaaaaaaaaaaaaa1');
+    await denySharedRoleInstance(new IAMClient({}), SHARED_ROLE, 'i-0bbbbbbbbbbbbbbb2');
+    expect(await terminateBox(sharedBox('a', 'i-0aaaaaaaaaaaaaaa1', { quarantinedAt: minutesAgo(90) }))).toBe(true);
+    expect(await sweepExpiredSharedRoleDenies(new Date())).toBe(0);
+    expect(await sweepExpiredSharedRoleDenies(new Date(Date.now() + 25 * 60 * 60_000))).toBe(1);
+    expect(denied()).toEqual(['*:i-0bbbbbbbbbbbbbbb2']);
+  });
+
+  it('keeps the deny entry while the instance is not yet terminated, and retries', async () => {
+    shareRole();
+    await denySharedRoleInstance(new IAMClient({}), SHARED_ROLE, 'i-0aaaaaaaaaaaaaaa1');
+    const box = sharedBox('a', 'i-0aaaaaaaaaaaaaaa1', { quarantinedAt: minutesAgo(90) });
+    aws.fail.set('TerminateInstances', 'Throttling');
+    expect(await terminateBox(box)).toBe(false);
+    expect(denied()).toEqual(['*:i-0aaaaaaaaaaaaaaa1']);
+    // No release is scheduled while the instance may still be running.
+    expect(denies.table!.rows[0].releaseAfter ?? null).toBeNull();
+    expect(rows.get('a')!.cleanedUpAt).toBeNull();
   });
 });

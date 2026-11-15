@@ -94,6 +94,11 @@ export function reportableSummary(summary: string | null): string | null {
   return hits.length ? `[summary withheld: it looked like it contained a ${hits.join(', ')}]` : summary;
 }
 
+/** Text as a Slack block quote, escaped. */
+export function slackQuote(text: string): string {
+  return `> ${slackEscape(text).split('\n').join('\n> ')}`;
+}
+
 const STATE_GLYPH: Record<string, string> = { done: '✅', blocked: '⛔', needs_input: '❓', failed: '❌' };
 
 /** The Slack message for one finished run, mrkdwn. */
@@ -107,7 +112,7 @@ export function reportText(i: ReportInput): string {
   if (typeof i.run.costUsd === 'number') facts.push(`$${i.run.costUsd.toFixed(2)}`);
   lines.push(facts.join(' · '));
   const summary = reportableSummary(i.run.summary);
-  if (summary) lines.push(`> ${slackEscape(summary).split('\n').join('\n> ')}`);
+  if (summary) lines.push(slackQuote(summary));
   if (i.base && i.run.workstream) {
     // The workspace deep link, as the briefing's Slack links use.
     lines.push(`<${sessionLink(i.base, i.projectId, i.run.workstream)}|the run> · <${i.base}/automations/${encodeURIComponent(i.projectId)}|the automation>`);

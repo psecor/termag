@@ -106,15 +106,15 @@ describe('pushOnChatTurn', () => {
     expect(sent.map(s => s.endpoint.split('/').pop())).toEqual(['owner', 'collab']);
     const n = sent[0].payload.notification as Record<string, unknown>;
     expect(n.title).toBe('orchestrator');
-    expect(n.body).toBe('Your turn · All green.');
+    expect(n.body).toBe('Idle · All green.');
     expect(String(n.navigate)).toMatch(/\/chat\/p\/p1$/);
     expect(n.data).toEqual({ key: 'chat-turn:p1:main', kind: 'chat-turn' });
   });
 
-  it('says Done · your turn for a turn that ended without an answer', async () => {
+  it('says Idle · your turn for a turn that ended without an answer', async () => {
     pushOnChatTurn(turn({ event: { type: 'turn-end', exitCode: 1 } }), deps);
     await settle();
-    expect((sent[0].payload.notification as Record<string, unknown>).body).toBe('Done · your turn');
+    expect((sent[0].payload.notification as Record<string, unknown>).body).toBe('Idle · your turn');
   });
 
   it('skips a person the flags are off for', async () => {

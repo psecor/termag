@@ -143,6 +143,25 @@ export function canonicalRestPath(restPath: string): string | null {
     .replace(/^\/organizations\/([^/]+)(?=\/|$)/, '/orgs/$1');
 }
 
+/**
+ * Why a REST read the broker forwards still can't give the box its answer, as
+ * the refusal message, or null. GitHub answers an Actions log download (a
+ * job's, a run's or an attempt's `…/logs`) with a 302 to a signed storage URL,
+ * and through the broker that comes back as a `BlobNotFound` XML 404 or a 200
+ * with an empty zip, both of which look like expired or deleted logs (bug
+ * cmw79qhn). Saying so up front, with what does work, saves the box the
+ * chase. A DELETE of a run's logs gets no redirect and is forwarded as before.
+ */
+export function unservedApiReason(method: string, restPath: string): string | null {
+  const m = method.toUpperCase();
+  if (m !== 'GET' && m !== 'HEAD') return null;
+  const path = canonicalRestPath(restPath);
+  if (!path || !/^\/repos\/[^/]+\/[^/]+\/actions\/(?:jobs\/[^/]+|runs\/[^/]+(?:\/attempts\/[^/]+)?)\/logs$/.test(path)) return null;
+  return 'The termag GitHub broker does not forward GitHub Actions log downloads (GitHub answers them with a redirect to signed storage the box cannot follow). ' +
+    'For why a job failed, read its check run\'s annotations (gh api repos/<owner>/<repo>/check-runs/<job id>/annotations) ' +
+    'or its steps (gh api repos/<owner>/<repo>/actions/jobs/<job id>); for the full log, open the run on github.com.';
+}
+
 /** Why the broker refuses this API request, or null to forward it. */
 export function blockedApiReason(method: string, restPath: string, body: string): string | null {
   const path = canonicalRestPath(restPath);

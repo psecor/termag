@@ -25,7 +25,9 @@
  *        Anthropic-managed git), has no ready box whose agent can run a
  *        runner (behind the claude-runner-auto-box-enabled flag the route
  *        first starts, claims or provisions one), every such box already
- *        runs MAX_RUNNERS_PER_BOX sessions, or this process is draining for
+ *        runs MAX_RUNNERS_PER_BOX sessions (behind the same flag the route
+ *        first gets one more, up to claude-runner-auto-box-max-boxes ready
+ *        boxes), or this process is draining for
  *        a deploy (its box agents are leaving)   -> hook exit 1 (retryable)
  *   502  a box agent failed an RPC             -> hook exit 1
  *
@@ -53,7 +55,7 @@ import { otlpDestinationFromEnv } from '../config/env';
 import { discardRunnerStart, recordRunnerStart } from '../services/claudeRunnerSessions';
 import { recordSessionEvent, type SessionEventKind } from '../services/claudeSessionEvents';
 import { recordProductEvent } from '../services/productEvents';
-import { boolVariation } from '../services/featureFlags';
+import { boolVariation, numberVariation } from '../services/featureFlags';
 import { isBoxProvisioningConfigured, isConcurrentCreate, pickFreeBoxName, provisionNewBox } from '../services/boxProvisioner';
 import { boxImageSelectionFor, isPublished } from '../services/boxImage';
 import { ownerDefaultSize } from '../services/boxSize';
@@ -71,8 +73,10 @@ import { notifyGithubAbsent, notifyRefusal } from '../services/claudeRunnerNotic
 import { requestFloorRuns, runnerFloors } from '../services/claudeRunnerFloor';
 import type { RefusalCode } from '../services/claudeRunnerSpawn';
 import {
+  AUTO_BOX_MAX_BOXES_FALLBACK,
   CLAUDE_RUNNER_ANTHROPIC_GIT_FLAG,
   CLAUDE_RUNNER_AUTO_BOX_FLAG,
+  CLAUDE_RUNNER_AUTO_BOX_MAX_FLAG,
   CLAUDE_RUNNER_AUTO_USER_FLAG,
   type GithubLaunchState,
   MAX_RUNNERS_PER_BOX,
@@ -86,7 +90,9 @@ import {
   autoBoxName,
   autoBoxPlan,
   bearerToken,
+  clampAutoBoxMaxBoxes,
   githubGate,
+  isAskBox,
   refusalStatus,
   type CandidateBox,
   ownerPlacementKey,
@@ -111,7 +117,8 @@ const refused = (r: Refusal): Outcome => ({ status: refusalStatus(r), body: { er
 
 /**
  * Behind CLAUDE_RUNNER_AUTO_BOX_FLAG, for an owner with no box a runner can
- * use: wait for one on its
+ * use, or whose every such
+ * box is full (`full`, "Cap"): wait for one on its
  * way, start a stopped one, or get a new one (a warm-pool claim, else a cold
  * box), unless one failed within the hour. Runs under the owner's spawn lock,
  * so the next session of a burst sees this one's box and waits. Always 503:
@@ -152,19 +159,49 @@ async function getOwnerABox(
   placeOnClaimed: (instance: Instance) => Promise<Outcome | null>,
   /** Place the runner on a ready box of the owner's as of now; null when there is none. */
   placeIfReady: () => Promise<Outcome | null>,
-  /**
+  opts: {
+    /**
    * Anthropic-managed git for this owner:
-   * with the flag on, a warm box may be claimed for an owner the Add box gate
-   * refuses, since the session's own git never touches the broker; a cold
-   * launch for an owner without a stored termag GitHub credential is never
-   * made, flag or no flag (github-first GATE-1).
-   */
-  git: { anthropicGit: boolean } = { anthropicGit: false },
+     * with the flag on, a warm box may be claimed for an owner the Add box gate
+     * refuses, since the session's own git never touches the broker; a cold
+     * launch for an owner without a stored termag GitHub credential is never
+     * made, flag or no flag (github-first GATE-1).
+     */
+    anthropicGit?: boolean;
+    /**
+     * The owner's ready boxes placement just listed and could not use (full,
+     * or not eligible for this session). They are up, not on their way, so
+     * autoBoxPlan leaves them out here and in each write's re-check; otherwise
+     * a full ready box would read as one to wait for.
+     */
+    full?: ReadonlySet<string>;
+    /**
+     * For an owner whose boxes were full: place on them again if a slot has
+     * freed since they were listed, else null. Asked right before anything
+     * billable, since a runner there can end while this looks for a box, and
+     * the writes' re-checks see box rows, not runner slots (Devin on #1592).
+     */
+    freedSlot?: () => Promise<Outcome | null>;
+  } = {},
 ): Promise<Outcome> {
+  const anthropicGit = opts.anthropicGit ?? false;
+  const full = opts.full ?? new Set<string>();
+  const usable = (rows: OwnedBox[]) => rows.filter(b => !full.has(b.id));
   const retry = (r: Refusal): Outcome => refused(r);
   const gone = (): Outcome => {
     console.warn(`[CLAUDE-RUNNER] order ${orderId}: the spawn hook stopped waiting; no box started for it (the session is re-offered)`);
     return retry(REFUSAL.hookGone('box'));
+  };
+  /**
+   * Right before a start, a claim or a create: an answer that makes it
+   * unneeded, else null. The hook is asked again after the freed-slot
+   * listing, which can take an agent RPC's timeout (Devin on #1592).
+   */
+  const beforeBuying = async (): Promise<Outcome | null> => {
+    if (callerGone()) return gone();
+    const freed = await opts.freedSlot?.();
+    if (freed) return freed;
+    return callerGone() ? gone() : null;
   };
   // The caller saw no ready box before it took the lock; the session ahead
   // of it in a burst may have claimed one and placed on it since. Re-read
@@ -173,9 +210,9 @@ async function getOwnerABox(
   if (placed) return placed;
   const owned = await prisma.instance.findMany({
     where: { userId: user.id, kind: 'ec2', status: { not: 'terminated' } },
-    select: { id: true, name: true, kind: true, status: true, ec2InstanceId: true, lastConnectedAt: true, createdAt: true },
+    select: { id: true, name: true, kind: true, status: true, ec2InstanceId: true, lastConnectedAt: true, createdAt: true, createdFor: true },
   });
-  const plan = autoBoxPlan(owned);
+  const plan = autoBoxPlan(usable(owned));
   if (plan.kind === 'wait') return retry(REFUSAL.boxWait(plan.reason));
   if (plan.kind === 'hold') return retry(REFUSAL.boxHold(plan.reason));
 
@@ -187,7 +224,8 @@ async function getOwnerABox(
     if (refusal || !instance) {
       return retry(REFUSAL.boxStartFailed(plan.box.name, plan.box.status, refusal?.error ?? 'not found'));
     }
-    if (callerGone()) return gone();
+    const instead = await beforeBuying();
+    if (instead) return instead;
     try {
       // As the owner's own Start does (routes/instances.ts): the idle clock
       // restarts and parkedAt clears in the same write, so a box the
@@ -211,7 +249,7 @@ async function getOwnerABox(
   // Anthropic-managed git it still rules the cold launch, not the warm claim.
   const facts = await readBoxCreationFacts(flagIdentity(user));
   const creation = boxCreationRefusal(facts);
-  if (creation && !git.anthropicGit) return retry(REFUSAL.boxCreationRefused(creation.body.error));
+  if (creation && !anthropicGit) return retry(REFUSAL.boxCreationRefused(creation.body.error));
   // Never a cold box for an owner without a stored termag GitHub credential
   // where one is required, whatever the gate's flag says: github-first's
   // GATE-1 holds for every entry point. The stored row decides, not the
@@ -222,7 +260,7 @@ async function getOwnerABox(
   // Asked again inside each write's own transaction: the owner's lock covers
   // this process only, and the names below dodge every existing row, so a
   // unique-index clash alone would not say another process got there first.
-  const stillNeeded = (owned: OwnedBox[]) => autoBoxPlan(owned).kind === 'acquire';
+  const stillNeeded = (owned: OwnedBox[]) => autoBoxPlan(usable(owned)).kind === 'acquire';
   // The owner's box-image flag, read once so the claim decision and the
   // launch agree, as Add box does (routes/instances.ts createBox): a pool box
   // runs the published image, so an owner whose flag says otherwise takes the
@@ -240,7 +278,8 @@ async function getOwnerABox(
         // A name free across all of the owner's rows: terminated ones still
         // hold theirs in the (userId, name) unique index.
         const taken = new Set((await prisma.instance.findMany({ where: { userId: user.id }, select: { name: true } })).map(i => i.name));
-        if (callerGone()) return gone();
+        const instead = await beforeBuying();
+        if (instead) return instead;
         // B3: an owner who can have no cold box runs only under
         // Anthropic-managed git, which only a wrapper that understands the
         // flags can start, so their claim takes only a pool box whose agent
@@ -268,7 +307,8 @@ async function getOwnerABox(
     }
     if (noColdBox) return retry(REFUSAL.boxCreationRefused(noColdBox.body.error));
     // Cold: minutes, async. The next spawn sees the box as `provisioning` and waits.
-    if (callerGone()) return gone();
+    const instead = await beforeBuying();
+    if (instead) return instead;
     const name = await provisionNewBox(user, autoBoxName(), stillNeeded, { image, flavor: 'full' }, size);
     // Provisioning is configured (checked above), so null means the re-check
     // found a box already on its way.
@@ -447,7 +487,7 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
       const readyCandidates = async () => {
         const rows = await prisma.instance.findMany({
           where: { userId: user.id, kind: 'ec2', status: 'ready' },
-          select: { id: true, kind: true, status: true, hostHome: true, hostUnixUser: true, lastConnectedAt: true, name: true },
+          select: { id: true, kind: true, status: true, hostHome: true, hostUnixUser: true, lastConnectedAt: true, name: true, createdFor: true },
         });
         return rows.map(b => {
           const caps = instanceAgentTransport(b.id)?.capabilities ?? [];
@@ -462,6 +502,13 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
       };
       const candidates = await readyCandidates();
       const boxes = runnerBoxes(candidates);
+      /**
+       * A ready, connected box of the owner's own (not an ask box) whose
+       * agent is too old to run a runner: a box, which needs updating, not
+       * a reason to buy another. Asked where placement found no box for a
+       * new session, whether ask boxes were ready or not (Bugbot on #1597).
+       */
+      const ownBoxOutdated = () => runnerBoxes(candidates.filter(b => !isAskBox(b)).map(b => ({ ...b, capable: true }))).length > 0;
       // The Claude Code floor: a
       // v3 wrapper is told the floor and enforces it; a box whose inventory
       // reads below it, with a wrapper that cannot, takes no new runner and is
@@ -483,9 +530,11 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
       // such a box must not get a second runner elsewhere, and a retry for
       // it must hear so rather than the GitHub refusal, so the refusal for
       // "no eligible box" is placement's, after the sessions are listed
-      // (placeRunner, `full` with no eligible box; Bugbot on #287).
+      // (placeRunner, `full` with no eligible box; Bugbot on #287). An ask
+      // box takes no new session either, and counts for "already running"
+      // the same way (isAskBox).
       const gitEligible = (box: { wrapperCapable?: boolean }) => !gateRefused || !!box.wrapperCapable;
-      const eligible = (box: { id: string; wrapperCapable?: boolean }) => gitEligible(box) && !tooOld(box);
+      const eligible = (box: { id: string; wrapperCapable?: boolean; createdFor?: string | null }) => !isAskBox(box) && gitEligible(box) && !tooOld(box);
       /** The git flags for a launch on `box`: only where its wrapper understands them. */
       const gitFor = (box: { wrapperCapable?: boolean }): RunnerGitOptions | null =>
         anthropicGit && box.wrapperCapable ? { anthropicGit: true, github: githubState } : null;
@@ -496,9 +545,14 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
        * the runner's tmux session. Runs under the owner's lock, which the
        * caller holds: it reads every box's tmux sessions and then creates one,
        * and the orchestrator runs several hooks at once (a retry can also
-       * race its own first attempt).
+       * race its own first attempt). `onFull` answers for a placement that
+       * finds every eligible box full, given every box it listed (getAnotherBox);
+       * null from it, or none given, is boxes-full.
        */
-      const placeOnBoxes = async (targets: Array<CandidateBox & { name: string }>): Promise<Outcome> => {
+      const placeOnBoxes = async (
+        targets: Array<CandidateBox & { name: string }>,
+        onFull: ((listedBoxes: Array<CandidateBox & { name: string }>) => Promise<Outcome | null>) | null = null,
+      ): Promise<Outcome> => {
         let listed;
         try {
           listed = await Promise.all(targets.map(async box => {
@@ -522,10 +576,17 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
         // No eligible box at all means every ready box has an old wrapper and
         // the owner has no termag GitHub credential: that is the GitHub
         // refusal, not "boxes full" (Bugbot on #287). Or every box git could
-        // use runs a Claude Code below the floor: claude-too-old.
+        // use runs a Claude Code below the floor: claude-too-old. Or the only
+        // ready boxes are ask boxes, which for a new session is no box at
+        // all: one is got as for a boxless owner (onFull), else no-box.
         if (placement.kind === 'full') {
-          if (placement.boxes > 0) return refused(REFUSAL.boxesFull(placement.boxes, placement.max));
-          return refused(listed.some(l => gitEligible(l.box) && tooOld(l.box)) ? REFUSAL.claudeOutdated() : REFUSAL.githubNotConnected());
+          const forSessions = listed.filter(l => !isAskBox(l.box));
+          if (placement.boxes === 0 && forSessions.length === 0 && ownBoxOutdated()) return refused(REFUSAL.agentOutdated());
+          if (placement.boxes > 0 || forSessions.length === 0) {
+            const answer = onFull ? await onFull(listed.map(l => l.box)) : null;
+            return answer ?? refused(placement.boxes > 0 ? REFUSAL.boxesFull(placement.boxes, placement.max) : REFUSAL.noBox());
+          }
+          return refused(forSessions.some(l => gitEligible(l.box) && tooOld(l.box)) ? REFUSAL.claudeOutdated() : REFUSAL.githubNotConnected());
         }
         if (callerGone) {
           console.warn(`[CLAUDE-RUNNER] order ${orderId}: the spawn hook stopped waiting; not launching (the session is re-offered)`);
@@ -609,6 +670,7 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
           capable: caps.includes(RUNNER_AGENT_CAPABILITY),
           wrapperCapable: caps.includes(WRAPPER_FLAGS_CAPABILITY),
           wrapperFloor: caps.includes(WRAPPER_FLOOR_CAPABILITY),
+          createdFor: instance.createdFor,
         };
         await addFloors([candidate]);
         if (runnerBoxes([candidate]).length === 0 || (gateRefused && !candidate.wrapperCapable)) {
@@ -621,11 +683,46 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
         return placeOnBoxes([candidate]);
       };
 
-      /** A ready box of the owner's as of now (a burst's earlier session may have claimed one): place on it, else null. */
-      const placeIfReady = async (): Promise<Outcome | null> => {
-        const fresh = runnerBoxes(await readyCandidates());
+      /**
+       * A ready box of the owner's as of now (a burst's earlier session may
+       * have claimed one, and its sessions filled it): place on it, else null.
+       * `skip`: boxes this request already found full, which getAnotherBox
+       * passes; without them a full box gets the owner another
+       * (getAnotherBox), at most one level deep.
+       */
+      const placeIfReady = async (skip: ReadonlySet<string> = new Set()): Promise<Outcome | null> => {
+        const fresh = runnerBoxes(await readyCandidates()).filter(b => !skip.has(b.id));
         if (fresh.length > 0) await addFloors(fresh);
-        return fresh.length > 0 ? placeOnBoxes(fresh) : null;
+        return fresh.length > 0 ? placeOnBoxes(fresh, skip.size === 0 ? getAnotherBox : null) : null;
+      };
+
+      /**
+       * Every eligible box placement found runs MAX_RUNNERS_PER_BOX sessions,
+       * or the only ready boxes are ask
+       * boxes (isAskBox). Behind the auto-box flag the
+       * owner gets one more box as a boxless owner gets a first one
+       * (getOwnerABox), while they have fewer ready boxes than
+       * claude-runner-auto-box-max-boxes, ask boxes not counted; `listedBoxes`
+       * is all of them, full or not eligible. Null with the flag off:
+       * boxes-full or no-box, as before.
+       * Called by placeOnBoxes, under the owner's lock.
+       */
+      const getAnotherBox = async (listedBoxes: Array<CandidateBox & { name: string }>): Promise<Outcome | null> => {
+        if (!await boolVariation(CLAUDE_RUNNER_AUTO_BOX_FLAG, ldUser, false)) return null;
+        const ceiling = clampAutoBoxMaxBoxes(await numberVariation(CLAUDE_RUNNER_AUTO_BOX_MAX_FLAG, ldUser, AUTO_BOX_MAX_BOXES_FALLBACK));
+        const forSessions = listedBoxes.filter(b => !isAskBox(b));
+        if (forSessions.length >= ceiling) return refused(REFUSAL.boxesFull(forSessions.length, MAX_RUNNERS_PER_BOX, ceiling));
+        const full = new Set(listedBoxes.map(b => b.id));
+        console.log(`[CLAUDE-RUNNER] order ${orderId}: every ready box of ${who} (${forSessions.length}, at most ${ceiling}${forSessions.length < listedBoxes.length ? `, and ${listedBoxes.length - forSessions.length} ask box(es)` : ''}) is full; getting another`);
+        // Listed again right before a box is bought: a runner on one may have
+        // ended since. Still full is null (go on); a placement, or a listing
+        // that failed, is the answer.
+        const freedSlot = async (): Promise<Outcome | null> => {
+          if (forSessions.length === 0) return null;
+          const again = await placeOnBoxes(forSessions);
+          return again.body.code === 'boxes-full' ? null : again;
+        };
+        return getOwnerABox(user, orderId, () => callerGone, placeOnClaimed, () => placeIfReady(full), { anthropicGit, full, freedSlot });
       };
 
       /** The outcome's log line, event and answer, placements and refusals alike. */
@@ -651,7 +748,7 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
       if (boxes.length === 0) {
         // A connected box with an outdated agent is a box: say so rather than
         // buy another.
-        if (runnerBoxes(candidates.map(b => ({ ...b, capable: true }))).length > 0) {
+        if (ownBoxOutdated()) {
           await refuse(refused(REFUSAL.agentOutdated()));
           return;
         }
@@ -667,7 +764,7 @@ export function claudeRunnerRouter(spawnToken: string, isServing: () => boolean 
         return;
       }
 
-      await finish(await serializeByKey<Outcome>(ownerPlacementKey(user.id), () => placeOnBoxes(boxes)));
+      await finish(await serializeByKey<Outcome>(ownerPlacementKey(user.id), () => placeOnBoxes(boxes, getAnotherBox)));
     } catch (err) {
       // A throw past this point (the instance query, the lock) answers 500
       // through apiErrorHandler, which logs the stack; the owner's outcome

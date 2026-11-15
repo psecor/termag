@@ -205,11 +205,54 @@ describe('link: a public channel, preview then commit', () => {
     expect(store.channels.get('CPUB0002')!.linkedVia).toBe('app_home');
   });
 
-  it('from the web, a public channel needs no membership; a private one does', async () => {
+  it('from the web and the CLI, a public channel the person isn\'t in is refused: nothing joined, nothing posted (product owner, 2026-11-06)', async () => {
     ws.add({ id: 'CELSE001', name: 'elsewhere', members: ['UBYST001'] });
-    expect(await link(deps, input({ channelId: 'CELSE001', via: 'web' }))).toMatchObject({ kind: 'linked' });
+    const join = vi.spyOn(ws.client.conversations, 'join');
+    const post = vi.spyOn(ws.client.chat, 'postMessage');
+    for (const via of ['web', 'cli'] as const) {
+      for (const mode of ['preview', 'commit'] as const) {
+        expect(await link(deps, input({ channelId: 'CELSE001', via, mode }))).toEqual({
+          kind: 'refused', code: 'not_in_channel', message: 'You need to be a member of this channel to link it.',
+        });
+      }
+    }
+    expect(join).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+    expect(ws.channels.get('CELSE001')!.is_member).toBe(false);
+    expect(store.channels.size).toBe(0);
+    expect(store.slack.size).toBe(0);
+    expect(spaces.eventRows).toEqual([]);
+    // A private one, as before.
     ws.add({ id: 'GPRIV002', name: 'others-secret', is_private: true, is_member: true, members: ['UBYST001'] });
     expect(await link(deps, input({ channelId: 'GPRIV002', via: 'web' }))).toMatchObject({ code: 'not_in_channel' });
+    // A member links from the web as before.
+    ws.channels.get('CELSE001')!.members.push(OWNER.slackId);
+    expect(await link(deps, input({ channelId: 'CELSE001', via: 'cli' }))).toMatchObject({ kind: 'linked', channel: { linkedVia: 'cli' } });
+  });
+
+  it('[S2 fallback] refuses a non-member after the join that read the members, and leaves termag there (a leave could race a concurrent link)', async () => {
+    setup({ membersNeedJoin: true });
+    payments = (await spaces.createSpace({ name: 'payments', description: null, userId: 'u-own' })).id;
+    ws.add({ id: 'CELSE002', name: 'elsewhere-2', members: ['UBYST001'] });
+    const post = vi.spyOn(ws.client.chat, 'postMessage');
+    expect(await link(deps, input({ channelId: 'CELSE002', via: 'web' }))).toMatchObject({ code: 'not_in_channel' });
+    expect(ws.channels.get('CELSE002')!.is_member).toBe(true);
+    expect(post).not.toHaveBeenCalled();
+    expect(store.channels.size).toBe(0);
+  });
+
+  it('[S2 fallback] a non-member\'s refused link and a member\'s link of the same channel at once: the member\'s link keeps termag in', async () => {
+    setup({ membersNeedJoin: true });
+    payments = (await spaces.createSpace({ name: 'payments', description: null, userId: 'u-own' })).id;
+    spaces.memberRows.push({ spaceId: payments, userId: 'u-other', role: 'owner', createdAt: new Date() });
+    ws.add({ id: 'CBOTH001', name: 'both', members: [OWNER.slackId] });
+    const [member, outsider] = await Promise.all([
+      link(deps, input({ channelId: 'CBOTH001', via: 'web' })),
+      link(deps, input({ channelId: 'CBOTH001', via: 'web', actor: { userId: 'u-other', slackId: 'UOTH0001' } })),
+    ]);
+    expect(member).toMatchObject({ kind: 'linked' });
+    expect(outsider).toMatchObject({ code: 'not_in_channel' });
+    expect(ws.channels.get('CBOTH001')!.is_member).toBe(true);
   });
 
   it('a private channel links once termag has been invited', async () => {
@@ -240,10 +283,11 @@ describe('link: a public channel, preview then commit', () => {
     limits.channelsPerSpace = 5;
     store.channels.set('CPUB0001', { channelId: 'CPUB0001', teamId: '', spaceSlackId: 'ss-other', name: 'pay-team', isPrivate: false, createdByTermag: false, linkedById: 'u-other', linkedVia: 'web', linkedAt: new Date(), confirmTs: null, pausedAt: null, unlinkedAt: null, unlinkReason: null });
     store.slack.set('ss-other', { id: 'ss-other', spaceId: 'sp-other', enabledById: 'u-other', runnerUserId: 'u-other', projectId: null, instanceId: null, status: 'active', limits: null, disabledAt: null });
-    // From the web there is no membership check: channel_linked. From Slack, termag won't join to read
-    // the members of a channel it would refuse, so the answer is that they can't be read.
-    expect(await link(deps, input({ mode: 'preview', via: 'web' }))).toMatchObject({ code: 'channel_linked' });
-    expect(await link(deps, input({ mode: 'preview' }))).toMatchObject({ code: 'slack_error', error: 'members_unreadable' });
+    // Membership is checked from every entry point, and termag won't join to read the members of a
+    // channel it would refuse, so the answer is that they can't be read.
+    for (const via of ['web', 'slack_command'] as const) {
+      expect(await link(deps, input({ mode: 'preview', via }))).toMatchObject({ code: 'slack_error', error: 'members_unreadable' });
+    }
     expect(join).not.toHaveBeenCalled();
     expect(ws.channels.get('CPUB0001')!.is_member).toBe(false);
   });

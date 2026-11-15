@@ -13,6 +13,7 @@
  * On a preview host:
  *
  *   /__termag/auth?code=   the code exchange: a session and its cookie, then a 302 to `next`
+ *   /__termag/clean?next=  a first open's clear (SR19), on its own cookie-free step, then a 302 to `next`
  *   /__termag/*            nothing else: termag's pages are answers, never relayed
  *   anything else          the session check, then the relay (services/previewRelay.ts)
  *
@@ -38,27 +39,32 @@ import { basisHolds, isAccessBasis, type AccessBasis } from './previewLinkAccess
 import { PREVIEW_LINK_CAPABILITY } from './previewLinkFlags';
 import { isLive, previewHostLabel } from './previewLinkRules';
 import {
-  classifyHost, CODE_TTL_MS, codeHash, cookieSecretFrom, crossSiteRefusal, framingRefusal, sameSiteRefusal, isNavigation, newSecret, pathOf,
+  classifyHost, cleanNextSig, cleanNextValid, CODE_TTL_MS, codeHash, cookieSecretFrom, crossSiteRefusal, framingRefusal, sameSiteRefusal, isNavigation, newSecret, pathOf,
   PREVIEW_BODY_LIMIT, previewOrigin, reverifyState, safeNext, sessionCookieValue, sessionExpiry, sessionIdHash, sessionSetCookie,
   signSessionCookie, linkMarkerSetCookie, markerNamesLink, targetRefusal, TERMAG_PREFIX, verifySessionCookie, viewerIp, type HostVerdict,
 } from './previewHostRules';
 import { pathRefusal } from './devServerPaths';
-import { accessAudienceOf, served, type HostLinkContext, type HostUser, type PreviewHostStore, type SessionRow } from './previewHostStore';
+import { accessAudienceOf, served, type CodeRow, type HostLinkContext, type HostUser, type PreviewHostStore, type SessionRow } from './previewHostStore';
 import { PreviewRelay, rawStatus, type PreviewTunnels, type RelayContext } from './previewRelay';
 import { sendPage } from '../previewPages';
 import { takeToken, type Bucket } from '../middleware/rateLimit';
-import { audit, linkRefused, refused } from './previewLinkTelemetry';
+import { audit, handoffBounced, linkRefused, refused } from './previewLinkTelemetry';
 import { endUpgrade } from '../routes/cliT3';
 import type { WebSocket, WebSocketServer } from 'ws';
 
 /** How long a session check is trusted in this process (L3). */
 export const SESSION_CACHE_MS = 30_000;
-/** What a first open clears (SR19): storage (Service Workers included) and the cache, never cookies. */
-export const CLEAR_SITE_DATA = '"storage", "cache"';
+/**
+ * What a first open clears (SR19): storage, Service Workers included, never cookies. Not "cache": each link
+ * has its own origin, so a new link's has no HTTP cache to clear, and Chrome's cache clear is the slow part
+ * that held the first navigation for seconds (decided 2026-11-12).
+ */
+export const CLEAR_SITE_DATA = '"storage"';
 /** Pre-auth answers per address: a burst, then two a second. */
 const PREAUTH_CAPACITY = 60;
 const PREAUTH_PER_SEC = 2;
 const PARKED = new Set(['stopping', 'stopped', 'starting', 'hibernating', 'hibernated']);
+const CLEAN_PATH = `${TERMAG_PREFIX}clean`;
 
 export interface PreviewHostDeps {
   store: PreviewHostStore;
@@ -252,6 +258,92 @@ export function createPreviewHost(deps: PreviewHostDeps): PreviewHost {
     res.end();
   }
 
+  /**
+   * Where a browser with a session goes: the app, once this browser was cleared for this link (its marker
+   * says so); else the clear first (SR19).
+   */
+  const toApp = (req: IncomingMessage, name: string, linkId: string, sessionIdHash: string, next: string): string =>
+    markerNamesLink(deps.cookieSecret()!, name, req.headers.cookie, linkId) ? next : cleanUrl(linkId, sessionIdHash, next);
+
+  /**
+   * The clean step, then `next`: a `next` other than the root is signed for this link and session, for a
+   * minute (cleanNextSig). Mint one only for a destination termag chose or the viewer's own first-party
+   * navigation asked for, never for a path from another site's link.
+   */
+  function cleanUrl(linkId: string, sessionIdHash: string, next: string): string {
+    if (next === '/') return CLEAN_PATH;
+    const exp = now().getTime() + CODE_TTL_MS;
+    return `${CLEAN_PATH}?next=${encodeURIComponent(next)}&exp=${exp}&sig=${cleanNextSig(deps.cookieSecret()!, linkId, sessionIdHash, next, exp)}`;
+  }
+
+  /** Back through the main host's landing check with a one-time ticket: a reverify, or a rebound (spent). */
+  async function ticketBack(res: ServerResponse, name: string, c: Pick<CodeRow, 'linkId' | 'userId' | 'basis' | 'tokenHash' | 'sessionIdHash' | 'next'>): Promise<void> {
+    const ticket = newSecret(deps.random);
+    await deps.store.createCode({
+      codeHash: codeHash('ticket', ticket)!, linkId: c.linkId, userId: c.userId, basis: c.basis, tokenHash: c.tokenHash,
+      sessionIdHash: c.sessionIdHash, next: safeNext(c.next), expiresAt: new Date(now().getTime() + CODE_TTL_MS),
+    });
+    redirect(res, `${deps.siteBase()}/previews/${name}/reverify?ticket=${ticket}`);
+  }
+
+  /**
+   * A code that's used or gone, most often the hand-off page's second navigation to it (Continue, Back, a
+   * repeated refresh). A browser that holds the session it made goes on to the app: sending it to the landing
+   * page would mint another code and, for a link audience, show the hand-off page again, round and round (#1742,
+   * bug cmwe2jg59). Else, in the code's minute, its rebound buys one ticket back
+   * through the landing page, redeemed only by the same termag user: a link audience's landing URL without
+   * its token lets no one in, so a plain bounce strands its viewer. The token itself never leaves the landing.
+   */
+  async function spent(req: IncomingMessage, res: ServerResponse, ctx: HostLinkContext, name: string, suffix: string | null, raw: string, nextParam: string | null): Promise<void> {
+    const next = safeNext(nextParam);
+    const hash = codeHash('rebound', raw);
+    const rebound = hash ? await deps.store.takeCode(hash, now()) : null;
+    const mine = rebound && rebound.linkId === ctx.link.id ? rebound : null;
+    const held = await verify(name, suffix, sessionCookieValue(req.headers.cookie));
+    // Where the code itself was headed, never the URL's `next`: any site can send a browser with a session here,
+    // and a same-origin hop to a path it chose would reach the app as an in-app navigation, with the app's
+    // SameSite=Strict cookies (Cursor Security). No rebound left (a stale bookmark, a made-up code): the app's root.
+    if (held.kind === 'ok') { redirect(res, toApp(req, name, ctx.link.id, held.v.session.idHash, safeNext(mine?.next))); return; }
+    // A used code back in its minute is a hand-off that went round again; a stale bookmark or an unknown
+    // code is not, and isn't counted.
+    if (mine) {
+      handoffBounced({ viewer: (await deps.store.user(mine.userId))?.googleEmail ?? null, linkId: ctx.link.id, name, boxId: boxOf(ctx) });
+      await ticketBack(res, name, mine);
+      return;
+    }
+    redirect(res, landing(name, next));
+  }
+
+  /**
+   * GET /__termag/clean?next=: a first open's clear (SR19), and the marker that says it was done, on a
+   * response that carries no session cookie. Chrome holds a redirect with Clear-Site-Data until the clear
+   * is done, seconds on a full profile, and stores none of its cookies if the navigation is dropped
+   * meanwhile; the session's cookie came on the exchange's response before this one.
+   */
+  async function clean(req: IncomingMessage, res: ServerResponse, name: string, suffix: string | null): Promise<void> {
+    if (!preauthAllowed(req)) { refused('rate_limited'); sendPage(res, 'rate_limited', req.method); return; }
+    if (req.method === 'HEAD') { res.writeHead(204, { 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' }); res.end(); return; }
+    if (req.method !== 'GET') { sendPage(res, 'bad_request', req.method); return; }
+    const q = new URL(req.url ?? '/', 'http://x').searchParams;
+    const ctx = served(await deps.store.resolveName(name));
+    if (!ctx || ctx.link.hostSuffix !== suffix) { redirect(res, landing(name, '/')); return; }
+    // Only a browser with a session on this link: the exchange sends its new session here, and handle() a
+    // session whose browser has no marker. Anyone else is sent through sign-in, as the app would send them.
+    const v = await verify(name, suffix, sessionCookieValue(req.headers.cookie), { fresh: true });
+    if (v.kind !== 'ok') { redirect(res, landing(name, '/')); return; }
+    // Only a `next` termag signed for this link and session, in its minute; anything else is the app's root, so
+    // another site can't use this same-origin 302 to land a viewer on a path it chose (Cursor Security).
+    const asked = safeNext(q.get('next'));
+    const next = asked !== '/' && cleanNextValid(deps.cookieSecret()!, ctx.link.id, v.v.session.idHash, asked, Number(q.get('exp')), q.get('sig') ?? '', now().getTime()) ? asked : '/';
+    // A check for this step alone: the app's first request makes its own, as it did before this step.
+    cache.delete(v.v.session.idHash);
+    // Anyone can be sent here, so a browser already cleared for this link is never cleared again: a crafted
+    // link can't wipe an established viewer's app data. One not yet cleared for it holds nothing of this link's.
+    if (markerNamesLink(deps.cookieSecret()!, name, req.headers.cookie, ctx.link.id)) { redirect(res, next); return; }
+    // Never "cookies": that would drop the session cookie and this marker.
+    redirect(res, next, linkMarkerSetCookie(deps.cookieSecret()!, name, ctx.link.id), { 'clear-site-data': CLEAR_SITE_DATA });
+  }
+
   /** GET /__termag/auth?code=: the landing page's code becomes a session (or refreshes one). */
   async function exchange(req: IncomingMessage, res: ServerResponse, name: string, suffix: string | null): Promise<void> {
     if (!preauthAllowed(req)) { refused('rate_limited'); sendPage(res, 'rate_limited', req.method); return; }
@@ -259,16 +351,17 @@ export function createPreviewHost(deps: PreviewHostDeps): PreviewHost {
     if (req.method === 'HEAD') { res.writeHead(204, { 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' }); res.end(); return; }
     if (req.method !== 'GET') { sendPage(res, 'bad_request', req.method); return; }
     const q = new URL(req.url ?? '/', 'http://x').searchParams;
-    const hash = codeHash('code', q.get('code') ?? '');
+    const raw = q.get('code') ?? '';
+    const hash = codeHash('code', raw);
     const t = now();
     // Only on the live link's own host is a code redeemed, so a Service Worker an earlier link's app left
     // under the name, on that link's origin, never gets one (SR19). Elsewhere it isn't used up: the landing
     // page sends the viewer to the right host.
     const ctx = served(await deps.store.resolveName(name));
     if (!ctx || ctx.link.hostSuffix !== suffix) { redirect(res, landing(name, safeNext(q.get('next')))); return; }
-    const code = hash ? await deps.store.takeCode(hash, t) : null;
-    // A missing or used code (a stale bookmark) goes back through sign-in, keeping where it was headed.
-    if (!code) { redirect(res, landing(name, safeNext(q.get('next')))); return; }
+    // For the rest of its minute the code leaves a rebound (spent, above), in the same statement that takes it.
+    const code = hash ? await deps.store.takeCode(hash, t, { rebound: codeHash('rebound', raw)! }) : null;
+    if (!code) { refused('code_gone'); await spent(req, res, ctx, name, suffix, raw, q.get('next')); return; }
     const user = await deps.store.user(code.userId);
     const deny = (reason: string) => {
       audit({ step: 'exchange', decision: 'deny', reason, viewer: user?.googleEmail ?? null, linkId: code.linkId, name, boxId: ctx ? boxOf(ctx) : null });
@@ -303,23 +396,15 @@ export function createPreviewHost(deps: PreviewHostDeps): PreviewHost {
     audit({ step: 'exchange', decision: 'grant', reason: code.basis, viewer: user.googleEmail, linkId: ctx.link.id, name, boxId: boxOf(ctx) });
     const value = signSessionCookie(deps.cookieSecret()!, name, id);
     // This browser's first session on this link: whatever an earlier link on this name left in it for
-    // this origin (storage, a Service Worker, the HTTP cache) goes before the new app runs (SR19).
-    // Decided per browser, from its HttpOnly marker, so a code an old worker took and redeemed
-    // elsewhere never stops this browser's clear. Never "cookies": that would drop the session
-    // cookie and the marker set on this same response.
-    const clear = !markerNamesLink(deps.cookieSecret()!, name, req.headers.cookie, ctx.link.id);
-    const session = sessionSetCookie(value, (expiresAt.getTime() - t.getTime()) / 1000);
-    redirect(res, next, clear ? [session, linkMarkerSetCookie(deps.cookieSecret()!, name, ctx.link.id)] : session, clear ? { 'clear-site-data': CLEAR_SITE_DATA } : {});
+    // this origin (storage, a Service Worker, the HTTP cache) goes before the new app runs (SR19), on
+    // the clean step after this response, never on it (clean, above). Decided per browser, from its
+    // HttpOnly marker, so a code an old worker took and redeemed elsewhere never stops this browser's clear.
+    redirect(res, toApp(req, name, ctx.link.id, sessionIdHash(id), next), sessionSetCookie(value, (expiresAt.getTime() - t.getTime()) / 1000));
   }
 
   /** Send a navigation back through the main host's landing check (A2), with a ticket bound to this session. */
-  async function reverify(res: ServerResponse, v: VerifiedSession, url: string): Promise<void> {
-    const ticket = newSecret(deps.random);
-    await deps.store.createCode({
-      codeHash: codeHash('ticket', ticket)!, linkId: v.ctx.link.id, userId: v.session.userId, basis: v.session.basis, tokenHash: v.session.tokenHash,
-      sessionIdHash: v.session.idHash, next: safeNext(url), expiresAt: new Date(now().getTime() + CODE_TTL_MS),
-    });
-    redirect(res, `${deps.siteBase()}/previews/${v.ctx.link.name}/reverify?ticket=${ticket}`);
+  function reverify(res: ServerResponse, v: VerifiedSession, url: string): Promise<void> {
+    return ticketBack(res, v.ctx.link.name, { linkId: v.ctx.link.id, userId: v.session.userId, basis: v.session.basis, tokenHash: v.session.tokenHash, sessionIdHash: v.session.idHash, next: url });
   }
 
   async function handle(req: IncomingMessage, res: ServerResponse, name: string, suffix: string | null): Promise<void> {
@@ -334,6 +419,7 @@ export function createPreviewHost(deps: PreviewHostDeps): PreviewHost {
     const path = pathOf(url);
     if (path.toLowerCase().startsWith(TERMAG_PREFIX) || path.toLowerCase() === TERMAG_PREFIX.slice(0, -1)) {
       if (path === '/__termag/auth') { await exchange(req, res, name, suffix); return; }
+      if (path === CLEAN_PATH) { await clean(req, res, name, suffix); return; }
       sendPage(res, 'not_found', req.method);
       return;
     }
@@ -354,6 +440,14 @@ export function createPreviewHost(deps: PreviewHostDeps): PreviewHost {
     // Never re-sent as a GET: a form POST past two hours is told to reload (SR18).
     if (state === 'overdue') { refused('reverify_overdue'); sendPage(res, 'refresh_needed', req.method); return; }
     const v = verdict.v;
+    // A first open whose clear was dropped with its navigation: the clear before any of the app (SR19).
+    if (isNavigation(req.method, req.headers) && !markerNamesLink(deps.cookieSecret()!, name, req.headers.cookie, v.ctx.link.id)) {
+      // The path it asked for only when the viewer's own browser asked from this origin or the address bar; from
+      // another site, the app's root, so this hop never turns a cross-site link into an in-app one (Cursor Security).
+      const site = String(req.headers['sec-fetch-site'] ?? '').trim().toLowerCase();
+      redirect(res, cleanUrl(v.ctx.link.id, v.session.idHash, site === 'same-origin' || site === 'none' ? safeNext(url) : '/'));
+      return;
+    }
     if (crossSiteRefusal(req.method, req.headers, previewOrigin(previewHostLabel(name, v.ctx.link.hostSuffix), domain))) { refused('cross_site'); sendPage(res, 'cross_site', req.method); return; }
     const why = pathRefusal(path, deps.checkoutDir(v.ctx));
     if (why) { refused(why); sendPage(res, 'path_refused', req.method); return; }

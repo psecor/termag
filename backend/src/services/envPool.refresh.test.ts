@@ -171,7 +171,8 @@ describe("a refreshing box's environment-status", () => {
   it('fails a refresh whose setup failed, as a prepare does, with where: refresh', async () => {
     rows.set('s1', stopped('s1', { status: 'env-preparing', refreshStartedAt: NOW }));
     await deliver(frame({ prepareId: refreshPrepareId(NOW), state: 'failed', setup: { state: 'failed', error: 'npm ci exited 1' }, log: 'npm ERR!' }));
-    expect(rows.get('s1')).toMatchObject({ status: 'env-failed' });
+    // Terminated at once, its reason and log kept: the failure the planner holds the pool by.
+    expect(rows.get('s1')).toMatchObject({ status: 'terminated', provisioningError: 'npm ci exited 1' });
     expect(String(rows.get('s1')!.poolLog)).toContain('npm ERR!');
     expect(recordProductEvent).toHaveBeenCalledWith('environment.setup', { user: null, box: 's1' }, expect.objectContaining({ outcome: 'failed', where: 'refresh', incremental: true }));
   });
@@ -217,20 +218,15 @@ describe("#1453's Bugbot fixes, on a refresh", () => {
     expect(rows.get('s1')).toMatchObject({ status: 'env-stopping', preparedCommit: NEW });
   });
 
-  it('marks a refresh whose setup ran and exited poolSetupFailed, at the hash and heads it started at', async () => {
-    rows.set('s1', stopped('s1'));
-    send.mockResolvedValue({});
-    expect(await refreshEnvPoolBox(asPoolRow(rows.get('s1')!), def, POLICY, NOW)).toBe('started');
-    await deliver(frame({ state: 'failed', setup: { state: 'failed', error: 'exited 1', exitCode: 1 }, prepareId: refreshPrepareId(NOW) }));
-    expect(rows.get('s1')).toMatchObject({ status: 'env-failed', poolSetupFailed: true, poolSetupHash: def.setupHash, preparedCommit: NEW });
-  });
-
-  it('records a refresh that failed before setup ran (its fetch) at the same hash and heads, not poolSetupFailed', async () => {
-    rows.set('s1', stopped('s1'));
-    send.mockResolvedValue({});
-    expect(await refreshEnvPoolBox(asPoolRow(rows.get('s1')!), def, POLICY, NOW)).toBe('started');
-    await deliver(frame({ state: 'failed', setup: { state: 'failed', error: 'fetch e2e-org/envdemo: fatal: 403' }, prepareId: refreshPrepareId(NOW) }));
-    expect(rows.get('s1')).toMatchObject({ status: 'env-failed', poolSetupFailed: false, poolSetupHash: def.setupHash, preparedCommit: NEW });
+  it('records a failed refresh, whatever failed, at the hash and heads it started at: one failure rule', async () => {
+    for (const setup of [{ state: 'failed', error: 'exited 1', exitCode: 1 }, { state: 'failed', error: 'fetch e2e-org/envdemo: fatal: 403' }]) {
+      rows.set('s1', stopped('s1'));
+      send.mockResolvedValue({});
+      prisma.instance.findUnique.mockClear();
+      expect(await refreshEnvPoolBox(asPoolRow(rows.get('s1')!), def, POLICY, NOW)).toBe('started');
+      await deliver(frame({ state: 'failed', setup, prepareId: refreshPrepareId(NOW) }));
+      expect(rows.get('s1')).toMatchObject({ status: 'terminated', provisioningError: setup.error, poolSetupHash: def.setupHash, preparedCommit: NEW });
+    }
   });
 });
 
@@ -266,3 +262,46 @@ describe("a refresh's pending state (Bugbot and Devin on #1455)", () => {
     expect(rows.get('s1')).toMatchObject({ status: 'env-stopping', preparedCommit: NEW });
   });
 });
+
+describe("the environment.setup event's on-warm outcome (Bugbot on #1461)", () => {
+  const frame = { instance: { id: 's1' }, capabilities: [], msg: { type: 'environment-status', projectId: 'pool', status: { state: 'ready', setup: { state: 'succeeded' }, setupCommit: NEW } } };
+  beforeEach(() => { startEnvPool(); send.mockResolvedValue({}); recordProductEvent.mockReset(); });
+
+  it('is what the row says when the event is recorded, not the snapshot the status frame began with', async () => {
+    rows.set('s1', stopped('s1', { status: 'env-preparing', onWarmStatus: 'running', onWarmSeconds: null }));
+    // The settled on-warm frame lands while this status frame is being handled.
+    prisma.instance.findUnique.mockImplementationOnce(async ({ where }: { where: { id: string } }) => {
+      const snapshot = { ...rows.get(where.id)! };
+      Object.assign(rows.get(where.id)!, { onWarmStatus: 'succeeded', onWarmSeconds: 41 });
+      return snapshot;
+    });
+    listeners.get('environment-status')!(frame);
+    await vi.waitFor(() => expect(recordProductEvent).toHaveBeenCalled());
+    expect(recordProductEvent).toHaveBeenCalledWith('environment.setup', { user: null, box: 's1' }, expect.objectContaining({ outcome: 'succeeded', onWarm: 'succeeded', onWarmSec: 41 }));
+  });
+});
+
+describe("the environment.setup event takes the prepare's own on-warm outcome when its frame carries one (Devin on #1461)", () => {
+  beforeEach(() => { startEnvPool(); send.mockResolvedValue({}); recordProductEvent.mockReset(); });
+
+  it("records a refresh that skipped on-warm as skipped, not as the box's earlier run", async () => {
+    rows.set('s1', stopped('s1', { status: 'env-preparing', refreshStartedAt: NOW, onWarmStatus: 'succeeded', onWarmSeconds: 41 }));
+    listeners.get('environment-status')!({ instance: { id: 's1' }, capabilities: [], msg: { type: 'environment-status', projectId: 'pool',
+      status: { state: 'ready', setup: { state: 'succeeded' }, setupCommit: NEW, prepareId: refreshPrepareId(NOW), onWarm: { state: 'skipped', seconds: 0 } } } });
+    await vi.waitFor(() => expect(recordProductEvent).toHaveBeenCalled());
+    expect(recordProductEvent).toHaveBeenCalledWith('environment.setup', { user: null, box: 's1' }, expect.objectContaining({ where: 'refresh', onWarm: 'skipped', onWarmSec: 0 }));
+  });
+});
+
+describe("a failed prepare's environment.setup event takes the frame's on-warm outcome too (Bugbot on #1461)", () => {
+  beforeEach(() => { startEnvPool(); send.mockResolvedValue({}); recordProductEvent.mockReset(); });
+
+  it('records a refresh that skipped on-warm and then failed setup as skipped', async () => {
+    rows.set('s1', stopped('s1', { status: 'env-preparing', refreshStartedAt: NOW, onWarmStatus: 'succeeded', onWarmSeconds: 41 }));
+    listeners.get('environment-status')!({ instance: { id: 's1' }, capabilities: [], msg: { type: 'environment-status', projectId: 'pool',
+      status: { state: 'failed', setup: { state: 'failed', error: 'npm ci exited 1', exitCode: 1 }, prepareId: refreshPrepareId(NOW), onWarm: { state: 'skipped', seconds: 0 } } } });
+    await vi.waitFor(() => expect(recordProductEvent).toHaveBeenCalled());
+    expect(recordProductEvent).toHaveBeenCalledWith('environment.setup', { user: null, box: 's1' }, expect.objectContaining({ outcome: 'failed', onWarm: 'skipped', onWarmSec: 0 }));
+  });
+});
+

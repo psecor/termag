@@ -35,6 +35,9 @@ function vars(p: typeof DARK): string {
   return Object.entries(p).map(([k, v]) => `--${k}:${v}`).join(';');
 }
 
+/** How long the hand-off page waits before it offers its link: well past its 1 s refresh (renderHandoff). */
+export const HANDOFF_FALLBACK_S = 5;
+
 export const PAGE_STYLE = [
   `:root{${vars(DARK)};color-scheme:dark}`,
   `@media(prefers-color-scheme:light){:root{${vars(LIGHT)};color-scheme:light}}`,
@@ -47,6 +50,8 @@ export const PAGE_STYLE = [
   `a{color:var(--accent)}`,
   `code{font-family:${MONO_FONT};font-size:.88em;overflow-wrap:anywhere;color:var(--text)}`,
   `.continue{display:inline-block;margin-top:.8rem;padding:.45rem 1rem;border-radius:6px;background:var(--fill);color:var(--onFill);text-decoration:none;font-weight:600}`,
+  // The hand-off's link, shown only once its refresh is long overdue (renderHandoff): hidden is unclickable.
+  `.handoff-fallback{visibility:hidden;animation:handoff-fallback 0s ${HANDOFF_FALLBACK_S}s forwards}@keyframes handoff-fallback{to{visibility:visible}}`,
   `.warn{margin:1rem 0;padding:.65rem .85rem;border-radius:8px;border:1px solid var(--warning);color:var(--text);background:var(--elevated)}`,
   `dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.35rem 1rem;margin:1rem 0;padding:.9rem 1rem;border-radius:8px;background:var(--elevated)}`,
   `dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}`,

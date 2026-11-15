@@ -10,6 +10,7 @@ import { GUEST_REFUSAL_MESSAGES, guestPaneKey, lastStackRefusal, wakeBudget, typ
 import { projectAgentCapabilities, sendForProject, type ProjectHost } from './agentRegistry';
 import { BROWSER_PANE_PROFILES_CAPABILITY } from './browserPane';
 import { projectDirUnder, resolveProjectRoot } from './projectPaths';
+import { linkWakesSince } from './previewAudience';
 
 export interface ShareRow extends GuestShare {
   projectId: string;
@@ -232,6 +233,27 @@ export interface PreviewShareStore {
   /** A project's preview settings (PreviewShareSettings): its default recipe and reviewer sign-in hint, and its automatic shares (4c). */
   settings(projectId: string): Promise<PreviewSettings>;
   saveSettings(projectId: string, settings: SavedPreviewSettings): Promise<PreviewSettings>;
+}
+
+/**
+ * The owner's guest wake budget (wakeBudget): one for their preview shares and
+ * their preview links (PRD U4; SR20, "shared with preview shares, not added
+ * to it"). Under one lock per owner, the last day's wakes of both are counted,
+ * and the new one is recorded by `record` in the same transaction, so two
+ * viewers at once can't both take the last one, whichever they opened.
+ */
+export async function claimGuestWake(
+  ownerId: string, now: number, record: (tx: Prisma.TransactionClient) => Promise<string>,
+): Promise<{ ok: true; wakeId: string } | { ok: false; reason: 'too-soon' | 'daily'; retryAt: number }> {
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`preview-wake:${ownerId}`}))`;
+    const since = new Date(now - 24 * 3600 * 1000);
+    const shares = await tx.previewShareEvent.findMany({ where: { kind: 'woke', at: { gt: since }, share: { ownerId } }, select: { at: true } });
+    const links = await linkWakesSince(tx, ownerId, since);
+    const budget = wakeBudget([...shares.map(e => e.at), ...links], now);
+    if (!budget.ok) return budget;
+    return { ok: true as const, wakeId: await record(tx) };
+  });
 }
 
 export const prismaPreviewShareStore: PreviewShareStore = {
@@ -591,18 +613,7 @@ export const prismaPreviewShareStore: PreviewShareStore = {
   },
 
   async claimWake({ ownerId, shareId, viewerId, now }) {
-    return prisma.$transaction(async (tx) => {
-      // Two reviewers at once can't both take the last wake.
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`preview-wake:${ownerId}`}))`;
-      const recent = await tx.previewShareEvent.findMany({
-        where: { kind: 'woke', at: { gt: new Date(now - 24 * 3600 * 1000) }, share: { ownerId } },
-        select: { at: true },
-      });
-      const budget = wakeBudget(recent.map(e => e.at), now);
-      if (!budget.ok) return budget;
-      const ev = await tx.previewShareEvent.create({ data: { shareId, kind: 'woke', actorId: viewerId, at: new Date(now) }, select: { id: true } });
-      return { ok: true as const, wakeId: ev.id };
-    });
+    return claimGuestWake(ownerId, now, async (tx) => (await tx.previewShareEvent.create({ data: { shareId, kind: 'woke', actorId: viewerId, at: new Date(now) }, select: { id: true } })).id);
   },
 
   async refundWake(wakeId) {

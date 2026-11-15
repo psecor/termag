@@ -13,6 +13,7 @@
 import { parse as legacyUrlParse } from 'url';
 import webpush from 'web-push';
 import { prisma } from '../db';
+import { sessionTitleOf } from './sessionTitle';
 
 // ── VAPID ──────────────────────────────────────────────────────
 
@@ -229,30 +230,61 @@ export interface WaitingPayloadInput {
   session: string;
   /** The status key (`statusKey(instanceId, session)`): a later wait on the same session replaces this one. */
   tag: string;
+  /** The session's one title (services/sessionTitle.ts); absent, the names' fallback (the project for main, else the workstream). */
+  title?: string | null;
   message?: string | null;
   waitingReason?: 'approval' | 'user_input' | 'unknown' | null;
   /** The owner's sessions currently waiting, this one included. */
   waitingCount: number;
+  /**
+   * Open the session's chat (`/chat/p/<id>`), not its phone conversation
+   * (`/m/p/<id>`): chat-phone-home-enabled for the recipient, and a session
+   * the chat can show (waitingOpensChat).
+   */
+  chat?: boolean;
+}
+
+/**
+ * Whether the chat can show a waiting session, by its project's kind: a
+ * normal project's session, or an automation's run; never MetaTerm or an
+ * automation's `main` (frontend chat/simpleChat.ts sessionHasChat).
+ */
+export function waitingOpensChat(kind: string | null | undefined, workstream: string): boolean {
+  const k = kind ?? 'normal';
+  return k === 'normal' || (k === 'automation' && workstream !== 'main');
 }
 
 const MAX_BODY = 180;
 
+/**
+ * The status words, as the chat and /m spell them (frontend
+ * chat/statusWords.ts): a push leads with Needs you or
+ * Idle, then why.
+ */
+const NEEDS_YOU = 'Needs you';
+const IDLE = 'Idle';
+
+/** A push's title: the session's one title, never "project · workstream". */
+function pushTitle(input: { title?: string | null; projectName: string; workstream: string }): string {
+  return input.title?.trim() || sessionTitleOf({ projectName: input.projectName, workstream: input.workstream || 'main' });
+}
+
 export function waitingBody(message: string | null | undefined, reason: WaitingPayloadInput['waitingReason']): string {
   const text = (message ?? '').replace(/\s+/g, ' ').trim();
-  if (text) return text.length > MAX_BODY ? `${text.slice(0, MAX_BODY - 1)}…` : text;
-  if (reason === 'approval') return 'Needs approval';
-  if (reason === 'user_input') return 'Asked you a question';
-  return 'Waiting for you';
+  if (text) return `${NEEDS_YOU} · ${text.length > MAX_BODY ? `${text.slice(0, MAX_BODY - 1)}…` : text}`;
+  if (reason === 'approval') return `${NEEDS_YOU} · approval`;
+  if (reason === 'user_input') return `${NEEDS_YOU} · a question`;
+  return NEEDS_YOU;
 }
 
 export function buildWaitingPayload(input: WaitingPayloadInput): DeclarativePushPayload {
-  const path = `/m/p/${encodeURIComponent(input.projectId)}`;
+  const path = `${input.chat ? '/chat' : '/m'}/p/${encodeURIComponent(input.projectId)}`;
   const query = input.workstream && input.workstream !== 'main' ? `?ws=${encodeURIComponent(input.workstream)}` : '';
   return {
     web_push: 8030,
     mutable: true,
     notification: {
-      title: input.workstream === 'main' ? input.projectName : `${input.projectName} · ${input.workstream}`,
+      title: pushTitle(input),
       body: waitingBody(input.message, input.waitingReason),
       navigate: `${input.baseUrl}${path}${query}`,
       tag: input.tag,
@@ -271,6 +303,8 @@ export interface ChatTurnPayloadInput {
   session: string;
   /** The chat's last words (the status message), if any. */
   message?: string | null;
+  /** The session's one title (services/sessionTitle.ts); absent, the names' fallback. */
+  title?: string | null;
 }
 
 /** One notification per chat: a later answer replaces the earlier one. No `:` or `|` inside a project id or workstream. */
@@ -297,8 +331,8 @@ export function buildChatTurnPayload(input: ChatTurnPayloadInput): DeclarativePu
     web_push: 8030,
     mutable: true,
     notification: {
-      title: input.workstream === 'main' ? input.projectName : `${input.projectName} · ${input.workstream}`,
-      body: text ? `Your turn · ${text.length > MAX_BODY ? `${text.slice(0, MAX_BODY - 1)}…` : text}` : 'Done · your turn',
+      title: pushTitle(input),
+      body: text ? `${IDLE} · ${text.length > MAX_BODY ? `${text.slice(0, MAX_BODY - 1)}…` : text}` : `${IDLE} · your turn`,
       navigate: `${input.baseUrl}${path}${query}`,
       tag,
       data: { key: tag, kind: 'chat-turn' },
@@ -307,14 +341,15 @@ export function buildChatTurnPayload(input: ChatTurnPayloadInput): DeclarativePu
   };
 }
 
-export function buildTestPayload(baseUrl: string): DeclarativePushPayload {
+/** "Notifications are on": opens the phone client, or the chat under chat-phone-home-enabled (`chat`). */
+export function buildTestPayload(baseUrl: string, chat = false): DeclarativePushPayload {
   return {
     web_push: 8030,
     mutable: true,
     notification: {
       title: 'termag',
       body: 'Notifications are on for this device',
-      navigate: `${baseUrl}/m`,
+      navigate: `${baseUrl}${chat ? '/chat' : '/m'}`,
       tag: 'termag-test',
       data: { key: 'termag-test' },
     },

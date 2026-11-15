@@ -13,8 +13,10 @@ export interface OwnedBoxRow {
   ec2InstanceId: string | null;
   lastConnectedAt: Date | null;
   createdAt: Date;
+  /** `ask` for a box made for a `termag ask` (boxLifecycle.applyAskBoxPolicy): autoBoxPlan neither waits for nor starts one. */
+  createdFor?: string | null;
 }
 
 export const OWNED_BOX_SELECT = {
-  id: true, name: true, kind: true, status: true, ec2InstanceId: true, lastConnectedAt: true, createdAt: true,
+  id: true, name: true, kind: true, status: true, ec2InstanceId: true, lastConnectedAt: true, createdAt: true, createdFor: true,
 } as const;

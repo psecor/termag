@@ -225,6 +225,6 @@ export async function getInstance(id: string) {
     } : null,
     projectList: row.projects.map(p => ({ id: p.id, name: p.name, archived: p.archived, lastActiveAt: p.lastActiveAt.toISOString() })),
     tokens: row.agentTokens.map(t => ({ ...t, createdAt: t.createdAt.toISOString(), lastUsedAt: t.lastUsedAt?.toISOString() ?? null, revokedAt: t.revokedAt?.toISOString() ?? null })),
-    securityGroupId: row.securityGroupId, iamRoleName: row.iamRoleName,
+    securityGroupId: row.securityGroupId, iamRoleName: row.iamRoleName, iamRoleShared: row.iamRoleShared,
   };
 }

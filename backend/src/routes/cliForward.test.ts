@@ -264,7 +264,7 @@ describe('the refusals, in the contract\'s order', () => {
     expect(accessCalls).toBe(0);
   });
 
-  it('then access: not_found (the flag off among them), box_parked, box_not_ready, box_outdated', async () => {
+  it('then access: not_found, box_parked, box_not_ready, box_outdated', async () => {
     for (const a of [
       { status: 404, code: 'not_found' }, { status: 409, code: 'box_parked' }, { status: 409, code: 'box_not_ready' }, { status: 501, code: 'box_outdated' },
     ]) {

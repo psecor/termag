@@ -159,6 +159,37 @@ describe.skipIf(!adminUrl)('RDS connection path (integration)', () => {
     expect(cols.rowCount).toBe(0);
   }, 180_000);
 
+  it('a skipped additive push that leaves a schema column missing fails with 3, then passes once it is synced', async () => {
+    // 2026-11-09: a dropped column holding data blocked the push, so a new column never landed.
+    await sql(dbName, 'migration', `ALTER TABLE users ADD COLUMN blocker_col text; UPDATE users SET blocker_col = 'keep';
+      ALTER TABLE users DROP COLUMN "chatNudgeDismissedAt"`);
+
+    const blocked = run('dbPush.ts', iamEnv('migration', { DB_PUSH_MODE: 'additive' }));
+    expect(blocked.stderr).toMatch(/schema sync SKIPPED/);
+    expect(blocked.stderr).toMatch(/schema check FAILED/);
+    expect(blocked.stderr).toMatch(/- column users\.chatNudgeDismissedAt/);
+    expect(blocked.status, blocked.stderr).toBe(3);
+
+    await sql(dbName, 'migration', `ALTER TABLE users DROP COLUMN blocker_col`);
+    const synced = run('dbPush.ts', iamEnv('migration', { DB_PUSH_MODE: 'additive' }));
+    expect(synced.status, synced.stderr).toBe(0);
+    expect(synced.stdout).toMatch(/schema check: the database has every/);
+  }, 180_000);
+
+  it('a skipped additive push that leaves a column of its old type fails with 3', async () => {
+    // A timestamp → text change: casting the stored text back would lose it, so the push skips it.
+    await sql(dbName, 'migration', `ALTER TABLE users ALTER COLUMN "chatNudgeDismissedAt" TYPE text USING 'not a date'`);
+
+    const blocked = run('dbPush.ts', iamEnv('migration', { DB_PUSH_MODE: 'additive' }));
+    expect(blocked.stderr).toMatch(/schema sync SKIPPED/);
+    expect(blocked.stderr).toMatch(/- column users\.chatNudgeDismissedAt is text, the schema wants timestamp/);
+    expect(blocked.status, blocked.stderr).toBe(3);
+
+    await sql(dbName, 'migration', `ALTER TABLE users ALTER COLUMN "chatNudgeDismissedAt" TYPE timestamp(3) USING NULL`);
+    const synced = run('dbPush.ts', iamEnv('migration', { DB_PUSH_MODE: 'additive' }));
+    expect(synced.status, synced.stderr).toBe(0);
+  }, 180_000);
+
   it('db:guard passes a restored RDS database and refuses an empty one unless allowed', async () => {
     const ok = run('dbGuard.ts', iamEnv('application'));
     expect(ok.status, `${ok.stdout}\n${ok.stderr}`).toBe(0);

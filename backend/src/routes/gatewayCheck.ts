@@ -27,6 +27,7 @@ export async function boxForToken(token: string, site: TokenSite): Promise<Authz
     instanceId: conn.instance.id,
     managed: isManagedBox(conn.instance),
     email: conn.user.googleEmail,
+    ld: { user: conn.user, box: conn.instance },
   };
 }
 

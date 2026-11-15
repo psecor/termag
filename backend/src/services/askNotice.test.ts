@@ -89,6 +89,16 @@ describe('askNoticeText', () => {
     expect(text).not.toMatch(/\n/);
   });
 
+  it('names the model the turn ran on, its backend with it (fireworks:<id>), and none for the box\'s default', () => {
+    expect(askNoticeText([item({ model: 'fireworks:accounts/fireworks/models/kimi-k3' })])).toContain(
+      'finished: completed; on fireworks:accounts/fireworks/models/kimi-k3; PR https://github.com/acme/api/pull/12;',
+    );
+    expect(askNoticeText([item({ model: 'opus' })], 'pane')).toContain('finished: completed; on opus; PR');
+    expect(askNoticeText([item({ model: null })])).not.toContain(' on ');
+    // Anything a tier or a Fireworks id can't hold is left out: a pane types the notice in.
+    expect(askNoticeText([item({ model: 'opus; rm -rf ~' })], 'pane')).not.toContain('rm -rf');
+  });
+
   it('gives the error of a failed or canceled ask, cut and on one line', () => {
     const text = askNoticeText([item({ status: 'failed', error: `lost: the run\nwas gone ${'x'.repeat(400)}`, publish: null, prUrl: null, replyBytes: null })]);
     expect(text).toContain('finished: failed (lost: the run was gone xxx');

@@ -121,9 +121,10 @@ const KNOWN: Record<string, { count: number; why: string }> = {
   'backend/src/services/t3RelayHeaders.ts': { count: 1, why: 'drops the box\'s set-cookie' },
   // Preview links: the preview host's own session, on its own
   // registrable domain, is __Host- too (sessionSetCookie, pinned in previewHostRules.test.ts).
-  'backend/src/services/previewHost.ts': { count: 1, why: 'the code exchange sets __Host-termag-preview (sessionSetCookie) and, on a browser\'s first session on a link, the __Host-termag-preview-link clear marker (linkMarkerSetCookie, row 2b, SR19)' },
+  'backend/src/services/previewHost.ts': { count: 1, why: 'the code exchange sets __Host-termag-preview (sessionSetCookie); the clean step after it, on a browser\'s first session on a link, the __Host-termag-preview-link clear marker (linkMarkerSetCookie, row 2b, SR19)' },
   'backend/src/services/previewHostRules.ts': { count: 2, why: 'the relay rewrites an app\'s set-cookie (no Domain, never __Host-termag-preview)' },
-  'backend/src/services/previewHostFixture.ts': { count: 1, why: 'test helper: reads the exchange\'s set-cookie' },
+  'backend/src/services/previewHostFixture.ts': { count: 2, why: 'test helper: reads the exchange\'s and the clean step\'s set-cookie' },
+  'backend/src/services/previewHostBrowserHarness.ts': { count: 1, why: 'test helper: logs the Set-Cookie names each answer carried, never a value' },
 };
 
 function sources(dir: string): string[] {

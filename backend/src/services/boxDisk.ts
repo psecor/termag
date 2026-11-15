@@ -25,6 +25,7 @@
  * EC2 is asked. A finished grow records the new size on `Instance.diskGiB`.
  */
 
+import { ec2For } from './ec2Box';
 import {
   DescribeInstancesCommand,
   DescribeVolumesCommand,
@@ -34,7 +35,6 @@ import {
 } from '@aws-sdk/client-ec2';
 import type { Instance } from '@prisma/client';
 import { prisma } from '../db';
-import { awsClientConfig, getBoxConfig } from './boxProvisioner';
 import { BOX_DISK_LIMITS } from './boxDiskSize';
 import { instanceAgentTransport, sendToInstanceAgent } from './agentRegistry';
 import { advanceBoxEvent, createBoxEvent, eventOpen, finishBoxEvent } from './boxEvents';
@@ -305,11 +305,6 @@ export function growRunning(instanceId: string): boolean {
   return (!!g && (g.state === 'modifying' || g.state === 'filesystem')) || reservations.has(instanceId);
 }
 
-function ec2For(box: Pick<Instance, 'region'>): EC2Client {
-  const cfg = getBoxConfig();
-  if (!cfg) throw new Error('Box provisioning is not configured');
-  return new EC2Client(awsClientConfig(cfg, box.region ?? cfg.region));
-}
 
 async function latestModification(ec2: EC2Client, volumeId: string): Promise<VolumeModification | null> {
   try {

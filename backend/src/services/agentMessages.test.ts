@@ -102,8 +102,12 @@ describe('parseAskBody', () => {
     expect(parseAskBody({ target: 'box/p', prompt: 'x' })).toMatchObject({ model: null });
     expect(parseAskBody({ target: 'box/p', prompt: 'x', model: null })).toMatchObject({ model: null });
     for (const model of ['opus', 'sonnet', 'haiku']) expect(parseAskBody({ target: 'box/p', prompt: 'x', model })).toMatchObject({ model });
-    for (const model of ['auto', 'gpt-5', 'Opus', 'us.anthropic.claude-opus-5-5', 1]) {
-      expect(parseAskBody({ target: 'box/p', prompt: 'x', model })).toEqual({ error: 'model must be opus, sonnet or haiku' });
+    // A Fireworks model (services/askModel.ts): the orchestrator resolves and checks it against fireworks-models.
+    for (const model of ['fireworks', 'fireworks:kimi-k3', 'fireworks:accounts/fireworks/models/kimi-k3']) {
+      expect(parseAskBody({ target: 'box/p', prompt: 'x', model })).toMatchObject({ model });
+    }
+    for (const model of ['auto', 'gpt-5', 'Opus', 'us.anthropic.claude-opus-5-5', 1, 'fireworks:', 'fireworks:kimi k3', 'fireworksx']) {
+      expect(parseAskBody({ target: 'box/p', prompt: 'x', model })).toEqual({ error: 'model must be opus, sonnet or haiku, or fireworks:<model> for a Fireworks model (e.g. fireworks:kimi-k3)' });
     }
   });
 
@@ -328,6 +332,26 @@ describe('runSystemPrompt with push (ask-push-v1)', () => {
     expect(p).toContain('termag-pr-create <title file> <body file> --draft');
     expect(p).toContain('git switch -c termag-ada/t1-<name> origin/<default branch>');
     expect(p).not.toContain('termag/base');
+    // Stacked PRs: cut from the parent branch and opened against it.
+    expect(p).toContain('git switch -c termag-ada/t1-<name> origin/<parent branch>');
+    expect(p).toContain('termag-pr-create <title file> <body file> --draft --base <parent branch>');
+    // Parent pushed and fetched before the cut, child pushed before its PR (Bugbot, Devin on #1629).
+    const order = ['git push origin HEAD:<parent branch>', 'git fetch origin <parent branch>', 'origin/<parent branch>` and commit there',
+      'git push origin HEAD:termag-ada/t1-<name>', '--draft --base <parent branch>'].map(s => p.indexOf(s));
+    expect(order.every(i => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // A squash-merged parent: the child's own commits are rebased onto the default branch (Devin on #1629).
+    expect(p).toContain('git rebase --onto origin/<default branch>');
+    // From the last parent commit the child has, not the parent's final head, which may be newer (Devin on #1629).
+    expect(p).toContain('git fetch origin pull/<parent n>/head');
+    expect(p).toContain('git merge-base HEAD FETCH_HEAD');
+    expect(p).not.toContain('headRefOid');
+    // Every step names its branch: a follow-up starts on the thread's branch, and another PR's branch is only read (Bugbot, Devin on #1629).
+    expect(p).toContain('never push to a parent that is another pull request');
+    const restack = p.indexOf('once the parent has merged');
+    expect(p.indexOf('git switch termag-ada/t1-<name>', restack)).toBeGreaterThan(restack);
+    expect(p.indexOf('git switch termag-ada/t1-<name>', restack)).toBeLessThan(p.indexOf('git rebase --onto', restack));
+    expect(p).toContain('gh pr edit <n> --base <default branch>');
     expect(p).not.toContain('TERMAG_ASK_PR_DIR');
     // A follow-up asked to update the PR body has no TERMAG_ASK_PR_BODY_FILE (report cmvv15bpz1is214bdn7778rjb).
     // Never through a pipe: gh runs on an empty stdin when termag-pr-body fails and blanks the PR (report cmvzm851b509mx3epx3r417eb).

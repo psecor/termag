@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   API_KEY_HELPER_PLACEHOLDER,
+  autoCompactWindow,
   getClaudeGatewayConfig,
   gatewaySettings,
   parseModelPins,
@@ -62,5 +63,29 @@ describe('gatewaySettings', () => {
       },
     });
     expect(JSON.stringify(s)).not.toMatch(/ANTHROPIC_API_KEY|AWS_BEARER_TOKEN_BEDROCK|ANTHROPIC_AUTH_TOKEN/);
+  });
+});
+
+describe('autoCompactWindow', () => {
+  it("is null for 0 and below, the model's full window", () => {
+    expect(autoCompactWindow(0)).toBeNull();
+    expect(autoCompactWindow(-1)).toBeNull();
+    expect(autoCompactWindow(Number.NaN)).toBeNull();
+  });
+
+  it("rounds, and clamps to Claude Code's 100K..1M", () => {
+    expect(autoCompactWindow(200_000)).toBe(200_000);
+    expect(autoCompactWindow(250_000.4)).toBe(250_000);
+    expect(autoCompactWindow(200)).toBe(100_000);
+    expect(autoCompactWindow(2_000_000)).toBe(1_000_000);
+  });
+});
+
+describe('gatewaySettings: the auto-compact window', () => {
+  it('sets CLAUDE_CODE_AUTO_COMPACT_WINDOW when given one, and nothing without', () => {
+    const cfg = getClaudeGatewayConfig(ENV)!;
+    expect((gatewaySettings(cfg, { compactWindow: 200_000 }).env as Record<string, string>).CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('200000');
+    expect(gatewaySettings(cfg, { compactWindow: null }).env).not.toHaveProperty('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
+    expect(gatewaySettings(cfg).env).not.toHaveProperty('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
   });
 });

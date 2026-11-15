@@ -9,11 +9,18 @@
  * `reboot` is the one component whose bad state is `pending`.
  */
 
-export type SoftwareState = 'current' | 'behind' | 'outdated' | 'ahead' | 'pending' | 'missing' | 'unknown';
-/** What "needs updating" counts, as the tab's NEEDS_UPDATE does: a pending reboot is an update not yet running. */
-export const NEEDS_UPDATE_STATES: ReadonlySet<SoftwareState> = new Set<SoftwareState>(['behind', 'outdated', 'pending']);
+/**
+ * `below-floor` and `held` are only for the tools termag updates, graded against each box's policy
+ * (toolGrade.ts): older than the policy's floor, and older than its target with the mode off.
+ */
+export type SoftwareState = 'current' | 'below-floor' | 'behind' | 'outdated' | 'ahead' | 'held' | 'pending' | 'missing' | 'unknown';
+/**
+ * What "needs updating" counts, as the tab's NEEDS_UPDATE does: a pending reboot is an update not yet
+ * running. `held` is not: its policy keeps it where it is.
+ */
+export const NEEDS_UPDATE_STATES: ReadonlySet<SoftwareState> = new Set<SoftwareState>(['below-floor', 'behind', 'outdated', 'pending']);
 /** Every state, in the order the tab counts them. */
-export const SOFTWARE_STATES: readonly SoftwareState[] = ['current', 'behind', 'outdated', 'ahead', 'pending', 'missing', 'unknown'];
+export const SOFTWARE_STATES: readonly SoftwareState[] = ['current', 'below-floor', 'behind', 'outdated', 'ahead', 'held', 'pending', 'missing', 'unknown'];
 
 /** Display order; anything else sorts after, by name. */
 export const COMPONENT_ORDER = [
@@ -64,13 +71,15 @@ export interface Observed { version: string | null; ok: boolean; path?: string |
 /**
  * A tool version against the fleet reference. Same major.minor is `behind`
  * (a patch or two), anything older `outdated`. Not installed is `missing`;
- * installed but unreadable, or never reported, is `unknown`.
+ * installed but unreadable, or never reported, is `unknown`. `compare` orders
+ * the two (compareVersions; the matrix passes the fleet update's
+ * compareToReference, which also orders the Cursor agent's dated builds).
  */
-export function toolState(o: Observed | null, reference: string | null): SoftwareState {
+export function toolState(o: Observed | null, reference: string | null, compare: (a: string, b: string) => number | null = compareVersions): SoftwareState {
   if (!o) return 'unknown';
   if (!o.ok) return o.path ? 'unknown' : 'missing';
   if (!o.version || !reference) return 'unknown';
-  const c = compareVersions(o.version, reference);
+  const c = compare(o.version, reference);
   if (c === null) return 'unknown';
   if (c === 0) return 'current';
   if (c > 0) return 'ahead';
@@ -143,14 +152,46 @@ export function hooksState(h: string | null): SoftwareState {
   return 'outdated'; // would-update, failed
 }
 
-export type ClientKind = 'web' | 'mobile' | 'cli' | 'tui' | 'metaterm';
+export type ClientKind = 'web' | 'mobile' | 'cli' | 'tui' | 'metaterm' | 'desktop';
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 const VER_RE = /^[0-9][0-9A-Za-z.+-]{0,30}$/;
+
+export type DesktopPlatform = 'darwin' | 'win32' | 'linux';
+export interface DesktopClient {
+  version: string;
+  /** The build's stage, from the app's name: beta, nightly or dev, or release for a name without one. Null when the User-Agent doesn't say. */
+  channel: string | null;
+  /** Electron's process.platform, from Chromium's User-Agent. Null when it doesn't say. */
+  platform: DesktopPlatform | null;
+}
+
+/**
+ * The termag desktop app (example-org/termag-desktop, an Electron build of
+ * T3 Code), from its User-Agent. Its main process calls /api/cli/v1 with
+ * Electron.net.fetch, which sends Chromium's User-Agent with the app's name
+ * and version in it. The fork names the app `termag <stage>`
+ * (DesktopAppIdentity.ts) and Electron drops the space, so:
+ *   … (KHTML, like Gecko) termagBeta/0.1.252 Chrome/152.0.0.0 Electron/44.0.0 Safari/537.36
+ * with Beta, Nightly or Dev, and a bare `termag/<v>` for a name without a
+ * stage. That form counts only with `Electron/` in it. Its forward socket
+ * sends `termag-desktop/<v>` instead. Pure.
+ */
+export function desktopFromUserAgent(userAgent: string | undefined): DesktopClient | null {
+  const ua = (userAgent ?? '').trim();
+  const own = /^termag-desktop\/(\S+)/.exec(ua);
+  if (own) return VER_RE.test(own[1]) ? { version: own[1], channel: null, platform: null } : null;
+  if (!/\bElectron\/\d/.test(ua)) return null;
+  const m = /(?:^|\s)termag([A-Z][A-Za-z]{0,15})?\/(\S+)/.exec(ua);
+  if (!m || !VER_RE.test(m[2])) return null;
+  const platform: DesktopPlatform | null = /\(Macintosh;/.test(ua) ? 'darwin' : /\(Windows /.test(ua) ? 'win32' : /\(X11;|Linux/.test(ua) ? 'linux' : null;
+  return { version: m[2], channel: (m[1] ?? 'release').toLowerCase(), platform };
+}
 
 /**
  * Which client sent a request, from the headers it sets:
  *   X-Termag-Client: web/<sha12> | mobile/<sha12>   (the web bundle)
  *   User-Agent: termag-cli/<v> | termag-tui/<v> | metaterm/<v>
+ *   User-Agent: … termagBeta/<v> … Electron/<v> … | termag-desktop/<v>   (the desktop app, desktopFromUserAgent)
  */
 export function clientFromHeaders(xClient: string | undefined, userAgent: string | undefined): { kind: ClientKind; version: string } | null {
   const x = /^(web|mobile)\/([0-9a-f]{7,40}|unknown)$/.exec((xClient ?? '').trim());
@@ -160,6 +201,8 @@ export function clientFromHeaders(xClient: string | undefined, userAgent: string
     const kind = ua[1] === 'termag-cli' ? 'cli' : ua[1] === 'termag-tui' ? 'tui' : 'metaterm';
     return { kind, version: ua[2] };
   }
+  const desktop = desktopFromUserAgent(userAgent);
+  if (desktop) return { kind: 'desktop', version: desktop.version };
   return null;
 }
 export const isSha = (v: string) => SHA_RE.test(v);

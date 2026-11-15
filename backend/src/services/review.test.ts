@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildGroupReviewPrompt, chooseReviewSlot, parseGroupReview,
   chooseGuess, guessRepoIndex, classifyReviewPane, isDevinForeground, parseGhPrView, parsePrInput, prFromLaunchEcho, prFromText, prNumberFromUrl,
-  reviewLaunchCommand, urlForPr, buildReviewPrompt, reviewPromptHeader, renderReviewTemplate, parseReviewBody, reviewPromptPath,
+  reviewLaunchCommand, urlForPr, buildReviewPrompt, reviewCheckoutLine, homeRelative, reviewPromptHeader, renderReviewTemplate, parseReviewBody, reviewPromptPath,
   DEFAULT_REVIEW_TEMPLATE, MAX_REVIEW_BODY, reviewAttribution, reviewPromptFooter, reviewTemplateCandidates, chooseReviewTemplate,
 } from './review';
 
@@ -111,6 +111,23 @@ describe('reviewLaunchCommand', () => {
   });
 });
 
+describe('homeRelative', () => {
+  it('names a path under the home through $HOME to type, and as ~/ to read', () => {
+    expect(homeRelative('/home/u', '/home/u/termag/projects/p/.worktrees/pr-1'))
+      .toEqual({ shell: '"$HOME/termag/projects/p/.worktrees/pr-1"', display: '~/termag/projects/p/.worktrees/pr-1' });
+    expect(homeRelative('/home/u/', '/home/u/termag/projects/my.app')).toEqual({ shell: '"$HOME/termag/projects/my.app"', display: '~/termag/projects/my.app' });
+  });
+  it('refuses a path outside the home, or one a shell would read anything into', () => {
+    expect(homeRelative('/home/u', '/home/uu/termag')).toBeNull();
+    expect(homeRelative('/home/u', '/home/u')).toBeNull();
+    expect(homeRelative('/home/u', '/srv/termag/projects/p')).toBeNull();
+    for (const bad of ['a b', 'a$b', 'a"b', 'a`b', 'a!b', '..', '.', "a'b", 'a\\b']) {
+      expect(homeRelative('/home/u', `/home/u/termag/${bad}/x`)).toBeNull();
+    }
+    expect(homeRelative('', '/x/y')).toBeNull();
+  });
+});
+
 describe('buildReviewPrompt', () => {
   const url = 'https://github.com/example-org/termag/pull/185';
   it('is the fixed header, the rendered built-in body and the attribution footer by default', () => {
@@ -144,6 +161,31 @@ describe('buildReviewPrompt', () => {
   it('the header round-trips through prFromLaunchEcho', () => {
     expect(prFromLaunchEcho(`❭ ${buildReviewPrompt(205, 'https://github.com/o/r/pull/205', 'anything')}`))
       .toEqual({ number: 205, url: 'https://github.com/o/r/pull/205' });
+  });
+  it('for a reviewer in a folder of its own, says where the checkout is, right under the header', () => {
+    const at = '~/termag/projects/p/.worktrees/pr-1';
+    const lines = buildReviewPrompt(185, url, null, 'Devin', at).split('\n');
+    expect(lines[0]).toBe(reviewPromptHeader(185, url));
+    expect(lines[1]).toBe(reviewCheckoutLine(at));
+    expect(lines[1]).toContain(`checked out at ${at}`);
+    expect(prFromLaunchEcho(lines.join('\n'))).toEqual({ number: 185, url });
+    // No URL: the header names the checkout's repository, not the current directory's.
+    expect(reviewPromptHeader(7, null, at)).toBe(`Review GitHub pull request #7 for the repository checked out at ${at}.`);
+    expect(prFromLaunchEcho(reviewPromptHeader(7, null, at))).toEqual({ number: 7, url: null });
+    // In the checkout, nothing changes.
+    expect(buildReviewPrompt(185, url, null, 'Devin', null)).toBe(buildReviewPrompt(185, url, null));
+    const group = parseGroupReview({ name: 'G', members: [{ repo: 'o/r', number: 5 }, { repo: 'o/s', number: 6 }] });
+    const g = group.ok ? buildGroupReviewPrompt(group.group!, 'Devin', at).split('\n') : [];
+    expect(g[0]).toMatch(/^Review GitHub pull request #5 /);
+    expect(g[1]).toBe(reviewCheckoutLine(at));
+  });
+  it('never starts with a slash, whatever the body: a reviewer reads a leading /command as a command (Devin: /bypass)', () => {
+    for (const body of ['/bypass', ' /bypass review it', '/permissions', null]) {
+      expect(buildReviewPrompt(5, 'https://github.com/o/r/pull/5', body)).toMatch(/^Review GitHub pull request #5 /);
+      expect(buildReviewPrompt(5, null, body)).toMatch(/^Review GitHub pull request #5 /);
+    }
+    const group = parseGroupReview({ name: '/bypass', members: [{ repo: 'o/r', number: 5, note: '/bypass' }] });
+    expect(group.ok && buildGroupReviewPrompt(group.group!, 'Devin')).toMatch(/^Review GitHub pull request #5 /);
   });
 });
 

@@ -1,7 +1,7 @@
 import { Router, RequestHandler } from 'express';
 import { requireAuth, requireAuthOrAgentToken } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
-import { connectedOwnedBoxes } from '../services/agentRegistry';
+import { connectedOwnedBoxes, instanceAgentTransport } from '../services/agentRegistry';
 import { githubTokenSource } from '../services/credentialStore';
 import { GithubApiError } from '../services/githubCredential';
 import { fetchPrFiles, fetchPrThreads, type PrFiles, type PrThread } from '../services/prFiles';
@@ -34,6 +34,8 @@ import { swrMemo } from '../services/ttlMemo';
 import { createWorkstreamFor } from './workstreams';
 import { parseFirstPrompt } from '../services/firstPrompt';
 import { sendResult, type RouteResult } from './routeResult';
+import { CHAT_PROVIDER_ID, chatEngineOf } from '../providers/registry';
+import { chatEngineRefusal } from '../services/chatRunner';
 import { parseDeferInput, parseDeferKey, prismaDeferrals, type DeferralStore, type PrDeferral } from '../services/prDeferrals';
 import {
   assembleGroups, finishedGroups, parseCreateInput, parseMembers, parsePatchInput, prismaReviewGroups,
@@ -675,11 +677,76 @@ export function prsLister(
  * passes its agent (`claude-chat`) and no first prompt. `params` are the route's
  * owner, repo and number; `body` is `{ projectId, name, prompt? }`.
  */
+/** The chat-runner providers a review chat may be made as (simple-ui-review-chat-enabled): Claude's, Cursor's and Devin's. */
+export const REVIEW_CHAT_PROVIDERS: readonly string[] = [CHAT_PROVIDER_ID, 'cursor-chat', 'devin-chat'];
+
+/**
+ * The cookie route's `provider` (simple-ui-review-chat-enabled): Review with Claude, Cursor or Devin makes its review
+ * session as that chat-runner provider, even in a Lab project whose main runs a pane agent, so it opens as a chat.
+ * Only those, only with the flag on for the caller, and Cursor's or Devin's only on a box whose agent can run it
+ * (`boxCapabilities`, read only then): a chat it couldn't send a message to is refused before its checkout is made.
+ * A body that names none gets main's, as before.
+ */
+export async function prWorkstreamProvider(
+  body: unknown, reviewChatOn: () => Promise<boolean>, boxCapabilities: () => Promise<readonly string[] | null> = async () => null,
+): Promise<{ provider?: string } | RouteResult> {
+  const provider = body && typeof body === 'object' ? (body as Record<string, unknown>).provider : undefined;
+  if (provider === undefined || provider === null) return {};
+  if (typeof provider !== 'string' || !REVIEW_CHAT_PROVIDERS.includes(provider)) {
+    return { status: 400, body: { error: `provider must be one of ${REVIEW_CHAT_PROVIDERS.join(', ')}` } };
+  }
+  if (!await reviewChatOn()) return { status: 403, body: { error: 'Review chats are off for you.', code: 'review-chat-off' } };
+  // An agent that isn't connected (a box just woken, its agent not yet in) says nothing of its engines: the create
+  // goes on as it would for Claude, and the chat's first send says why if the agent then lacks the engine.
+  const capabilities = chatEngineOf(provider) === 'claude' ? null : await boxCapabilities();
+  const refusal = capabilities ? chatEngineRefusal(chatEngineOf(provider), capabilities) : null;
+  if (refusal) return refusal;
+  return { provider };
+}
+
+/**
+ * The cookie route's `copyOf` (a review chat, simple-ui-review-chat-enabled): a review beside a session on its own PR,
+ * or a group's from the checkout one of its members has, where the PR's branch is already that session's checkout and
+ * git allows a branch in one worktree only. The review gets a branch of its own off that session's branch instead
+ * at the PR's head (prWorkstreamFor: read-only, as any PR checkout). `copyFrom` is the session's branch, which a
+ * branch-off would take the session's access from; it isn't used as the base until that is decided. Only
+ * with a review chat's provider; `sourceBranch` reads the named workstream's branch in the project, null when
+ * there's none.
+ */
+export async function prWorkstreamCopy(
+  body: unknown, provider: string | undefined, sourceBranch: (workstream: string) => Promise<string | null>,
+): Promise<{ copyFrom?: string; keepLink?: boolean } | RouteResult> {
+  const copyOf = body && typeof body === 'object' ? (body as Record<string, unknown>).copyOf : undefined;
+  if (copyOf === undefined || copyOf === null) return {};
+  if (typeof copyOf !== 'string' || !/^[A-Za-z0-9._-]{1,80}$/.test(copyOf)) return { status: 400, body: { error: 'copyOf must be a workstream name' } };
+  if (!provider) return { status: 400, body: { error: 'copyOf is for a review chat: it needs a provider' } };
+  const branch = await sourceBranch(copyOf);
+  if (!branch) return { status: 404, body: { error: `No workstream ${copyOf} in this project` } };
+  // A review of your own PR (the client says, `copyKeepsLink`) leaves the PR's link where it is: on the session that
+  // works on it, whose PR tab, merge panel and Review tab are the PR's. Someone else's PR's moves to the new review.
+  const keep = (body as Record<string, unknown>).copyKeepsLink === true;
+  return { copyFrom: branch, ...(keep ? { keepLink: true } : {}) };
+}
+
+/** The branch of a workstream in one of the user's own projects, or null. */
+async function workstreamBranch(userId: string, projectId: unknown, name: string): Promise<string | null> {
+  if (typeof projectId !== 'string' || !projectId) return null;
+  const ws = await prisma.workstream.findFirst({ where: { name, project: { id: projectId, userId } }, select: { branch: true } });
+  return ws?.branch || null;
+}
+
+/** The capabilities the agent of the user's project's box announced; null when it isn't connected (nothing known). */
+async function projectBoxCapabilities(userId: string, projectId: unknown): Promise<readonly string[] | null> {
+  if (typeof projectId !== 'string' || !projectId) return null;
+  const project = await prisma.project.findFirst({ where: { id: projectId, userId }, select: { instanceId: true } });
+  return project?.instanceId ? instanceAgentTransport(project.instanceId)?.capabilities ?? null : null;
+}
+
 export async function prWorkstreamFor(
   user: Express.User,
   params: { owner?: string; repo?: string; number?: string },
   body: unknown,
-  options: { provider?: string },
+  options: { provider?: string; copyFrom?: string; keepLink?: boolean },
   tokenFor: (userId: string) => Promise<string | null> = githubTokenSource,
   head: PrActionDeps['head'] = defaultActions.head,
   createWorkstream: typeof createWorkstreamFor = createWorkstreamFor,
@@ -705,13 +772,26 @@ export async function prWorkstreamFor(
     return { status: failure.status, body: { error: failure.error } };
   }
   if (prHead.state !== 'OPEN') return { status: 409, body: { error: `The pull request is ${prHead.state.toLowerCase()}: nothing to work on.` } };
-  const result = await createWorkstream(user, projectId, {
-    name, branch: prHead.branch, pr: { repo: `${ref.owner}/${ref.name}`, number: ref.number, sameRepo: prHead.sameRepo, headOid: prHead.headOid },
-    firstPrompt: first.prompt, ...(options.provider ? { provider: options.provider } : {}),
-  });
+  // A review chat where the PR's branch is checked out already (prWorkstreamCopy): a branch of its own, not a second
+  // checkout of the PR's, which git would refuse while the session has it. It's the box's PR checkout all the same
+  // (git-worktree-add-pr: it fetches pull/<n>/head, so a head past what the project has lands, and marks the branch a
+  // PR's, so the chat is read-only like any PR checkout's), on the chat's own branch name, as a fork's: it tracks
+  // nothing, so no push from it lands on the PR. Off the session's branch (options.copyFrom) instead, it would have the
+  // session's access: marked own exactly when that branch is (agent/git-worktree-own.js), a change of trust boundary
+  // that waits on a decision.
+  const result = await createWorkstream(user, projectId, options.copyFrom
+    ? {
+      name, branch: name, pr: { repo: `${ref.owner}/${ref.name}`, number: ref.number, sameRepo: false, headOid: prHead.headOid },
+      firstPrompt: first.prompt, ...(options.provider ? { provider: options.provider } : {}),
+    }
+    : {
+      name, branch: prHead.branch, pr: { repo: `${ref.owner}/${ref.name}`, number: ref.number, sameRepo: prHead.sameRepo, headOid: prHead.headOid },
+      firstPrompt: first.prompt, ...(options.provider ? { provider: options.provider } : {}),
+    });
   if (result.status === 201) {
     const ws = (result.body as { name?: string }).name ?? name;
-    await links.record(user.id, { repo: `${ref.owner}/${ref.name}`, number: ref.number }, { projectId, workstream: ws }, 'manual')
+    // A copy of your own PR's session (keepLink) links only where nothing is linked ('created' never replaces).
+    await links.record(user.id, { repo: `${ref.owner}/${ref.name}`, number: ref.number }, { projectId, workstream: ws }, options.keepLink ? 'created' : 'manual')
       .catch(err => console.warn('[PRS] could not attach the new workstream:', err instanceof Error ? err.message : String(err)));
   }
   return result;
@@ -1021,7 +1101,15 @@ export function prsRouter(
 
   // A new workstream on the PR's own branch (routes/workstreams.ts, `pr`), attached to the PR by hand.
   const newWorkstream: RequestHandler = async (req, res) => {
-    sendResult(res, await prWorkstreamFor(req.user!, req.params, req.body, {}, tokenFor, actions.head, createWorkstream, links));
+    const options = await prWorkstreamProvider(
+      req.body, () => boolVariation('simple-ui-review-chat-enabled', req.user!, false),
+      () => projectBoxCapabilities(req.user!.id, (req.body as { projectId?: unknown } | undefined)?.projectId),
+    );
+    if ('status' in options) { sendResult(res, options); return; }
+    const projectId = (req.body as { projectId?: unknown } | undefined)?.projectId;
+    const copy = await prWorkstreamCopy(req.body, options.provider, name => workstreamBranch(req.user!.id, projectId, name));
+    if ('status' in copy) { sendResult(res, copy); return; }
+    sendResult(res, await prWorkstreamFor(req.user!, req.params, req.body, { ...options, ...copy }, tokenFor, actions.head, createWorkstream, links));
   };
 
   const version: RequestHandler = async (_req, res) => {

@@ -15,6 +15,7 @@ import {
   pushRepo,
   ssoRequiredMessage,
   targetOwner,
+  unservedApiReason,
   type BrokerTarget,
 } from './githubBroker';
 import type { OrgAccess } from './githubRepos';
@@ -74,6 +75,8 @@ function deny(status: number, message: string, audit: string): AuthzDecision {
 export async function decideGithubRequest(req: AuthzRequest, deps: AuthzDeps): Promise<AuthzDecision> {
   const target = brokerTarget(req.method, req.path, req.search);
   if (!target) return deny(404, 'Not a path the termag GitHub broker forwards', 'not a brokered path');
+  const unserved = target.kind === 'api' ? unservedApiReason(req.method, target.logPath) : null;
+  if (unserved) return deny(404, unserved, `api ${req.method.toUpperCase()} ${target.logPath} not served (Actions log download)`);
   const token = boxTokenFrom(req.authorization);
   if (!token) return deny(401, "The termag GitHub broker needs this box's agent token", 'no box token');
 

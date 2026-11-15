@@ -19,6 +19,8 @@ import {
   appBaseUrl, buildTestPayload, defaultSendDeps, parseEndpointBody, parseSubscriptionBody, sendToUser,
   type DeclarativePushPayload, type PushSubscriptionInput, type SendSummary, type VapidConfig,
 } from '../services/webPush';
+import { boolVariation } from '../services/featureFlags';
+import type { FlagUser } from '../services/featureFlags';
 
 export interface SubscriptionView {
   id: string;
@@ -41,6 +43,8 @@ export interface PushRouteDeps {
   vapid: () => VapidConfig | null;
   send: (userId: string, payload: DeclarativePushPayload) => Promise<SendSummary>;
   baseUrl: () => string;
+  /** chat-phone-home-enabled for the caller: the test notification opens the chat. */
+  phoneChat: (user: FlagUser) => Promise<boolean>;
 }
 
 /** Push is available: the server has VAPID keys. */
@@ -77,9 +81,10 @@ export async function removeSubscription(userId: string, body: unknown, deps: Pi
   return { status: 204, body: null };
 }
 
-export async function sendTest(userId: string, deps: Pick<PushRouteDeps, 'vapid' | 'send' | 'baseUrl'>): Promise<RouteResult> {
+export async function sendTest(user: FlagUser, deps: Pick<PushRouteDeps, 'vapid' | 'send' | 'baseUrl' | 'phoneChat'>): Promise<RouteResult> {
   if (!deps.vapid()) return { status: 409, body: { error: 'push is not configured on this server' } };
-  const { sent, failed } = await deps.send(userId, buildTestPayload(deps.baseUrl()));
+  const chat = await deps.phoneChat(user).catch(() => false);
+  const { sent, failed } = await deps.send(user.id, buildTestPayload(deps.baseUrl(), chat));
   return { status: 200, body: { sent, failed } };
 }
 
@@ -106,6 +111,7 @@ export function defaultPushRouteDeps(): PushRouteDeps {
     vapid: () => defaultSendDeps().vapid,
     send: (userId, payload) => sendToUser(userId, payload, defaultSendDeps()),
     baseUrl: () => appBaseUrl(),
+    phoneChat: user => boolVariation('chat-phone-home-enabled', user, false),
   };
 }
 
@@ -118,10 +124,10 @@ export function pushRouter(deps: PushRouteDeps = defaultPushRouteDeps()): Router
   const router = Router();
   router.use(requireAuth);
 
-  const wrap = (fn: (userId: string, body: unknown) => Promise<RouteResult> | RouteResult): RequestHandler =>
+  const wrap = (fn: (userId: string, body: unknown, user: FlagUser) => Promise<RouteResult> | RouteResult): RequestHandler =>
     async (req, res) => {
       try {
-        reply(res, await fn(req.user!.id, req.body));
+        reply(res, await fn(req.user!.id, req.body, req.user!));
       } catch (err) {
         console.error('[PUSH] route failed:', err instanceof Error ? err.message : String(err));
         res.status(500).json({ error: 'push request failed' });
@@ -132,6 +138,6 @@ export function pushRouter(deps: PushRouteDeps = defaultPushRouteDeps()): Router
   router.get('/subscriptions', wrap(userId => listSubscriptions(userId, deps)));
   router.post('/subscriptions', wrap((userId, body) => addSubscription(userId, body, deps)));
   router.delete('/subscriptions', wrap((userId, body) => removeSubscription(userId, body, deps)));
-  router.post('/test', wrap(userId => sendTest(userId, deps)));
+  router.post('/test', wrap((_userId, _body, user) => sendTest(user, deps)));
   return router;
 }

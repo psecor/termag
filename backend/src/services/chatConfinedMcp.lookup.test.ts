@@ -11,7 +11,7 @@ vi.mock('../db', () => ({ prisma }));
 import { automationOutputsOf, spaceReadersOf } from './chatConfinedMcp';
 
 const automationRow = (over: Record<string, unknown> = {}) => ({
-  spaceName: 'mine', notifySlack: false, project: { slackChannelId: 'C-proj', _count: { shares: 0, invites: 0 } }, ...over,
+  spaceName: 'mine', notifySlack: false, alertPrefix: null, alertRegex: null, alertTarget: 'dm', webhookHost: null, project: { slackChannelId: 'C-proj', _count: { shares: 0, invites: 0 } }, ...over,
 });
 const runChat = (over: Record<string, unknown> = {}) => ({ projectId: 'p1', name: 'run-20261105-0900', slackChannelId: null, spaceId: null, space: null, ...over });
 
@@ -35,7 +35,15 @@ describe('automationOutputsOf', () => {
   it('a run\'s own workstream: the automation\'s space and the chat\'s, no Slack', async () => {
     prisma.automation.findUnique.mockResolvedValue(automationRow());
     prisma.workstream.findUnique.mockResolvedValue(runChat({ spaceId: 's-old', space: { name: 'team' } }));
-    expect(await automationOutputsOf('p1', 'ws1')).toEqual({ spaceNames: ['mine', 'team'], notifySlack: false, workstreamSlack: false, projectSharees: 0 });
+    expect(await automationOutputsOf('p1', 'ws1')).toEqual({ spaceNames: ['mine', 'team'], notifySlack: false, alertsLeaveOwner: false, workstreamSlack: false, projectSharees: 0 });
+  });
+
+  it('an automation with a webhook, or a keyword alert to a channel, sends its runs\' words beyond the owner', async () => {
+    prisma.workstream.findUnique.mockResolvedValue(runChat());
+    for (const over of [{ webhookHost: 'hooks.example.com' }, { alertPrefix: 'BLOCKER:', alertTarget: 'project' }]) {
+      prisma.automation.findUnique.mockResolvedValueOnce(automationRow(over));
+      expect((await automationOutputsOf('p1', 'ws1'))?.alertsLeaveOwner, JSON.stringify(over)).toBe(true);
+    }
   });
 
   it('Slack, or a workstream it can\'t place: a channel of its own, main on the project\'s channel, none found, another project\'s, or no id', async () => {

@@ -34,6 +34,9 @@ vi.mock('../services/agentRegistry', () => ({
   sendToAgent: vi.fn(),
   projectAgentCapabilities: () => capabilities,
 }));
+let carry = false;
+const afterConversationsMoved = vi.fn();
+vi.mock('../services/renameConversations', () => ({ carriesConversations: vi.fn(async () => carry), afterConversationsMoved }));
 vi.mock('../services/agentRuntime', () => ({
   ensureAgentSessionsAndLaunch,
   resolveAgentProvider: (p: string) => p,
@@ -167,6 +170,44 @@ describe('renameOwnedProject and the owner\'s tabs', () => {
       expect(changed.mock.calls).toEqual([['u1', 'projects']]);
     } finally {
       setWorkspaceChangeCallback(null);
+    }
+  });
+});
+
+describe('renameOwnedProject and the project\'s conversations', () => {
+  const answer = { ok: true, movedDir: true, usageSources: [{ from: '-home-alice-termag-projects-old', to: '-home-alice-termag-projects-new' }] };
+  const renameCall = () => sendForProject.mock.calls.find(c => c[1] === 'project-rename')!;
+
+  it('asks the box to carry them when its agent and the flag allow, and hands the answer on', async () => {
+    carry = true;
+    sendForProject.mockImplementation(async (_host: unknown, command: string) => (command === 'project-rename' ? answer : {}));
+    try {
+      expect((await renameOwnedProject(user, 'p1', 'new')).status).toBe(200);
+      expect(renameCall()[2]).toMatchObject({ fromDir: '/home/alice/termag/projects/old', toDir: '/home/alice/termag/projects/new', conversations: true });
+      expect(afterConversationsMoved).toHaveBeenCalledWith('u1', { userId: 'u1', instanceId: 'i1' }, answer);
+    } finally {
+      carry = false;
+    }
+  });
+
+  it('sends the plan as before otherwise', async () => {
+    sendForProject.mockResolvedValue({});
+    expect((await renameOwnedProject(user, 'p1', 'new')).status).toBe(200);
+    expect('conversations' in (renameCall()[2] as object)).toBe(false);
+    expect(afterConversationsMoved).not.toHaveBeenCalled();
+  });
+
+  it('touches no usage when the box refuses the rename', async () => {
+    carry = true;
+    sendForProject.mockImplementation(async (_host: unknown, command: string) => {
+      if (command === 'project-rename') throw new Error('/home/alice/termag/projects/new already exists');
+      return {};
+    });
+    try {
+      expect((await renameOwnedProject(user, 'p1', 'new')).status).toBe(502);
+      expect(afterConversationsMoved).not.toHaveBeenCalled();
+    } finally {
+      carry = false;
     }
   });
 });

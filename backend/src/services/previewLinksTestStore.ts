@@ -205,6 +205,7 @@ export function memoryConfirmationStore(now: () => Date = () => new Date()) {
       Object.assign(r, data);
       return true;
     },
+    async askedFor(id) { return [...rows.values()].some(r => r.kind === 'publish' && r.request.requestId === id); },
   };
   return { store, rows };
 }

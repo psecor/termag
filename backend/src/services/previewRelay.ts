@@ -6,7 +6,8 @@
  * routes/cliT3.ts's relays, whose WebSocket helpers it shares.
  *
  * - **One pool per viewer session (SR7).** Each session gets its own
- *   keep-alive http.Agent (16 connections, dropped after 30 s idle) whose
+ *   keep-alive http.Agent (16 connections, a free one dropped a second before
+ *   the app's own Keep-Alive timeout, else after 30 s idle) whose
  *   createConnection opens a tunnel, so a tunnel opens once per kept-alive
  *   connection rather than once per request, and no two viewers' requests
  *   ever share a connection to the app: a request-smuggling desync in a dev
@@ -157,7 +158,10 @@ export class PreviewRelay {
         this.retired.set(ctx.sessionIdHash, set);
       }
     }
-    const agent = new http.Agent({ keepAlive: true, maxSockets: this.maxSockets, maxFreeSockets: this.maxSockets });
+    // `timeout` lets Node apply the app's `Keep-Alive: timeout=` hint: a free connection is dropped a second
+    // before the app would hang up on it (Node ignores the hint on an agent without one), and else after
+    // the pool's idle time. It never cuts a request in flight.
+    const agent = new http.Agent({ keepAlive: true, maxSockets: this.maxSockets, maxFreeSockets: this.maxSockets, timeout: this.idleMs });
     (agent as unknown as { createConnection: unknown }).createConnection = (_opts: unknown, cb: (err: Error | null, s?: Duplex) => void) => {
       this.open(ctx).then(s => cb(null, s), err => cb(err as Error));
     };

@@ -17,6 +17,11 @@ let unavailable = false;
 let identities: PresignerIdentity[];
 /** Live file changes the router sent (onFileChange), for the open views a change must reach. */
 const fileChanges: Array<{ kind: string; path: string; etag?: string }> = [];
+/** What the router told files.saved and files.moved (onUploadSigned, onFileMoved). */
+const uploadsSigned: Array<{ spaceId: string; path: string; chosen: string | null }> = [];
+const filesMoved: Array<{ caller: SpaceCaller; fromSpaceId: string; toSpaceId: string; saved: { byBox: boolean; at: Date } | null }> = [];
+/** project-files-enabled, which files/move-to is behind. */
+let moveToOn = true;
 let server: Server;
 let origin: string;
 let base: string;
@@ -40,6 +45,9 @@ beforeAll(async () => {
     },
     fileLink: (space, path) => `https://ui.example${spaceFileLinkPath('/termag', space, path)}`,
     onFileChange: c => { fileChanges.push(c as never); },
+    onUploadSigned: u => { uploadsSigned.push(u); },
+    onFileMoved: m => { filesMoved.push(m); },
+    moveToEnabled: async () => moveToOn,
   }));
   // The browser link, for a non-member's read of a file a box shared.
   app.use('/termag/files', spaceFilesRouter({
@@ -1044,3 +1052,167 @@ describe('sharing a file', () => {
     expect(store.shareRows).toEqual([]);
   });
 });
+
+describe('moving a file to another space (files/move-to)', () => {
+  let project: { id: string; name: string };
+  let mine: { id: string; name: string };
+  beforeEach(async () => {
+    project = await createSpace('alice-site');
+    mine = await createSpace('alice-my-files');
+    uploadsSigned.length = 0;
+    filesMoved.length = 0;
+    moveToOn = true;
+  });
+
+  it('is behind project-files-enabled: off, a 404 that moves nothing', async () => {
+    objects.put(`${project.id}/a.md`, 1);
+    moveToOn = false;
+    expect(await moveTo({ path: 'a.md', toSpace: 'alice-my-files' })).toMatchObject({ status: 404, body: { code: 'project_files_disabled' } });
+    expect(objects.files.has(`${project.id}/a.md`)).toBe(true);
+  });
+  const moveTo = (body: Record<string, unknown>, as = 'alice', from = 'alice-site') => call('POST', `/${from}/files/move-to`, { as, body });
+
+  it('copies it into the other space at the same path, deletes it here, and says where it went', async () => {
+    objects.put(`${project.id}/shots/run.png`, 7);
+    const r = await moveTo({ path: 'shots/run.png', toSpace: 'alice-my-files' });
+    expect(r).toMatchObject({ status: 200, body: { ok: true, moved: 1, to: { space: 'alice-my-files', path: 'shots/run.png' } } });
+    expect([...objects.files.keys()]).toEqual([`${mine.id}/shots/run.png`]);
+    // A put there once it has landed, then a removal here once it's gone, for the history and the live views.
+    expect(store.eventRows.slice(-2).map(e => [e.spaceId, e.action, e.path, e.note])).toEqual([
+      [mine.id, 'file.put', 'shots/run.png', 'moved from alice-site:shots/run.png'],
+      [project.id, 'file.rm', 'shots/run.png', 'moved to alice-my-files:shots/run.png'],
+    ]);
+    expect(filesMoved).toEqual([{ caller: { kind: 'user', userId: 'alice' }, fromSpaceId: project.id, toSpaceId: mine.id, saved: null }]);
+    // To another path, if asked.
+    objects.put(`${project.id}/a.md`, 1);
+    expect((await moveTo({ path: 'a.md', toSpace: 'alice-my-files', toPath: 'notes/a.md' })).body.to).toEqual({ space: 'alice-my-files', path: 'notes/a.md' });
+  });
+
+  it('asks before overwriting: 409 exists, then force replaces it', async () => {
+    objects.put(`${project.id}/shots/run.png`, 7);
+    objects.put(`${mine.id}/shots/run.png`, 3);
+    const r = await moveTo({ path: 'shots/run.png', toSpace: 'alice-my-files' });
+    expect(r).toMatchObject({ status: 409, body: { code: 'exists', error: 'alice-my-files already has shots/run.png' } });
+    expect(objects.files.has(`${project.id}/shots/run.png`)).toBe(true);
+    expect((await moveTo({ path: 'shots/run.png', toSpace: 'alice-my-files', force: true })).status).toBe(200);
+    expect(objects.files.has(`${project.id}/shots/run.png`)).toBe(false);
+  });
+
+  it('refuses a stale ifMatch with 412, and moves when it is current', async () => {
+    objects.put(`${project.id}/a.md`, 1);
+    const read = objects.etagOf(`${project.id}/a.md`)!;
+    objects.put(`${project.id}/a.md`, 2);
+    expect((await moveTo({ path: 'a.md', toSpace: 'alice-my-files', ifMatch: read })).status).toBe(412);
+    expect(objects.files.has(`${mine.id}/a.md`)).toBe(false);
+    const now = objects.etagOf(`${project.id}/a.md`)!;
+    expect((await moveTo({ path: 'a.md', toSpace: 'alice-my-files', ifMatch: now })).status).toBe(200);
+  });
+
+  it('needs editor on both: a space the caller has no role in is a 404, a viewer\'s a 403', async () => {
+    objects.put(`${project.id}/a.md`, 1);
+    await createSpace('bob-space', 'bob');
+    expect((await moveTo({ path: 'a.md', toSpace: 'bob-space' })).status).toBe(404);
+    expect((await moveTo({ path: 'a.md', toSpace: 'nope' })).status).toBe(404);
+    await call('POST', '/bob-space/members', { as: 'bob', body: { email: 'alice@example.com', role: 'viewer' } });
+    expect((await moveTo({ path: 'a.md', toSpace: 'bob-space' })).status).toBe(403);
+    // Bob can't move Alice's file anywhere: he has no role in her space.
+    expect((await moveTo({ path: 'a.md', toSpace: 'bob-space' }, 'bob')).status).toBe(404);
+    expect(objects.files.has(`${project.id}/a.md`)).toBe(true);
+  });
+
+  it('drops the old path\'s share link, as a move within a space does', async () => {
+    objects.put(`${project.id}/a.png`, 1);
+    expect((await call('PUT', '/alice-site/files/share', { as: 'alice', body: { path: 'a.png' } })).status).toBe(200);
+    await moveTo({ path: 'a.png', toSpace: 'alice-my-files' });
+    expect(await store.fileShare(project.id, 'a.png')).toBeNull();
+    expect(await store.fileShare(mine.id, 'a.png')).toBeNull();
+  });
+
+  it('charges the target\'s quota, and refuses a move it can\'t hold', async () => {
+    objects.put(`${project.id}/big.bin`, 50);
+    store.spaces.get(mine.id)!.quotaBytes = 40n;
+    const r = await moveTo({ path: 'big.bin', toSpace: 'alice-my-files' });
+    expect(r.status).toBe(413);
+    expect(objects.files.has(`${project.id}/big.bin`)).toBe(true);
+    store.spaces.get(mine.id)!.quotaBytes = 1000n;
+    expect((await moveTo({ path: 'big.bin', toSpace: 'alice-my-files' })).status).toBe(200);
+    expect(store.spaces.get(mine.id)!.usedBytes).toBe(50n);
+  });
+
+  it('refuses the same space, a missing file, and a space\'s memory', async () => {
+    objects.put(`${project.id}/.termag/memory/x.md`, 1);
+    expect((await moveTo({ path: 'a.md', toSpace: 'alice-site' })).body.code).toBe('same_space');
+    expect((await moveTo({ path: 'gone.md', toSpace: 'alice-my-files' })).status).toBe(404);
+    expect((await moveTo({ path: '.termag/memory/x.md', toSpace: 'alice-my-files' })).body.code).toBe('memory_path');
+    expect((await moveTo({ path: 'x.md', toSpace: 'alice-my-files', toPath: '.termag/x.md' })).body.code).toBe('memory_path');
+    expect((await moveTo({ path: 'a.md' })).body.code).toBe('invalid_space');
+  });
+
+  it('refuses a destination that appeared after the check, as S3 does at the copy (Devin, #1832)', async () => {
+    objects.put(`${project.id}/draft.md`, 1);
+    objects.beforeCopyWrite = to => { objects.put(to, 9); };
+    const r = await moveTo({ path: 'draft.md', toSpace: 'alice-my-files' });
+    objects.beforeCopyWrite = null;
+    expect(r).toMatchObject({ status: 409, body: { code: 'exists' } });
+    expect(objects.files.has(`${project.id}/draft.md`)).toBe(true);
+    expect(objects.files.get(`${mine.id}/draft.md`)!.size).toBe(9);
+    expect(filesMoved).toEqual([]);
+  });
+
+  it('keeps a write that landed after the copy: 409 changed_while_moving, the newer version stays here (Devin, #1832)', async () => {
+    objects.put(`${project.id}/a.md`, 1);
+    objects.beforeConditionalDelete = key => { objects.put(key, 2); };
+    const r = await moveTo({ path: 'a.md', toSpace: 'alice-my-files' });
+    objects.beforeConditionalDelete = null;
+    expect(r).toMatchObject({ status: 409, body: { code: 'changed_while_moving', to: { space: 'alice-my-files', path: 'a.md' } } });
+    expect(objects.files.get(`${project.id}/a.md`)!.size).toBe(2);
+    expect(objects.files.get(`${mine.id}/a.md`)!.size).toBe(1);
+    expect(store.eventRows.some(e => e.spaceId === project.id && e.action === 'file.rm')).toBe(false);
+    expect(filesMoved).toEqual([]);
+  });
+
+  it('says so when the source can\'t be removed: ok false, both copies there, nothing says it left (Devin, #1832)', async () => {
+    objects.put(`${project.id}/r.pdf`, 1);
+    expect((await call('PUT', '/alice-site/files/share', { as: 'alice', body: { path: 'r.pdf' } })).status).toBe(200);
+    objects.deleteRefusal = 'failed';
+    const r = await moveTo({ path: 'r.pdf', toSpace: 'alice-my-files' });
+    objects.deleteRefusal = null;
+    expect(r).toMatchObject({ status: 200, body: { ok: false, moved: 0, failed: ['r.pdf'] } });
+    expect(objects.files.has(`${project.id}/r.pdf`)).toBe(true);
+    expect(await store.fileShare(project.id, 'r.pdf')).not.toBeNull();
+    expect(store.eventRows.some(e => e.spaceId === project.id && e.action === 'file.rm')).toBe(false);
+    expect(filesMoved).toEqual([]);
+  });
+
+  it('won\'t force a file over a shared one: 409 destination_shared, the share and both files as they were (Devin, #1832)', async () => {
+    objects.put(`${project.id}/p.png`, 1);
+    objects.put(`${mine.id}/p.png`, 2);
+    expect((await call('PUT', '/alice-my-files/files/share', { as: 'alice', body: { path: 'p.png' } })).status).toBe(200);
+    const r = await moveTo({ path: 'p.png', toSpace: 'alice-my-files', force: true });
+    expect(r).toMatchObject({ status: 409, body: { code: 'destination_shared', space: 'alice-my-files', path: 'p.png' } });
+    // Refused before the charge: the target's quota holds nothing for it (Bugbot, #1832).
+    expect(store.spaces.get(mine.id)!.usedBytes).toBe(0n);
+    expect(objects.files.get(`${mine.id}/p.png`)!.size).toBe(2);
+    expect(objects.files.has(`${project.id}/p.png`)).toBe(true);
+    expect((await store.fileShare(mine.id, 'p.png'))?.sharedById).toBe('alice');
+    // Made private, it can be replaced.
+    await call('DELETE', '/alice-my-files/files/share?path=p.png', { as: 'alice' });
+    expect((await moveTo({ path: 'p.png', toSpace: 'alice-my-files', force: true })).status).toBe(200);
+  });
+
+  it('tells files.moved who saved it last and when, from a box or a person', async () => {
+    await call('POST', '/alice-site/boxes', { as: 'alice', body: { box: 'alice-box' } });
+    const up = await call('POST', '/alice-site/files/upload', { as: 'alice', box: 'alicebox', body: { path: 'shot.png', size: 4, chosen: 'default' } });
+    expect(up.status).toBe(200);
+    expect(uploadsSigned.at(-1)).toMatchObject({ spaceId: project.id, path: 'shot.png', chosen: 'default' });
+    objects.put(`${project.id}/shot.png`, 4);
+    await call('POST', '/alice-site/files/uploaded', { as: 'alice', box: 'alicebox', body: { path: 'shot.png' } });
+    await moveTo({ path: 'shot.png', toSpace: 'alice-my-files' });
+    expect(filesMoved.at(-1)).toMatchObject({ fromSpaceId: project.id, toSpaceId: mine.id, saved: { byBox: true } });
+    expect(filesMoved.at(-1)!.saved!.at).toBeInstanceOf(Date);
+    // An upload that names no choice says so as null.
+    await call('POST', '/alice-site/files/upload', { as: 'alice', body: { path: 'b.md', size: 1 } });
+    expect(uploadsSigned.at(-1)).toMatchObject({ path: 'b.md', chosen: null });
+  });
+});
+

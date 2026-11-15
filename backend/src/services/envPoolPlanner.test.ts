@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { envPoolRetryAt, nextRefreshAt, pickSubnet, planEnvironmentPool, planEnvPoolRefresh, refreshDueAt, sameHeads, type EnvPoolPlanInput, type EnvPoolRefreshInput, type EnvPoolRowView } from './envPoolPlanner';
+import { holdingFailure, nextRefreshAt, pickSubnet, planEnvironmentPool, planEnvPoolRefresh, refreshDueAt, sameHeads, type EnvPoolFailureView, type EnvPoolPlanInput, type EnvPoolRefreshInput, type EnvPoolRowView } from './envPoolPlanner';
 
 const NOW = new Date('2026-11-06T12:00:00Z');
 const HEADS = { 'e2e-org/envdemo': 'a'.repeat(40) };
@@ -84,87 +84,52 @@ describe('planEnvironmentPool: stale rows', () => {
   });
 });
 
-describe('planEnvironmentPool: failures', () => {
-  const failed = row({ id: 'f1', status: 'env-failed', preparedAt: null, setupFailed: true, createdAt: ago(20) });
+describe('planEnvironmentPool: one failure rule', () => {
+  // A failed prepare or refresh, whatever failed (its launch, the image, a clone, setup, a timeout): a terminated row
+  // that keeps the setup hash and heads it ran at, and when it failed.
+  const HOLD = 60 * 60_000;
+  const failure = (min: number, over: Partial<EnvPoolFailureView> = {}): EnvPoolFailureView =>
+    ({ id: 'f1', poolSetupHash: 'h1', preparedCommit: HEADS, failedAt: ago(min), ...over });
 
-  it('launches nothing after a failure at the current setup and heads', () => {
-    const p = plan({ rows: [failed] });
-    expect(p.blocked).toEqual({ rowId: 'f1' });
+  it('holds launches at the hash and heads it failed at, for an hour', () => {
+    const p = plan({ lastFailure: failure(20), holdMs: HOLD });
     expect(p.launch).toEqual([]);
-    expect(p.retire).toEqual([]);
+    expect(p.held).toEqual({ rowId: 'f1', until: new Date(ago(20).getTime() + HOLD) });
   });
 
-  it('launches again once the setup text changed (a new hash)', () => {
-    const p = plan({ current: { ok: true, hash: 'h2', heads: HEADS }, rows: [failed] });
-    expect(p.blocked).toBeNull();
-    expect(p.launch).toHaveLength(1);
-    // The newest failure is kept for the page until a box prepares after it.
-    expect(p.retire).toEqual([]);
-  });
-
-  it('launches again once a default branch moved', () => {
-    const p = plan({ current: { ok: true, hash: 'h1', heads: { 'e2e-org/envdemo': 'b'.repeat(40) } }, rows: [failed] });
-    expect(p.blocked).toBeNull();
+  it('lets go after the hour: a transient failure recovers on its own, a broken setup costs one box an hour', () => {
+    const p = plan({ lastFailure: failure(61), holdMs: HOLD });
+    expect(p.held).toBeNull();
     expect(p.launch).toHaveLength(1);
   });
 
-  it('retires a failure once a later box prepared, and older failures at once', () => {
-    const older = row({ id: 'f0', status: 'env-failed', preparedAt: null, createdAt: ago(200), poolSetupHash: 'h0' });
-    const later = row({ id: 's1', preparedAt: ago(5) });
-    const p = plan({ current: { ok: true, hash: 'h1', heads: { x: 'y' } }, rows: [older, failed, later] });
-    expect(p.retire.map(r => r.id).sort()).toEqual(['f0', 'f1']);
+  it('lets go at once when the setup hash changed (a new image, a changed setup)', () => {
+    const p = plan({ lastFailure: failure(5, { poolSetupHash: 'h0' }), holdMs: HOLD });
+    expect(p.held).toBeNull();
+    expect(p.launch).toHaveLength(1);
+  });
+
+  it('lets go at once when a default branch moved past it', () => {
+    const p = plan({ lastFailure: failure(5, { preparedCommit: { 'e2e-org/envdemo': 'b'.repeat(40) } }), holdMs: HOLD });
+    expect(p.held).toBeNull();
+    expect(p.launch).toHaveLength(1);
+  });
+
+  it('a failure that recorded no heads holds nothing', () => {
+    expect(plan({ lastFailure: failure(5, { preparedCommit: null }), holdMs: HOLD }).held).toBeNull();
+  });
+
+  it('holds nothing while the environment is unresolved (nothing is launched then anyway)', () => {
+    const p = plan({ current: { ok: false, reason: 'GitHub said 502' }, lastFailure: failure(5), holdMs: HOLD });
+    expect(p.held).toBeNull();
+    expect(p.launch).toEqual([]);
   });
 
   it('fails a box that has been preparing past the window', () => {
     const p = plan({ rows: [row({ id: 'p1', status: 'env-preparing', preparedAt: null, createdAt: ago(46) })] });
     expect(p.fail).toEqual([{ id: 'p1', reason: 'prepare timed out after 45 min' }]);
-    // Its slot is free again this tick.
+    // Its slot is free again this tick: one probe, until a box prepares at the current hash.
     expect(p.launch).toHaveLength(1);
-  });
-});
-
-describe('planEnvironmentPool: failures that are not setup\'s', () => {
-  // A launch error, an old image, a clone or a timeout: the row keeps the hash and heads it launched at, and
-  // setupFailed is false.
-  const other = (min: number, over: Partial<EnvPoolRowView> = {}) =>
-    row({ id: 'o1', status: 'env-failed', preparedAt: null, setupFailed: false, createdAt: ago(min + 1), terminatedAt: ago(min), ...over });
-  const COOLDOWN = 10 * 60_000;
-
-  it('never holds the pool, at the current hash and heads', () => {
-    const p = plan({ rows: [other(30)], retryAfterMs: COOLDOWN });
-    expect(p.blocked).toBeNull();
-    expect(p.launch).toHaveLength(1);
-  });
-
-  it('spaces out the retries of the definition it failed for', () => {
-    const p = plan({ rows: [row({ id: 's1' }), other(3)], retryAfterMs: COOLDOWN });
-    expect(p.blocked).toBeNull();
-    expect(p.launch).toEqual([]);
-    expect(p.retryAt).toEqual(new Date(ago(3).getTime() + COOLDOWN));
-  });
-
-  it('does not delay a new definition: a failure at an old setup hash (a new image, a changed setup) inside the cooldown', () => {
-    const p = plan({ rows: [other(3, { poolSetupHash: 'h0' })], retryAfterMs: COOLDOWN });
-    expect(p.retryAt).toBeNull();
-    expect(p.launch).toHaveLength(1);
-  });
-
-  it('does not delay a new definition for a failure that recorded no heads either', () => {
-    const p = plan({ rows: [other(3, { poolSetupHash: 'h0', preparedCommit: null })], retryAfterMs: COOLDOWN });
-    expect(p.retryAt).toBeNull();
-    expect(p.launch).toHaveLength(1);
-  });
-
-  it('does not delay once a default branch moved past the failure', () => {
-    const p = plan({ rows: [other(3, { preparedCommit: { 'e2e-org/envdemo': 'b'.repeat(40) } })], retryAfterMs: COOLDOWN });
-    expect(p.retryAt).toBeNull();
-    expect(p.launch).toHaveLength(1);
-  });
-
-  it('while a setup that ran and failed still holds it, at its hash and heads only', () => {
-    const failed = row({ id: 'f1', status: 'env-failed', preparedAt: null, setupFailed: true, createdAt: ago(20) });
-    expect(plan({ rows: [failed], retryAfterMs: COOLDOWN }).blocked).toEqual({ rowId: 'f1' });
-    expect(plan({ rows: [{ ...failed, poolSetupHash: 'h0' }], retryAfterMs: COOLDOWN }).blocked).toBeNull();
   });
 });
 
@@ -215,12 +180,12 @@ describe('planEnvPoolRefresh', () => {
     const rows = over.rows ?? [];
     return planEnvPoolRefresh({
       rows, stoppedRows: rows.map(r => r.id), current: { ok: true, hash: 'h1', heads: HEADS },
-      blocked: false, intervalMs: HOUR, now: NOW, ...over,
+      held: null, intervalMs: HOUR, now: NOW, ...over,
     });
   }
 
   it('skips a due row whose every default-branch head is the one it was prepared at', () => {
-    expect(refresh({ rows: [row({ id: 's1', preparedAt: ago(61) })] })).toEqual({ refresh: [], skip: [{ id: 's1', reason: 'unchanged' }], held: [] });
+    expect(refresh({ rows: [row({ id: 's1', preparedAt: ago(61) })] })).toEqual({ refresh: [], skip: [{ id: 's1', reason: 'unchanged' }] });
   });
 
   it('refreshes a due row when a default branch moved, oldest prepared first', () => {
@@ -246,18 +211,20 @@ describe('planEnvPoolRefresh', () => {
   });
 
   it('checks nothing while the environment is unresolved', () => {
-    expect(refresh({ rows: [row({ id: 's1', preparedAt: ago(200) })], current: { ok: false, reason: 'GitHub down' } })).toEqual({ refresh: [], skip: [], held: [] });
+    expect(refresh({ rows: [row({ id: 's1', preparedAt: ago(200) })], current: { ok: false, reason: 'GitHub down' } })).toEqual({ refresh: [], skip: [] });
   });
 
-  it('holds a refresh while a failed prepare at these heads holds the pool', () => {
+  it('checks nothing while a failure holds the pool, so each row is still due once it lets go', () => {
     const rows = [row({ id: 's1', preparedAt: ago(200) })];
-    expect(refresh({ rows, blocked: true, current: { ok: true, hash: 'h1', heads: MOVED } })).toEqual({ refresh: [], skip: [], held: ['s1'] });
+    const held = { rowId: 'f1', until: new Date(NOW.getTime() + 60_000) };
+    expect(refresh({ rows, held, current: { ok: true, hash: 'h1', heads: MOVED } })).toEqual({ refresh: [], skip: [] });
+    expect(refresh({ rows, held: null, current: { ok: true, hash: 'h1', heads: MOVED } }).refresh).toEqual(['s1']);
   });
 
   it('considers only the plan\'s stopped rows: not stale, surplus or preparing ones', () => {
     const rows = [row({ id: 's1', preparedAt: ago(200) }), row({ id: 'p1', status: 'env-preparing', preparedAt: ago(200) })];
     const p = refresh({ rows, stoppedRows: ['p1'], current: { ok: true, hash: 'h1', heads: MOVED } });
-    expect(p).toEqual({ refresh: [], skip: [], held: [] });
+    expect(p).toEqual({ refresh: [], skip: [] });
   });
 
   it('dates the next check: the soonest due, never before now, null with nothing stopped', () => {
@@ -270,83 +237,36 @@ describe('planEnvPoolRefresh', () => {
   });
 });
 
-describe('planEnvironmentPool: a failed refresh', () => {
-  it("dates a failed refresh from the refresh, so a box prepared before it doesn't supersede it", () => {
-    // Launched ten hours ago, refreshed (and failed) five minutes ago; the other box was prepared an hour ago.
-    const failed = row({ id: 'f1', status: 'env-failed', createdAt: ago(600), refreshStartedAt: ago(5), preparedCommit: { 'e2e-org/envdemo': 'b'.repeat(40) } });
-    const p = plan({ rows: [failed, row({ id: 's1', preparedAt: ago(60) })] });
-    expect(p.retire).toEqual([]);
-  });
-  it('holds the pool when a refresh failed at the current heads, as a failed prepare does', () => {
-    const failed = row({ id: 'f1', status: 'env-failed', createdAt: ago(600), refreshStartedAt: ago(5), setupFailed: true });
-    expect(plan({ rows: [failed, row({ id: 's1' })] }).blocked).toEqual({ rowId: 'f1' });
-    // The same failure before setup ran (its fetch, a timeout) doesn't hold it.
-    expect(plan({ rows: [{ ...failed, setupFailed: false }, row({ id: 's1' })] }).blocked).toBeNull();
-  });
-});
-
-describe('planEnvPoolRefresh and #1453\'s failure kinds', () => {
-  const HOUR = 60 * 60_000;
+describe('planEnvironmentPool and planEnvPoolRefresh: a failed refresh holds both, at the heads it refreshed to', () => {
   const MOVED = { 'e2e-org/envdemo': 'b'.repeat(40) };
-  const due = row({ id: 's1', preparedAt: ago(200) });
-
-  it('is blocked only by a setup that ran and failed (its heads kept), not by any env-failed row', () => {
-    // Both keep the hash and the heads the refresh started at (#1453's 47e76cd5); poolSetupFailed tells them apart.
-    const setupFailed = row({ id: 'f1', status: 'env-failed', refreshStartedAt: ago(30), terminatedAt: ago(29), preparedCommit: MOVED, setupFailed: true });
-    const otherFailed = row({ id: 'f2', status: 'env-failed', refreshStartedAt: ago(30), terminatedAt: ago(29), preparedCommit: MOVED, setupFailed: false });
+  it('holds the refresh of the other rows and new launches, until the hour or a head moves', () => {
     const current = { ok: true as const, hash: 'h1', heads: MOVED };
-    const withSetup = plan({ rows: [due, setupFailed], current });
-    expect(withSetup.blocked).toEqual({ rowId: 'f1' });
-    expect(planEnvPoolRefresh({ rows: [due, setupFailed], stoppedRows: withSetup.stoppedRows, current, blocked: !!withSetup.blocked, retryAt: withSetup.retryAt, intervalMs: HOUR, now: NOW }))
-      .toEqual({ refresh: [], skip: [], held: ['s1'] });
-    const withOther = plan({ rows: [due, otherFailed], current, retryAfterMs: 10 * 60_000 });
-    expect(withOther.blocked).toBeNull();
-    // Older than ENV_POOL_RETRY_MS: no wait left, so the row is refreshed.
-    expect(withOther.retryAt).toBeNull();
-    expect(planEnvPoolRefresh({ rows: [due, otherFailed], stoppedRows: withOther.stoppedRows, current, blocked: !!withOther.blocked, retryAt: withOther.retryAt, intervalMs: HOUR, now: NOW }).refresh).toEqual(['s1']);
-  });
-
-  it("waits out the plan's retryAt after a failure that wasn't setup's, checking nothing so the row stays due", () => {
-    const recent = row({ id: 'f2', status: 'env-failed', refreshStartedAt: ago(4), terminatedAt: ago(3), preparedCommit: MOVED, setupFailed: false });
-    const current = { ok: true as const, hash: 'h1', heads: MOVED };
-    const p = plan({ rows: [due, recent], current, retryAfterMs: 10 * 60_000 });
-    expect(p.retryAt).toEqual(new Date(NOW.getTime() + 7 * 60_000));
-    const input = { rows: [due, recent], stoppedRows: p.stoppedRows, current, blocked: !!p.blocked, retryAt: p.retryAt, intervalMs: HOUR };
-    expect(planEnvPoolRefresh({ ...input, now: NOW })).toEqual({ refresh: [], skip: [], held: [] });
-    expect(planEnvPoolRefresh({ ...input, now: new Date(NOW.getTime() + 8 * 60_000) }).refresh).toEqual(['s1']);
-  });
-
-  it('waits only for a failure at the current hash and heads: a refresh to a newer commit goes at once', () => {
-    const NEWER = { 'e2e-org/envdemo': 'c'.repeat(40) };
-    const recent = row({ id: 'f2', status: 'env-failed', refreshStartedAt: ago(4), terminatedAt: ago(3), preparedCommit: MOVED, setupFailed: false });
-    const current = { ok: true as const, hash: 'h1', heads: NEWER };
-    const p = plan({ rows: [due, recent], current, retryAfterMs: 10 * 60_000 });
-    expect(p.retryAt).toBeNull();
-    expect(p.blocked).toBeNull();
-    expect(planEnvPoolRefresh({ rows: [due, recent], stoppedRows: p.stoppedRows, current, blocked: false, retryAt: p.retryAt, intervalMs: HOUR, now: NOW }).refresh).toEqual(['s1']);
+    const due = row({ id: 's1', preparedAt: ago(200) });
+    const failed = { id: 'f1', poolSetupHash: 'h1', preparedCommit: MOVED, failedAt: ago(5) };
+    const p = plan({ rows: [due], current, target: 2, lastFailure: failed, holdMs: 60 * 60_000 });
+    expect(p.held?.rowId).toBe('f1');
+    expect(p.launch).toEqual([]);
+    expect(planEnvPoolRefresh({ rows: [due], stoppedRows: p.stoppedRows, current, held: p.held, intervalMs: 60 * 60_000, now: NOW })).toEqual({ refresh: [], skip: [] });
+    const later = { ok: true as const, hash: 'h1', heads: { 'e2e-org/envdemo': 'c'.repeat(40) } };
+    const q = plan({ rows: [due], current: later, target: 2, lastFailure: failed, holdMs: 60 * 60_000 });
+    expect(q.held).toBeNull();
+    expect(planEnvPoolRefresh({ rows: [due], stoppedRows: q.stoppedRows, current: later, held: q.held, intervalMs: 60 * 60_000, now: NOW }).refresh).toEqual(['s1']);
   });
 });
 
-describe("nextRefreshAt and the retry wait (Bugbot on #1455)", () => {
+describe("nextRefreshAt and the failure hold (Bugbot on #1455)", () => {
   const HOUR = 60 * 60_000;
   const due = row({ id: 's1', preparedAt: ago(200) });
-  const failed = row({ id: 'f1', status: 'env-failed', refreshStartedAt: ago(4), terminatedAt: ago(3), setupFailed: false });
   const current = { ok: true as const, hash: 'h1', heads: HEADS };
+  const failed = { id: 'f1', poolSetupHash: 'h1', preparedCommit: HEADS, failedAt: ago(3) };
 
-  it("is the plan's retryAt: the same failures at the current hash and heads, only while it is ahead", () => {
-    expect(envPoolRetryAt([due, failed], current, 10 * 60_000, NOW)).toEqual(new Date(NOW.getTime() + 7 * 60_000));
-    expect(plan({ rows: [due, failed], current, retryAfterMs: 10 * 60_000 }).retryAt).toEqual(envPoolRetryAt([due, failed], current, 10 * 60_000, NOW));
-    expect(envPoolRetryAt([due, failed], current, 2 * 60_000, NOW)).toBeNull();
-    expect(envPoolRetryAt([due, { ...failed, setupFailed: true }], current, 10 * 60_000, NOW)).toBeNull();
-    expect(envPoolRetryAt([due, failed], { ok: true, hash: 'h2', heads: HEADS }, 10 * 60_000, NOW)).toBeNull();
-    expect(envPoolRetryAt([due, failed], { ok: false, reason: 'down' }, 10 * 60_000, NOW)).toBeNull();
-  });
-
-  it('dates the next check no earlier than the end of the wait, when nothing is checked', () => {
-    const retryAt = new Date(NOW.getTime() + 7 * 60_000);
-    expect(nextRefreshAt([due], HOUR, NOW, retryAt)).toEqual(retryAt);
-    // A check due after the wait is unchanged by it.
-    expect(nextRefreshAt([row({ id: 's2', preparedAt: ago(10) })], HOUR, NOW, retryAt)).toEqual(new Date(NOW.getTime() + 50 * 60_000));
+  it("dates the next check no earlier than the end of the plan's hold, when nothing is checked", () => {
+    const p = plan({ rows: [due], current, lastFailure: failed, holdMs: 10 * 60_000 });
+    const until = new Date(NOW.getTime() + 7 * 60_000);
+    expect(p.held).toEqual({ rowId: 'f1', until });
+    expect(nextRefreshAt([due], HOUR, NOW, p.held?.until ?? null)).toEqual(until);
+    // A check due after the hold is unchanged by it.
+    expect(nextRefreshAt([row({ id: 's2', preparedAt: ago(10) })], HOUR, NOW, until)).toEqual(new Date(NOW.getTime() + 50 * 60_000));
     expect(nextRefreshAt([due], HOUR, NOW, null)).toEqual(NOW);
   });
 });
@@ -358,7 +278,7 @@ describe('planEnvPoolRefresh probes one box at new heads first (Bugbot on #1455)
   const a = row({ id: 'a', preparedAt: ago(200) });
   const b = row({ id: 'b', preparedAt: ago(201) });
   const refresh = (rows: EnvPoolRowView[], stoppedRows = rows.filter(r => r.status === 'env-stopped').map(r => r.id)) =>
-    planEnvPoolRefresh({ rows, stoppedRows, current, blocked: false, intervalMs: HOUR, now: NOW });
+    planEnvPoolRefresh({ rows, stoppedRows, current, held: null, intervalMs: HOUR, now: NOW });
 
   it('refreshes one box until a box has prepared at the new heads, so a broken setup costs one box', () => {
     expect(refresh([a, b]).refresh).toEqual(['b']);
@@ -366,7 +286,7 @@ describe('planEnvPoolRefresh probes one box at new heads first (Bugbot on #1455)
 
   it('starts no second one while that probe (or a launch at the new heads) is still preparing', () => {
     const probing = row({ id: 'b', status: 'env-preparing', refreshStartedAt: ago(1), preparedCommit: MOVED });
-    expect(refresh([a, probing], ['a'])).toEqual({ refresh: [], skip: [], held: [] });
+    expect(refresh([a, probing], ['a'])).toEqual({ refresh: [], skip: [] });
     const launching = row({ id: 'l', status: 'env-preparing', preparedAt: null, createdAt: ago(1), preparedCommit: MOVED });
     expect(refresh([a, launching], ['a']).refresh).toEqual([]);
   });
@@ -386,7 +306,7 @@ describe('planEnvPoolRefresh probes one box at new heads first (Bugbot on #1455)
 describe('planEnvPoolRefresh counts this tick\'s launches as the probe (Bugbot on #1455)', () => {
   const MOVED = { 'e2e-org/envdemo': 'b'.repeat(40) };
   const a = row({ id: 'a', preparedAt: ago(200) });
-  const input = { rows: [a], stoppedRows: ['a'], current: { ok: true as const, hash: 'h1', heads: MOVED }, blocked: false, intervalMs: 60 * 60_000, now: NOW };
+  const input = { rows: [a], stoppedRows: ['a'], current: { ok: true as const, hash: 'h1', heads: MOVED }, held: null, intervalMs: 60 * 60_000, now: NOW };
 
   it('starts no refresh in a tick that launches a box at the new heads, until a box has prepared at them', () => {
     expect(planEnvPoolRefresh({ ...input, launched: 1 }).refresh).toEqual([]);
@@ -399,16 +319,34 @@ describe('planEnvPoolRefresh counts this tick\'s launches as the probe (Bugbot o
   });
 });
 
-describe('planEnvPoolRefresh holds a blocked row due (Bugbot on #1455)', () => {
+describe('planEnvPoolRefresh keeps a held row due (Bugbot on #1455)', () => {
   const MOVED = { 'e2e-org/envdemo': 'b'.repeat(40) };
   it("leaves a row a failed setup holds back unchecked, so it refreshes as soon as the hold lifts, not an interval later", () => {
     const a = row({ id: 'a', preparedAt: ago(200) });
     const input = { rows: [a], stoppedRows: ['a'], intervalMs: 60 * 60_000, now: NOW };
-    const held = planEnvPoolRefresh({ ...input, current: { ok: true, hash: 'h1', heads: MOVED }, blocked: true });
-    expect(held.skip).toEqual([]);
-    expect(held.held).toEqual(['a']);
+    const held = planEnvPoolRefresh({ ...input, current: { ok: true, hash: 'h1', heads: MOVED }, held: { rowId: 'f1', until: new Date(NOW.getTime() + 60 * 60_000) } });
+    expect(held).toEqual({ refresh: [], skip: [] });
     // The broken commit is fixed: new heads, no hold, and the row is still due.
-    const fixed = planEnvPoolRefresh({ ...input, current: { ok: true, hash: 'h1', heads: { 'e2e-org/envdemo': 'c'.repeat(40) } }, blocked: false, now: new Date(NOW.getTime() + 60_000) });
+    const fixed = planEnvPoolRefresh({ ...input, current: { ok: true, hash: 'h1', heads: { 'e2e-org/envdemo': 'c'.repeat(40) } }, held: null, now: new Date(NOW.getTime() + 60_000) });
     expect(fixed.refresh).toEqual(['a']);
+  });
+});
+
+describe('holdingFailure: the failure that holds the pool at the current hash and heads (Devin on #1464)', () => {
+  const A = { 'e2e-org/envdemo': 'a'.repeat(40) };
+  const B = { 'e2e-org/envdemo': 'b'.repeat(40) };
+  const at = (min: number) => new Date(NOW.getTime() - min * 60_000);
+  const failures = [
+    { id: 'fB', poolSetupHash: 'h1', preparedCommit: B, failedAt: at(5) },
+    { id: 'fA', poolSetupHash: 'h1', preparedCommit: A, failedAt: at(20) },
+  ];
+  it("finds A's failure when the branch went back to A after a newer failure at B", () => {
+    expect(holdingFailure(failures, { ok: true, hash: 'h1', heads: A })?.id).toBe('fA');
+    expect(holdingFailure(failures, { ok: true, hash: 'h1', heads: B })?.id).toBe('fB');
+  });
+  it('finds none at another hash or heads, or unresolved', () => {
+    expect(holdingFailure(failures, { ok: true, hash: 'h2', heads: A })).toBeNull();
+    expect(holdingFailure(failures, { ok: true, hash: 'h1', heads: { 'e2e-org/envdemo': 'c'.repeat(40) } })).toBeNull();
+    expect(holdingFailure(failures, { ok: false, reason: 'down' })).toBeNull();
   });
 });

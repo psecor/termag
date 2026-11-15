@@ -7,6 +7,7 @@ import express from 'express';
 import type { AddressInfo } from 'net';
 import type { Server } from 'http';
 import { spaceSlackRouter } from './spaceSlack';
+import { ABSENCE_RECHECK_MS, PUBLIC_MEMBER_LOOKUPS_PER_PICK, type PickerCache } from '../services/spaceSlack/picker';
 import type { SpaceCaller } from '../services/spaces/spaceAccess';
 import { MemorySpaceStore } from '../services/spaces/spacesTestkit';
 import { createFakeWorkspace, fakeSlackId, fakeWorkspaceEnabled, type FakeWorkspace } from '../services/spaceSlack/fakeWorkspace';
@@ -23,6 +24,9 @@ let flagOn: Set<string>;
 let limits: SpaceSlackLimits;
 let slackOff: boolean;
 let server: Server;
+let pickerMembers: PickerCache['members'];
+/** The routes' clock (ManageDeps.now), so a test can step past the picker's recheck window. */
+let clockMs: number;
 /** The admin store, with an optional hook that runs after markDisabled (a link landing mid-disable). */
 let afterDisable: (() => Promise<void>) | null;
 let freezer: ThreadFreezer | undefined;
@@ -38,6 +42,7 @@ function services(): Promise<ManageDeps & { slack: FakeWorkspace['client'] | nul
   return Promise.resolve({
     spaces, store: ws.wrapStore(store), admin: adminFor(), slack: slackOff ? null : ws.client, botUserId: ws.botUserId,
     ...(freezer ? { freezer } : {}),
+    now: () => new Date(clockMs),
     channelsEnabled: async (id: string) => flagOn.has(id),
     limitsFor: async () => limits,
   });
@@ -53,8 +58,10 @@ const caller = (r: express.Request): SpaceCaller | null => {
 beforeAll(async () => {
   const app = express();
   app.use(express.json());
-  app.use('/web', spaceSlackRouter({ services, caller, via: 'web', slackMode: () => 'fake' }));
-  app.use('/cli', spaceSlackRouter({ services, caller, via: 'cli' }));
+  // Each test's own member cache, through a getter, so one test's cached lists never answer another's.
+  const pickerCache = { get members() { return pickerMembers; } };
+  app.use('/web', spaceSlackRouter({ services, caller, via: 'web', slackMode: () => 'fake', pickerCache }));
+  app.use('/cli', spaceSlackRouter({ services, caller, via: 'cli', pickerCache }));
   await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', () => resolve()); });
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
@@ -69,6 +76,8 @@ beforeEach(async () => {
   limits = { ...DEFAULT_SPACE_SLACK_LIMITS };
   slackOff = false;
   afterDisable = null;
+  pickerMembers = new Map();
+  clockMs = Date.now();
   freezer = undefined;
   for (const id of ['alice', 'bob', 'carol', 'dave']) spaces.addUser(id);
   spaces.addBox('alice-box', 'alice', 'alice-box');
@@ -129,13 +138,66 @@ describe('the picker, GET /slack/channels', () => {
     const r = await call('GET', '/slack/channels', { as: 'alice' });
     expect(r.status).toBe(200);
     const byName = Object.fromEntries((r.body.channels as Array<{ name: string }>).map(c => [c.name, c]));
-    expect(Object.keys(byName).sort()).toEqual(['general', 'leads', 'partner-shared', 'proj-demo-main', 'team-payments']);
+    expect(Object.keys(byName).sort()).toEqual(['general', 'leads', 'outsiders', 'partner-shared', 'proj-demo-main', 'team-payments']);
     expect(byName.general).toMatchObject({ id: 'C0FAKEGEN1', private: false, termagIn: false });
     expect(byName.leads).toMatchObject({ private: true, termagIn: true });
     expect(byName.general).not.toHaveProperty('disabled');
     expect(byName['proj-demo-main']).toMatchObject({ disabled: 'channel_workstream' });
     expect(byName['partner-shared']).toMatchObject({ disabled: 'channel_ext_shared' });
+    // A public channel the caller isn't in is listed, but can't be picked: linking needs membership from termag too.
+    expect(byName.outsiders).toMatchObject({ id: 'C0FAKEOUT1', private: false, termagIn: false, disabled: 'not_in_channel' });
+    expect(byName['team-payments']).not.toHaveProperty('disabled');
     expect(r.body.nextCursor).toBeNull();
+  });
+
+  it('bounds the public member lookups of a cold picker, leaving the unchecked channels pickable', async () => {
+    for (let i = 0; i < 200; i++) {
+      const id = `C0BULK${String(i).padStart(4, '0')}`;
+      ws.channels.set(id, { id, name: `bulk-${String(i).padStart(3, '0')}`, is_private: false, is_member: false, members: ['UBYBULK01'] });
+    }
+    const lookups = vi.spyOn(ws.client.conversations, 'members');
+    const r = await call('GET', '/slack/channels?query=bulk', { as: 'alice' });
+    expect(r.status).toBe(200);
+    expect(lookups.mock.calls.length).toBe(PUBLIC_MEMBER_LOOKUPS_PER_PICK);
+    const bulk = r.body.channels as Array<{ name: string; disabled?: string }>;
+    // The first ones by name were checked (alice isn't in them); the rest are left to link()'s own check.
+    expect(bulk.slice(0, PUBLIC_MEMBER_LOOKUPS_PER_PICK).every(c => c.disabled === 'not_in_channel')).toBe(true);
+    expect(bulk.slice(PUBLIC_MEMBER_LOOKUPS_PER_PICK).every(c => c.disabled === undefined)).toBe(true);
+  });
+
+  it('leaves a public channel pickable when Slack throttles its member lookup', async () => {
+    const real = ws.client.conversations.members;
+    vi.spyOn(ws.client.conversations, 'members').mockImplementation(async args => {
+      if (args.channel === 'C0FAKEOUT1') throw Object.assign(new Error('ratelimited'), { data: { error: 'ratelimited' } });
+      return real(args);
+    });
+    const outsiders = (await call('GET', '/slack/channels?query=outsiders', { as: 'alice' })).body.channels[0];
+    expect(outsiders).toMatchObject({ name: 'outsiders' });
+    expect(outsiders).not.toHaveProperty('disabled');
+  });
+
+  it('enables a public channel soon after the caller joins it, despite a cached list without them', async () => {
+    expect((await call('GET', '/slack/channels?query=outsiders', { as: 'alice' })).body.channels[0]).toMatchObject({ disabled: 'not_in_channel' });
+    ws.channels.get('C0FAKEOUT1')!.members.push(fakeSlackId('alice'));
+    // Within the recheck window the cached absence still answers (no Slack call per keystroke)…
+    expect((await call('GET', '/slack/channels?query=outsiders', { as: 'alice' })).body.channels[0]).toMatchObject({ disabled: 'not_in_channel' });
+    // …and once past it the list is read again, well before the cache's minute is up.
+    clockMs += ABSENCE_RECHECK_MS;
+    expect((await call('GET', '/slack/channels?query=outsiders', { as: 'alice' })).body.channels[0]).not.toHaveProperty('disabled');
+  });
+
+  it('disables every channel for a caller without a Slack id, and lists no private ones', async () => {
+    const noSlackId = { ...ws.wrapStore(store), slackIdsOf: async () => new Map<string, string>() };
+    const real = ws.wrapStore;
+    ws.wrapStore = () => noSlackId as never;
+    try {
+      const r = await call('GET', '/slack/channels', { as: 'alice' });
+      const channels = r.body.channels as Array<{ name: string; private: boolean; disabled?: string }>;
+      expect(channels.some(c => c.private)).toBe(false);
+      expect(channels.find(c => c.name === 'general')).toMatchObject({ disabled: 'actor_not_in_slack' });
+    } finally {
+      ws.wrapStore = real;
+    }
   });
 
   it('filters by name, a leading # ignored', async () => {
@@ -318,6 +380,20 @@ describe('preview and commit', () => {
     expect(neverLinked.body.code).toBe('not_in_channel');
     const commit = await call('POST', '/payments/slack/channels', { as: 'alice', body: { channelId: 'G0FAKESEC1' } });
     expect(commit).toMatchObject({ status: 409, body: { code: 'needs_invite' } });
+  });
+
+  it('refuses a public channel the owner is not in, from the web and the CLI alike, and joins nothing', async () => {
+    const joins = vi.spyOn(ws.client.conversations, 'join');
+    for (const via of ['web', 'cli'] as const) {
+      const preview = await call('POST', '/payments/slack/channels/preview', { as: 'alice', via, body: { channelId: 'C0FAKEOUT1' } });
+      expect(preview, via).toMatchObject({ status: 403, body: { code: 'not_in_channel' } });
+      const commit = await call('POST', '/payments/slack/channels', { as: 'alice', via, body: { channelId: 'C0FAKEOUT1' } });
+      expect(commit, via).toMatchObject({ status: 403, body: { code: 'not_in_channel' } });
+    }
+    expect(joins).not.toHaveBeenCalled();
+    expect(ws.channels.get('C0FAKEOUT1')!.is_member).toBe(false);
+    expect(store.channels.has('C0FAKEOUT1')).toBe(false);
+    expect(store.slack.size).toBe(0);
   });
 
   it('takes a channel as Slack writes it, <#C…|name>', async () => {

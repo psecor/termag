@@ -2,7 +2,7 @@ import { createECDH, randomBytes } from 'crypto';
 import { describe, expect, it, vi } from 'vitest';
 import webpush from 'web-push';
 import {
-  appBaseUrl, buildChatTurnPayload, plainPreview, buildTestPayload, buildWaitingPayload, isAllowedPushEndpoint, isLiveSubscription,
+  appBaseUrl, buildChatTurnPayload, plainPreview, buildTestPayload, buildWaitingPayload, isAllowedPushEndpoint, isLiveSubscription, waitingOpensChat,
   parseEndpointBody, parseSubscriptionBody, sendToSubscriptions, sendToUser, vapidConfigFromEnv, vapidSubjectProblem,
   PUSH_TTL_SECONDS, type PushStore, type SendDeps, type StoredSubscription,
 } from './webPush';
@@ -195,7 +195,7 @@ describe('buildChatTurnPayload', () => {
       mutable: true,
       notification: {
         title: 'orchestrator',
-        body: 'Your turn · The ask is waiting in the background.',
+        body: 'Idle · The ask is waiting in the background.',
         navigate: 'https://example.com/termag/chat/p/proj1',
         tag: 'chat-turn:proj1:main',
         data: { key: 'chat-turn:proj1:main', kind: 'chat-turn' },
@@ -204,17 +204,17 @@ describe('buildChatTurnPayload', () => {
     });
   });
 
-  it('names a workstream, and says Done without a message', () => {
+  it('names a workstream, and says Idle without a message', () => {
     const p = buildChatTurnPayload({ ...base, workstream: 'run-20261021-0900', message: '  ' });
-    expect(p.notification.title).toBe('orchestrator · run-20261021-0900');
+    expect(p.notification.title).toBe('run-20261021-0900');
     expect(p.notification.navigate).toBe('https://example.com/termag/chat/p/proj1?ws=run-20261021-0900');
-    expect(p.notification.body).toBe('Done · your turn');
+    expect(p.notification.body).toBe('Idle · your turn');
     expect(p.notification.tag).toBe('chat-turn:proj1:run-20261021-0900');
   });
 
   it('caps a long message', () => {
     const body = buildChatTurnPayload({ ...base, workstream: 'main', message: 'x'.repeat(400) }).notification.body;
-    expect(body.length).toBe('Your turn · '.length + 180);
+    expect(body.length).toBe('Idle · '.length + 180);
     expect(body.endsWith('…')).toBe(true);
   });
 });
@@ -235,7 +235,7 @@ describe('buildWaitingPayload', () => {
       mutable: true,
       notification: {
         title: 'termag',
-        body: 'Claude needs your permission to use Bash',
+        body: 'Needs you · Claude needs your permission to use Bash',
         navigate: 'https://example.com/termag/m/p/proj1',
         tag: 'box-a|alice-termag-agent',
         data: { key: 'box-a|alice-termag-agent' },
@@ -245,23 +245,24 @@ describe('buildWaitingPayload', () => {
     });
   });
 
-  it('names a non-main workstream in the title and the URL', () => {
+  it('titles a session by its one title, never "project · workstream", and names its workstream in the URL', () => {
+    expect(buildWaitingPayload({ ...base, workstream: 'main', title: 'Fix the login test' }).notification.title).toBe('Fix the login test');
     const p = buildWaitingPayload({ ...base, workstream: 'fix/login bug', session: 'alice-termag-fix-agent' });
-    expect(p.notification.title).toBe('termag · fix/login bug');
+    expect(p.notification.title).toBe('fix/login bug');
     expect(p.notification.navigate).toBe('https://example.com/termag/m/p/proj1?ws=fix%2Flogin%20bug');
     expect(p.termag?.workstream).toBe('fix/login bug');
   });
 
   it('falls back on the waiting reason when there is no message', () => {
-    expect(buildWaitingPayload({ ...base, workstream: 'main', waitingReason: 'approval' }).notification.body).toBe('Needs approval');
-    expect(buildWaitingPayload({ ...base, workstream: 'main', message: '  ', waitingReason: 'user_input' }).notification.body).toBe('Asked you a question');
-    expect(buildWaitingPayload({ ...base, workstream: 'main', waitingReason: null }).notification.body).toBe('Waiting for you');
+    expect(buildWaitingPayload({ ...base, workstream: 'main', waitingReason: 'approval' }).notification.body).toBe('Needs you · approval');
+    expect(buildWaitingPayload({ ...base, workstream: 'main', message: '  ', waitingReason: 'user_input' }).notification.body).toBe('Needs you · a question');
+    expect(buildWaitingPayload({ ...base, workstream: 'main', waitingReason: null }).notification.body).toBe('Needs you');
   });
 
   it('collapses whitespace and caps a long message', () => {
     const body = buildWaitingPayload({ ...base, workstream: 'main', message: `a\n\nb ${'x'.repeat(400)}` }).notification.body;
-    expect(body.startsWith('a b x')).toBe(true);
-    expect(body.length).toBe(180);
+    expect(body.startsWith('Needs you · a b x')).toBe(true);
+    expect(body.length).toBe('Needs you · '.length + 180);
     expect(body.endsWith('…')).toBe(true);
   });
 
@@ -275,9 +276,45 @@ describe('buildWaitingPayload', () => {
     expect(buildWaitingPayload({ ...base, projectId: '../x', workstream: 'main' }).notification.navigate)
       .toBe('https://example.com/termag/m/p/..%2Fx');
   });
+
+  it('opens the session\'s chat with `chat` (chat-phone-home-enabled), else its phone conversation', () => {
+    expect(buildWaitingPayload({ ...base, workstream: 'main', chat: true }).notification.navigate).toBe('https://example.com/termag/chat/p/proj1');
+    expect(buildWaitingPayload({ ...base, workstream: 'fix/login bug', chat: true }).notification.navigate)
+      .toBe('https://example.com/termag/chat/p/proj1?ws=fix%2Flogin%20bug');
+    expect(buildWaitingPayload({ ...base, projectId: '../x', workstream: 'main', chat: true }).notification.navigate)
+      .toBe('https://example.com/termag/chat/p/..%2Fx');
+    expect(buildWaitingPayload({ ...base, workstream: 'main', chat: false }).notification.navigate).toBe('https://example.com/termag/m/p/proj1');
+    // The rest of the payload is the same either way: the tag, the badge, the record the worker keeps.
+    const { notification: a, ...restA } = buildWaitingPayload({ ...base, workstream: 'main', chat: true });
+    const { notification: b, ...restB } = buildWaitingPayload({ ...base, workstream: 'main' });
+    expect(restA).toEqual(restB);
+    expect({ ...a, navigate: '' }).toEqual({ ...b, navigate: '' });
+  });
+});
+
+describe('waitingOpensChat', () => {
+  it('is a normal project\'s session, or an automation\'s run', () => {
+    expect(waitingOpensChat('normal', 'main')).toBe(true);
+    expect(waitingOpensChat('normal', 'feature-x')).toBe(true);
+    expect(waitingOpensChat(null, 'main')).toBe(true);
+    expect(waitingOpensChat(undefined, 'main')).toBe(true);
+    expect(waitingOpensChat('automation', 'run-1')).toBe(true);
+  });
+
+  it('is never MetaTerm or an automation\'s main', () => {
+    expect(waitingOpensChat('metaterm', 'main')).toBe(false);
+    expect(waitingOpensChat('metaterm', 'other')).toBe(false);
+    expect(waitingOpensChat('automation', 'main')).toBe(false);
+    expect(waitingOpensChat('something-new', 'main')).toBe(false);
+  });
 });
 
 describe('buildTestPayload', () => {
+  it('opens the chat under chat-phone-home-enabled', () => {
+    expect(buildTestPayload('https://example.com/termag', true).notification.navigate).toBe('https://example.com/termag/chat');
+    expect(buildTestPayload('https://example.com/termag', false).notification.navigate).toBe('https://example.com/termag/m');
+  });
+
   it('opens the phone inbox', () => {
     expect(buildTestPayload('https://example.com/termag')).toEqual({
       web_push: 8030,

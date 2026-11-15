@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { prisma } from '../db';
 import { getAllStatuses } from './status';
 import { resolveSessionProject } from './sessionResolver';
+import { boolVariation } from './featureFlags';
 import {
   countOwnerWaiting, pushOnWaitingTransition, resetPushWaitingState, shouldPushWaiting, waitingChatMuted,
   PUSH_WAITING_COOLDOWN_MS,
@@ -11,6 +12,7 @@ import type { AgentStatus } from '../types/index';
 
 vi.mock('../db', () => ({ prisma: { project: { findUnique: vi.fn() }, user: { findUnique: vi.fn() } } }));
 vi.mock('./status', () => ({ getAllStatuses: vi.fn(() => new Map()) }));
+vi.mock('./featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
 vi.mock('./sessionResolver', () => ({
   resolveSessionProject: vi.fn(),
   isAmbiguousSession: (v: unknown) => !!v && typeof v === 'object' && (v as { ambiguous?: boolean }).ambiguous === true,
@@ -110,7 +112,7 @@ describe('pushOnWaitingTransition', () => {
       mutable: true,
       notification: {
         title: 'cx',
-        body: 'Claude needs your permission to use Bash',
+        body: 'Needs you · Claude needs your permission to use Bash',
         navigate: 'https://example.com/termag/m/p/p1',
         tag: 'box-a|alice-cx-agent',
         data: { key: 'box-a|alice-cx-agent' },
@@ -120,6 +122,39 @@ describe('pushOnWaitingTransition', () => {
     });
     // bob's waiting session is never resolved for alice's badge.
     expect(vi.mocked(resolveSessionProject).mock.calls.map(c => c[0])).not.toContain('bob-cx-agent');
+  });
+
+  describe('under chat-phone-home-enabled', () => {
+    const OWNER = { id: 'u1', googleEmail: 'alice@example.com', displayName: 'Alice', unixUsername: 'alice', defaultAgentProvider: 'claude' };
+    async function navigateFor(kind: string, workstream: string, flagOn: boolean): Promise<string> {
+      resetPushWaitingState();
+      vi.mocked(boolVariation).mockReset().mockResolvedValue(flagOn);
+      vi.mocked(resolveSessionProject).mockResolvedValue({ userId: 'u1', instanceId: 'box-a', projectId: 'p1', workstream });
+      vi.mocked(prisma.project.findUnique).mockResolvedValue({ name: 'cx', kind, user: OWNER } as never);
+      vi.mocked(getAllStatuses).mockReturnValue(new Map());
+      const d = deps();
+      pushOnWaitingTransition({ session: 'alice-cx-agent', instanceId: 'box-a', prev: 'working', next: 'waiting', now: 1000 }, d);
+      await flush(); await flush();
+      return JSON.parse(d.transport.mock.calls[0][1] as string).notification.navigate;
+    }
+
+    it("opens a chat session's chat, read for the owner", async () => {
+      expect(await navigateFor('normal', 'main', true)).toBe('https://example.com/termag/chat/p/p1');
+      expect(boolVariation).toHaveBeenCalledWith('chat-phone-home-enabled', OWNER, false);
+      expect(await navigateFor('normal', 'feat', true)).toBe('https://example.com/termag/chat/p/p1?ws=feat');
+      expect(await navigateFor('automation', 'run-1', true)).toBe('https://example.com/termag/chat/p/p1?ws=run-1');
+    });
+
+    it("opens MetaTerm and an automation's main on the phone client, without reading the flag", async () => {
+      expect(await navigateFor('metaterm', 'main', true)).toBe('https://example.com/termag/m/p/p1');
+      expect(await navigateFor('automation', 'main', true)).toBe('https://example.com/termag/m/p/p1');
+      expect(boolVariation).not.toHaveBeenCalled();
+    });
+
+    it('opens the phone conversation with the flag off', async () => {
+      expect(await navigateFor('normal', 'main', false)).toBe('https://example.com/termag/m/p/p1');
+      expect(await navigateFor('automation', 'run-1', false)).toBe('https://example.com/termag/m/p/p1?ws=run-1');
+    });
   });
 
   it('does not re-notify a session that waits again inside 30 s', () => {

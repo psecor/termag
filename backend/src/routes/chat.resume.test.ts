@@ -501,17 +501,16 @@ describe('an ask thread\'s chat on a stopped box', () => {
     expect(vi.mocked(continuationFacts).mock.calls.at(-1)?.[4]).toBe(true);
   });
 
-  it('reports the model its turns run on, the default, not the workstream\'s saved one (Bugbot on #970)', async () => {
+  it('reports the model its turns run on: a Fireworks model the thread keeps (termag ask --model fireworks:<id>)', async () => {
     h.connected = false;
     h.facts = { box: { id: 'box-new', status: 'stopped', kind: 'ec2' }, connected: false, setupReady: true };
     const saved = askProject();
     saved.workflows[0] = { ...saved.workflows[0], backend: 'fireworks', model: 'accounts/fireworks/models/kimi-k2' } as never;
     prisma.project.findUnique.mockResolvedValue(saved);
-    const { resolvedChatTier, storedChatChoice } = await import('../services/claudeChatModel');
     const r = await chatHistoryFor('owner', 'p1', { workstream: 'ask-t1' });
-    // An ask's chat runs on the default backend and model (agent/ask-chat.js, chatTarget's storedChatChoice(null, null)).
-    expect(r.body).toMatchObject({ stored: true, model: resolvedChatTier(storedChatChoice(null, null).model) });
-    expect(r.body).not.toHaveProperty('backend');
+    // An ask's chat keeps a Fireworks choice whatever the flags say, so a message is refused with the reason rather
+    // than run on Claude (chatTarget, turnTarget); the picker shows what it is on.
+    expect(r.body).toMatchObject({ stored: true, model: 'accounts/fireworks/models/kimi-k2', backend: 'fireworks' });
   });
 
   it("reports the tier the thread keeps (termag ask --model), the one its turns run on", async () => {

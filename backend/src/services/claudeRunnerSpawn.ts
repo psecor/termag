@@ -150,7 +150,19 @@ export interface CandidateBox {
   wrapperCapable?: boolean;
   /** The agent announced WRAPPER_FLOOR_CAPABILITY: the wrapper takes --claude-floor. */
   wrapperFloor?: boolean;
+  /** Instance.createdFor: `ask` for a box made for a `termag ask` (isAskBox). */
+  createdFor?: string | null;
 }
+
+/**
+ * A box made for a `termag ask` (`termag ask --new-box`, Instance.createdFor
+ * `ask`). It takes no new cloud session, and auto-box neither waits for nor
+ * starts one: the agent that made it stops or removes it once the ask is
+ * done, which on 11-06 ended five cloud sessions placed there minutes before.
+ * An order already running on one is still found there, so a retry never
+ * starts a second runner.
+ */
+export const isAskBox = (box: { createdFor?: string | null }): boolean => box.createdFor === 'ask';
 
 /**
  * The boxes a session may land on, best first: owned (the caller already
@@ -243,6 +255,23 @@ export function isRunnerSessionOf(session: string, hostUnixUser: string | null |
 /** Does the name look like any box's runner session (`<user>-claude-runner-s<slot>-<order>-r`)? A cheap pre-check before a box lookup. */
 export function isRunnerSessionShaped(session: string): boolean {
   return /-claude-runner-s\d+-[A-Za-z0-9][A-Za-z0-9_-]*-r$/.test(session);
+}
+
+/**
+ * How many Claude Code cloud sessions run on a box now: the larger of its
+ * open session rows and the runner tmux sessions its agent lists. The tmux
+ * sessions are the truth, as for placement, and a runner whose start row
+ * could not be written (recordRunnerStart is best effort) has only those
+ * (Devin on #1597); the rows answer when the agent cannot be asked
+ * (`tmuxSessions` null, or it throws).
+ */
+export async function countLiveCloudSessions(
+  boxId: string,
+  deps: { openRows: (boxId: string) => Promise<number>; tmuxSessions: (boxId: string) => Promise<string[] | null> },
+): Promise<number> {
+  const rows = await deps.openRows(boxId);
+  const names = await deps.tmuxSessions(boxId).catch(() => null);
+  return Math.max(rows, names ? names.filter(isRunnerSessionShaped).length : 0);
 }
 
 export function isOwnRunnerSessionStatus(session: string, instanceId: string | null, ownedBoxes: ReadonlyMap<string, string | null>): boolean {
@@ -393,12 +422,37 @@ export function serializeByKey<T>(key: string, fn: () => Promise<T>): Promise<T>
  * Boxless engineers.
  * Behind this feature flag the spawn route gets the owner a box instead
  * of only queueing: start a stopped one, else claim a warm-pool one, else
- * cold-provision one. Every path still answers 503 so the session retries
- * once the box's agent connects. The route runs this under the owner's spawn
- * lock (serializeByKey), so a burst of sessions sees the first one's box and
- * waits instead of getting a box each.
+ * cold-provision one. The same goes for an owner whose every ready box is
+ * full, up to CLAUDE_RUNNER_AUTO_BOX_MAX_FLAG's ceiling. A path that only gets
+ * the box answers 503, so the session retries once the box's agent connects.
+ * The route runs this under the owner's spawn lock (serializeByKey), so a
+ * burst of sessions sees the first one's box and waits instead of getting a
+ * box each.
  */
 export const CLAUDE_RUNNER_AUTO_BOX_FLAG = 'claude-runner-auto-box-enabled';
+
+/**
+ * The ceiling on auto-box for an owner whose every ready box is full:
+ * with CLAUDE_RUNNER_AUTO_BOX_FLAG on,
+ * a session that finds each of their ready boxes running MAX_RUNNERS_PER_BOX
+ * sessions gets them one more box only while they have fewer ready boxes than
+ * this. A number flag read for the owner; clampAutoBoxMaxBoxes bounds what it
+ * serves.
+ */
+export const CLAUDE_RUNNER_AUTO_BOX_MAX_FLAG = 'claude-runner-auto-box-max-boxes';
+export const AUTO_BOX_MAX_BOXES_FALLBACK = 5;
+export const AUTO_BOX_MAX_BOXES_LIMIT = 20;
+
+/**
+ * A served ceiling as a box count: whole, 1..AUTO_BOX_MAX_BOXES_LIMIT, the
+ * fallback when it is not a number at all. Never 0: whether a boxless owner
+ * gets a first box is CLAUDE_RUNNER_AUTO_BOX_FLAG's to decide, and a typo
+ * should not buy dozens.
+ */
+export function clampAutoBoxMaxBoxes(raw: unknown): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return AUTO_BOX_MAX_BOXES_FALLBACK;
+  return Math.min(AUTO_BOX_MAX_BOXES_LIMIT, Math.max(1, Math.floor(raw)));
+}
 
 /**
  * How long a failed box holds off another automatic one. Sessions are retried
@@ -431,15 +485,19 @@ export type AutoBoxPlan =
   | { kind: 'acquire' };
 
 /**
- * What to do for an owner with no ready, connected box. `boxes` is every
- * non-terminated EC2 box of theirs. Waiting beats starting beats acquiring,
+ * What to do for an owner with no ready, connected box that has a free slot.
+ * `boxes` is every non-terminated EC2 box of theirs, less the ready ones the
+ * route found full: those are working, not on their way. Waiting beats starting beats acquiring,
  * so one engineer never ends up with two boxes from one burst of sessions; a
  * recent failure stops acquiring altogether.
  */
 export function autoBoxPlan(boxes: OwnedBox[], now: number = Date.now()): AutoBoxPlan {
   const ec2 = boxes.filter(b => b.kind === 'ec2' && b.status !== 'terminated');
+  // Ask boxes are neither a box to wait for nor one to start (isAskBox); a
+  // failed one still holds off a new box, as any failed launch does.
+  const forSessions = ec2.filter(b => !isAskBox(b));
   const byRecency = (a: OwnedBox, b: OwnedBox) => (b.lastConnectedAt?.getTime() ?? 0) - (a.lastConnectedAt?.getTime() ?? 0);
-  const pending = ec2.filter(b => ['provisioning', 'starting', 'ready', 'stopping', 'hibernating'].includes(b.status)).sort(byRecency)[0];
+  const pending = forSessions.filter(b => ['provisioning', 'starting', 'ready', 'stopping', 'hibernating'].includes(b.status)).sort(byRecency)[0];
   if (pending) {
     const reason = pending.status === 'ready'
       ? `box "${pending.name}" is ready but its agent is not connected; retried when it reconnects`
@@ -452,7 +510,7 @@ export function autoBoxPlan(boxes: OwnedBox[], now: number = Date.now()): AutoBo
   }
   // A start resumes a hibernated box too (boxPowerPolicy: start is valid from
   // stopped and hibernated), so neither of them buys a new box.
-  const parked = ec2.filter(b => (b.status === 'stopped' || b.status === 'hibernated') && b.ec2InstanceId).sort(byRecency)[0];
+  const parked = forSessions.filter(b => (b.status === 'stopped' || b.status === 'hibernated') && b.ec2InstanceId).sort(byRecency)[0];
   if (parked) return { kind: 'start', box: parked };
   // createdAt is not when the box failed; the failure was at most
   // PROVISIONING_FAILURE_WINDOW_MS later, so the hold runs from there and
@@ -519,7 +577,8 @@ export const REFUSAL = {
   agentOutdated: () => refusal('agent-too-old', REFUSAL_TEXTS.agentTooOld),
   /** Every box that could take the session runs a Claude Code below the floor its wrapper cannot enforce (ClaudeFloorDecision). */
   claudeOutdated: () => refusal('claude-too-old', REFUSAL_TEXTS.claudeTooOld),
-  boxesFull: (boxes: number, max: number) => refusal('boxes-full', REFUSAL_TEXTS.boxesFull(boxes, max)),
+  /** `ceiling`: auto-box would get another box, but the owner already has that many ready (CLAUDE_RUNNER_AUTO_BOX_MAX_FLAG). */
+  boxesFull: (boxes: number, max: number, ceiling: number | null = null) => refusal('boxes-full', REFUSAL_TEXTS.boxesFull(boxes, max, ceiling)),
   /** The hook's curl gave up before the launch: nothing started, claimed or bought. */
   hookGone: (what: 'launch' | 'box') => refusal('hook-gave-up',
     what === 'launch' ? REFUSAL_TEXTS.hookGaveUp : 'the spawn hook stopped waiting; no box started for it'),
@@ -584,7 +643,8 @@ export const REFUSAL_TEXTS = {
   noBox: 'no ready termag box with a connected agent for the session owner; start or add a box in termag',
   /** Carries counts: `every box of the session owner (2) already runs 3 cloud sessions; ...`. Matched by prefix. */
   boxesFullPrefix: 'every box of the session owner (',
-  boxesFull: (boxes: number, max: number) => `${REFUSAL_TEXTS.boxesFullPrefix}${boxes}) already runs ${max} cloud sessions; it is retried when one ends`,
+  boxesFull: (boxes: number, max: number, ceiling: number | null = null) => `${REFUSAL_TEXTS.boxesFullPrefix}${boxes}) already runs ${max} cloud sessions${
+    ceiling === null ? '' : `, and termag gets one owner's cloud sessions no more than ${ceiling} boxes`}; it is retried when one ends`,
   hookGaveUp: 'the spawn hook stopped waiting; not launched',
 } as const;
 

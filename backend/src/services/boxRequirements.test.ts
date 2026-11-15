@@ -102,7 +102,7 @@ describe('the launch order: fewest vCPUs, then least memory, then the newer gene
     expect(orderCandidates({ vcpu: 4, memoryGiB: 32 }, candidates)).toEqual(['r8g.xlarge', 'r7g.xlarge', 'm8g.2xlarge', 'm7g.2xlarge']);
   });
 
-  it('keeps the presets\' shapes on their m types: 2/8 is m8g.large, 8/32 m8g.2xlarge', () => {
+  it('keeps 2/8 on m8g.large, and puts 8 vCPU / 32 GiB on an 8 vCPU type: m8g.2xlarge, then m7g.2xlarge', () => {
     const all = [
       { type: 'm8g.large', vcpu: 2, memoryMiB: 8192 }, { type: 'm7g.large', vcpu: 2, memoryMiB: 8192 },
       { type: 'r8g.large', vcpu: 2, memoryMiB: 16384 }, ...candidates,
@@ -123,7 +123,9 @@ describe('the launch order: fewest vCPUs, then least memory, then the newer gene
 
   it('is a preset when it starts with a preset\'s type', () => {
     expect(presetFor(['m8g.xlarge', 'm7g.xlarge'], {})).toBe('medium');
-    expect(presetFor(['r8g.xlarge'], {})).toBeNull();
+    expect(presetFor(['r8g.xlarge', 'r7g.xlarge'], {})).toBe('large');
+    expect(presetFor(['m8g.2xlarge', 'm7g.2xlarge'], {})).toBeNull();
+    expect(presetFor(['r8g.xlarge'], { BOX_LARGE_INSTANCE_TYPES: 'm8g.2xlarge' })).toBeNull();
   });
 });
 
@@ -131,7 +133,7 @@ describe('the resolver, against EC2', () => {
   it('asks EC2 for arm64 matches in the allowed families, every page, and describes them', async () => {
     ec2.pages = [Object.keys(SHAPES).slice(0, 2), Object.keys(SHAPES).slice(2)];
     const real = await requirementsResolver.resolve({ vcpu: 4, memoryGiB: 32 });
-    expect(real).toEqual({ ok: true, choice: { type: 'r8g.xlarge', fallbacks: ['r7g.xlarge', 'm8g.2xlarge', 'm7g.2xlarge'] }, preset: null });
+    expect(real).toEqual({ ok: true, choice: { type: 'r8g.xlarge', fallbacks: ['r7g.xlarge', 'm8g.2xlarge', 'm7g.2xlarge'] }, preset: 'large' });
     const asked = ec2.sent.filter(s => s.command === 'GetInstanceTypesFromInstanceRequirementsCommand');
     expect(asked).toHaveLength(2);
     expect(asked[0].input).toEqual({
@@ -162,6 +164,24 @@ describe('the resolver, against EC2', () => {
     clock = 1001;
     await resolver.resolve({ vcpu: 4, memoryGiB: 32 });
     expect(aws.matching).toHaveBeenCalledTimes(3);
+  });
+
+  it('resolves 8 vCPU / 32 GiB to the 8 vCPU types, which no preset starts with', async () => {
+    const resolver = createRequirementsResolver(() => ({
+      matching: async () => Object.keys(SHAPES),
+      describe: async names => names.map(type => ({ type, vcpu: SHAPES[type][0], memoryMiB: SHAPES[type][1] * 1024 })),
+    }));
+    expect(await resolver.resolve({ vcpu: 8, memoryGiB: 32 }))
+      .toEqual({ ok: true, choice: { type: 'm8g.2xlarge', fallbacks: ['m7g.2xlarge'] }, preset: null });
+  });
+
+  it('is large when the cheapest match is large\'s type: 4 vCPU / 32 GiB, and 2 vCPU / 32 GiB', async () => {
+    const resolver = createRequirementsResolver(() => ({
+      matching: async () => Object.keys(SHAPES),
+      describe: async names => names.map(type => ({ type, vcpu: SHAPES[type][0], memoryMiB: SHAPES[type][1] * 1024 })),
+    }));
+    expect(await resolver.resolve({ vcpu: 4, memoryGiB: 32 })).toMatchObject({ ok: true, preset: 'large', choice: { type: 'r8g.xlarge' } });
+    expect(await resolver.resolve({ vcpu: 2, memoryGiB: 32 })).toMatchObject({ ok: true, preset: 'large', choice: { type: 'r8g.xlarge' } });
   });
 
   it('is a preset when the cheapest match is one: 4 vCPU / 16 GiB is medium', async () => {

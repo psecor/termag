@@ -3,7 +3,7 @@
 // code, the hand-off page, the same 404 for every refusal (A4), and the
 // reverify route a preview host sends a navigation through (A2, SR10, SR11,
 // SR16, SR22).
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import http from 'http';
 import type { AddressInfo } from 'net';
@@ -239,6 +239,8 @@ describe('reverify', () => {
     expect(a.status).toBe(302);
     const code = codeIn(a.headers.location!);
     expect(mem.codes.get(codeHash('code', code)!)).toMatchObject({ sessionIdHash: 'sess-1', userId: 'owner', next: '/where' });
+    // And in the URL: a repeat of it from a browser that holds the session goes there, not to `/`.
+    expect(new URL(a.headers.location!).searchParams.get('next')).toBe('/where');
     // Single use.
     expect((await get(`/termag/previews/my-app/reverify?ticket=${ticket}`)).status).toBe(404);
   });
@@ -269,5 +271,37 @@ describe('reverify', () => {
     const code = newSecret();
     await mem.store.createCode({ codeHash: codeHash('code', code)!, linkId: 'link-my-app', userId: 'owner', basis: 'owner', tokenHash: null, sessionIdHash: 'sess-1', next: '/', expiresAt: new Date(Date.now() + 60_000) });
     expect((await get(`/termag/previews/my-app/reverify?ticket=${code}`)).status).toBe(404);
+  });
+});
+
+describe('a rebound (a used code\'s ticket, no session yet)', () => {
+  async function withRebound(tokenHash = linkTokenHash(TOKEN)) {
+    const l = await landing();
+    Object.assign(l.mem.links.get('link-my-app')!.link, { audience: 'link', linkTokenHash: linkTokenHash(TOKEN) });
+    l.state.user = 'viewer';
+    const ticket = newSecret();
+    await l.mem.store.createCode({ codeHash: codeHash('ticket', ticket)!, linkId: 'link-my-app', userId: 'viewer', basis: 'token', tokenHash, sessionIdHash: null, next: '/where', expiresAt: new Date(Date.now() + 60_000) });
+    return { ...l, ticket };
+  }
+
+  it('gives a link-audience viewer a fresh code on the basis the used one had, without the token, once', async () => {
+    const { mem, get, ticket } = await withRebound();
+    const a = await get(`/termag/previews/my-app/reverify?ticket=${ticket}`);
+    expect(a.status).toBe(302);
+    expect(a.headers.location).toMatch(/^https:\/\/my-app--abcdef\.previews\.test\/__termag\/auth\?code=[A-Za-z0-9_-]{43}&next=%2Fwhere$/);
+    expect(mem.codes.get(codeHash('code', codeIn(a.headers.location!))!)).toMatchObject({ userId: 'viewer', basis: 'token', tokenHash: linkTokenHash(TOKEN), sessionIdHash: null, next: '/where' });
+    expect((await get(`/termag/previews/my-app/reverify?ticket=${ticket}`)).status).toBe(404);
+  });
+
+  it('is nobody else\'s (SR10), and a token rotated since, or access taken away, shuts it out', async () => {
+    const other = await withRebound();
+    other.state.user = 'owner';
+    expect((await other.get(`/termag/previews/my-app/reverify?ticket=${other.ticket}`)).status).toBe(404);
+    const rotated = await withRebound(linkTokenHash('x'.repeat(22)));
+    expect((await rotated.get(`/termag/previews/my-app/reverify?ticket=${rotated.ticket}`)).status).toBe(404);
+    const off = await withRebound();
+    off.state.flags.killSwitch = true;
+    expect((await off.get(`/termag/previews/my-app/reverify?ticket=${off.ticket}`)).status).toBe(404);
+    for (const l of [other, rotated, off]) expect([...l.mem.codes.values()].filter(c => c.codeHash.length && c.sessionIdHash === null && c.next === '/where')).toHaveLength(0);
   });
 });

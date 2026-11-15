@@ -73,6 +73,11 @@ export interface LaunchOptions {
   models?: string;
   /** A spawned agent's spawn (spawnTelemetryFor), for the resource's termag.spawn.*. */
   spawn?: SpawnTelemetry | null;
+  /**
+   * The pane's Project files and My files (services/projectFiles.ts paneFilesFor), already granted to the box,
+   * for the agent's TERMAG_SPACE and TERMAG_MY_FILES (filesEnvPrefix). Only for a box with project-files-v1.
+   */
+  files?: { project: string | null; mine: string | null } | null;
 }
 
 /** What a spawned agent's launch names of its spawn. */
@@ -197,6 +202,20 @@ export function resourceEnvPrefix(project?: string | null, workstream?: string |
   return `TERMAG_PROJECT=${project} TERMAG_WORKSTREAM=${workstream} `;
 }
 
+/**
+ * `TERMAG_INFERENCE_BACKEND=default [TERMAG_INFERENCE_MODEL=<id>] ` ahead of
+ * Claude Code's box script on the harness's own backend: the box script reads
+ * which one that is (termag's Claude gateway to Bedrock, the owner's own
+ * login, ...) and names it, with the launch's model, as
+ * termag.inference.backend and termag.inference.model (termag-credentials
+ * inference_resource). A
+ * model backend's launch names its own (launch-settings --backend).
+ * Environment, so an older box script ignores it.
+ */
+export function inferenceEnvPrefix(model?: string | null): string {
+  return `TERMAG_INFERENCE_BACKEND=default ${model && MODEL_ARG.test(model) ? `TERMAG_INFERENCE_MODEL=${model} ` : ''}`;
+}
+
 // Spawn, root and box ids are cuids; checked again for the shell and the resource.
 const SPAWN_ID = /^[a-z0-9]{8,40}$/;
 
@@ -220,6 +239,39 @@ export function spawnEnvPrefix(spawn?: SpawnTelemetry | null): string {
   return `${parts.join(' ')} `;
 }
 
+const SPACE_NAME = /^[a-z0-9-]{2,40}$/;
+
+/**
+ * `TERMAG_SPACE=<project files> TERMAG_MY_FILES=<my files> ` ahead of the
+ * agent: the box's `termag
+ * space` then saves a path with no space to Project files and `--mine` to My
+ * files, as a chat turn's do (agent/chat-runner.js). Each name is checked
+ * again, since it is typed into a shell; a bad one, or none, is left out.
+ */
+export function filesEnvPrefix(files?: { project: string | null; mine: string | null } | null): string {
+  if (!files) return '';
+  const parts = [];
+  if (files.project && SPACE_NAME.test(files.project)) parts.push(`TERMAG_SPACE=${files.project}`);
+  if (files.mine && SPACE_NAME.test(files.mine)) parts.push(`TERMAG_MY_FILES=${files.mine}`);
+  return parts.length ? `${parts.join(' ')} ` : '';
+}
+
+/**
+ * The agent command with filesEnvPrefix right after each PANE_KIND_ENV that
+ * starts a command, which is where the agent's own environment is set: the
+ * line's start, or after `&&` / `||` (Fireworks' Claude assigns its settings
+ * first, then runs `TERMAG_SESSION_KIND=interactive claude …`). Never inside
+ * a `$(…)`, where the box script runs. A line with no agent command on it (a
+ * refusal) is left as it is.
+ */
+function withFilesEnv(command: string, files: LaunchOptions['files']): string {
+  const prefix = filesEnvPrefix(files);
+  if (!command || !prefix) return command;
+  return command.replace(AGENT_COMMAND_START, (_m, lead: string) => `${lead}${PANE_KIND_ENV}${prefix}`);
+}
+
+const AGENT_COMMAND_START = new RegExp(`(^|&& |\\|\\| )${PANE_KIND_ENV.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'g');
+
 /**
  * The provider's launch (or resume) command: Claude Code's with the telemetry
  * settings (the replay it came from, the project and the workstream) on a box
@@ -228,9 +280,14 @@ export function spawnEnvPrefix(spawn?: SpawnTelemetry | null): string {
  * one, and a spawned agent's spawn (spawnEnvPrefix). Anything else, bare.
  * A non-default backend first swaps in its launcher (onBackend), and a
  * chosen model goes in as `--model` right after the harness's word. Every
- * agent command starts with PANE_KIND_ENV; an empty one stays empty.
+ * agent command starts with PANE_KIND_ENV, then the pane's Project files and
+ * My files when it has them (filesEnvPrefix); an empty one stays empty.
  */
-export function launchCommandFor(launchCommand: string, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context, models, spawn }: LaunchOptions): string {
+export function launchCommandFor(launchCommand: string, opts: LaunchOptions): string {
+  return withFilesEnv(agentLaunchCommand(launchCommand, opts), opts.files);
+}
+
+function agentLaunchCommand(launchCommand: string, { replaySessionId, capabilities, provider, project, workstream, backend, model, fastModel, context, models, spawn }: LaunchOptions): string {
   const id = replaySessionIdFrom(replaySessionId);
   const env = `${resourceEnvPrefix(project, workstream)}${spawnEnvPrefix(spawn)}`;
   const modelArgs = model && MODEL_ARG.test(model) ? ['--model', model] : [];
@@ -253,5 +310,5 @@ export function launchCommandFor(launchCommand: string, { replaySessionId, capab
   if (first !== 'claude' || !capabilities.includes(TELEMETRY_REPLAY_CAPABILITY)) return `${PANE_KIND_ENV}${launchCommand}`;
   // `-` stands for "no replay": an older box script reads it as a bad id and
   // prints {}, the current one adds the project and workstream alone.
-  return [`${PANE_KIND_ENV}claude --settings "$(${PANE_KIND_ENV}${env}termag-credentials telemetry-launch ${id ?? '-'})"`, ...rest].join(' ');
+  return [`${PANE_KIND_ENV}claude --settings "$(${PANE_KIND_ENV}${env}${inferenceEnvPrefix(model)}termag-credentials telemetry-launch ${id ?? '-'})"`, ...rest].join(' ');
 }

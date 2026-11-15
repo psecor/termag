@@ -44,6 +44,22 @@ describe('decideGithubRequest', () => {
     expect(await decideGithubRequest(req('GET', '/login/oauth/access_token'), deps())).toMatchObject({ allow: false, status: 404 });
   });
 
+  it('refuses an Actions log download with a message that says so and names what works', async () => {
+    for (const path of [
+      '/api/v3/repos/o/r/actions/jobs/1286138/logs',
+      '/api/v3/repos/o/r/actions/runs/42442268316/logs',
+      '/api/v3/repos/O/R/actions/runs/42442268316/attempts/2/logs/',
+      '/api/v3/repositories/123/actions/runs/9/logs',
+    ]) {
+      const d = await decideGithubRequest(req('GET', path), deps());
+      expect(d, path).toMatchObject({ allow: false, status: 404, message: expect.stringMatching(/Actions log downloads.*annotations/) });
+    }
+    // Deleting a run's logs gets no redirect; the jobs list and annotations are ordinary reads.
+    expect(await decideGithubRequest(req('DELETE', '/api/v3/repos/o/r/actions/runs/9/logs'), deps())).toMatchObject({ allow: true });
+    expect(await decideGithubRequest(req('GET', '/api/v3/repos/o/r/actions/runs/9/jobs'), deps())).toMatchObject({ allow: true });
+    expect(await decideGithubRequest(req('GET', '/api/v3/repos/o/r/check-runs/7/annotations'), deps())).toMatchObject({ allow: true });
+  });
+
   it('asks for a box token, and refuses an unknown one', async () => {
     const none = await decideGithubRequest(req('GET', '/api/v3/user', { authorization: undefined }), deps());
     expect(none).toMatchObject({ allow: false, status: 401, headers: { 'www-authenticate': expect.stringContaining('Basic') } });
@@ -192,7 +208,7 @@ describe('decideGithubRequest: the environment pool rule', () => {
     expect(deps.ownerToken).not.toHaveBeenCalled();
   });
 
-  it.each(['env-stopping', 'env-stopped', 'env-starting', 'env-failed'])('refuses a pool box that is %s', async status => {
+  it.each(['env-stopping', 'env-stopped', 'env-starting'])('refuses a pool box that is %s', async status => {
     const d = await decideGithubRequest(refsUpload(), poolDeps({ box: poolBox(status) }));
     expect(d).toMatchObject({ allow: false, status: 403, message: expect.stringMatching(new RegExp(`pool rule \\(preparing only\\).*${status}`)) });
   });

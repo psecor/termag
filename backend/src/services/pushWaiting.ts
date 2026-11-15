@@ -17,8 +17,10 @@ import { parseStatusKey, statusKey } from './statusKey';
 import { isAmbiguousSession, resolveSessionProject, type ResolvedSession } from './sessionResolver';
 import { sessionBelongsToUser } from './tmux';
 import {
-  appBaseUrl, buildWaitingPayload, defaultSendDeps, isLiveSubscription, sendToUser, type SendDeps,
+  appBaseUrl, buildWaitingPayload, defaultSendDeps, isLiveSubscription, sendToUser, waitingOpensChat, type SendDeps,
 } from './webPush';
+import { loadSessionTitle } from './sessionTitle';
+import { boolVariation } from './featureFlags';
 
 /** The same session waiting again inside this window does not re-notify. */
 export const PUSH_WAITING_COOLDOWN_MS = 30_000;
@@ -108,9 +110,15 @@ export function pushOnWaitingTransition(t: WaitingTransition, deps?: SendDeps): 
     if (!owner?.projectId || !owner.workstream) return;
     const project = await prisma.project.findUnique({
       where: { id: owner.projectId },
-      select: { name: true, user: { select: { unixUsername: true } } },
+      select: {
+        name: true, kind: true,
+        user: { select: { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true } },
+      },
     });
     if (!project) return;
+    // Under chat-phone-home-enabled, for the owner: tapping it opens the session's chat when it has one.
+    const chat = waitingOpensChat(project.kind, owner.workstream)
+      && await boolVariation('chat-phone-home-enabled', project.user, false);
     const payload = buildWaitingPayload({
       baseUrl: appBaseUrl(),
       projectId: owner.projectId,
@@ -118,9 +126,11 @@ export function pushOnWaitingTransition(t: WaitingTransition, deps?: SendDeps): 
       workstream: owner.workstream,
       session: t.session,
       tag: key,
+      title: await loadSessionTitle(owner.projectId, project.name, owner.workstream),
       message: t.message,
       waitingReason: t.waitingReason,
       waitingCount: await ownerWaitingCount(owner.userId, project.user.unixUsername),
+      chat,
     });
     const summary = await sendToUser(owner.userId, payload, sendDeps);
     if (summary.sent || summary.failed) {

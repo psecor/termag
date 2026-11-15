@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  BROWSER_PANE_CAPABILITY, BROWSER_VIEWPORT, agentSupportsBrowserPane, clampViewport, normalizeBrowserUrl,
+  BROWSER_GUEST_CHECK_CAPABILITY, BROWSER_PANE_CAPABILITY, BROWSER_PANE_GUEST_CAPABILITY, BROWSER_PANE_PROFILES_CAPABILITY, BROWSER_VIEWPORT, parseBrowserChromiumAnswer, agentSupportsBrowserPane, browserPaneUnsupportedReason, clampViewport, normalizeBrowserUrl,
   parseBrowserClientMessage, parseBrowserInputEvent, parseBrowserPaneQuery, parseBrowserSuggestions, toAgentBrowserMessage,
 } from './browserPane';
 
@@ -9,6 +9,26 @@ describe('browser pane helpers', () => {
     expect(agentSupportsBrowserPane(['tmux-create-command-v1', BROWSER_PANE_CAPABILITY])).toBe(true);
     expect(agentSupportsBrowserPane(['tmux-create-command-v1'])).toBe(false);
     expect(agentSupportsBrowserPane([])).toBe(false);
+  });
+
+  it("reads a browser-chromium answer, keeping only the pane's own capabilities", () => {
+    expect(parseBrowserChromiumAnswer(null)).toBeNull();
+    expect(parseBrowserChromiumAnswer('x')).toBeNull();
+    expect(parseBrowserChromiumAnswer({ chromium: null, installing: true })).toEqual({ chromium: null, installing: true, error: null, capabilities: [] });
+    expect(parseBrowserChromiumAnswer({
+      chromium: '/snap/bin/chromium', installing: false,
+      capabilities: [BROWSER_PANE_CAPABILITY, BROWSER_PANE_GUEST_CAPABILITY, BROWSER_PANE_PROFILES_CAPABILITY, 'credentials-v1', BROWSER_PANE_CAPABILITY, 7],
+    })).toEqual({ chromium: '/snap/bin/chromium', installing: false, error: null, capabilities: [BROWSER_PANE_CAPABILITY, BROWSER_PANE_GUEST_CAPABILITY, BROWSER_PANE_PROFILES_CAPABILITY] });
+    // No Chromium, no capabilities, whatever the list says.
+    expect(parseBrowserChromiumAnswer({ chromium: '', error: 'error: unable to contact snap store', capabilities: [BROWSER_PANE_CAPABILITY] }))
+      .toEqual({ chromium: null, installing: false, error: 'error: unable to contact snap store', capabilities: [] });
+  });
+
+  it('tells a box with no Chromium from an agent that predates the pane', () => {
+    // Every agent with the pane announces the stack check, Chromium or not.
+    expect(browserPaneUnsupportedReason(['tmux-create-command-v1', BROWSER_GUEST_CHECK_CAPABILITY])).toBe('no-chromium');
+    expect(browserPaneUnsupportedReason(['tmux-create-command-v1'])).toBe('agent-outdated');
+    expect(browserPaneUnsupportedReason([])).toBe('agent-outdated');
   });
 
   it('clamps the viewport and falls back for garbage', () => {

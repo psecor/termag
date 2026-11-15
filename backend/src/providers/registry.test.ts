@@ -73,7 +73,7 @@ describe('chat engines (an automation run is a chat-runner turn)', () => {
 
   it('every chat-runner provider names its engine, is never selectable, and reports as the runner', () => {
     const runners = backend.PROVIDER_IDS.filter(backend.isChatRunnerProvider);
-    expect(runners).toEqual(['claude-chat', 'pi-chat']);
+    expect(runners).toEqual(['claude-chat', 'cursor-chat', 'devin-chat', 'pi-chat']);
     for (const id of runners) {
       expect(backend.PROVIDERS[id].chatEngine, id).toBeDefined();
       expect(backend.PROVIDERS[id].selectable, id).toBe(false);
@@ -85,6 +85,8 @@ describe('chat engines (an automation run is a chat-runner turn)', () => {
     }
     expect(backend.chatEngineOf('claude-chat')).toBe('claude');
     expect(backend.chatEngineOf('pi-chat')).toBe('pi');
+    expect(backend.chatEngineOf('cursor-chat')).toBe('cursor');
+    expect(backend.chatEngineOf('devin-chat')).toBe('devin');
     expect(backend.chatEngineOf('claude')).toBeUndefined();
     expect(backend.chatEngineOf(null)).toBeUndefined();
     // The runner's source still books as Claude's chat, as before pi-chat existed.
@@ -96,6 +98,9 @@ describe('chat engines (an automation run is a chat-runner turn)', () => {
     expect([...backend.SUPPORTED_CHAT_ENGINES]).toEqual(['claude']);
     expect(backend.PROVIDER_IDS.filter(backend.isLaunchableChatProvider)).toEqual(['claude-chat']);
     expect(backend.isLaunchableChatProvider('pi-chat')).toBe(false);
+    // A Cursor chat is only ever a review's (routes/prs.ts REVIEW_CHAT_PROVIDERS), never New session's.
+    expect(backend.isLaunchableChatProvider('cursor-chat')).toBe(false);
+    expect(backend.isLaunchableChatProvider('devin-chat')).toBe(false);
     expect(backend.isLaunchableChatProvider('claude')).toBe(false);
     expect(backend.isLaunchableChatProvider(undefined)).toBe(false);
   });

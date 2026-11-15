@@ -47,19 +47,22 @@ import { prisma } from '../db';
 import { anyClaimUpdateRunning, claimUpdateSettled } from '../services/claimUpdateGate';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
-import { chatEngineOf, isChatRunnerProvider } from '../providers/registry';
+import { chatEngineOf, isChatRunnerProvider, type ChatEngine } from '../providers/registry';
 import { instanceAgentTransport, isProjectAgentConnected, sendForProject } from '../services/agentRegistry';
 import { chatTurnChoice, resolvedChatTier, storedChatChoice, type ChatChoice } from '../services/claudeChatModel';
 import { askReportedTier } from '../services/askChat';
-import { askModelChoiceOn } from '../services/askModelFlag';
+import { askFireworksOn, askModelChoiceOn } from '../services/askModelFlag';
+import { getFireworksGatewayConfig } from '../services/fireworksGateway';
+import { askFireworksRefusal, FIREWORKS_UNAVAILABLE_CODE } from '../services/askModel';
 import { chatLaunchFor, type ChatLaunchResult } from '../services/chatLaunch';
 import { fireworksOfferedTo } from '../services/fireworksFlag';
 import { paneLockKey, withPaneLock } from '../services/agentRuntime';
 import { isChatSessionId, isT3ThreadId, saveChatHolder, saveChatSession } from '../services/chatHolder';
 import { CLAUDE_EXIT_KEYS, interruptAnswer, reclaimAnswer, reclaimChatFromPane, resumeChatInPane, sendUnlessTerminalHolds, TERMINAL_HOLDS_ANSWER, terminalAnswer } from '../services/chatResume';
-import { CHAT_AUTO_CAPABILITY, CHAT_HISTORY_PAGES_CAPABILITY, CHAT_SUBAGENTS_CAPABILITY, historyCursorOf, historyUuidOf, CHAT_SUBAGENTS_FLAG, subagentIdOf, chatContextAction, chatContextActions, chatContextRefusals, chatInterruptRpcPayload, chatKeyFor, chatRequireCheckout, chatResumeClaimPayload, chatRpcFailure, chatSendRpcPayload, chatSendsLive, chatStopScope, chatStopsTurn, chatTargetError, chatTextError, historyTerminalHolds, probeFromForeground, reconcileChatStatus, type PaneForeground, type PaneProbe, chatHistoryFromStore, CHAT_PLAN_SPEND_FLAG, CHAT_T3_HOLD_CAPABILITY, chatSendId, chatSendTimeoutMs } from '../services/chatRunner';
+import { CHAT_AUTO_CAPABILITY, CHAT_HISTORY_PAGES_CAPABILITY, CHAT_SUBAGENTS_CAPABILITY, historyCursorOf, historyUuidOf, CHAT_SUBAGENTS_FLAG, subagentIdOf, chatContextAction, chatContextActions, chatContextRefusals, chatEngineRefusal, chatEngineTakesImages, chatTerminalRefusal, chatInterruptRpcPayload, chatKeyFor, chatRequireCheckout, chatResumeClaimPayload, chatRpcFailure, chatSendRpcPayload, chatSendsLive, chatStopScope, chatStopsTurn, chatTargetError, chatTextError, historyTerminalHolds, probeFromForeground, reconcileChatStatus, type PaneForeground, type PaneProbe, chatHistoryFromStore, CHAT_PLAN_SPEND_FLAG, CHAT_T3_HOLD_CAPABILITY, chatSendId, chatSendTimeoutMs } from '../services/chatRunner';
 import { brokerMcpFor } from '../services/chatConfinedMcp';
 import { turnMemorySpace } from '../services/chatSpace';
+import { turnFilesFor, type TurnFiles } from '../services/projectFiles';
 import { chatTrust, followUpMode, TRUSTED_MODE, type ChatTrust } from '../services/chatTrust';
 import { ASK_PUSH_CAPABILITY, askBranch, askChatSendRefusal, askCwd } from '../services/agentMessages';
 import { chatContextPostRefusal, chatReclaimPostRefusal, chatTerminalPostRefusal, chatTrustPostRefusal, runAfterPostRefusal } from '../services/chatTrustPost';
@@ -105,7 +108,7 @@ interface ChatTarget {
   agentCapabilities: readonly string[];
   isOwner: boolean;
   /** An ask thread's chat (services/askChat.ts): its turns run in the thread's clone on the box. */
-  ask: { threadId: string; baseSha: string | null; gitName: string; gitEmail: string; pushBranch?: string; permissionMode?: string; sendRefusal: Result | null; thread: AskTelemetryThread } | null;
+  ask: { threadId: string; baseSha: string | null; gitName: string; gitEmail: string; pushBranch?: string; permissionMode?: string; sendRefusal: Result | null; thread: AskTelemetryThread; fireworksRefusal: () => Promise<string | null> } | null;
   /** The workstream's agent row, which holds what the chat runs on. */
   workflowId: string;
   /** What the chat runs on: the row's backend and model. */
@@ -117,7 +120,7 @@ interface ChatTarget {
   /** Started with "Act as an orchestrator" (never an ask's chat). */
   orchestrator: boolean;
   /** The headless agent the runner drives for this chat (registry chatEngine). */
-  engine: 'claude' | 'pi' | null;
+  engine: ChatEngine | null;
 }
 
 async function chatTarget(userId: string, projectId: string, workstreamRaw: unknown): Promise<ChatTarget | Result> {
@@ -188,11 +191,14 @@ async function chatTarget(userId: string, projectId: string, workstreamRaw: unkn
   const capRefusal = askThread ? askCapRefusal(project, project.instance?.name ?? 'The box', caps) : null;
   const askMode = askCap ?? TRUSTED_MODE;
   const trust: ChatTrust = askThread ? { trusted: true, reason: 'trusted', mode: TRUSTED_MODE } : chatTrust(project);
-  // An ask's chat runs on the default backend (agent/ask-chat.js), on the tier it has stored (`termag ask --model`, or a
-  // pick here) while ask-model-choice-enabled is on for the asker and box; else on none, the box's default, as its asks ran.
-  const askTierOn = !!askThread?.originUser && !!project.instance
-    && await askModelChoiceOn(askThread.originUser, { id: project.instance.id, name: project.instance.name, kind: project.instance.kind });
-  const choice = askThread ? storedChatChoice(null, askTierOn ? workflow!.model : null) : storedChatChoice(workflow!.backend, workflow!.model);
+  // An ask's chat runs on the choice it has stored (`termag ask --model`, or a pick here) while ask-model-choice-enabled
+  // is on for the asker and box; else on none, the box's default, as its asks ran. A stored Fireworks model is kept
+  // either way, so a message is refused with the reason (turnTarget) rather than run on Claude.
+  const askBox = project.instance ? { id: project.instance.id, name: project.instance.name, kind: project.instance.kind } : null;
+  const askTierOn = !!askThread?.originUser && !!askBox && await askModelChoiceOn(askThread.originUser, askBox);
+  const choice = askThread
+    ? (askTierOn || workflow!.backend === 'fireworks' ? storedChatChoice(workflow!.backend, workflow!.model) : storedChatChoice(null, null))
+    : storedChatChoice(workflow!.backend, workflow!.model);
   return {
     host: access.host, projectId, project: project.name, workstream: wsName, workstreamId: wsId,
     chatKey: chatKeyFor(projectId, wsId), cwd,
@@ -214,6 +220,12 @@ async function chatTarget(userId: string, projectId: string, workstreamRaw: unkn
       ...(askCap ? { permissionMode: askCap } : {}),
       sendRefusal: askRefusal ?? (capRefusal ? { status: 409, body: { error: capRefusal, code: 'ask-mode-cap' } } : null),
       thread: { id: askThread.id, parentProjectId: askThread.parentProjectId, parentWorkstream: askThread.parentWorkstream, parentClaudeSession: askThread.parentClaudeSession },
+      // Why a message here can't run on Fireworks, as the thread's asks are refused (services/askModel.ts); read only for one that would.
+      fireworksRefusal: async () => askFireworksRefusal({
+        box: project.instance?.name ?? 'The box', modelChoiceOn: askTierOn,
+        fireworksOn: !!askBox && await askFireworksOn(askThread.originUser, askBox),
+        gatewayConfigured: !!getFireworksGatewayConfig(), caps,
+      }),
     } : null,
     workflowId: workflow!.id, choice, ownerId: project.userId, ownerOnGateway: !!project.user?.claudeGatewayEnabled,
     orchestrator: !askThread && project.chatOrchestrator === true,
@@ -242,9 +254,14 @@ async function turnTarget(
   const fireworks = sent.backend === 'fireworks' && ldUser ? await fireworksOfferedTo(ldUser) : null;
   const turn = chatTurnChoice(target.choice, sent, fireworks);
   if (!turn.ok) return { status: 400, body: { error: turn.error } };
-  if (turn.choice.backend && target.ask) return { status: 409, body: { error: "An ask's chat runs on Claude's own models", code: 'ask-chat' } };
+  // An ask's chat on Fireworks: as its asks are (services/askModel.ts askFireworksRefusal), refused with the reason until
+  // a message switches it back to a Claude model, never run on Claude instead.
+  if (turn.choice.backend && target.ask) {
+    const why = await target.ask.fireworksRefusal();
+    if (why) return { status: 409, body: { error: `This ask's chat runs on Fireworks, and ${why}`, code: FIREWORKS_UNAVAILABLE_CODE } };
+  }
   // An ask's chat with no tier names no `--model`, as its ask turns did (askService askTurnModel): the box's default.
-  const launch: ChatLaunchResult = target.ask && !turn.choice.model ? { ok: true, launch: { model: null } } : await launchFor(target, turn.choice);
+  const launch: ChatLaunchResult = target.ask && !turn.choice.backend && !turn.choice.model ? { ok: true, launch: { model: null } } : await launchFor(target, turn.choice);
   if (!launch.ok) return { status: launch.status, body: launch.body };
   return {
     target: { ...target, choice: turn.choice, ...launch.launch },
@@ -260,7 +277,7 @@ async function turnTarget(
  * cannot be read (the picker shows it as Fireworks).
  */
 async function reportedModel(target: ChatTarget): Promise<string | null> {
-  if (target.ask) return askReportedTier(target.choice.model, target.ownerOnGateway);
+  if (target.ask && target.choice.backend !== 'fireworks') return askReportedTier(target.choice.model, target.ownerOnGateway);
   if (target.choice.backend !== 'fireworks') return resolvedChatTier(target.choice.model);
   if (target.choice.model) return target.choice.model;
   const launch = await launchFor(target, target.choice);
@@ -279,6 +296,11 @@ function effortContext(target: ChatTarget): ChatEffortContext {
 /** The space a chat's turn loads: the chat's own, never the tab it is open in (services/chatSpace.ts turnMemorySpace). */
 function chatMemorySpaceOf(target: ChatTarget): Promise<string | null | undefined> {
   return turnMemorySpace(target.workstreamId);
+}
+
+/** The turn's Project files and My files, granted to its box first (services/projectFiles.ts), for a box with project-files-v1. */
+function chatFilesOf(target: ChatTarget): Promise<TurnFiles | undefined> {
+  return turnFilesFor(target.workstreamId, target.agentCapabilities);
 }
 
 /** Whether this send's turn is told about generative UI (services/chatGenUi.ts): the sender's flag, this chat and its box. */
@@ -347,7 +369,9 @@ async function storedHistoryFor(userId: string, projectId: string, workstreamRaw
   if (!view) return null;
   // An ask's chat runs on the default backend, whatever its workstream saved, on its stored tier or the box's default (chatTarget).
   const askTierOn = ask && !!project.instance && !!project.user && await askModelChoiceOn(project.user, { id: project.instance.id, name: project.instance.name, kind: project.instance.kind });
-  const choice = ask ? storedChatChoice(null, askTierOn ? workflow.model : null) : storedChatChoice(workflow.backend, workflow.model);
+  const choice = ask
+    ? (askTierOn || workflow.backend === 'fireworks' ? storedChatChoice(workflow.backend, workflow.model) : storedChatChoice(null, null))
+    : storedChatChoice(workflow.backend, workflow.model);
   // A send continues it on a new box, or starts its stopped box (services/chatNewBox.ts).
   const continuation = await continuationBody(await continuationFacts(projectId, workflow.workstream.id, workflow.workstream.name, isOwner, ask), workflow.workstream.id, userId);
   return {
@@ -355,15 +379,16 @@ async function storedHistoryFor(userId: string, projectId: string, workstreamRaw
     body: {
       chatKey: chatKeyFor(projectId, workflow.workstream.id), workstream: workflow.workstream.name,
       sessionId: view.sessionId, entries: view.entries, running: false, liveInput: false, queued: 0, parked: false, turn: null, turns: [],
-      // Images always: the box isn't here to say chat-images-v1. A send holds them with the
-      // message on the orchestrator (holdIfContinuing), and the box's runner checks them at delivery.
-      checkoutReady: true, sendsLive: false, imageInput: true, pdfInput: false, stopsTurn: false,
+      // Images whenever its engine takes them: the box isn't here to say chat-images-v1. A send holds them with the
+      // message on the orchestrator (holdIfContinuing), and the box's runner checks them at delivery. A Cursor chat
+      // takes none (chatEngineTakesImages), whether its box is here or not.
+      checkoutReady: true, sendsLive: false, imageInput: chatEngineTakesImages(chatEngineOf(workflow.provider)), pdfInput: false, stopsTurn: false,
       // Files on the flag alone, with no box here to say chat-files-v1: the upload wakes the box and is refused then if it
       // can't. Never in an ask's thread, nor in a chat whose box is gone, which no upload could reach (Devin on #1478).
       fileInput: filesOn && !ask && project.instance != null && !GONE_BOX_STATES.has(project.instance.status),
       // Trust is the project's (chatTrustFor), so the box need not answer.
       trust: ask ? { trusted: true, reason: 'trusted', mode: TRUSTED_MODE } : chatTrust(project), canTrust: isOwner && !ask,
-      model: ask ? askReportedTier(choice.model, !!project.user?.claudeGatewayEnabled) : choice.backend === 'fireworks' ? choice.model : resolvedChatTier(choice.model),
+      model: choice.backend === 'fireworks' ? choice.model : ask ? askReportedTier(choice.model, !!project.user?.claudeGatewayEnabled) : resolvedChatTier(choice.model),
       ...(choice.backend ? { backend: choice.backend } : {}),
       // Read from the store: the box did not answer. Sending still needs it.
       stored: true,
@@ -482,7 +507,8 @@ export async function chatHistoryFor(userId: string, projectId: string, query: R
     // The running turn's liveInput says it reads messages; sendsLive, whether this viewer's would go in.
     const sendsLive = !target.ask && chatSendsLive(target.agentCapabilities, true);
     // Whether this viewer's composer offers images.
-    const imageInput = chatImageInput(target.agentCapabilities);
+    // A chat on another engine (SENT_CHAT_ENGINES: Cursor's) takes no images, so the composer offers none.
+    const imageInput = chatImageInput(target.agentCapabilities) && chatEngineTakesImages(target.engine);
     const pdfInput = chatPdfInput(imageInput, target.agentCapabilities, target.choice.backend ?? null);
     // Whether this viewer's model menu offers an effort for this chat, the same way.
     const effortInput = chatEffortInput(effortContext(target));
@@ -866,6 +892,9 @@ export async function chatSendFor(userId: string, projectId: string, body: Recor
   }
   const found = await chatTarget(userId, projectId, body.workstream);
   if (isResult(found)) return found;
+  // A Cursor chat on a box whose agent can't run it, or with images it takes none of: why, rather than a Claude turn.
+  const engineRefusal = chatEngineRefusal(found.engine, found.agentCapabilities, images.images.length);
+  if (engineRefusal) return engineRefusal;
   const turn = await turnTarget(found, { model: body.model, backend: body.backend }, ldUser);
   if (isResult(turn)) return turn;
   const { target } = turn;
@@ -886,12 +915,13 @@ export async function chatSendFor(userId: string, projectId: string, body: Recor
   try {
     // An ask's chat has no agent pane: its session lives in the thread's clone (agent/ask-chat.js).
     if (target.ask) {
-      const { sendRefusal: _refusal, thread: askThread, ...askFacts } = target.ask;
+      const { sendRefusal: _refusal, thread: askThread, fireworksRefusal: _fireworks, ...askFacts } = target.ask;
       // The chat's own space, as for a person's turn anywhere else (Bugbot, #769).
       const memorySpace = await chatMemorySpaceOf(target);
+      const files = await chatFilesOf(target);
       // The thread and who asked, for the turn's telemetry resource like its asks' turns (services/askTelemetry.ts).
       const ask = { ...askFacts, telemetry: await askTelemetryFor(askThread) };
-      const payload = { ...chatSendRpcPayload(target, body.text as string, target.agentCapabilities, { liveInput: false, images: images.images, memorySpace, sendId: chatSendId(body.sendId) }), ask };
+      const payload = { ...chatSendRpcPayload(target, body.text as string, target.agentCapabilities, { liveInput: false, images: images.images, memorySpace, sendId: chatSendId(body.sendId), files }), ask };
       const sent = await sendForProject(target.host, 'chat-send', payload, chatSendTimeoutMs(images.images.length));
       await turn.save();
       return { status: 202, body: sent };
@@ -899,6 +929,7 @@ export async function chatSendFor(userId: string, projectId: string, body: Recor
     // A termag notice never goes into a running turn: it queues after it (sendAskNotice).
     const liveInput = !opts.noLive;
     const memorySpace = await chatMemorySpaceOf(target);
+    const files = await chatFilesOf(target);
     const genUi = await genUiFor(target, ldUser);
     const genUiHint = await genUiHintFor(genUi, ldUser);
     // The turn hears of a restart, or of the new box it continues on (an agent with chat-box-notice-v1).
@@ -915,7 +946,7 @@ export async function chatSendFor(userId: string, projectId: string, body: Recor
     const r = await withPaneLock(paneLockKey(target.instanceId, target.paneSession), () => sendUnlessTerminalHolds(
       () => readPane(target),
       probe => sendForProject(target.host, 'chat-send', {
-        ...chatSendRpcPayload(target, body.text as string, target.agentCapabilities, { liveInput, images: images.images, titles: true, headings: true, effort, genUi, genUiHint, memorySpace, boxNotices: true, notice: resumed?.notice, planSpend, sendId: chatSendId(body.sendId), brokerMcp }),
+        ...chatSendRpcPayload(target, body.text as string, target.agentCapabilities, { liveInput, images: images.images, titles: true, headings: true, effort, genUi, genUiHint, memorySpace, boxNotices: true, notice: resumed?.notice, planSpend, sendId: chatSendId(body.sendId), brokerMcp, files }),
         paneProbe: probe,
       }, chatSendTimeoutMs(images.images.length)),
     ));
@@ -997,6 +1028,9 @@ export async function chatTerminalFor(userId: string, projectId: string, body: R
   const target = await chatTarget(userId, projectId, body.workstream);
   if (isResult(target)) return target;
   if (target.ask) return { status: 409, body: { error: "An ask's chat runs in the thread's own clone and has no terminal to continue in", code: 'ask-chat' } };
+  // Only Claude Code's session continues in the pane: another engine's (Cursor's) has nothing to type there.
+  const engineRefusal = chatTerminalRefusal(target.engine);
+  if (engineRefusal) return engineRefusal;
   // The pane continues on the chat's backend, never quietly on the default one.
   const launch = await launchFor(target, target.choice);
   if (!launch.ok) return { status: launch.status, body: launch.body };
@@ -1054,6 +1088,7 @@ export async function chatReclaimFor(userId: string, projectId: string, body: Re
   try {
     const liveInput = hasDraft;
     const memorySpace = hasDraft ? await chatMemorySpaceOf(target) : undefined;
+    const files = hasDraft ? await chatFilesOf(target) : undefined;
     const genUi = hasDraft && await genUiFor(target, ldUser);
     const genUiHint = await genUiHintFor(genUi, ldUser);
     const planSpend = hasDraft ? await sendsPlanSpend(target, ldUser) : false;
@@ -1092,7 +1127,7 @@ export async function chatReclaimFor(userId: string, projectId: string, body: Re
       const sent = await sendUnlessTerminalHolds(
         () => readPane(target),
         probe => sendForProject(target.host, 'chat-send', {
-          ...chatSendRpcPayload(target, text, target.agentCapabilities, { liveInput, images: images.images, titles: true, headings: true, effort, genUi, genUiHint, memorySpace, boxNotices: true, notice: resumed?.notice, planSpend, brokerMcp }),
+          ...chatSendRpcPayload(target, text, target.agentCapabilities, { liveInput, images: images.images, titles: true, headings: true, effort, genUi, genUiHint, memorySpace, boxNotices: true, notice: resumed?.notice, planSpend, brokerMcp, files }),
           paneProbe: probe,
         }, chatSendTimeoutMs(images.images.length)),
       );

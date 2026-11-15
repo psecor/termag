@@ -23,6 +23,7 @@ import {
   closeBrowserStream,
   isProjectAgentConnected,
   projectAgentCapabilities,
+  requestBrowserChromium,
   requestBrowserStream,
   requestBrowserSuggestions,
   sendBrowserMessage,
@@ -31,18 +32,24 @@ import {
 } from '../services/agentRegistry';
 import { projectDirUnder, resolveProjectRoot } from '../services/projectPaths';
 import {
+  BROWSER_PANE_CHROMIUM_FLAG,
   BROWSER_PANE_DISABLED_CLOSE_CODE,
+  BROWSER_PANE_NO_CHROMIUM_REASON,
   BROWSER_PANE_RETRY_CLOSE_CODE,
   BROWSER_PANE_UNSUPPORTED_CLOSE_CODE,
+  agentChecksChromium,
   agentSupportsBrowserPane,
   agentSupportsGuests,
   agentSupportsKeptProfiles,
+  browserPaneUnsupportedReason,
   clampViewport,
   normalizeBrowserUrl,
+  parseBrowserChromiumAnswer,
   parseBrowserClientMessage,
   parseBrowserPaneQuery,
   parseBrowserSuggestions,
   toAgentBrowserMessage,
+  type BrowserChromiumAnswer,
   type BrowserSuggestion,
 } from '../services/browserPane';
 import {
@@ -89,6 +96,14 @@ export interface BrowserWsDeps {
   closeStream(streamId: string): void;
   /** Which web apps listen on the box; `cwd` is the project's directory there, for a dev-stack hint. */
   suggest(host: ProjectHost, cwd: string | null): Promise<BrowserSuggestion[]>;
+  /** browser-pane-chromium-enabled for the project's owner and box. */
+  chromiumEnabled(owner: User, box: Instance | null): Promise<boolean>;
+  /**
+   * Ask the agent for a Chromium now (`browser-chromium`), installing one with
+   * `install`; null when it couldn't say. `adopt` adds the pane capabilities
+   * it gained to the connection that answered, while that one is still the box's.
+   */
+  checkChromium(host: ProjectHost, install: boolean): Promise<{ answer: BrowserChromiumAnswer; adopt(): void } | null>;
   log(line: string): void;
   // ── the guest path ──
   /** With `viewerId`, a link share's row for that viewer too. */
@@ -121,6 +136,12 @@ export const defaultBrowserWsDeps: BrowserWsDeps = {
   sendToStream: sendBrowserMessage,
   closeStream: closeBrowserStream,
   suggest: async (host, cwd) => parseBrowserSuggestions(await requestBrowserSuggestions(host, cwd)),
+  chromiumEnabled: (owner, box) => boolVariation(BROWSER_PANE_CHROMIUM_FLAG, owner, false, box),
+  async checkChromium(host, install) {
+    const reply = await requestBrowserChromium(host, install).catch(() => null);
+    const answer = reply && parseBrowserChromiumAnswer(reply.answer);
+    return reply && answer ? { answer, adopt: () => reply.adopt(answer.capabilities) } : null;
+  },
   log: (line) => console.log(line),
   guestContext: (shareId, viewerId) => prismaPreviewShareStore.guestContext(shareId, viewerId),
   async guestFlags(owner, box) {
@@ -146,7 +167,15 @@ const PRE_ATTACH_QUEUE = 64;
 // time, and a repeat inside this window gets the last answer again.
 const SUGGEST_REUSE_MS = 3000;
 
+// Why a box can't run a pane (services/browserPane.ts browserPaneUnsupportedReason).
+// frontend/src/utils/browserPaneInput.ts carries the same words for a pane
+// that missed the `exit` frame; browserWs.test.ts keeps the two in step.
 export const BROWSER_PANE_UNSUPPORTED_MESSAGE = "This box's agent needs an update before it can run a browser pane.";
+export const BROWSER_PANE_NO_CHROMIUM_MESSAGE = "This box has no Chromium, so it can't run a browser pane. To add it, run sudo snap install chromium on the box, then restart its agent with systemctl --user restart termag-agent (a restart ends a chat turn that is still running).";
+export const BROWSER_PANE_INSTALLING_CHROMIUM_MESSAGE = "Installing Chromium on this box so it can run a browser pane. It takes a minute or two; the pane opens when it's done.";
+export const browserPaneInstallFailedMessage = (error: string) => `This box has no Chromium, and installing it failed (${error}). To add it, run sudo snap install chromium on the box, then open the browser again.`;
+export const BROWSER_PANE_GUEST_UNSUPPORTED_MESSAGE = "The owner's box can't run a reviewer's browser yet (it needs an update).";
+export const BROWSER_PANE_GUEST_NO_CHROMIUM_MESSAGE = "The owner's box can't run a reviewer's browser: it has no Chromium.";
 
 export async function handleBrowserPaneSocket(
   ws: BrowserPaneSocket,
@@ -191,8 +220,36 @@ export async function handleBrowserPaneSocket(
     refuse(BROWSER_PANE_RETRY_CLOSE_CODE, 'agent not connected', 'Agent not connected for this box.');
     return;
   }
-  if (!agentSupportsBrowserPane(deps.agentCapabilities(host))) {
-    refuse(BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, 'browser pane unsupported', BROWSER_PANE_UNSUPPORTED_MESSAGE);
+  let announced = deps.agentCapabilities(host);
+  // A box with no Chromium, behind the flag: the agent looks again and
+  // installs one when there is still none. The pane redials on
+  // 1013 while it installs, each dial asking again, and opens on the first
+  // that finds it.
+  if (!agentSupportsBrowserPane(announced) && agentChecksChromium(announced)) {
+    const owner = project.userId === viewer.id ? viewer : await deps.findUser(project.userId);
+    if (owner && await deps.chromiumEnabled(owner, project.instance)) {
+      const checked = await deps.checkChromium(host, true);
+      const answer = checked?.answer;
+      if (checked && answer?.chromium) {
+        checked.adopt();
+        announced = deps.agentCapabilities(host);
+        deps.log(`[BROWSER-PANE] project ${project.id}: the box has Chromium now (${answer.chromium})`);
+      } else if (answer?.installing) {
+        deps.log(`[BROWSER-PANE] user ${viewer.id} waits for project ${project.id}: installing Chromium on the box`);
+        refuse(BROWSER_PANE_RETRY_CLOSE_CODE, 'installing chromium', BROWSER_PANE_INSTALLING_CHROMIUM_MESSAGE);
+        return;
+      } else if (answer?.error) {
+        deps.log(`[BROWSER-PANE] user ${viewer.id} refused for project ${project.id}: installing Chromium failed: ${answer.error}`);
+        refuse(BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, BROWSER_PANE_NO_CHROMIUM_REASON, browserPaneInstallFailedMessage(answer.error));
+        return;
+      }
+    }
+  }
+  if (!agentSupportsBrowserPane(announced)) {
+    const why = browserPaneUnsupportedReason(announced);
+    deps.log(`[BROWSER-PANE] user ${viewer.id} refused for project ${project.id}: ${why === 'no-chromium' ? 'the box has no Chromium' : 'the agent predates the browser pane'}`);
+    if (why === 'no-chromium') refuse(BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, BROWSER_PANE_NO_CHROMIUM_REASON, BROWSER_PANE_NO_CHROMIUM_MESSAGE);
+    else refuse(BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, 'browser pane unsupported', BROWSER_PANE_UNSUPPORTED_MESSAGE);
     return;
   }
 
@@ -283,26 +340,41 @@ async function handleGuestSocket(ws: BrowserPaneSocket, url: URL, viewerId: stri
   const project = ctx.project;
   // Seam 1: the box, checkout and recipe come from the share's target, not its fields.
   const target = shareTarget(ctx);
-  if (!target) { refuse(GUEST_REFUSED_CLOSE_CODE, 'workstream-gone', GUEST_REFUSAL_MESSAGES['workstream-gone']); return; }
+  // Logged, and a final refusal is kept as the share's `refused` event, so its
+  // history says why. A retryable one (null reason) is only logged: the pane
+  // redials it every few seconds, and each redial would add an event.
+  const guestRefused = async (reason: string | null, why: string) => {
+    deps.log(`[BROWSER-PANE] guest ${viewer.id} refused for share ${shareId}: ${why}`);
+    if (reason) await deps.recordShareEvent(shareId, 'refused', { actorId: viewer.id, reason });
+  };
+  if (!target) {
+    await guestRefused('workstream-gone', 'workstream-gone');
+    refuse(GUEST_REFUSED_CLOSE_CODE, 'workstream-gone', GUEST_REFUSAL_MESSAGES['workstream-gone']);
+    return;
+  }
   const host: ProjectHost = target.host;
   const refusal = terminalAttachRefusal(project.instanceId, await deps.boxStatus(project.instanceId), deps.agentConnected(host), project);
   if (refusal?.kind === 'parked') {
     // A guest never wakes a box (phase 1): the page offers to ask the owner.
-    await deps.recordShareEvent(shareId, 'refused', { actorId: viewer.id, reason: 'box-asleep' });
+    await guestRefused('box-asleep', 'box asleep');
     refuse(TERMINAL_BOX_PARKED_CLOSE_CODE, 'box asleep', `${ctx.owner.displayName}'s box is asleep.`);
     return;
   }
   if (refusal?.kind === 'setup') {
+    await guestRefused('project-setup', `project setup ${refusal.refusal.setupStatus}`);
     refuse(1008, `project setup ${refusal.refusal.setupStatus}`, "The owner's project is still being set up.");
     return;
   }
   if (refusal) {
+    await guestRefused(null, `agent not connected (${project.instanceId ?? 'orchestrator'})`);
     refuse(BROWSER_PANE_RETRY_CLOSE_CODE, 'agent not connected', "The owner's box isn't connected right now.");
     return;
   }
   const capabilities = deps.agentCapabilities(host);
   if (!agentSupportsBrowserPane(capabilities) || !agentSupportsGuests(capabilities)) {
-    refuse(BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, 'guest pane unsupported', "The owner's box can't run a reviewer's browser yet (it needs an update).");
+    const noChromium = !agentSupportsBrowserPane(capabilities) && browserPaneUnsupportedReason(capabilities) === 'no-chromium';
+    await guestRefused('guest-pane-unsupported', `guest pane unsupported: ${noChromium ? 'the box has no Chromium' : `the agent does not advertise ${agentSupportsBrowserPane(capabilities) ? 'guests' : 'the browser pane'}`}`);
+    refuse(BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, 'guest pane unsupported', noChromium ? BROWSER_PANE_GUEST_NO_CHROMIUM_MESSAGE : BROWSER_PANE_GUEST_UNSUPPORTED_MESSAGE);
     return;
   }
 

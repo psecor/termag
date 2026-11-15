@@ -5,6 +5,7 @@ const prisma = vi.hoisted(() => ({
   instance: { findMany: vi.fn() },
   project: { findMany: vi.fn() },
   user: { findUnique: vi.fn() },
+  projectShare: { findMany: vi.fn().mockResolvedValue([]) },
   boxEvent: { findMany: vi.fn().mockResolvedValue([]) },
   spaceSlack: { findMany: vi.fn().mockResolvedValue([]) },
 }));
@@ -75,6 +76,21 @@ describe('prismaCliStore lists', () => {
       { id: 'p-app', name: 'app' },
       { id: 'p-space', name: 'space-design', label: 'space orchestrator for design' },
     ]);
+  });
+
+  it('says which boxes have a shared project, archived ones counted', async () => {
+    prisma.instance.findMany.mockResolvedValue([box('shared-box', null), box('own-box', null)]);
+    prisma.projectShare.findMany.mockResolvedValue([{ project: { instanceId: 'shared-box' } }]);
+    const boxes = await prismaCliStore.listBoxes('u1');
+    expect(boxes.map(b => [b.name, b.shared])).toEqual([['shared-box', true], ['own-box', false]]);
+    // No archived filter: a share on an archived project still gives its sharee a shell there.
+    expect(prisma.projectShare.findMany.mock.calls[0][0].where).toEqual({ project: { instanceId: { in: ['shared-box', 'own-box'] } } });
+  });
+
+  it('asks for no shares when there are no boxes', async () => {
+    prisma.instance.findMany.mockResolvedValue([]);
+    expect(await prismaCliStore.listBoxes('u1')).toEqual([]);
+    expect(prisma.projectShare.findMany).not.toHaveBeenCalled();
   });
 
   it('lists no space orchestrator among the projects', async () => {

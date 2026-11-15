@@ -17,7 +17,7 @@ export interface FlagSpec {
   kind: 'boolean' | 'string' | 'number' | 'json';
   // What every read falls back to when TERMAG_FLAGS does not set the key.
   // A json flag falls back to null: its reader's code defaults, key by key.
-  fallback: boolean | string | number | null;
+  fallback: boolean | string | number | null | readonly [];
   // The contexts the server evaluates it for (services/ldContext.ts):
   // `user`, `user+box` (multi: the owner and the box), `user+box+repo` (the
   // same plus a `repo` context keyed `owner/name`), `pool` (the warm
@@ -48,6 +48,11 @@ export const FLAG_REGISTRY = {
     kind: 'boolean', fallback: false, server: ['user+box'], client: true, lifecycle: 'release', addedIn: '#433',
     purpose: 'Hand an agent pane off: it writes a handoff, the pane is cleared, compacted or restarted, and the next agent starts on it.',
   },
+  'agent-mcp-events-enabled': {
+    kind: 'boolean', fallback: false, server: ['user'], client: false, lifecycle: 'release', addedIn: '#1638',
+    docs: 'docs/agents/observability.md',
+    purpose: 'The agent.mcp.used product event: POST /api/status/mcp, which deploy/termag-status posts from the PostToolUse and PostToolUseFailure hooks for each MCP tool call (services/mcpUseEvent.ts). Off, the route answers 404 like an older orchestrator, the hook ignores it, and nothing is recorded.',
+  },
   'agent-spawn-limits': {
     kind: 'json', fallback: null, server: ['user+box', 'user'], client: false, lifecycle: 'config', addedIn: '#428',
     purpose: 'Spawn limits and hot-box thresholds as tuning parameters; malformed keys fall back one by one to DEFAULT_SPAWN_LIMITS.',
@@ -60,9 +65,17 @@ export const FLAG_REGISTRY = {
     kind: 'boolean', fallback: false, server: ['user'], client: false, lifecycle: 'release', addedIn: '#0',
     purpose: "When an ask finishes, termag tells the session that sent it (a turn of its chat, or a line typed into its idle agent pane), metadata only, read for the asker when the notice is due; off, the finish is only in `termag ask --inbox`.",
   },
+  'ask-fireworks-enabled': {
+    kind: 'boolean', fallback: false, server: ['user+box'], client: false, lifecycle: 'release', addedIn: '#1674',
+    purpose: "`termag ask --model fireworks:<id>` (services/askModelFlag.ts askFireworksOn), read for the asker and the target box, with ask-model-choice-enabled and fireworks-models: the ask's turn runs on that Fireworks model through the gateway, and the thread's chat keeps it. Off, a Fireworks ask is refused (fireworks_unavailable), and so is a follow-up on a thread whose chat keeps a Fireworks model, never run on Claude instead.",
+  },
   'ask-model-choice-enabled': {
     kind: 'boolean', fallback: false, server: ['user+box'], client: false, lifecycle: 'release', addedIn: '#1322',
     purpose: "`termag ask --model` and `project create --model` (services/askModelFlag.ts), read for the asker and the target box: the turn launches on the tier, which the thread's chat keeps. Off, a requested model is ignored as an older box agent's is (the box's default, modelIgnored says why), and an ask thread's stored tier is not applied.",
+  },
+  'automation-alerts-enabled': {
+    kind: 'boolean', fallback: false, server: ['user+box'], client: true, lifecycle: 'release', addedIn: '#1572',
+    purpose: "Automation alerts and the outbound webhook (services/automations/alerts.ts, notices.ts, webhook.ts), read for the owner and the box: a keyword alert when a finished run's summary matches its prefix or regex, a health alert for every pause (its cause named) and the first box_unavailable skip of a streak, to the owner's Slack DM, the project's channel or a channel, and a signed POST of run.done, run.failed and automation.paused to the owner's https URL; the browser shows the fields in Run settings. Off, create and PATCH refuse a keyword, a non-DM target or a webhook (403 automation_alerts_disabled), nothing is queued, and a pause is only the row, as before.",
   },
   'automation-limits': {
     kind: 'json', fallback: null, server: ['user+box'], client: false, lifecycle: 'config', addedIn: '#483',
@@ -110,9 +123,13 @@ export const FLAG_REGISTRY = {
     docs: 'docs/box-hibernation.md',
     purpose: 'The AMI a user\'s boxes launch from: a pinned ami-… or a channel; empty is the published image.',
   },
-  'box-port-forward-enabled': {
-    kind: 'boolean', fallback: false, server: ['user+box'], client: true, lifecycle: 'release', addedIn: '#724',
-    purpose: 'The native port forward (termag forward): GET /api/cli/v1/boxes/:id/forward (the probe) and the forward socket at /api/cli/v1/boxes/:id/forward/:port, relayed to the box\'s loopback port over an agent tunnel. Owner and device sign-in only; off, both answer 404 not_found. The browser reads it only for What\'s new.',
+  'box-placement-enabled': {
+    kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#1662',
+    purpose: 'Runs on: Auto in New session: GET /api/boxes/placement, Auto as the default box, POST /api/projects onto a parked box waking it, and the personal default. Off, New session defaults to New box and a parked box must be woken before Send, as before; the placement route answers 404 box_placement_disabled.',
+  },
+  'box-placement-policy': {
+    kind: 'string', fallback: 'reuse-first', server: ['user'], client: false, lifecycle: 'config', addedIn: '#1662',
+    purpose: "The org default for where a New session runs when nobody picks a box: reuse-first (one of your boxes, services/boxPlacement.ts) or fresh-first (New box). Anything else reads as reuse-first and is logged once (routes/boxPlacement.ts orgPlacementPolicy). A person's own setting beats it.",
   },
   'box-root-volume-performance': {
     kind: 'json', fallback: null, server: ['pool'], client: false, lifecycle: 'config', addedIn: '#1216',
@@ -122,6 +139,10 @@ export const FLAG_REGISTRY = {
   'box-sharing-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#397',
     purpose: 'Sending and accepting new project shares; existing shares are never behind it.',
+  },
+  'box-stop-cloud-session-guard-enabled': {
+    kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#1489',
+    purpose: 'A stop of a running box with live Claude Code cloud sessions is refused (409 box_busy) until a person forces it; off, stops go ahead and end them, as before. The browser reads it only for What\'s new, whose entry about the stop needs it.',
   },
   'box-volume-initialization-rate': {
     kind: 'number', fallback: 0, server: ['pool'], client: false, lifecycle: 'config', addedIn: '#1210',
@@ -140,6 +161,10 @@ export const FLAG_REGISTRY = {
     kind: 'json', fallback: null, server: ['pool'], client: false, lifecycle: 'config', addedIn: '#0',
     docs: 'docs/box-provisioning.md',
     purpose: 'How many warm boxes the pool holds of each size, e.g. {"small":4,"medium":2,"large":2}; read for the fixed pool context while box-default-size is on for it. A served object\'s counts are the pool: their sum is the total and box-warm-pool-size is ignored. A size left out takes DEFAULT_WARM_POOL_SIZES (4/2/2). The total is clamped in code to 20, filled smallest size first (15/15/15 is 15/5/0), with a warning; no size has a limit of its own. Unset or malformed (not an object, or a count that is not a whole number of 0 or more) is the single-size pool of box-warm-pool-size.',
+  },
+  'browser-pane-chromium-enabled': {
+    kind: 'boolean', fallback: false, server: ['user+box'], client: false, lifecycle: 'release', addedIn: '#1804',
+    purpose: 'On: a browser pane asked of a box with no Chromium has the agent look again and, when there is still none, install it (sudo -n snap install chromium), the pane showing the install and opening when it is done. Off: the pane says the box has no Chromium and how to add it. Only for an agent that announces browser-pane-chromium-v1; read for the project\'s owner and box at each pane request.',
   },
   'browser-pane-guest-kill-switch': {
     kind: 'boolean', fallback: false, server: ['user+box'], client: false, lifecycle: 'kill-switch', addedIn: '#520',
@@ -185,13 +210,25 @@ export const FLAG_REGISTRY = {
     kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#1418',
     purpose: 'Simple UI: the Agent-tool subagents of a pane Claude (a project made in Lab) in the pane chat, read from beside its session by its box (agent pane-subagents-v1) through GET …/chat/pane-subagents and GET …/chat/pane-subagents/:agentId. Off, both routes answer 404 and the pane chat is unchanged.',
   },
+  'chat-phone-home-enabled': {
+    kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#1651',
+    purpose: 'Phones and the installed app on a touch device land in the chat (`/chat`), not on `/m`: a page loaded at the workspace URL on a phone opens `/chat`, and a Lab link to a session (`/?project=&ws=`) opens its chat once the project list shows it has one, else `/m/p/…`; the app icon on a touch device opens `/chat`. Phone view still reaches `/m`, and in-app navigation to Lab still goes there. The server reads it for a push\'s recipient: a needs-you push opens the session\'s chat (`/chat/p/…`) when the chat can show it, else `/m/p/…`, and the test push opens `/chat`. Off, phones and pushes land on `/m` as before.',
+  },
   'chat-plan-spend-enabled': {
-    kind: 'boolean', fallback: false, server: ['user'], client: false, lifecycle: 'release', addedIn: '#705',
+    kind: 'boolean', fallback: false, server: ['user'], client: false, lifecycle: 'kill-switch', addedIn: '#705',
     purpose: 'Simple UI: the session composer\'s context ring shows the box owner\'s Claude Enterprise monthly spend. Read for the project\'s owner when they send a chat message, which asks the box to read the spend from Anthropic\'s undocumented usage endpoint with its claude.ai login after the answer, at most once a minute, and to send only the numbers to the owner\'s view; off, and for a collaborator\'s send, the box never calls the endpoint and the ring shows no spend.',
+  },
+  'chat-session-permissions-enabled': {
+    kind: 'boolean', fallback: false, server: [], client: true, lifecycle: 'release', addedIn: '#1884',
+    purpose: 'Simple UI: New session on a worktree of a checkout says which code the session gets, as a pill in the bar ("Worktree of termag-22" or "New checkout", switched with a press), and its permission pill names the setting and the checkout ("Full access · from termag-22"), never implying the box. Browser only for now; the per-session Read only and orchestrator choice that will join it are a later PR that reads it on the server too. Off, the worktree choice is only under Options and the pill reads "As termag-22", as before.',
   },
   'chat-session-references-enabled': {
     kind: 'boolean', fallback: false, server: [], client: true, lifecycle: 'release', addedIn: '#947',
     purpose: 'Simple UI: drag a session from the sidebar (a row or a tab) into a composer, and the message gets a reference to it at the drop point: what the sidebar calls it and the `termag ask` (with --thread for an ask\'s chat) that messages it. A session that can\'t be asked (shared, a cloud session, not on a box of yours) says why instead. No server side: the drag is all browser, and an ask checks itself.',
+  },
+  'chat-sidebar-recent-order-enabled': {
+    kind: 'boolean', fallback: false, server: [], client: true, lifecycle: 'release', addedIn: '#1812',
+    purpose: 'Order the chat sidebar spaces and their sessions by latest session activity, without manual reordering.',
   },
   'chat-subagents-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#932',
@@ -200,6 +237,10 @@ export const FLAG_REGISTRY = {
   'chat-turn-notifications-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#546',
     purpose: 'Simple UI: notify a person who opted in when a chat they can see finishes its turn (web push, else the open tab); off, nothing is sent and the Settings switch is hidden.',
+  },
+  'chat-ui-nudge-enabled': {
+    kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#1566',
+    purpose: 'Lab\'s nudge toward termag\'s chat, read for the user: on, /auth/me carries `chatNudgeDismissed` (`users.chatNudgeDismissedAt` set) and PUT /auth/me/preferences takes it; off, /me leaves it out and the write is refused 403 `chat_nudge_disabled`. The browser reads it for the toast (chatNudge/ChatNudge.tsx: shown in Lab to a person whose kept choice is Lab, until answered; dismissed, it spotlights the switch to termag) and for where termag opens: on, only an explicit switch (Lab\'s Open in termag, the chat\'s Open Lab, the toast) changes it, and a page loaded at a Lab link to a project\'s session (`/?project=&ws=`) opens its chat for a person whose choice is the chat (chat/uiMode.ts simpleUiDeepLink); off, every visit to either UI does, and such a link opens Lab, as before.',
   },
   'chat-worktree-sessions-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#701',
@@ -213,13 +254,21 @@ export const FLAG_REGISTRY = {
     kind: 'json', fallback: null, server: ['user+box', 'orchestrator'], client: false, lifecycle: 'config', addedIn: '#0',
     purpose: 'Claude Code update policy: floor, target (latest, stable or x.y.z), restart (none, idle, force), drainSec (0..3600), forceAfterHours (1..168); malformed keys fall back one by one to DEFAULT_CLAUDE_UPDATE_POLICY (services/claudeUpdatePolicy.ts). The floor goes to a v3 runner wrapper as --claude-floor. mode (off, manual or auto; services/toolUpdate/gate.ts): off turns off the Software tab\'s actions (404 claude_update_off), the sweep and session restarts, and keeps the floor, and nothing else: a box\'s policy is floor only, restart none, and a v3 runner wrapper still enforces the floor; manual, the routes are on and the sweep does nothing; auto, the sweep runs it too. A missing or malformed mode is off, and so is a value the flag source cannot serve (each logged once).',
   },
+  'claude-context-tokens': {
+    kind: 'number', fallback: 400000, server: ['user+box'], client: false, lifecycle: 'config', addedIn: '#1739',
+    purpose: "The context size, in tokens, at which Claude Code on termag's Bedrock gateway auto-compacts, for the box's owner: delivered with the gateway settings as CLAUDE_CODE_AUTO_COMPACT_WINDOW, so every Claude Code run on the box that reads the owner's settings (panes, chats, ask threads, automations) compacts there and keeps the model's own window. 0 (or below) is the model's full window: no variable. Anything else is rounded and clamped to Claude Code's 100000..1000000 (services/claudeGateway.ts autoCompactWindow). A change reaches a box at its next credential delivery and a Claude Code process at its next launch. Read for the owner and box.",
+  },
   'claude-runner-anthropic-git-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: false, lifecycle: 'release', addedIn: '#287',
     purpose: 'A Claude Code cloud session fetches and pushes through Anthropic-managed git with the owner\'s claude.ai GitHub token; the termag GitHub credential becomes advisory for it.',
   },
   'claude-runner-auto-box-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: false, lifecycle: 'release', addedIn: '#191',
-    purpose: 'A Claude Code cloud session whose owner has no usable box gets one: a stopped box started, a warm box claimed, else a cold box.',
+    purpose: 'A Claude Code cloud session whose owner has no usable box, or whose every ready box already runs 3 sessions, gets one: a stopped box started, a warm box claimed, else a cold box.',
+  },
+  'claude-runner-auto-box-max-boxes': {
+    kind: 'number', fallback: 5, server: ['user'], client: false, lifecycle: 'config', addedIn: '#1592',
+    purpose: 'The ceiling on claude-runner-auto-box-enabled for an owner whose every ready box already runs 3 cloud sessions: they get another box only while they have fewer ready boxes than this. A whole number clamped to 1..20, the 5 fallback when it is not a number (services/claudeRunnerSpawn.ts clampAutoBoxMaxBoxes); it never stops a boxless owner\'s first box. Read for the owner.',
   },
   'claude-runner-auto-user-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: false, lifecycle: 'release', addedIn: '#288',
@@ -274,6 +323,10 @@ export const FLAG_REGISTRY = {
     kind: 'json', fallback: null, server: ['user', 'user+box'], client: false, lifecycle: 'config', addedIn: '#585',
     purpose: 'The Fireworks models termag offers a person: the pickers, a launch\'s default and fast model, windows and Claude Code\'s /model menu: { default, fast, models: [{ id, label?, context? }] }. Not an allowlist: the gateway\'s check does not read it, and Fireworks\' account governance decides which models run. Off or malformed = none offered.',
   },
+  'fireworks-own-key-required-enabled': {
+    kind: 'boolean', fallback: false, server: ['user', 'user+box'], client: false, lifecycle: 'release', addedIn: '#1557',
+    purpose: 'What the gateway does for a box whose owner has stored no Fireworks key of their own (Settings, Credentials on your boxes). Off (the fallback): the shared inference key. On: the check refuses the call with "add your Fireworks API key in Settings". A stored key is used either way, and an invalid or expired one is refused either way.',
+  },
   'gh-update-policy': {
     kind: 'json', fallback: null, server: ['user+box'], client: false, lifecycle: 'config', addedIn: '#1102',
     purpose: 'GitHub CLI update policy, the shape of claude-code-update-policy: floor, target (latest or x.y.z; the box installs only the version cli.github.com\'s apt repository lists), restart (gh has no sessions, so none of them restarts anything), drainSec (0..3600), forceAfterHours (1..168); malformed keys fall back one by one to DEFAULT_GH_UPDATE_POLICY (services/ghUpdatePolicy.ts: floor 2.102.0 from the advisories, restart none). mode (off, manual or auto; services/toolUpdate/gate.ts): off turns off the Software tab\'s actions (404 claude_update_off), the sweep and session restarts, and keeps the floor, and nothing else: a box\'s policy is floor only, restart none; manual, the routes are on and the sweep does nothing; auto, the sweep runs it too. A missing or malformed mode is off, and so is a value the flag source cannot serve (each logged once).',
@@ -300,6 +353,10 @@ export const FLAG_REGISTRY = {
     kind: 'json', fallback: null, server: ['user'], client: false, lifecycle: 'config', addedIn: '#1286',
     purpose: 'Labels for the OAuth scopes in Settings → MCP servers\' scope checklist, per authorization server: a JSON object keyed by issuer ("https://mcp.slack.com"), each a list of {scope, label} (services/mcpOAuthScopes.ts parseScopeLabels). A value that is not an object (null, the fallback) uses the built-in Slack table; malformed issuers and entries are skipped with a warning. Unlisted scopes show their raw name.',
   },
+  'mcp-upstream-allowlist': {
+    kind: 'json', fallback: [], server: ['user'], client: false, lifecycle: 'config', addedIn: '#1642',
+    purpose: 'The MCP server URLs connectors may use, read for the connector\'s owner: a JSON array of https://host[:port][/path] strings, matched on scheme, host, port and a path prefix on a / boundary, trailing slashes ignored, no wildcards (services/mcpUpstreamAllowlist.ts). Every MCP server not on it is refused: when a connector is added, edited or connected (403 mcp_upstream_not_allowed), on every broker call (mcpAuthz, a readable 403), and in Settings → MCP → Available to connect, which hides servers off the list; Settings shows a connector off the list as blocked. API connectors (the API broker) and OAuth endpoints are not checked. The fallback, [], allows nothing; it is served only when the orchestrator never loaded the flag (no SDK key, the SDK not initialised, the flag missing), and those refusals say termag couldn\'t load its allowlist. A value that is not an array allows nothing; entries that do not parse are ignored with a log line. The flag has to exist with the list before any deploy that reads it.',
+  },
 
   'multi-repo-projects-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#729',
@@ -307,11 +364,15 @@ export const FLAG_REGISTRY = {
   },
   'node-update-policy': {
     kind: 'json', fallback: null, server: ['user+box'], client: false, lifecycle: 'config', addedIn: '#1113',
-    purpose: 'Node update policy, the shape of claude-code-update-policy: floor, target (latest: the newest release of the box\'s major; or x.y.z in that major), restart (no session is restarted in this version, so none of them changes anything), drainSec (0..3600), forceAfterHours (1..168); malformed keys fall back one by one to DEFAULT_NODE_UPDATE_POLICY (services/nodeUpdatePolicy.ts: floor 24.22.1 from the security releases, restart none). mode (off, manual or auto; services/toolUpdate/gate.ts): off turns off the Software tab\'s actions (404 claude_update_off), the sweep and session restarts, and keeps the floor, and nothing else: a box\'s policy is floor only, restart none; manual, the routes are on and the sweep does nothing; auto, the sweep runs it too. A missing or malformed mode is off, and so is a value the flag source cannot serve (each logged once).',
+    purpose: 'Node update policy, the shape of claude-code-update-policy: floor, target (latest: the newest release of the box\'s major; or x.y.z in that major), restart (no session is restarted in this version, so none of them changes anything), drainSec (0..3600), forceAfterHours (1..168); malformed keys fall back one by one to DEFAULT_NODE_UPDATE_POLICY (services/nodeUpdatePolicy.ts: floor 24.22.3 from the security releases, restart none). mode (off, manual or auto; services/toolUpdate/gate.ts): off turns off the Software tab\'s actions (404 claude_update_off), the sweep and session restarts, and keeps the floor, and nothing else: a box\'s policy is floor only, restart none; manual, the routes are on and the sweep does nothing; auto, the sweep runs it too. A missing or malformed mode is off, and so is a value the flag source cannot serve (each logged once).',
+  },
+  'notice-banner': {
+    kind: 'json', fallback: null, server: [], client: true, lifecycle: 'config', addedIn: '#1809',
+    purpose: "The notice banner at the top of the web app's main pane (frontend/src/notice/): id, tone (info, warning, outage), title, message (**bold** and `code` only), one https link, dismissible, endsAt, parsed by frontend/src/notice/notice.ts; {}, null or a value without an id and a message shows nothing. Each notice is a variation named after its id, variation 0 is {} (No notice); dismissal is per browser, by id. Edit it only with the notice-banner skill (.claude/skills/notice-banner).",
   },
   'onboarding-mcp-step-enabled': {
     kind: 'boolean', fallback: false, server: [], client: true, lifecycle: 'release', addedIn: '#1369',
-    purpose: 'The first-run wizard\'s optional MCP servers step, read by the browser for the signed-in user: on, the step shows when the mcp-default-connectors catalog offers a server; off, the wizard has no MCP step. Settings → MCP and the returnTo: "welcome" sign-in return are not gated.',
+    purpose: 'The optional MCP servers step in both first-run wizards ("The MCP servers step" and "The refresh"), read by the browser for the signed-in user: on, the step shows when the mcp-default-connectors catalog offers a server; off, neither wizard has an MCP step. Settings → MCP and the returnTo: "welcome" sign-in return are not gated.',
   },
   'onboarding-refresh-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#886',
@@ -357,9 +418,23 @@ export const FLAG_REGISTRY = {
     kind: 'boolean', fallback: false, server: ['user+box'], client: false, lifecycle: 'release', addedIn: '#1107',
     purpose: 'The preview\'s asleep page offers Wake for a box the idle sweep stopped, within the owner\'s guest wake budget; read for the link\'s owner and box.',
   },
+  'project-files-enabled': {
+    kind: 'boolean', fallback: false, server: ['user', 'user+box'], client: true, lifecycle: 'kill-switch', addedIn: '#1829',
+    purpose: 'Project files and My files (services/projectFiles.ts): a space per project (UserProject.filesSpaceId), made with it and granted to the boxes running its sessions; one My files per person (User.myFilesSpaceId), granted to the boxes they own while Settings keeps it on (User.myFilesOnBoxes); a new session\'s space is its project\'s files; and each chat turn on a box whose agent announces project-files-v1 carries `files`, so the turn\'s TERMAG_SPACE and TERMAG_MY_FILES make a bare `termag space put` save to Project files and `--mine` to My files. Grants go only to boxes with that capability. Needs user-projects-enabled for the same person. Read for the user (routes) and the user and box (grants, turns), and in the browser for the side panel\'s Files as Project files | My files with Move between them, Other spaces, Settings → My files, the project menu\'s Use an existing space for files… and Slack channels…, and no space pill on New session (part B). A kill switch: it carries a change to the agent\'s prompt (the termag-spaces skill\'s rule reads true either way, but only this makes it act), so off is a real fix. Off, spaces work as before.',
+  },
   'python-update-policy': {
     kind: 'json', fallback: null, server: ['user+box'], client: false, lifecycle: 'config', addedIn: '#1219',
     purpose: 'Python update policy, the shape of claude-code-update-policy: floor, target (latest: the newest CPython of the box\'s minor that its uv lists; or x.y.z in that minor), restart (Python has no sessions, so none of them restarts anything), drainSec (0..3600), forceAfterHours (1..168); malformed keys fall back one by one to DEFAULT_PYTHON_UPDATE_POLICY (services/pythonUpdatePolicy.ts: floor 3.13.18, the newest 3.13 security release, restart none). mode (off, manual or auto; services/toolUpdate/gate.ts): off turns off the Software tab\'s actions (404 claude_update_off), the sweep and session restarts, and keeps the floor, and nothing else: a box\'s policy is floor only, restart none; manual, the routes are on and the sweep does nothing; auto, the sweep runs it too. A missing or malformed mode is off, and so is a value the flag source cannot serve (each logged once).',
+  },
+  'rename-conversations-enabled': {
+    kind: 'boolean', fallback: false, server: ['user+box'], client: false, lifecycle: 'release', addedIn: '#1613',
+    docs: 'docs/agents/gotchas.md',
+    purpose: 'A project or workstream rename on a box carries its Claude Code and pi conversations to the new folder (agent/conversation-move.js), so `claude --resume` in the renamed checkout still lists them: the rename RPC says `conversations: true` to an agent announcing rename-conversations-v1 (services/renameConversations.ts), and the moved folders\' token-usage rows follow them to the new name. Off, or on an older agent, a rename leaves them under the old folder as before.',
+  },
+  'review-pane-confined-enabled': {
+    kind: 'boolean', fallback: false, server: ['user'], client: false, lifecycle: 'release', addedIn: '#1882',
+    docs: 'docs/agents/gotchas.md',
+    purpose: "The lab's review pane (Review with Devin, Claude or Cursor; routes/review.ts) starts its reviewer without the checkout's own startup config, which in a pull request's checkout is the PR's: Claude with --setting-sources user, Devin and Cursor in a folder of the pane's own, made afresh, with the checkout reached by path (services/reviewers.ts `confined`). Read for the person starting the review. Off, the reviewer loads the checkout's hooks, settings and MCP servers as before.",
   },
   'simple-ui-automations-enabled': {
     kind: 'boolean', fallback: false, server: [], client: true, lifecycle: 'release', addedIn: '#852',
@@ -372,6 +447,10 @@ export const FLAG_REGISTRY = {
   'simple-ui-inflight-changes-enabled': {
     kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'kill-switch', addedIn: '#968',
     purpose: 'In-flight changes on the simple UI\'s context card: GET /api/projects/:id/workstreams/:ws/changes asks the box (agent git-changes-v1) for the files its checkout, or the worktree on the session\'s PR branch, has changed and not pushed or not committed, and the card lists them above the PR\'s, re-read as the session\'s tools finish. Read for the caller; off, the route answers 404 and the card shows the PR\'s files alone.',
+  },
+  'simple-ui-review-chat-enabled': {
+    kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#1716',
+    purpose: 'Simple UI: Review with Claude, Cursor or Devin opens a chat, not a terminal. It starts a review session (a chat-runner session on a checkout of the PR, made as claude-chat, cursor-chat or devin-chat even in a Lab project) instead of the lab\'s review pane, opens at once on the review-start page, which wakes the box and shows the checkout, then hands over to the chat. The chat follows the session\'s trust, and posting stays termag\'s Post. Devin\'s review is a chat only on a box whose agent says it runs Devin (the box list\'s chatEngines); elsewhere it keeps the review pane. Read for the caller on the server: off, POST /api/prs/:owner/:repo/:n/workstream refuses a `provider` (403, code review-chat-off); on, cursor-chat needs the box agent\'s chat-cursor-v1 and devin-chat its chat-devin-v1 (409, code engine-missing).',
   },
   'simple-ui-review-clone-enabled': {
     kind: 'boolean', fallback: false, server: [], client: true, lifecycle: 'release', addedIn: '#1188',
@@ -431,6 +510,10 @@ export const FLAG_REGISTRY = {
   'tool-auto-update-schedule': {
     kind: 'json', fallback: null, server: ['user'], client: false, lifecycle: 'config', addedIn: '#1300',
     purpose: "The automatic tool sweep's nightly schedule, for testing nightly runs in the daytime (services/toolUpdate/auto.ts parseNightlySchedule), read once per pass for the box's owner: { \"nightFromHour\": 0..23, \"nightToHour\": 0..23 (the night window in the owner's User.timeZone, end exclusive; it may wrap past midnight, e.g. 22 to 4; start equal to end keeps 0 to 6), \"everyHours\": 1..168 (between nightly runs, 24), \"quietMinutes\": 10..1440 (activity clock age for quiet, 60) }. A missing or invalid field keeps today's value; off, unset or unreadable is today's schedule. Moves only the nightly decision (session tools and sessionless ones, and the never-quiet fallback's window), never floor or resume runs, the force clock, the backoffs or the pacer. A moved value shows in the run's reason and the [TOOL-AUTO] log.",
+  },
+  'user-projects-enabled': {
+    kind: 'boolean', fallback: false, server: ['user'], client: true, lifecycle: 'release', addedIn: '#1685',
+    purpose: 'The user-level project record: on, a person\'s checkouts are attached to projects (services/userProjects.ts ensureUserProjects), new checkouts attach on create, GET /api/user-projects answers and POST /api/user-projects makes one (+ New project); off, nothing reads or writes user_projects, and the routes answer 404 user_projects_disabled. The browser reads it for New session\'s project picker, and for the chat sidebar, which groups by project and opens on Projects, with no Group by Space. It also gates the sidebar\'s server-side session pins (GET/PUT/DELETE /api/session-pins, 404 session_pins_disabled when off), which the browser reads through chat/sessionPins.ts. And the redesigned sidebar\'s card actions on a chat: the archive\'s dry run, GET /api/chats/:id/archive-plan, and a person\'s rename of a session, POST /api/chats/:id/title (404 chat_actions_disabled when off; routes/chats.ts).',
   },
   'whats-new-enabled': {
     kind: 'boolean', fallback: false, server: [], client: true, lifecycle: 'release', addedIn: '#928',

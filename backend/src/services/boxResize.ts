@@ -29,6 +29,7 @@
  * boxes change). A process that dies mid-resize leaves a lock that goes stale
  * after RESIZE_STALE_MS, and the view says the resize was cut off.
  */
+import { ec2For } from './ec2Box';
 import {
   DescribeInstancesCommand,
   DescribeInstanceTypeOfferingsCommand,
@@ -38,7 +39,7 @@ import {
 } from '@aws-sdk/client-ec2';
 import type { Instance, Prisma } from '@prisma/client';
 import { prisma } from '../db';
-import { awsClientConfig, getBoxConfig, isBoxProvisioningConfigured, isCapacityRefusal } from './boxProvisioner';
+import { isBoxProvisioningConfigured, isCapacityRefusal } from './boxProvisioner';
 import { requestPower } from './boxPower';
 import { busyBoxes, workingBoxes } from './boxLifecycle';
 import { powerTimeoutsFromEnv } from './boxPowerPolicy';
@@ -232,11 +233,6 @@ export async function runResize(plan: ResizePlan, fx: ResizeEffects): Promise<Re
 const POLL_MS = 3_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-function ec2For(box: Pick<Instance, 'region'>): EC2Client {
-  const cfg = getBoxConfig();
-  if (!cfg) throw new Error('Box provisioning is not configured');
-  return new EC2Client(awsClientConfig(cfg, box.region ?? cfg.region));
-}
 
 async function row(id: string): Promise<Instance> {
   return prisma.instance.findUniqueOrThrow({ where: { id } });

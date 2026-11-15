@@ -31,6 +31,7 @@ import type { Instance, User } from '@prisma/client';
 import { prisma } from '../db';
 import { getBoxConfig } from './boxProvisioner';
 import { onAutoParkSettled, powerRequestedAt, PowerRequestConflict, requestPower } from './boxPower';
+import { pauseAutomations, pauseDmFallback } from './automations/alerts';
 import { automationsPausedMessage, automationsSkippedWhileParked, parkedMessage, sendIdleNotice, stuckStartMessage, stuckStartWarningMessage, warningMessage } from './boxIdleNotices';
 import { recordProductEvent } from './productEvents';
 import { boxEventDimensions } from './boxPowerEvents';
@@ -97,13 +98,23 @@ export function registerBoxBusyCheck(name: string, check: BoxBusyCheck): void {
  */
 export const RUNNER_BUSY_MAX_MS = 13 * 60 * 60 * 1000;
 
-registerBoxBusyCheck('claude-runner', async ids => {
+/** The open runner sessions on these boxes: no end reported, started within RUNNER_BUSY_MAX_MS. */
+export function openRunnerSessionsWhere(ids: string[], now: number = Date.now()) {
+  return { instanceId: { in: ids }, endedAt: null, startedAt: { gte: new Date(now - RUNNER_BUSY_MAX_MS) } };
+}
+
+/** How many cloud sessions each of `ids` runs now, for boxes running at least one. */
+export async function liveRunnerSessions(ids: string[]): Promise<Map<string, number>> {
   const live = await prisma.claudeRunnerSession.findMany({
-    where: { instanceId: { in: ids }, endedAt: null, startedAt: { gte: new Date(Date.now() - RUNNER_BUSY_MAX_MS) } },
+    where: openRunnerSessionsWhere(ids),
     select: { instanceId: true },
   });
-  return new Set(live.map(r => r.instanceId));
-});
+  const counts = new Map<string, number>();
+  for (const r of live) counts.set(r.instanceId, (counts.get(r.instanceId) ?? 0) + 1);
+  return counts;
+}
+
+registerBoxBusyCheck('claude-runner', async ids => new Set((await liveRunnerSessions(ids)).keys()));
 
 /**
  * Sustained load: at least LOAD_BUSY_MIN_SAMPLES of the box's last
@@ -687,12 +698,12 @@ async function terminatePass(now: number, terminator: BoxTerminator): Promise<Sw
 }
 
 /** The enabled automations whose project lives on the box, by name. */
-async function enabledAutomationsOn(boxId: string): Promise<Array<{ id: string; name: string }>> {
+async function enabledAutomationsOn(boxId: string): Promise<Array<{ id: string; name: string; pausedReason: string | null }>> {
   const rows = await prisma.automation.findMany({
     where: { enabled: true, project: { instanceId: boxId, archived: false } },
-    select: { id: true, project: { select: { name: true } } },
+    select: { id: true, pausedReason: true, project: { select: { name: true } } },
   });
-  return rows.map(r => ({ id: r.id, name: r.project.name }));
+  return rows.map(r => ({ id: r.id, name: r.project.name, pausedReason: r.pausedReason ?? null }));
 }
 
 /** Boxes already logged as kept for their automations, so the line comes once per process, not every sweep. */
@@ -709,13 +720,27 @@ export async function pauseAutomationsForTerminate(box: Pick<Instance, 'id' | 'n
   try {
     const automations = await enabledAutomationsOn(box.id);
     if (automations.length === 0) return [];
-    await prisma.automation.updateMany({ where: { id: { in: automations.map(a => a.id) } }, data: { pausedReason: 'box_gone' } });
+    // One transaction for the group, the pauses with their notices (the
+    // channel and webhook ones; the summary DM below stands for the owner's),
+    // so a failure pauses none rather than some. One already paused stays as
+    // it was and is not announced again.
+    const cause = { error: `${box.name} was terminated`, ownerTold: true };
+    const paused = await pauseAutomations(automations.filter(a => !a.pausedReason).map(a => a.id), 'box_gone', cause);
     const names = automations.map(a => a.name);
     console.warn(`[LIFECYCLE] ${box.name}: terminated by ${by === 'admin' ? 'an admin' : 'the lifecycle sweep'} with automations on it; paused ${names.join(', ')}`);
-    const owner = box.userId
-      ? await prisma.user.findUnique({ where: { id: box.userId }, select: { id: true, slackUserId: true, googleEmail: true } })
-      : null;
-    if (owner) await sendIdleNotice('automation-paused', owner, box, automationsPausedMessage(box, names, by));
+    // The owner's summary DM is its own try: a failed lookup or send must not
+    // keep the pauses, already written, from their alerts and webhooks.
+    let ownerTold = false;
+    try {
+      const owner = box.userId
+        ? await prisma.user.findUnique({ where: { id: box.userId }, select: { id: true, slackUserId: true, googleEmail: true } })
+        : null;
+      if (owner) ownerTold = await sendIdleNotice('automation-paused', owner, box, automationsPausedMessage(box, names, by));
+    } catch (err) {
+      console.warn(`[LIFECYCLE] ${box.name}: could not tell the owner about the paused automations:`, errMsg(err));
+    }
+    // The summary didn't go: each one whose alerts go to the owner's DM gets its own.
+    if (!ownerTold) await pauseDmFallback(paused, 'box_gone', cause);
     return names;
   } catch (err) {
     console.error(`[LIFECYCLE] ${box.name}: could not pause its automations before the terminate:`, errMsg(err));

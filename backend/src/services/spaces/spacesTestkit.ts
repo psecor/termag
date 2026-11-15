@@ -352,7 +352,7 @@ export class MemorySpaceObjects implements SpaceObjects {
   history = new Map<string, Array<ObjectVersionInfo & { size: number; meta?: Record<string, string> }>>();
   /** What moves copied, for tests that check the version a copy was bound to. */
   copies: Array<{ from: string; to: string; sourceIfMatch?: string | null }> = [];
-  /** As S3 does (and Floci 2.1.0, for a PUT's If-Match); false is storage that ignores them, so only the orchestrator's own checks hold. */
+  /** As S3 does (and Floci 2.2.0, for a PUT's If-Match); false is storage that ignores them, so only the orchestrator's own checks hold. */
   enforceConditions = true;
 
   put(key: string, size: number, contentType = 'application/octet-stream', lastModified = new Date(), meta?: Record<string, string>) {
@@ -470,12 +470,29 @@ export class MemorySpaceObjects implements SpaceObjects {
 
   async abortMultipart(_key: string, uploadId: string) { this.uploads.delete(uploadId); }
 
-  async copy(from: string, to: string, opts: { sourceIfMatch?: string | null } = {}) {
+  /** Runs just before a copy writes its destination: a test's way to land a write in that window. */
+  beforeCopyWrite: ((to: string) => void) | null = null;
+  /** Runs just before a conditional delete checks: a test's way to land a write after a copy. */
+  beforeConditionalDelete: ((key: string) => void) | null = null;
+  /** Set, deleteIfMatch answers this, as S3 refusing for a reason other than the condition. */
+  deleteRefusal: 'failed' | null = null;
+
+  async copy(from: string, to: string, opts: { sourceIfMatch?: string | null; destNew?: boolean } = {}) {
     const f = this.files.get(from);
     if (!f) throw new Error('NoSuchKey');
     this.copies.push({ from, to, ...(opts.sourceIfMatch ? { sourceIfMatch: opts.sourceIfMatch } : {}) });
     if (opts.sourceIfMatch && this.enforceConditions && opts.sourceIfMatch !== this.etagOf(from)) throw preconditionFailed();
+    this.beforeCopyWrite?.(to);
+    if (opts.destNew && this.files.has(to)) throw preconditionFailed();
     this.put(to, f.size, f.contentType);
+  }
+
+  async deleteIfMatch(key: string, etag: string): Promise<'deleted' | 'changed' | 'failed'> {
+    this.beforeConditionalDelete?.(key);
+    if (this.deleteRefusal) return this.deleteRefusal;
+    if (this.etagOf(key) !== etag) return 'changed';
+    await this.deleteKeys([key]);
+    return 'deleted';
   }
 
   async deleteKeys(keys: string[]) {

@@ -7,7 +7,8 @@
  * `scopes` always asks for those, with no checklist. The scope that asks for a
  * refresh token (`offline_access`, or `offline` where that is all the server
  * offers) is never on the checklist: every sign-in asks for it when the server
- * advertises it. Labels come from the
+ * advertises it. Nor is a scope in WITHHELD_SCOPES: no sign-in asks for one,
+ * whatever the server advertises or the client posts. Labels come from the
  * mcp-oauth-scope-labels flag per authorization server issuer, with Slack's
  * table as the fallback.
  */
@@ -68,10 +69,6 @@ export const SCOPE_LABELS_FALLBACK: ScopeLabelsFlag = {
     slack('groups:read', 'See private channels'),
     slack('im:read', 'See direct messages'),
     slack('mpim:read', 'See group direct messages'),
-    slack('channels:write', 'Manage public channels'),
-    slack('groups:write', 'Manage private channels'),
-    slack('im:write', 'Start direct messages'),
-    slack('mpim:write', 'Start group direct messages'),
     slack('chat:write', 'Send messages'),
     slack('users:read', 'See people'),
     slack('users:read.email', "See people's email addresses"),
@@ -89,6 +86,37 @@ export const SCOPE_LABELS_FALLBACK: ScopeLabelsFlag = {
 };
 
 const trimSlash = (s: string) => s.replace(/\/+$/, '');
+
+/**
+ * Scopes termag never asks for, per authorization server issuer (no trailing
+ * slash), even when the server advertises them in `scopes_supported`. They are
+ * not on the checklist, not in a sign-in's `scope` (a client that posts one has
+ * it dropped, and Change permissions on a grant that holds one asks again
+ * without it), and not in a DCR registration. Kept in code, not in a flag, so
+ * that adding to it or taking from it is a reviewed change.
+ */
+export const WITHHELD_SCOPES: Readonly<Record<string, readonly string[]>> = {
+  // An agent acting as the person does not create, rename or archive channels,
+  // or invite or remove people (conversations.create, .rename, .archive,
+  // .invite, .kick; channels:write for public channels, groups:write for
+  // private ones, mpim:write for group DMs), and does not open or manage
+  // conversations (im:write: conversations.open, and the Slack MCP server's
+  // "Create conversation" tool). Posting to an existing DM needs only
+  // chat:write. termag's Slack app leaves them out of its user scopes
+  // (deploy/slack-app-manifest.yaml), so Slack refuses a sign-in that asks for
+  // one.
+  'https://mcp.slack.com': ['channels:write', 'groups:write', 'mpim:write', 'im:write'],
+};
+
+/** Whether termag never asks this issuer for the scope (WITHHELD_SCOPES). */
+export function isWithheld(issuer: string, scope: string): boolean {
+  return WITHHELD_SCOPES[trimSlash(issuer)]?.includes(scope) ?? false;
+}
+
+/** The advertised scopes termag may ask for: all but the withheld ones. */
+export function requestableScopes(meta: Pick<DiscoveredOAuth, 'issuer' | 'scopes'>): string[] {
+  return meta.scopes.filter(s => !isWithheld(meta.issuer, s));
+}
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 const warned = new Set<string>();
@@ -150,13 +178,13 @@ export function offlineScope(meta: DiscoveredOAuth): string | null {
   return OFFLINE_SCOPES.find(s => meta.scopes.includes(s)) ?? null;
 }
 
-/** The advertised scopes a person chooses from: all but the offline ones. */
-const choosable = (meta: DiscoveredOAuth) => meta.scopes.filter(s => !isOffline(s));
+/** The advertised scopes a person chooses from: all but the offline and the withheld ones. */
+const choosable = (meta: DiscoveredOAuth) => requestableScopes(meta).filter(s => !isOffline(s));
 
 /**
  * The checklist Settings shows before the redirect, or null when there is
  * nothing to choose: fewer than two advertised scopes besides the offline
- * ones, or a pre-registered client that pins its scopes.
+ * and withheld ones, or a pre-registered client that pins its scopes.
  */
 export function scopeChoice(meta: DiscoveredOAuth, pre: PreregisteredClient | null, labels: ScopeLabels): ScopeChoice | null {
   const names = choosable(meta);
@@ -170,14 +198,17 @@ export function scopeChoice(meta: DiscoveredOAuth, pre: PreregisteredClient | nu
  * a list asks for exactly those, each of which the server must advertise. A
  * pre-registered client that pins scopes asks for them and takes no choice.
  * Each adds the server's offline scope (offlineScope) unless the list already
- * names an offline scope, and asks for at most one of them.
+ * names an offline scope, and asks for at most one of them. A withheld scope
+ * (WITHHELD_SCOPES) is dropped from every list, pinned or chosen, without an
+ * error, so a client still showing an older grant can't ask for it; a choice
+ * of withheld scopes only is refused like an empty one.
  */
 export function scopesToRequest(meta: DiscoveredOAuth, chosen: unknown, pre: PreregisteredClient | null): string[] {
   const offline = offlineScope(meta);
   const withOffline = (list: string[]) => (offline && !list.some(isOffline) ? [...list, offline] : list);
   if (pre?.scopes) {
     if (chosen !== undefined) throw new McpConnectorError("this server's scopes are set by this orchestrator (MCP_OAUTH_CLIENTS) and cannot be chosen");
-    return withOffline([...pre.scopes]);
+    return withOffline(pre.scopes.filter(s => !isWithheld(meta.issuer, s)));
   }
   if (chosen === undefined) return withOffline(choosable(meta));
   if (!Array.isArray(chosen) || !chosen.every(s => typeof s === 'string')) throw new McpConnectorError('scopes must be a list of scope names');
@@ -185,7 +216,9 @@ export function scopesToRequest(meta: DiscoveredOAuth, chosen: unknown, pre: Pre
   for (const s of chosen) {
     if (!meta.scopes.includes(s)) throw new McpConnectorError(`the server does not offer the scope "${s.slice(0, 100)}"`);
   }
-  return withOffline(choosable(meta).filter(s => chosen.includes(s)));
+  const list = choosable(meta).filter(s => chosen.includes(s));
+  if (list.length === 0 && chosen.some(s => isWithheld(meta.issuer, s))) throw new McpConnectorError('choose at least one scope that termag asks for');
+  return withOffline(list);
 }
 
 /** The token response's `scope` as a list (Slack separates them with commas), or null when it named none. */

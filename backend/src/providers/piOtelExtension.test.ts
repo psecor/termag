@@ -31,7 +31,7 @@ describe('parseDestination', () => {
       endpoint: 'https://otel.example.test',
       resource: {
         'telemetry.project_id': 'abc123', 'termag.session.kind': 'interactive', 'termag.box': 'box1',
-        'service.name': 'termag-pi-session', 'termag.agent': 'pi', 'termag.replay.id': RID,
+        'service.name': 'termag-pi-session', 'termag.agent': 'pi', 'termag.inference.backend': 'broker', 'termag.replay.id': RID,
       },
     });
     expect(parseDestination(RECORD, 'short')?.resource['termag.replay.id']).toBeUndefined();
@@ -41,6 +41,9 @@ describe('parseDestination', () => {
     const fw = parseDestination(RECORD, undefined, 'fireworks')?.resource;
     expect([fw?.['termag.agent'], fw?.['termag.backend']]).toEqual(['pi', 'fireworks']);
     expect(parseDestination(RECORD, undefined, 'other')?.resource['termag.backend']).toBeUndefined();
+    expect(fw?.['termag.inference.backend']).toBe('fireworks');
+    expect(parseDestination(RECORD)?.resource['termag.inference.backend']).toBe('broker');
+    expect(parseDestination(RECORD, undefined, 'other')?.resource['termag.inference.backend']).toBe('broker');
   });
 
   it('is null for anything termag-credentials would not have written', () => {

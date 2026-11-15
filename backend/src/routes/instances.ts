@@ -35,19 +35,20 @@ import { randomBytes, createHash } from 'crypto';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import { provisionBox, terminateBox, isBoxProvisioningConfigured } from '../services/boxProvisioner';
-import { PowerAction, powerRequestError } from '../services/boxPowerPolicy';
+import { liveCloudSessionRefusal, PowerAction, powerRequestError } from '../services/boxPowerPolicy';
 import { QUARANTINED, QUARANTINED_OWNER_ERROR, ownerBoxView } from '../services/boxQuarantinePolicy';
 import { boxInUseFields } from '../services/boxActivity';
 import { recordProductEvent } from '../services/productEvents';
 import { boxEventDimensions } from '../services/boxPowerEvents';
 import { PowerRequestConflict, requestPower } from '../services/boxPower';
-import { lifecycleViewFor, recentAutoTerminations, setBoxLifecycle } from '../services/boxLifecycle';
+import { lifecycleViewFor, liveRunnerSessions, recentAutoTerminations, setBoxLifecycle } from '../services/boxLifecycle';
 import { HIBERNATE_OFF_CODE, HIBERNATE_OFF_ERROR } from '../services/boxPowerPolicy';
 import { lifecycleSettingsError, parseLifecycleSettings } from '../services/boxLifecyclePolicy';
 import { boolVariation } from '../services/featureFlags';
 import { marksNewBoxForDotfiles, NEW_BOX_DOTFILES_FLAG } from '../services/newBoxDotfiles';
 import { boxImageSelectionFor, isPublished, PUBLISHED_IMAGE } from '../services/boxImage';
 import { boxSizeOptions, coveringPreset, decideBoxSize, instanceTypesForSize, isBoxSize, ownerDefaultSize, type BoxSize } from '../services/boxSize';
+import { sessionWakes } from '../services/sessionBoxWake';
 import { recordPoolClaim, warmPoolTargetFor } from '../services/warmPoolSizes';
 import { repoSetupFor, repoSizesFor } from '../services/repoEnvironment';
 import { prismaEnvironmentStore, resolveEnvironment, resolveStoredEnvironment, usableEnvironment, type EnvironmentRecord } from '../services/environments';
@@ -59,6 +60,7 @@ import type { InstanceTypeChoice } from '../services/boxProvisioner';
 import type { EnvPoolMissReason } from '../services/envPoolClaim';
 import { poolSpecHashOrNull, reconcileWarmPool } from '../services/warmPool';
 import { instanceAgentTransport, isInstanceAgentConnected, sendToInstanceAgent } from '../services/agentRegistry';
+import { chatEnginesOf } from '../services/chatRunner';
 import { describeRootVolume, diskView, growErrorMessage, growRefusal, growView, lastGrow, parseOwnerGrowBody, pendingRetry, reserveGrow, startGrow } from '../services/boxDisk';
 import { revokeChats } from '../services/chatRevoke';
 import {
@@ -354,12 +356,14 @@ async function createBoxRow(
     if (provisioned && environment && environment.visibility === 'shared'
       && setupEnabled && spec.warmPoolEligible && isPublished(image) && !matched
       && await (await import('../services/envPoolSizes')).envPoolTargetFor(environment.name) > 0) {
-      // Loaded here, not at the top: only a pooled environment's create needs the pool's GitHub reader and claim.
-      const { envPoolDefinitionByName } = await import('../services/envPool');
+      // Loaded here, not at the top: only a pooled environment's create needs the pool's claim.
+      const { lastEnvPoolResolution } = await import('../services/envPool');
       const { claimEnvPoolBox, claimerCanRead, prismaEnvClaimEffects, recordEnvPoolClaim } = await import('../services/envPoolClaim');
       const { envPoolConfigFromEnv } = await import('../config/env');
       const env = environment;
-      const pool = await envPoolDefinitionByName(env.name);
+      // The pool tick's last resolution: no GitHub read of the environment while the person waits. None yet (a
+      // restart, a pool just turned on, an edit of the environment since the tick) is a miss.
+      const pool = lastEnvPoolResolution(env) ?? { ok: false as const, reason: 'the pool has not resolved it since the environment last changed' };
       const poolDisk = pool.ok ? applyImageFloor(pool.def.diskGiB, floor, false).diskGiB : null;
       const miss: EnvPoolMissReason | null = !pool.ok ? 'empty'
         : pool.def.size !== size || poolDisk !== diskGiB ? 'size'
@@ -656,11 +660,31 @@ async function terminateBoxRow(user: Express.User, id: string, confirmed: boolea
 // Stop or start the box's EC2 instance. Answers 202 with the transitional
 // status; the power sweep settles `stopping` to `stopped`, and the agent's
 // connect settles `starting` to `ready`.
-export async function powerOwnedBox(user: Express.User, id: string, action: PowerAction): Promise<RouteResult> {
-  return notifyOnSuccess(await powerBoxRow(user, id, action), user.id, 'boxes');
+// opts.force: stop a box even though it runs cloud sessions (a person who was
+// told so); opts.boxCredential: the CLI call came from a box (its agent token,
+// or a sign-in made on it), which never may (liveCloudSessionRefusal).
+const STOP_GUARD_FLAG = 'box-stop-cloud-session-guard-enabled';
+export interface PowerOptions { force?: boolean; boxCredential?: boolean }
+
+/**
+ * Whether box-stop-cloud-session-guard-enabled refuses this person's stop of a ready box, because Claude Code cloud
+ * sessions still run on it (services/boxPowerPolicy.ts liveCloudSessionRefusal), and how many; null when the stop
+ * may go ahead. powerBoxRow refuses on it, and the chat archive's dry run (routes/chats.ts) predicts with it.
+ */
+export async function cloudSessionStopRefusal(
+  user: Express.User, instance: { id: string; name: string; status: string }, opts: PowerOptions = {},
+): Promise<{ busy: NonNullable<ReturnType<typeof liveCloudSessionRefusal>>; live: number } | null> {
+  if (instance.status !== 'ready' || !await boolVariation(STOP_GUARD_FLAG, user, false)) return null;
+  const live = (await liveRunnerSessions([instance.id])).get(instance.id) ?? 0;
+  const busy = liveCloudSessionRefusal(instance, live, opts);
+  return busy ? { busy, live } : null;
 }
 
-async function powerBoxRow(user: Express.User, id: string, action: PowerAction): Promise<RouteResult> {
+export async function powerOwnedBox(user: Express.User, id: string, action: PowerAction, opts: PowerOptions = {}): Promise<RouteResult> {
+  return notifyOnSuccess(await powerBoxRow(user, id, action, opts), user.id, 'boxes');
+}
+
+async function powerBoxRow(user: Express.User, id: string, action: PowerAction, opts: PowerOptions): Promise<RouteResult> {
   const instance = await prisma.instance.findUnique({ where: { id } });
   const refused = powerRequestError(instance, user.id, action, isBoxProvisioningConfigured());
   if (refused) return { status: refused.status, body: { error: refused.error } };
@@ -668,6 +692,14 @@ async function powerBoxRow(user: Express.User, id: string, action: PowerAction):
   // already hibernated.
   if (action === 'hibernate') {
     return { status: 409, body: { error: HIBERNATE_OFF_ERROR, code: HIBERNATE_OFF_CODE } };
+  }
+  if (action === 'stop') {
+    const refusal = await cloudSessionStopRefusal(user, instance!, opts);
+    if (refusal) {
+      console.log(`[BOX] ${instance!.name}: stop refused, ${refusal.live} cloud session(s) running${opts.boxCredential ? ' (box credential)' : ''}`);
+      const { status, ...body } = refusal.busy;
+      return { status, body };
+    }
   }
   try {
     const status = await requestPower(instance!, action, { markInUse: action === 'start', byOwner: true });
@@ -917,11 +949,19 @@ export async function ownedBoxResizeInfo(user: Express.User, id: string): Promis
   return { status: 200, body: { ...await resizeInfo(instance!), disk } };
 }
 
+/** `chatEngines` for the box list: what its connected agent can run (chatEnginesOf), or nothing when it isn't connected. */
+export function chatEnginesView(id: string, transport: (id: string) => { capabilities: readonly string[] } | null | undefined = instanceAgentTransport): { chatEngines?: string[] } {
+  const capabilities = transport(id)?.capabilities;
+  return capabilities ? { chatEngines: chatEnginesOf(capabilities) } : {};
+}
+
 export function instancesRouter(): Router {
   const router = Router();
 
   // List the caller's non-terminated boxes, including project counts.
   const list: RequestHandler = async (req, res) => {
+    // Read once per box: errorFor drops an expired error as it reads it.
+    const wakeErrorOf = (id: string) => { const e = sessionWakes.errorFor(id); return e ? { wakeError: e } : {}; };
     const instances = await prisma.instance.findMany({
       where: { userId: req.user!.id, status: { not: 'terminated' } },
       include: { _count: { select: { projects: true } } },
@@ -934,6 +974,11 @@ export function instancesRouter(): Router {
       ...ownerBoxView(i), lifecycle: await lifecycleViewFor(req.user!, i), resize: resizeView(resizes.get(i.id)),
       // What the Stop warning names beside its count: a space orchestrator is never hidden there (projectKind.ts inProjectLists).
       managedProjects: managed.get(i.id) ?? [],
+      // A New session's wake of it that failed (services/sessionBoxWake.ts), for the session to say so.
+      ...wakeErrorOf(i.id),
+      // The engines beside Claude its connected agent can run in a chat (chatEnginesOf): Review with Devin is a chat only
+      // on a box that says devin. None while its agent isn't connected, since nothing is known then.
+      ...chatEnginesView(i.id),
     }))));
   };
 
@@ -1031,7 +1076,7 @@ export function instancesRouter(): Router {
   // to `ready`. A hibernate EC2 refuses answers `stopping`: it fell back to a
   // plain stop, and the row's provisioningError says so.
   const power = (action: PowerAction): RequestHandler => async (req, res) => {
-    sendResult(res, await powerOwnedBox(req.user!, req.params.id, action));
+    sendResult(res, await powerOwnedBox(req.user!, req.params.id, action, { force: req.body?.force === true }));
   };
 
   // asyncHandler: Express 4 drops async rejections on the floor, so a DB error

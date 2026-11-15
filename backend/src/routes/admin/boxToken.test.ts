@@ -43,6 +43,9 @@ describe('a box token under /api/admin', () => {
     ['GET', '/bug-reports/counts'],
     ['GET', '/bug-reports/bug1'],
     ['PATCH', '/bug-reports/bug1'],
+    ['GET', '/feedback'],
+    ['GET', '/feedback/counts'],
+    ['PATCH', '/feedback/fb1'],
   ])('refuses %s %s with 404, as for any non-admin', async (method, path) => {
     const r = await fetch(`${base}/api/admin${path}`, {
       method, headers: { authorization: `Bearer ${BOX}`, 'content-type': 'application/json' },

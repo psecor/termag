@@ -40,7 +40,12 @@ import { replaySessionIdFrom } from '../services/launchCommand';
 import { ensureMainWorkstream } from '../services/workstreams';
 import { adoptWorkstreamAgent } from '../services/workstreamAgent';
 import { agentView, applySetupEvent } from '../services/projectClone';
-import { cloneRoute, needsBoxRelaunch, waitsForBoxAgent } from '../services/projectSetup';
+import { cloneRoute, GOING_DOWN_BOX_STATUSES, needsBoxRelaunch, WAKEABLE_BOX_STATUSES, waitsForBoxAgent } from '../services/projectSetup';
+import { BOX_PLACEMENT_FLAG } from '../services/boxPlacement';
+import { boolVariation } from '../services/featureFlags';
+import { uniqueName } from '../services/agentSpawn';
+import { claimedJustNow, noteSessionCreated, placementFor } from '../services/sessionStartTiming';
+import { sessionWakes } from '../services/sessionBoxWake';
 import { ensureHostSetup, hostAgentUnavailableResponse } from '../services/hostSetup';
 import { askChatPaneRefusal, assertSessionAccess, SessionAccessError } from '../services/sessionAccess';
 import { historyFor } from './paneHistory';
@@ -50,21 +55,24 @@ import { refuseParkedBox } from '../middleware/parkedBox';
 import { refuseUnreadySetup } from '../middleware/unreadySetup';
 import { RouteResult, sendResult } from './routeResult';
 import { boxRenameError, boxRenameRpcError, renameSessionPairs } from './projectRename';
+import { afterConversationsMoved, carriesConversations } from '../services/renameConversations';
 import { isAdminUser } from '../services/admin/adminAccess';
 import { revokeChats } from '../services/chatRevoke';
 import { LISTED_PROJECT_KINDS, isProjectKind, kindRefusal, projectKindTraits, type ProjectKind } from '../services/projectKind';
 import { recordProductEvent } from '../services/productEvents';
-import { notifyOnSuccess } from '../services/workspaceEvents';
+import { notifyOnSuccess, notifyWorkspaceChange } from '../services/workspaceEvents';
 import { endPreviewShares } from '../services/previewShares';
 import { endPreviewAudiences } from '../services/previewAudience';
-import { guideRepos, isWorkspace, planWorkspaceRepos, workspaceBoxRefusal, workspaceGuideWrites, workspaceRenameRefusal, WORKSPACE_UNSUPPORTED } from '../services/projectRepos';
+import { guideRepos, isWorkspace, planWorkspaceRepos, projectRepoKeys, workspaceBoxRefusal, workspaceGuideWrites, workspaceRenameRefusal, WORKSPACE_UNSUPPORTED } from '../services/projectRepos';
 import { prismaEnvironmentStore, withEnvironmentRepos, type ProjectEnvironmentFile } from '../services/environments';
 import { freezeEnvironmentFile } from '../services/projectEnvironment';
 import { MULTI_REPO_DISABLED_CODE, multiRepoEnabled } from '../services/multiRepoFlag';
+import { attachCheckout, checkRequestedUserProject, createRepoUrls, ensureUserProjects, findUserProjectForRepoSet, repoSetKeyForUrls, userProjectsEnabled } from '../services/userProjects';
 import { dispatchWorkspace, retryWorkspace, workstreamGuideRepos } from '../services/workspaceSetup';
 import { addProjectRepo, listProjectRepos } from './projectRepos';
 import { mainUseKey, usedMains } from '../services/workstreamUse';
 import { chatSpaceFor, fixedOnCreate, fixListedChatSpaces, resolveChatSpaceChoice } from '../services/chatSpace';
+import { grantSessionFiles, projectFilesEnabled, sessionSpaceChoice } from '../services/projectFiles';
 
 
 const CAPTURE_MIN_INTERVAL_MS = 1000;
@@ -193,6 +201,25 @@ export interface CreateProjectInput {
    * name on this box (services/repoCreate.ts ArchivedNameChoice).
    */
   archivedName?: ArchivedNameChoice | null;
+  /**
+   * The project this checkout is for,
+   * read only under user-projects-enabled: the caller's own, unarchived, with
+   * exactly the repositories this create clones (404, or 409
+   * user_project_archived / user_project_repos_mismatch). Absent, the checkout
+   * joins the caller's project for its repo set, or a new one.
+   */
+  userProjectId?: unknown;
+}
+
+/** The person's existing project for a create's repositories (findUserProjectForRepoSet), or none. */
+async function userProjectForRepos(userId: string, input: { repoUrl?: unknown; repos?: unknown }): Promise<string | null> {
+  const urls = createRepoUrls(input);
+  if (!urls || urls.length === 0) return null;
+  const projects = await prisma.userProject.findMany({
+    where: { userId, archivedAt: null },
+    select: { id: true, repoSetKey: true, formerRepoSetKeys: true, archivedAt: true, createdAt: true },
+  });
+  return findUserProjectForRepoSet(projects, repoSetKeyForUrls(urls))?.id ?? null;
 }
 
 export async function createProjectFor(user: Express.User, input: CreateProjectInput): Promise<RouteResult> {
@@ -206,23 +233,143 @@ export async function createProjectFor(user: Express.User, input: CreateProjectI
   // What of its definition was left out (a pointer's file missing or malformed): never a failure, but said, as a box create says its own.
   const { warnings } = sourced;
   for (const w of warnings) console.warn(`[PROJECTS] ${user.unixUsername}'s ${input.name ?? 'project'}: ${w}`);
+  // The project record: a project the create names is checked before anything is made.
+  const userProjects = await userProjectsEnabled(user);
+  let requestedUserProject: string | null = null;
+  // The repo set the requested project was checked on, so a repository added to it meanwhile doesn't send the checkout elsewhere.
+  let requestedSetKey: string | null = null;
+  if (userProjects && input.userProjectId != null) {
+    const repoUrls = createRepoUrls(input);
+    if (!repoUrls) return { status: 400, body: { error: 'repos must be a list of repositories' } };
+    const checked = await checkRequestedUserProject(user.id, input.userProjectId, repoUrls);
+    if (!checked.ok) return { status: checked.status, body: { error: checked.error, code: checked.code } };
+    requestedUserProject = checked.id;
+    requestedSetKey = repoSetKeyForUrls(repoUrls);
+  }
+  // Project files: under project-files-enabled a session of a
+  // project belongs to its project's files, made now; it replaces New session's space pill, which goes away.
+  // With no space pill, a session's create from a repository names neither a project nor a space: its project is
+  // found by its repositories now, as the attach after the insert will find it, so the insert is fixed to that
+  // project's files, or to no space, and is never left for a project-list listing during setup to bind to the box's
+  // oldest grant (Security Agent).
+  const noPill = !requestedUserProject && userProjects && input.chatSpace === undefined
+    && (!input.kind || input.kind === 'normal') && !input.spawnId && await projectFilesEnabled(user);
+  const filesProject = requestedUserProject ?? (noPill ? await userProjectForRepos(user.id, input) : null);
+  const filesSpace = filesProject ? await sessionSpaceChoice(user, filesProject) : null;
   // New session's space, resolved now and written in the main workstream's insert: a listing while
   // setup and launch run would otherwise fix the chat to its box's first grant first (Bugbot, #769).
-  const choice = input.chatSpace === null || typeof input.chatSpace === 'string'
-    ? await resolveChatSpaceChoice(input.chatSpace, user.id).catch(() => null)
+  const choice = filesSpace
+    ? { spaceId: filesSpace.id }
+    : input.chatSpace === null || typeof input.chatSpace === 'string' || noPill
+      ? await resolveChatSpaceChoice(input.chatSpace ?? null, user.id).catch(() => null)
+      : null;
+  // Runs on: Auto: the caller's own parked box is taken, and woken once the project exists.
+  // A session only: an automation's project or a spawn's keeps today's refusal (they have their own wake rules).
+  const session = (!input.kind || input.kind === 'normal') && !input.spawnId;
+  const wakes = session && !!input.instanceId && await boolVariation(BOX_PLACEMENT_FLAG, user, false);
+  // How the session got its box, for its start timing (services/sessionStartTiming.ts), read before the create wakes it.
+  const startBox = session && input.instanceId && input.initialAgent?.provider === CHAT_PROVIDER_ID
+    ? await prisma.instance.findFirst({ where: { id: input.instanceId, userId: user.id }, select: { status: true, claimedAt: true } })
     : null;
-  const result = await createProjectRow(user, input, fixedOnCreate(choice));
+  // A just-claimed box is this session's pool claim only if nothing else runs on it yet.
+  const startBoxSessions = startBox?.claimedAt
+    ? await prisma.project.count({ where: { instanceId: input.instanceId!, userId: user.id, archived: false } })
+    : 0;
+  const createStartedAt = Date.now();
+  let result = await createProjectRow(user, input, fixedOnCreate(choice), wakes, requestedUserProject !== null);
+  if (wakes && result.status < 300) result = await withBoxWake(user, input.instanceId!, result);
   const id = result.status < 300 && result.body && typeof result.body === 'object' ? (result.body as { id?: unknown }).id : undefined;
-  if (typeof id === 'string' && (input.chatSpace === null || typeof input.chatSpace === 'string')) {
-    // An un-archived project's main existed already: fixed here unless it was. An unknown name falls back to the box's first grant.
+  if (typeof id === 'string') result = userProjects ? await withUserProject(user, id, requestedUserProject, result, requestedSetKey) : withoutUserProject(result);
+  if (startBox && typeof id === 'string' && result.status === 201) {
+    const setup = (result.body as { setupStatus?: unknown }).setupStatus;
+    noteSessionCreated(id, 'main', {
+      userId: user.id, boxId: input.instanceId!, provider: CHAT_PROVIDER_ID,
+      placement: placementFor(startBox.status, input.warmClaimed ?? claimedJustNow(startBox.claimedAt, startBoxSessions)),
+      boxUp: isProjectAgentConnected({ userId: user.id, instanceId: input.instanceId! }) && !WAKEABLE_BOX_STATUSES.includes(startBox.status),
+      setupDone: setup === 'ready' || setup === 'none',
+    }, createStartedAt);
+  }
+  // A checkout that found its project only now (no userProjectId asked for) gets its Project files the same way,
+  // unless something fixed its session's space first (an un-archived checkout's main keeps its own).
+  const attachedTo = typeof id === 'string' && !filesSpace && result.body && typeof result.body === 'object'
+    ? (result.body as { userProjectId?: unknown }).userProjectId : null;
+  const lateFiles = typeof attachedTo === 'string' ? await sessionSpaceChoice(user, attachedTo) : null;
+  const requested = lateFiles ? lateFiles.name : input.chatSpace;
+  // A repository new to termag: its project was made just now by the attach. The insert above was fixed to no space
+  // only as a placeholder, in this request, so it's moved to the project's files while it's still that. Only a row
+  // this request fixed: a restored chat's main existed already, and goes the usual way below.
+  let swapped = false;
+  if (typeof id === 'string' && noPill && !filesSpace && lateFiles) {
     try {
       const ws = await ensureMainWorkstream(id);
-      await chatSpaceFor(ws.id, { requested: { name: input.chatSpace, userId: user.id } });
+      const moved = await prisma.workstream.updateMany({
+        where: { id: ws.id, spaceId: null, spaceFixedAt: { gte: new Date(createStartedAt) } },
+        data: { spaceId: lateFiles.id },
+      });
+      swapped = moved.count > 0;
+    } catch (err) {
+      console.warn(`[PROJECTS] ${id}: Project files not recorded: ${(err as Error).message}`);
+    }
+  }
+  // A no-pill create always ends fixed: a restored checkout's main (un-archived, or made now for one with no agent
+  // workflow) wasn't inserted with the choice above, so it's fixed here to its project's files, or to no space, unless
+  // it was fixed already, which chatSpaceFor leaves (Security Agent).
+  if (typeof id === 'string' && !swapped && (noPill || (!filesSpace && (requested === null || typeof requested === 'string')))) {
+    // An un-archived project's main existed already: fixed here unless it was. An unknown name falls back to the box's first grant.
+    const name = noPill ? (filesSpace ?? lateFiles)?.name ?? null : requested ?? null;
+    try {
+      const ws = await ensureMainWorkstream(id);
+      await chatSpaceFor(ws.id, { requested: { name, userId: user.id } });
     } catch (err) {
       console.warn(`[PROJECTS] ${id}: chat space not recorded: ${(err as Error).message}`);
     }
   }
+  // Its box gets the project's files (and My files) now if its agent is up and can address them; else on its hello.
+  if (typeof id === 'string' && (filesSpace || lateFiles)) void grantSessionFiles(user, id);
   return notifyOnSuccess(withWarnings(result, warnings), user.id, 'projects');
+}
+
+/**
+ * A session made on a parked box wakes it: an asleep box
+ * is started now through the owner-only start, one on its way down once it's
+ * down (services/sessionBoxWake.ts), one already starting is left be. The answer
+ * says so as `wake` (`waking`, `held`, or `failed` with the reason), and the
+ * project waits `pending` for the box's agent either way: a failed wake is the
+ * session's to show, with its Retry, not a refused create.
+ */
+async function withBoxWake(user: Express.User, instanceId: string, result: RouteResult): Promise<RouteResult> {
+  const box = await prisma.instance.findFirst({ where: { id: instanceId, userId: user.id }, select: { name: true, status: true } });
+  if (!box || !WAKEABLE_BOX_STATUSES.includes(box.status)) return result;
+  const wake = await sessionWakes.wakeFor(user.id, instanceId, box.name, box.status);
+  if (wake.state === 'none' || !result.body || typeof result.body !== 'object') return result;
+  if (wake.state === 'failed') console.warn(`[PROJECTS] ${user.unixUsername}'s session on ${box.name}: ${wake.error}`);
+  return { ...result, body: { ...(result.body as object), wake } };
+}
+
+/**
+ * The new checkout joins its project (services/userProjects.ts attachCheckout),
+ * and the answer says which as `userProjectId`. Never fails the create: the
+ * checkout exists by now, and the next read's ensureUserProjects attaches one
+ * this missed.
+ */
+async function withUserProject(user: Express.User, checkoutId: string, requested: string | null, result: RouteResult, checkedSetKey: string | null = null): Promise<RouteResult> {
+  try {
+    const userProjectId = await attachCheckout(user.id, checkoutId, requested, checkedSetKey);
+    // Attach writes the checkout's userProjectId in raw SQL, which the Prisma middleware
+    // (services/workspaceWrites.ts) never sees: say so, so the sidebar moves it into its project.
+    if (userProjectId) notifyWorkspaceChange(user.id, 'projects');
+    if (!result.body || typeof result.body !== 'object') return result;
+    return { ...result, body: { ...(result.body as object), userProjectId } };
+  } catch (err) {
+    console.warn(`[USER-PROJECTS] ${user.unixUsername}'s ${checkoutId}: not attached: ${(err as Error).message}`);
+    return result;
+  }
+}
+
+/** With the flag off, a create's answer never names a project, even an un-archived checkout's from when it was on. */
+function withoutUserProject(result: RouteResult): RouteResult {
+  if (!result.body || typeof result.body !== 'object' || !('userProjectId' in result.body)) return result;
+  return { ...result, body: { ...(result.body as object), userProjectId: null } };
 }
 
 /** A 2xx create's body with the environment's `warnings`, only when there are any. */
@@ -231,7 +378,22 @@ function withWarnings(result: RouteResult, warnings: string[]): RouteResult {
   return { ...result, body: { ...(result.body as object), warnings } };
 }
 
-async function createProjectRow(user: Express.User, input: CreateProjectInput, chatSpace: { spaceId?: string | null; spaceFixedAt?: Date } = {}): Promise<RouteResult> {
+/**
+ * A 409 on a checkout name another checkout of the caller's holds on that box
+ * (a live one, or with `fresh` an archived one): New session's project picker
+ * names its checkout itself and tries the next suffix.
+ */
+export const CHECKOUT_NAME_TAKEN = 'checkout_name_taken';
+
+/**
+ * `fresh`: the create names a project (New session's project picker), so it
+ * means a new checkout, never an archived one brought back by name. An archived
+ * checkout with the name on that box answers 409 CHECKOUT_NAME_TAKEN instead of
+ * being un-archived (a no-repo name's, which otherwise came from any box) or
+ * asking which (a repository's), whatever `archivedName` says. One on another
+ * box doesn't hold the name there.
+ */
+async function createProjectRow(user: Express.User, input: CreateProjectInput, chatSpace: { spaceId?: string | null; spaceFixedAt?: Date } = {}, wakes = false, fresh = false): Promise<RouteResult> {
   try {
     const { name, description, color, initialAgent, instanceId, repoUrl: repoUrlInput, defaultBranch } = input;
     if (!name) { return { status: 400, body: { error: 'name required' } }; }
@@ -315,7 +477,8 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
         const why = instance.provisioningError ? `: ${instance.provisioningError}` : '';
         return { status: 409, body: { error: `The box failed to launch${why}`, code: 'box-failed' } };
       }
-      const powerError = powerStateError(instance.status);
+      // With Runs on: Auto, the caller's own parked box is taken and woken (withBoxWake); quarantined never is.
+      const powerError = wakes && WAKEABLE_BOX_STATUSES.includes(instance.status) ? null : powerStateError(instance.status);
       if (powerError) { return { status: 409, body: { error: powerError } }; }
       if (input.chatOrchestrator === true && isSetupOff(instance)) {
         return setupOffRefusal('Act as an orchestrator');
@@ -336,12 +499,13 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
 
     if (input.repos != null) {
       return await createWorkspaceProject(user, input, chatSpace, {
-        name, instanceId: projectInstanceId, boxStatus, replaySessionId, initialBackend, initialModel,
+        name, instanceId: projectInstanceId, boxStatus, replaySessionId, initialBackend, initialModel, wakes,
       });
     }
 
     let archived = null;
-    for (const where of archivedLookups(!!repo, projectInstanceId)) {
+    // A fresh checkout's name only clashes on its own box (the unique index is per box); the cross-box look is for an un-archive.
+    for (const where of fresh ? [{ archived: true as const, instanceId: projectInstanceId }] : archivedLookups(!!repo, projectInstanceId)) {
       archived = await prisma.project.findFirst({
         where: { userId: user.id, name, ...where },
         include: {
@@ -351,6 +515,9 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
         orderBy: { updatedAt: 'desc' },
       });
       if (archived) break;
+    }
+    if (fresh && archived) {
+      return { status: 409, body: { error: `An archived checkout is named ${name}`, code: CHECKOUT_NAME_TAKEN } };
     }
     // Un-archiving would bring it back with no clones (on a new box) and no marker.
     if (archived && isWorkspace(archived)) {
@@ -377,6 +544,11 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
           },
         },
       };
+    }
+    // Both answers to an archived name run on the box's agent now (a rename moves its dir and sessions, an un-archive
+    // relaunches), so a parked box, taken only for a new session, is refused as it always was.
+    if ((archivedDisposition === 'rename-aside' || archivedDisposition === 'unarchive') && archived && boxStatus && powerStateError(boxStatus)) {
+      return { status: 409, body: { error: powerStateError(boxStatus) } };
     }
     if (archivedDisposition === 'rename-aside' && archived) {
       // Through the rename route, which also moves its folder on the box if
@@ -585,7 +757,7 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
     // makes the dir and sessions.
     const projectHost = { userId: user.id, instanceId: projectInstanceId };
     const setupBox = cloneBox ?? (
-      projectInstanceId && boxStatus && waitsForBoxAgent(boxStatus, isProjectAgentConnected(projectHost))
+      projectInstanceId && boxStatus && waitsForBoxAgent(boxStatus, isProjectAgentConnected(projectHost), wakes)
         ? projectInstanceId
         : null
     );
@@ -679,8 +851,11 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
       if (setupBox) {
         // Read again now the row exists: a hello that landed since the check
         // above found nothing to redispatch, so this create has to drive it.
+        // Never a box on its way down: its agent is about to go, and the
+        // checkout runs on its next hello, once it's woken.
         const now = agentView(setupBox);
-        if (now.kind === 'present') {
+        const goingDown = wakes && !!boxStatus && GOING_DOWN_BOX_STATUSES.includes(boxStatus);
+        if (now.kind === 'present' && !goingDown) {
           // On a box still waiting for its GitHub delivery the checkout goes on
           // in the background, so the session opens now (deferDeliveryWait).
           const outcome = await applySetupEvent({ projectId: project.id, instanceId: setupBox }, {
@@ -753,7 +928,7 @@ async function createProjectRow(user: Express.User, input: CreateProjectInput, c
     return { status: 201, body: projectWithWorkflows };
   } catch (err: unknown) {
     if ((err as { code?: string }).code === 'P2002') {
-      return { status: 409, body: { error: 'Project name already exists' } };
+      return { status: 409, body: { error: 'Project name already exists', code: CHECKOUT_NAME_TAKEN } };
     }
     console.error('[PROJECTS create]', err);
     return { status: 500, body: { error: 'Failed to create project' } };
@@ -795,7 +970,7 @@ async function createWorkspaceProject(
   user: Express.User,
   input: CreateProjectInput,
   chatSpace: { spaceId?: string | null; spaceFixedAt?: Date },
-  checked: { name: string; instanceId: string | null; boxStatus: string | null; replaySessionId: string | null; initialBackend: string | null; initialModel: string | null },
+  checked: { name: string; instanceId: string | null; boxStatus: string | null; replaySessionId: string | null; initialBackend: string | null; initialModel: string | null; wakes?: boolean },
 ): Promise<RouteResult> {
   if (!await multiRepoEnabled(user)) {
     return { status: 403, body: { error: 'Projects with more than one repository are not on for you', code: MULTI_REPO_DISABLED_CODE } };
@@ -810,7 +985,7 @@ async function createWorkspaceProject(
   const view = agentView(checked.instanceId);
   const refusal = workspaceBoxRefusal({
     present: view.kind === 'present',
-    booting: checked.boxStatus != null && waitsForBoxAgent(checked.boxStatus, view.kind === 'present'),
+    booting: checked.boxStatus != null && waitsForBoxAgent(checked.boxStatus, view.kind === 'present', checked.wakes),
     capabilities: view.kind === 'present' ? view.capabilities : [],
   });
   if (refusal) return { status: refusal.status, body: { error: refusal.error } };
@@ -855,8 +1030,10 @@ async function createWorkspaceProject(
     throw err;
   }
   // An init-workspace and up to MULTI_REPO_MAX clone RPCs: not the request's
-  // to wait on. What does not go out now goes at the box's next hello.
-  void dispatchWorkspace(project.id).catch(err => console.error(`[PROJECTS] ${project.id}: workspace setup failed:`, (err as Error).message));
+  // to wait on. What does not go out now goes at the box's next hello: all of
+  // it for a box on its way down, whose agent is about to go.
+  const goingDown = !!checked.wakes && !!checked.boxStatus && GOING_DOWN_BOX_STATUSES.includes(checked.boxStatus);
+  if (!goingDown) void dispatchWorkspace(project.id).catch(err => console.error(`[PROJECTS] ${project.id}: workspace setup failed:`, (err as Error).message));
   startProjectChannel(user, project.id, checked.name, checked.instanceId);
   const created = await prisma.project.findUniqueOrThrow({
     where: { id: project.id },
@@ -949,6 +1126,69 @@ async function relaunchBoxFor(
 }
 
 /** opts.setupEnabled: for a relaunched box, termag setup as asked, over the failed box's. */
+/**
+ * A session still waiting on a box that won't wake
+ * : Start on a new box makes one (claimed from the
+ * pool when it can, else launched) and moves this session's project onto it.
+ * The old box is left as it is, and so is anything else on it. Behind
+ * box-placement-enabled; only the owner's own project, still `pending`, on a
+ * box that isn't up.
+ */
+export async function moveToNewBoxFor(user: Express.User, id: string): Promise<RouteResult> {
+  if (!await boolVariation(BOX_PLACEMENT_FLAG, user, false)) {
+    return { status: 404, body: { error: 'Runs on: Auto is not on for you', code: 'box_placement_disabled' } };
+  }
+  const project = await prisma.project.findFirst({
+    where: { id, userId: user.id, archived: false },
+    select: {
+      id: true, layout: true, setupStatus: true, instanceId: true, repoUrl: true,
+      instance: { select: { name: true, status: true } }, repos: { select: { url: true } },
+    },
+  });
+  if (!project) return { status: 404, body: { error: 'Project not found' } };
+  if (project.setupStatus !== 'pending' || !project.instanceId || !project.instance) {
+    return { status: 409, body: { error: 'Only a session still waiting for its box moves to a new one' } };
+  }
+  if (!WAKEABLE_BOX_STATUSES.includes(project.instance.status)) {
+    return { status: 409, body: { error: `${project.instance.name} is ${project.instance.status.replace(/-/g, ' ')}: nothing to move` } };
+  }
+  // The box routes pull in the provisioner and the warm pool: loaded here, as relaunchBoxFor does.
+  const { createBox } = await import('./instances');
+  const taken = (await prisma.instance.findMany({ where: { userId: user.id, status: { not: 'terminated' } }, select: { name: true } })).map(b => b.name);
+  const name = uniqueName(project.instance.name, taken);
+  // Sized for the session's repositories (their .termag/environment.json), as New box sizes a box for them.
+  const repoUrls = project.layout === 'workspace' ? project.repos.map(r => r.url) : project.repoUrl ? [project.repoUrl] : [];
+  const created = await createBox(user, { name, kind: 'ec2', ...(repoUrls.length ? { repo: repoUrls.length > 1 ? repoUrls : repoUrls[0] } : {}) });
+  if (created.status !== 201) return created;
+  const fresh = (created.body as { instance: { id: string; name: string } }).instance;
+  const moved = await prisma.project.updateMany({
+    where: { id: project.id, setupStatus: 'pending', instanceId: project.instanceId },
+    data: { instanceId: fresh.id },
+  });
+  if (moved.count === 0) {
+    // The session moved on meanwhile (its box woke, or another press moved it): the box made for it goes again,
+    // unless something else landed on it since (a terminate archives every live project on the box).
+    const others = await prisma.project.count({ where: { instanceId: fresh.id, archived: false } });
+    if (others === 0) {
+      const { terminateOwnedBox } = await import('./instances');
+      await terminateOwnedBox(user, fresh.id, true).catch(err => console.error(`[PROJECTS] ${fresh.name}: not terminated after a move that didn't happen: ${(err as Error).message}`));
+    }
+    return { status: 409, body: { error: 'That session changed; try again.' } };
+  }
+  console.log(`[PROJECTS] moved waiting session ${project.id} off ${project.instance.name} onto new box ${fresh.name}`);
+  // A claimed warm box said hello long ago, so nothing else drives it.
+  const view = agentView(fresh.id);
+  if (view.kind === 'present') {
+    if (project.layout === 'workspace') {
+      await dispatchWorkspace(project.id).catch(err => console.error(`[PROJECTS] ${project.id}: workspace setup on ${fresh.id} failed:`, (err as Error).message));
+    } else {
+      await applySetupEvent({ projectId: project.id, instanceId: fresh.id }, { kind: 'agent-connected', capabilities: view.capabilities })
+        .catch(err => console.error(`[PROJECTS] ${project.id}: setup on ${fresh.id} failed:`, (err as Error).message));
+    }
+  }
+  return { status: 202, body: { instanceId: fresh.id, name: fresh.name } };
+}
+
 export async function retryCloneFor(user: Express.User, id: string, opts: { setupEnabled?: boolean } = {}): Promise<RouteResult> {
   try {
     const project = await prisma.project.findFirst({
@@ -1105,11 +1345,15 @@ async function renameProjectRow(user: Express.User, id: string, newName: unknown
         }
         workspacePlan = { repos: project.repos.map(r => r.name), guides };
       }
+      // The box carries the project's Claude and pi conversations to the new folder (services/renameConversations.ts).
+      const conversations = await carriesConversations(user, projectHost);
       try {
-        await sendForProject(projectHost, 'project-rename', {
+        const answer = await sendForProject(projectHost, 'project-rename', {
           sessions, fromDir: pathOf(oldName), toDir: pathOf(newName),
           ...(workspacePlan ? { workspace: workspacePlan } : {}),
+          ...(conversations ? { conversations: true } : {}),
         }, workspacePlan ? WORKSPACE_RENAME_TIMEOUT_MS : undefined);
+        if (conversations) afterConversationsMoved(user.id, projectHost, answer);
       } catch (err) {
         await restartCodex(oldName);
         return boxRenameRpcError(err instanceof Error ? err.message : String(err));
@@ -1251,7 +1495,7 @@ export function projectsRouter(): Router {
 
   const list: RequestHandler = async (req, res) => {
     try {
-      res.json(await listProjectsFor(req.user!.id));
+      res.json(await listProjectsFor(req.user!.id, { userProjects: await userProjectsEnabled(req.user!) }));
     } catch {
       res.status(500).json({ error: 'Failed to list projects' });
     }
@@ -1489,6 +1733,10 @@ export function projectsRouter(): Router {
     const setupEnabled = (req.body as { setupEnabled?: unknown } | undefined)?.setupEnabled;
     sendResult(res, await retryCloneFor(req.user!, req.params.id, typeof setupEnabled === 'boolean' ? { setupEnabled } : {}));
   });
+  // Runs on: Auto: a waiting session whose box won't wake moves to a new box (behind box-placement-enabled).
+  router.post('/:id/new-box', requireAuth, async (req, res) => {
+    sendResult(res, await moveToNewBoxFor(req.user!, req.params.id));
+  });
   router.post('/:id/clone/start-empty', requireAuth, refuseParkedBox('id'), async (req, res) => {
     sendResult(res, await startEmptyFor(req.user!, req.params.id));
   });
@@ -1521,8 +1769,18 @@ function workstreamView<W extends { name: string; _count: { chatTranscripts: num
  * Every live project the user owns or has been shared, with its workflows and
  * workstreams (main first). GET /api/projects and the TUI's
  * GET /api/cli/v1/lobby both answer with this.
+ *
+ * `userProjects` (user-projects-enabled, read by the caller): the person's
+ * checkouts without a project get one first (ensureUserProjects), and each of
+ * their own carries its `userProjectId`. Off, and on a shared checkout, it is
+ * null: a collaborator never sees the owner's project.
  */
-export async function listProjectsFor(userId: string) {
+export async function listProjectsFor(userId: string, opts: { userProjects?: boolean } = {}) {
+  if (opts.userProjects) {
+    const backfill = await ensureUserProjects(userId).catch(err => { console.warn(`[USER-PROJECTS] ${userId}: backfill on list failed: ${(err as Error).message}`); return null; });
+    // Its raw-SQL attach pushes nothing of itself: the person's other tabs re-read.
+    if (backfill && backfill.attached > 0) notifyWorkspaceChange(userId, 'projects');
+  }
   const projectInclude = {
     workflows: true,
     // An ask's chat carries its thread, whose title the simple UI names it by, and
@@ -1537,6 +1795,8 @@ export async function listProjectsFor(userId: string) {
       },
     },
     user: { select: { unixUsername: true } },
+    // Only for repoKeys: a workspace's repositories, in checkout order.
+    repos: { select: { url: true, position: true }, orderBy: { position: 'asc' as const } },
   };
   // A space orchestrator is the space's, reached from Slack: never listed (projectKind.ts inProjectLists).
   const owned = await prisma.project.findMany({
@@ -1566,6 +1826,10 @@ export async function listProjectsFor(userId: string) {
       archived: p.archived, pinned: p.pinned, lastActiveAt: p.lastActiveAt,
       createdAt: p.createdAt, updatedAt: p.updatedAt,
       userId: p.userId, instanceId: p.instanceId, kind: p.kind, createdFor: p.createdFor, repoUrl: p.repoUrl, layout: p.layout,
+      // The chat's Projects view groups sessions by this repository set (services/projectRepos.ts projectRepoKeys).
+      repoKeys: projectRepoKeys(p),
+      // The user-level project, only under its flag.
+      userProjectId: opts.userProjects ? p.userProjectId : null,
       repoDefaultBranch: p.repoDefaultBranch, setupStatus: p.setupStatus, setupError: p.setupError,
       // The box's last report of the environment file's steps (services/projectEnvironment.ts).
       environmentStatus: p.environmentStatus ?? null,
@@ -1584,6 +1848,9 @@ export async function listProjectsFor(userId: string) {
         createdAt: s.project.createdAt, updatedAt: s.project.updatedAt,
         userId: s.project.userId, instanceId: s.project.instanceId, kind: s.project.kind,
         createdFor: s.project.createdFor, repoUrl: s.project.repoUrl, layout: s.project.layout,
+        repoKeys: projectRepoKeys(s.project),
+        // The owner's project is the owner's alone.
+        userProjectId: null,
         repoDefaultBranch: s.project.repoDefaultBranch,
         setupStatus: s.project.setupStatus, setupError: s.project.setupError,
         environmentStatus: s.project.environmentStatus ?? null,

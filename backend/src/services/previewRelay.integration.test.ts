@@ -60,6 +60,29 @@ describe('HTTP over pooled tunnels', () => {
     expect(f.tunnels.count('owner', 'box-1', 'preview')).toBe(1);
   });
 
+  it('drops a kept-alive connection before the app\'s Keep-Alive timeout, so a request after a pause gets a fresh tunnel', async () => {
+    // A dev server's Node http closes an idle connection after keepAliveTimeout (5 s by default, which
+    // Next and Vite keep) and says so in `Keep-Alive: timeout=`. The box's close reaches the relay late, as
+    // through the load balancer: the pool must not hand the next request that dead tunnel (a 502).
+    const app = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => res.end(`${req.method} ${body}`));
+    });
+    app.keepAliveTimeout = 2_000;
+    const port = await listen(app);
+    const f = await setup(port, { closeDelayMs: 5_000 });
+    const { cookie } = await signIn(f, 'my-app', 'owner');
+    const headers = previewHeaders('my-app', { cookie, origin: ORIGIN, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' });
+    expect((await request(f.port, '/api/hello', { headers })).status).toBe(200);
+    // Past keepAliveTimeout and Node's keepAliveTimeoutBuffer (1 s), so the app has hung up.
+    await new Promise(r => setTimeout(r, 3_500));
+    const post = await request(f.port, '/api/hello', { method: 'POST', headers, body: '{"name":"x"}' });
+    expect(post.status).toBe(200);
+    expect(post.body).toBe('POST {"name":"x"}');
+    expect(f.agent.opened).toHaveLength(2);
+  }, 15_000);
+
   it('dials the new port when a renew moves the link, rather than the pool\'s first target (Bugbot)', async () => {
     const first = await startHttpEcho(closers);
     const second = await startHttpEcho(closers);

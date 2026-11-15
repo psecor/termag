@@ -1,12 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const prisma = vi.hoisted(() => ({
-  automationRun: { findUnique: vi.fn(), updateMany: vi.fn(), update: vi.fn() },
-  automation: { update: vi.fn() },
-  instance: { findUnique: vi.fn() },
-  user: { findUnique: vi.fn() },
-  workflow: { findFirst: vi.fn(async () => ({ provider: 'claude-chat', model: 'sonnet' })) },
-}));
+const prisma = vi.hoisted(() => {
+  const p: Record<string, any> = {
+    automationRun: { findUnique: vi.fn(), updateMany: vi.fn(), update: vi.fn() },
+    automation: { update: vi.fn() },
+    automationNotice: { createMany: vi.fn(async () => ({ count: 0 })) },
+    instance: { findUnique: vi.fn() },
+    user: { findUnique: vi.fn() },
+    workflow: { findFirst: vi.fn(async () => ({ provider: 'claude-chat', model: 'sonnet' })) },
+  };
+  p.$transaction = vi.fn(async (fn: (tx: unknown) => unknown) => fn(p));
+  return p;
+});
 vi.mock('../../db', () => ({ prisma }));
 vi.mock('./spaceSync', () => ({
   pushAfterRun: vi.fn(async (_t: unknown, o: { queued?: (d: Promise<unknown>) => void }) => { o.queued?.(Promise.resolve()); return null; }),
@@ -23,11 +28,18 @@ vi.mock('./report', () => ({
   changesLabel: () => '2 commits, pushed',
   reportableSummary: (s: string | null) => s,
 }));
+vi.mock('./alerts', () => ({ noteFailedRun: vi.fn(async () => {}) }));
+// The finish and its event are one write in notices.ts; here, the row write it makes.
+vi.mock('./notices', () => ({
+  finishRunWithEvent: vi.fn(async (run: { id: string }, where: object, data: object) => (await prisma.automationRun.updateMany({ where: { ...where, id: run.id }, data })).count),
+}));
 vi.mock('../tmux', () => ({ projectDirFor: vi.fn(() => '/home/me/termag/projects/triage/.worktrees/run-x') }));
 
 import { completeRun, finishFields, noteEvent, pendingResultFor, pushNotesForRun, settleInterruptedRun } from './complete';
 import { noteSpaceSyncError, pushAfterRun, pushRunLog, spaceFoldersEnabledFor } from './spaceSync';
 import { postRunReport, summarizeBranch } from './report';
+import { noteFailedRun } from './alerts';
+import { finishRunWithEvent } from './notices';
 
 const seen = (workstreamId: string, event: unknown) => ({ projectId: 'p1', workstream: 'run-x', workstreamId, instanceId: 'box1', turnId: 't1', event });
 
@@ -232,6 +244,20 @@ describe('completeRun', () => {
     prisma.automationRun.updateMany.mockResolvedValue({ count: 0 }); // another caller claimed reportedAt first
     await completeRun(ref('w1'), { exitCode: 0 });
     expect(postRunReport).not.toHaveBeenCalled();
+  });
+
+  it('finishes the row through finishRunWithEvent (the run.finished event rides with it)', async () => {
+    prisma.automationRun.findUnique.mockResolvedValue({ ...run('running'), reportedAt: null });
+    await completeRun(ref('w1'), { exitCode: 0 });
+    expect(finishRunWithEvent).toHaveBeenCalledWith(expect.objectContaining({ id: 'r1' }), { state: 'running' }, expect.objectContaining({ state: 'done' }));
+    // The report's claim is its own write again, coupled to no alert (the claim itself is the next tests').
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('counts a failed turn through noteFailedRun, with its reason', async () => {
+    prisma.automationRun.findUnique.mockResolvedValue(run('running'));
+    await completeRun(ref('w1'), { exitCode: 1 });
+    expect(noteFailedRun).toHaveBeenCalledWith('a1', 0, 3, { id: 'r1', reason: 'runner-error' });
   });
 
   it('claims the report even when there is nowhere to post it, so a later follow-up or opt-in posts nothing for this run', async () => {

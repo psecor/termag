@@ -85,12 +85,19 @@ export interface CliLifecycle {
   /** The user's box's parent: undefined when the user has no such box. */
   boxParent(user: CliUser, boxId: string): Promise<string | null | undefined>;
   /**
+   * How many Claude Code cloud sessions run on the user's box now, counted as
+   * the lifecycle's claude-runner busy check counts them; 0 for a box that is
+   * not theirs.
+   */
+  liveCloudSessions(user: CliUser, boxId: string): Promise<number>;
+  /**
    * The GitHub repository a project the user owns or shares is a checkout of,
    * for `from: <box>/<project>`: its recorded repoUrl, else its checkout's
    * origin, asked of the box.
    */
   projectRepoUrl(user: CliUser, box: string, project: string): Promise<{ repoUrl: string } | RouteResult>;
-  powerBox(user: CliUser, boxId: string, action: 'start' | 'stop' | 'hibernate'): Promise<RouteResult>;
+  /** opts.force: stop a box running cloud sessions anyway; opts.boxCredential: a box's own credential asked, which never may. */
+  powerBox(user: CliUser, boxId: string, action: 'start' | 'stop' | 'hibernate', opts?: { force?: boolean; boxCredential?: boolean }): Promise<RouteResult>;
   /** The settings body of PATCH /api/instances/:id/lifecycle, passed through for the shared parser. */
   setBoxLifecycle(user: CliUser, boxId: string, settings: unknown): Promise<RouteResult>;
   /** Keep running: restart the box's idle clock. Never for a box's own credential (the route refuses those). */
@@ -133,7 +140,7 @@ export interface CliLifecycle {
 /**
  * A shared handler's failure, as the CLI sees it: its error message, a code
  * the CLI can branch on, a box's live projects when that is the reason, and
- * a resize's blockers. Everything else in the body is dropped.
+ * a resize's or a stop's blockers. Everything else in the body is dropped.
  */
 export function cliErrorResult(result: RouteResult): RouteResult {
   const body = (result.body ?? {}) as { error?: unknown; code?: unknown; projects?: unknown };
@@ -146,7 +153,7 @@ export function cliErrorResult(result: RouteResult): RouteResult {
   if (Array.isArray(body.projects)) {
     out.projects = (body.projects as Array<{ id: string; name: string }>).map(p => ({ id: p.id, name: p.name }));
   }
-  // A busy box's resize refusal: what blocks it, and whether --force would go ahead.
+  // A busy box's resize or stop refusal: what blocks it, and whether --force would go ahead.
   const busy = result.body as { blockers?: unknown; forceable?: unknown } | null;
   if (Array.isArray(busy?.blockers)) {
     out.blockers = (busy!.blockers as Array<{ check: string; reason: string; forceable: boolean }>)
@@ -278,11 +285,33 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
     send(res, await lifecycle.createBox(user, input, credential.kind === 'box' ? credential.boxId : null, purpose.createdFor));
   }));
 
+  /**
+   * A box's own credential (an agent on a box) may not stop or remove a box
+   * that runs Claude Code cloud sessions: on 11-06 an agent cleaning up the
+   * box it had made for an ask stopped two sessions running there. The
+   * owner still can, signed in as themselves. Answers the 409 and true when
+   * it refuses.
+   */
+  const refusedForCloudSessions = async (res: Response, user: CliUser, boxId: string, verb: 'stop' | 'hibernate' | 'rm' | 'resize'): Promise<boolean> => {
+    const live = await lifecycle.liveCloudSessions(user, boxId);
+    if (live === 0) return false;
+    res.status(409).json({
+      error: `The box runs ${live} Claude Code cloud session${live === 1 ? '' : 's'}, and a box's own credentials can't ${verb === 'rm' ? 'remove' : verb} it while ${live === 1 ? 'it runs' : 'they run'}. Leave it to its idle window, or run \`termag box ${verb}\` where you've run \`termag login\``,
+      code: 'cloud_sessions',
+    });
+    return true;
+  };
+
   // hibernate: the same rules as the web UI's (powerRequestError: a box
   // launched hibernation-capable; otherwise 409 with the reason).
   for (const action of ['start', 'stop', 'hibernate'] as const) {
     router.post(`/boxes/:id/${action}`, bearer, asyncHandler(async (req, res) => {
-      send(res, await lifecycle.powerBox(cliAuth(res).user, req.params.id, action));
+      const { user, credential } = cliAuth(res);
+      if (action !== 'start' && credential.kind === 'box' && await refusedForCloudSessions(res, user, req.params.id, action)) return;
+      const force = (req.body as { force?: unknown } | undefined)?.force === true;
+      // A sign-in made on a box is readable by every process there, agents included, so it can't force either.
+      const fromBox = credential.kind === 'box' || !!credential.issuedOnBoxId;
+      send(res, await lifecycle.powerBox(user, req.params.id, action, { force, boxCredential: fromBox }));
     }));
   }
 
@@ -341,6 +370,9 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
       });
       return;
     }
+    // A resize stops the box, and --force passes its claude-runner blocker:
+    // a box's own credential gets the stop's refusal instead (Devin on #1597).
+    if (credential.kind === 'box' && await refusedForCloudSessions(res, user, req.params.id, 'resize')) return;
     const force = (req.body as { force?: unknown } | undefined)?.force === true;
     send(res, await lifecycle.resizeBox(user, req.params.id, { size, force }));
   }));
@@ -370,6 +402,7 @@ export function mountCliLifecycleRoutes(router: Router, lifecycle: CliLifecycle,
       });
       return;
     }
+    if (credential.kind === 'box' && await refusedForCloudSessions(res, user, req.params.id, 'rm')) return;
     const confirmed = (req.body as { confirmed?: unknown } | undefined)?.confirmed === true;
     send(res, await lifecycle.removeBox(user, req.params.id, confirmed));
   }));

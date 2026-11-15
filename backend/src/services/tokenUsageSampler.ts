@@ -16,7 +16,22 @@
  *
  * normalizeScanResponse / resolveRows / buildUsageResponse are pure and
  * unit-tested; the scheduler and prisma writes wrap them.
+ *
+ * Load on the database (2026-11-13: this sweep held the 10-connection pool for
+ * seconds at a time and every query in the orchestrator waited behind it):
+ *  - a host's rows go in ONE multi-row INSERT … ON CONFLICT per table
+ *    (dayUpsertSql / modelUpsertSql), not one Prisma upsert round trip per row,
+ *    and a row whose values didn't change isn't rewritten (`WHERE … IS DISTINCT
+ *    FROM`), so a rescan of 400 unchanged days writes nothing. Its scannedAt
+ *    stays put too: the page's staleness comes from lastSuccessfulRun, falling
+ *    back to the newest scannedAt after a restart (newestScanAt).
+ *  - at most MAX_CONCURRENT_PERSISTS host scans write at once (the agent RPCs
+ *    before them still run in parallel);
+ *  - each user keeps a fixed slot in the 5-minute cycle (nextDueAt), so users
+ *    whose scans end together don't start together again.
  */
+import { randomUUID } from 'crypto';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { getConnectedAgents, sendForProject } from './agentRegistry';
 import { getPollerUsage } from './tmuxPoller';
@@ -32,6 +47,8 @@ const RPC_TIMEOUT_MS = 60_000;      // a cold parse of a big ~/.claude can excee
 const HISTORY_DAYS = 400;
 const STALE_AFTER_MS = 15 * 60_000;
 export const RESCAN_THROTTLE_MS = 30_000;
+export const MAX_CONCURRENT_PERSISTS = 3;
+const UPSERT_CHUNK = 1000;          // 18 parameters a row; Postgres allows 65535 per statement
 
 // `reasoning` stays tagged separately (only pi reports it) so it can
 // be broken out later; routes/usage.ts folds it into `output` for reporting.
@@ -220,6 +237,41 @@ function hashStagger(userId: string): number {
   for (let i = 0; i < userId.length; i++) h = (h * 31 + userId.charCodeAt(i)) >>> 0;
   return h % STAGGER_WINDOW_MS;
 }
+/**
+ * Pure: the user's next scan, on its own fixed slot of the cycle: the first
+ * time after `now` that sits `hashStagger(userId)` into a 5-minute period.
+ * Anchored to the clock, not to when the last scan ended, so scans that
+ * finished together (all waiting on the same database) still start apart.
+ */
+export function nextDueAt(userId: string, now: number, interval = PER_USER_INTERVAL_MS): number {
+  const phase = hashStagger(userId) % interval;
+  return phase + (Math.floor((now - phase) / interval) + 1) * interval;
+}
+
+/** Pure: a limiter that runs at most `max` of the functions it is given at once, the rest in arrival order. */
+export function createLimiter(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  // A finishing call hands its slot straight to the next waiter and leaves
+  // `active` alone. Decrementing first would free the slot for a caller that
+  // arrives before the woken waiter resumes (resolving a promise does not run
+  // its continuation synchronously), admitting both and exceeding `max`.
+  const release = () => {
+    const next = queue.shift();
+    if (next) next(); else active--;
+  };
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    // A waiter's slot was reserved by the release that woke it, so only a
+    // caller that claimed a genuinely free slot increments.
+    if (active >= max) await new Promise<void>(resolve => queue.push(resolve));
+    else active++;
+    try { return await fn(); } finally { release(); }
+  };
+}
+
+/** The database writes of host scans: MAX_CONCURRENT_PERSISTS at a time, whatever the number of users due. */
+const persistSlot = createLimiter(MAX_CONCURRENT_PERSISTS);
+
 function sinceDate(): string {
   return new Date(Date.now() - HISTORY_DAYS * 86_400_000).toISOString().slice(0, 10);
 }
@@ -242,50 +294,86 @@ export async function persistHost(userId: string, hostKey: string, norm: Normali
   await prisma.tokenUsageModelDay.deleteMany({ where: otherSchema });
   if (flipped.count) console.warn(`[TOKEN-USAGE] ${hostKey}: removed ${flipped.count} rows of the other schema for ${dates.length} dates`);
 
-  const ops = resolved.map(r => prisma.tokenUsageDay.upsert({
-    where: { userId_hostKey_provider_date_sourceKey: { userId, hostKey, provider: r.provider, date: r.date, sourceKey: r.sourceKey } },
-    update: {
-      cwdHint: r.cwdHint, projectId: r.projectId, workstream: r.workstream,
-      input: BigInt(r.day.input), output: BigInt(r.day.output), cacheRead: BigInt(r.day.cacheRead), cacheCreate: BigInt(r.day.cacheCreate),
-      reasoning: BigInt(r.day.reasoning), calls: r.day.calls, agentSchema: r.agentSchema, scannedAt,
-    },
-    create: {
-      userId, hostKey, provider: r.provider, date: r.date, sourceKey: r.sourceKey,
-      cwdHint: r.cwdHint, projectId: r.projectId, workstream: r.workstream,
-      input: BigInt(r.day.input), output: BigInt(r.day.output), cacheRead: BigInt(r.day.cacheRead), cacheCreate: BigInt(r.day.cacheCreate),
-      reasoning: BigInt(r.day.reasoning), calls: r.day.calls, agentSchema: r.agentSchema, scannedAt,
-    },
-  }));
-  for (let i = 0; i < ops.length; i += 200) await prisma.$transaction(ops.slice(i, i + 200));
+  for (const chunk of chunks(lastByKey(resolved, dayKey), UPSERT_CHUNK)) await prisma.$executeRaw(dayUpsertSql(userId, hostKey, chunk, scannedAt));
 
   // A rescan is authoritative for the model split of every bucket-day it reports:
   // delete the model rows it no longer names (a corrected or truncated log, an agent
   // without models[]). Buckets it skipped (read errors) keep theirs, as their day rows do.
-  const bucketKey = (r: { provider: string; date: string; sourceKey: string }) => `${r.provider}\n${r.date}\n${r.sourceKey}`;
-  const modelKey = (r: { provider: string; date: string; sourceKey: string; backend: string; model: string }) => `${bucketKey(r)}\n${r.backend}\n${r.model}`;
-  const reported = new Set(resolved.map(bucketKey));
+  const reported = new Set(resolved.map(dayKey));
   const named = new Set(resolvedModels.map(modelKey));
   const existing = await prisma.tokenUsageModelDay.findMany({
     where: { userId, hostKey, date: { in: dates } },
     select: { id: true, provider: true, date: true, sourceKey: true, backend: true, model: true },
   });
-  const stale = existing.filter(r => reported.has(bucketKey(r)) && !named.has(modelKey(r))).map(r => r.id);
+  const stale = existing.filter(r => reported.has(dayKey(r)) && !named.has(modelKey(r))).map(r => r.id);
   for (let i = 0; i < stale.length; i += 500) await prisma.tokenUsageModelDay.deleteMany({ where: { id: { in: stale.slice(i, i + 500) } } });
 
-  const modelOps = resolvedModels.map(r => {
-    const tokens = {
-      projectId: r.projectId, workstream: r.workstream,
-      input: BigInt(r.day.input), output: BigInt(r.day.output), cacheRead: BigInt(r.day.cacheRead), cacheCreate: BigInt(r.day.cacheCreate),
-      reasoning: BigInt(r.day.reasoning), calls: r.day.calls, scannedAt,
-    };
-    const key = { userId, hostKey, provider: r.provider, date: r.date, sourceKey: r.sourceKey, backend: r.backend, model: r.model };
-    return prisma.tokenUsageModelDay.upsert({
-      where: { userId_hostKey_provider_date_sourceKey_backend_model: key },
-      update: tokens,
-      create: { ...key, ...tokens },
-    });
-  });
-  for (let i = 0; i < modelOps.length; i += 200) await prisma.$transaction(modelOps.slice(i, i + 200));
+  for (const chunk of chunks(lastByKey(resolvedModels, modelKey), UPSERT_CHUNK)) await prisma.$executeRaw(modelUpsertSql(userId, hostKey, chunk, scannedAt));
+}
+
+const dayKey = (r: { provider: string; date: string; sourceKey: string }) => `${r.provider}\n${r.date}\n${r.sourceKey}`;
+const modelKey = (r: { provider: string; date: string; sourceKey: string; backend: string; model: string }) => `${dayKey(r)}\n${r.backend}\n${r.model}`;
+
+/**
+ * Pure: one row per key, the last one reported, as the per-row upserts used to
+ * leave it. One INSERT … ON CONFLICT can't touch the same row twice.
+ */
+export function lastByKey<T>(rows: readonly T[], key: (r: T) => string): T[] {
+  const byKey = new Map<string, T>();
+  for (const r of rows) { const k = key(r); byKey.delete(k); byKey.set(k, r); }
+  return [...byKey.values()];
+}
+
+function chunks<T>(rows: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
+  return out;
+}
+
+// Timestamps as Prisma stores them: UTC wall time in a `timestamp(3)` column,
+// whatever the session's TimeZone.
+const utc = (d: Date) => Prisma.sql`(${d.toISOString()}::timestamptz AT TIME ZONE 'UTC')`;
+const NOW_UTC = Prisma.sql`(now() AT TIME ZONE 'UTC')`;
+
+/**
+ * Pure: the day rows' upsert. `id` and `updatedAt` are Prisma-side defaults
+ * (`cuid()`, `@updatedAt`), so the statement supplies both. Rows already there
+ * with the same values are left alone: no new tuple, no WAL, scannedAt kept.
+ */
+export function dayUpsertSql(userId: string, hostKey: string, rows: readonly ResolvedRow[], scannedAt: Date, newId: () => string = randomUUID): Prisma.Sql {
+  const values = rows.map(r => Prisma.sql`(${newId()}, ${userId}, ${hostKey}, ${r.provider}, ${r.date}, ${r.sourceKey}, ${r.cwdHint}, ${r.projectId}, ${r.workstream},
+    ${BigInt(r.day.input)}, ${BigInt(r.day.output)}, ${BigInt(r.day.cacheRead)}, ${BigInt(r.day.cacheCreate)}, ${BigInt(r.day.reasoning)},
+    ${r.day.calls}::int, ${r.agentSchema}::int, ${utc(scannedAt)}, ${NOW_UTC})`);
+  return Prisma.sql`
+    INSERT INTO "token_usage_days" AS t ("id", "userId", "hostKey", "provider", "date", "sourceKey", "cwdHint", "projectId", "workstream",
+      "input", "output", "cacheRead", "cacheCreate", "reasoning", "calls", "agentSchema", "scannedAt", "updatedAt")
+    VALUES ${Prisma.join(values)}
+    ON CONFLICT ("userId", "hostKey", "provider", "date", "sourceKey") DO UPDATE SET
+      "cwdHint" = EXCLUDED."cwdHint", "projectId" = EXCLUDED."projectId", "workstream" = EXCLUDED."workstream",
+      "input" = EXCLUDED."input", "output" = EXCLUDED."output", "cacheRead" = EXCLUDED."cacheRead", "cacheCreate" = EXCLUDED."cacheCreate",
+      "reasoning" = EXCLUDED."reasoning", "calls" = EXCLUDED."calls", "agentSchema" = EXCLUDED."agentSchema",
+      "scannedAt" = EXCLUDED."scannedAt", "updatedAt" = EXCLUDED."updatedAt"
+    WHERE (t."cwdHint", t."projectId", t."workstream", t."input", t."output", t."cacheRead", t."cacheCreate", t."reasoning", t."calls", t."agentSchema")
+      IS DISTINCT FROM (EXCLUDED."cwdHint", EXCLUDED."projectId", EXCLUDED."workstream", EXCLUDED."input", EXCLUDED."output",
+        EXCLUDED."cacheRead", EXCLUDED."cacheCreate", EXCLUDED."reasoning", EXCLUDED."calls", EXCLUDED."agentSchema")`;
+}
+
+/** Pure: the model rows' upsert, the same way. */
+export function modelUpsertSql(userId: string, hostKey: string, rows: ReadonlyArray<Resolved<ModelRowInput>>, scannedAt: Date, newId: () => string = randomUUID): Prisma.Sql {
+  const values = rows.map(r => Prisma.sql`(${newId()}, ${userId}, ${hostKey}, ${r.provider}, ${r.date}, ${r.sourceKey}, ${r.backend}, ${r.model}, ${r.projectId}, ${r.workstream},
+    ${BigInt(r.day.input)}, ${BigInt(r.day.output)}, ${BigInt(r.day.cacheRead)}, ${BigInt(r.day.cacheCreate)}, ${BigInt(r.day.reasoning)},
+    ${r.day.calls}::int, ${utc(scannedAt)}, ${NOW_UTC})`);
+  return Prisma.sql`
+    INSERT INTO "token_usage_model_days" AS t ("id", "userId", "hostKey", "provider", "date", "sourceKey", "backend", "model", "projectId", "workstream",
+      "input", "output", "cacheRead", "cacheCreate", "reasoning", "calls", "scannedAt", "updatedAt")
+    VALUES ${Prisma.join(values)}
+    ON CONFLICT ("userId", "hostKey", "provider", "date", "sourceKey", "backend", "model") DO UPDATE SET
+      "projectId" = EXCLUDED."projectId", "workstream" = EXCLUDED."workstream",
+      "input" = EXCLUDED."input", "output" = EXCLUDED."output", "cacheRead" = EXCLUDED."cacheRead", "cacheCreate" = EXCLUDED."cacheCreate",
+      "reasoning" = EXCLUDED."reasoning", "calls" = EXCLUDED."calls", "scannedAt" = EXCLUDED."scannedAt", "updatedAt" = EXCLUDED."updatedAt"
+    WHERE (t."projectId", t."workstream", t."input", t."output", t."cacheRead", t."cacheCreate", t."reasoning", t."calls")
+      IS DISTINCT FROM (EXCLUDED."projectId", EXCLUDED."workstream", EXCLUDED."input", EXCLUDED."output",
+        EXCLUDED."cacheRead", EXCLUDED."cacheCreate", EXCLUDED."reasoning", EXCLUDED."calls")`;
 }
 
 /** Rows that couldn't be attributed when written may resolve now (project created later). */
@@ -318,7 +406,7 @@ async function scanHost(userId: string, username: string, instanceId: string | n
     const resolvedModels = resolveRows(norm.modelRows, username, projects, instanceId);
     const parsed = norm.scannedAt ? new Date(norm.scannedAt) : new Date();
     const scannedAt = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
-    await persistHost(userId, hostKey, norm, resolved, resolvedModels, scannedAt);
+    await persistSlot(() => persistHost(userId, hostKey, norm, resolved, resolvedModels, scannedAt));
     run.lastScanAt = Date.now(); run.lastError = null; run.schema = norm.schema; run.rows = resolved.length;
     lastSuccess.set(userId, Date.now());
   } catch (err) {
@@ -340,12 +428,66 @@ export function runUserScan(userId: string): Promise<void> {
     const projects = await loadProjects(userId);
     await Promise.allSettled(hosts.map(h => scanHost(userId, username, h.instanceId, projects)));
     await reResolveUnattributed(userId, username, projects).catch(() => {});
-  })().finally(() => { inFlight.delete(userId); due.set(userId, Date.now() + PER_USER_INTERVAL_MS); });
+  })().finally(() => { inFlight.delete(userId); due.set(userId, nextDueAt(userId, Date.now())); });
   inFlight.set(userId, p);
   return p;
 }
 
+export interface UsageSourceMove { from: string; to: string }
+
+/**
+ * A rename moved these Claude log folders on a box (agent/conversation-move.js,
+ * services/renameConversations.ts): their files scan under the new folder's
+ * name from now on, and a day no longer reported keeps its last row, so the
+ * rows under the old name would count the same days twice. A scan already
+ * under way may have read the old folders, so it lands first. Then, per
+ * folder: the days a scan reports (from sinceDate on) go under the old name,
+ * and the fresh scan started here writes them under the new one; older days,
+ * which no scan reports again, keep their rows under the new name, except a
+ * day the new name already has, which keeps the old row as it was. Day and
+ * model rows move together. Answers how many day rows went and moved.
+ */
+export async function moveUsageSources(userId: string, instanceId: string, moves: readonly UsageSourceMove[]): Promise<{ dropped: number; rekeyed: number }> {
+  const byFrom = new Map<string, string>();
+  for (const m of moves) {
+    if (m && typeof m.from === 'string' && typeof m.to === 'string' && m.from && m.to && m.from !== m.to && !byFrom.has(m.from)) byFrom.set(m.from, m.to);
+  }
+  if (byFrom.size === 0) return { dropped: 0, rekeyed: 0 };
+  await inFlight.get(userId)?.catch(() => {});
+  const scope = { userId, hostKey: hostKeyOf(instanceId), provider: 'claude' };
+  const since = sinceDate();
+  let dropped = 0;
+  let rekeyed = 0;
+  for (const [from, to] of byFrom) {
+    const recent = { ...scope, sourceKey: from, date: { gte: since } };
+    const taken = (await prisma.tokenUsageDay.findMany({ where: { ...scope, sourceKey: to, date: { lt: since } }, select: { date: true } })).map(r => r.date);
+    const older = { ...scope, sourceKey: from, date: { lt: since, notIn: taken } };
+    const [days, , moved] = await prisma.$transaction([
+      prisma.tokenUsageDay.deleteMany({ where: recent }),
+      prisma.tokenUsageModelDay.deleteMany({ where: recent }),
+      prisma.tokenUsageDay.updateMany({ where: older, data: { sourceKey: to } }),
+      prisma.tokenUsageModelDay.updateMany({ where: older, data: { sourceKey: to } }),
+    ]);
+    dropped += days.count;
+    rekeyed += moved.count;
+  }
+  void runUserScan(userId).catch(() => {});
+  return { dropped, rekeyed };
+}
+
 export function lastSuccessfulRun(userId: string): number | null { return lastSuccess.get(userId) ?? null; }
+
+/**
+ * Pure: when the user's usage was last scanned, for the page's staleness. An
+ * unchanged row keeps its old scannedAt (dayUpsertSql), so the newest one in
+ * the table only says when something last changed; this process's last
+ * successful run says when a scan last worked. After a restart there is none
+ * yet, and the table's newest scannedAt is the best there is.
+ */
+export function newestScanAt(lastRunMs: number | null, newestRow: Date | null): Date | null {
+  if (lastRunMs === null) return newestRow;
+  return newestRow && newestRow.getTime() > lastRunMs ? newestRow : new Date(lastRunMs);
+}
 
 /** Host statuses for the route: every connected agent + every host we've heard from. */
 export function hostStatuses(userId: string, instanceNames: Map<string, string>): HostStatus[] {
@@ -395,7 +537,7 @@ function tick(): void {
   const users = new Set(getConnectedAgents().map(a => a.userId));
   for (const userId of users) {
     if (inFlight.has(userId)) continue;
-    const next = due.get(userId) ?? (now + hashStagger(userId));
+    const next = due.get(userId) ?? nextDueAt(userId, now);
     if (!due.has(userId)) due.set(userId, next);
     if (now >= next) void runUserScan(userId);
   }

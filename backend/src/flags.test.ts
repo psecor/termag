@@ -104,7 +104,8 @@ describe('flag registry', () => {
   it('gives each entry a fallback of its kind and docs that exist', () => {
     for (const key of keys) {
       const spec = FLAG_REGISTRY[key];
-      if (spec.kind === 'json') expect(spec.fallback, `${key}: a json flag falls back to its reader's code defaults`).toBeNull();
+      // A json flag falls back to its reader's code defaults (null), or to [] for a list that must fail closed (mcp-upstream-allowlist).
+      if (spec.kind === 'json') expect([null, '[]'], `${key}: a json flag falls back to null or []`).toContain(spec.fallback === null ? null : JSON.stringify(spec.fallback));
       else expect(typeof spec.fallback, key).toBe(spec.kind);
       expect(spec.addedIn, key).toMatch(/^#\d+$/);
       if ('docs' in spec) expect(existsSync(join(repo, spec.docs)), `${key}: ${spec.docs}`).toBe(true);

@@ -24,6 +24,7 @@ import { boolVariationOrUnknown } from './featureFlags';
 import type { FlagBox, FlagUser } from './featureFlags';
 import { catalogForUser, listConnectors } from './mcpConnectorStore';
 import { getMcpBrokerUrl } from './mcpConnectors';
+import type { ChatEngine } from '../providers/registry';
 
 export const CHAT_CONFINED_MCP_CAPABILITY = 'chat-confined-mcp-v1';
 export const CHAT_CONFINED_MCP_FLAG = 'chat-confined-mcp-enabled';
@@ -82,7 +83,7 @@ export interface BrokerMcpTarget {
   agentCapabilities: readonly string[];
   /** An ask's chat: never (its turns are the ask runner's). */
   ask?: unknown;
-  engine?: 'claude' | 'pi' | null;
+  engine?: ChatEngine | null;
 }
 
 export interface BrokerMcpDeps {
@@ -108,6 +109,8 @@ export interface AutomationOutputs {
   spaceNames: readonly string[];
   /** Each finished run's report goes to the project's Slack channel (Automation.notifySlack). */
   notifySlack: boolean;
+  /** A keyword alert to a channel, or a webhook, sends the run's summary beyond the owner (alertsLeaveOwner). */
+  alertsLeaveOwner?: boolean;
   /** The turn's workstream has a Slack channel (its own, or the project's for main), or it could not be told. */
   workstreamSlack: boolean;
   /** People the project is shared with, or have a pending invitation to it: they read its chats. */
@@ -134,7 +137,7 @@ export interface SpaceReaders {
  * lookup that fails included (it throws to the caller), is not.
  */
 export async function automationStaysWithOwner(outputs: AutomationOutputs, ownerId: string, spaceReaders: BrokerMcpDeps['spaceReaders']): Promise<boolean> {
-  if (outputs.notifySlack || outputs.workstreamSlack || outputs.projectSharees > 0) return false;
+  if (outputs.notifySlack || outputs.alertsLeaveOwner || outputs.workstreamSlack || outputs.projectSharees > 0) return false;
   for (const name of new Set(outputs.spaceNames)) {
     if (!privateToOwner(await spaceReaders(name), ownerId)) return false;
   }
@@ -144,6 +147,12 @@ export async function automationStaysWithOwner(outputs: AutomationOutputs, owner
 function privateToOwner(readers: SpaceReaders | null, ownerId: string): boolean {
   if (!readers || readers.pendingInvites > 0 || readers.slackLinked || readers.fileShares > 0) return false;
   return readers.memberIds.length > 0 && readers.memberIds.every(id => id === ownerId);
+}
+
+/** Whether an automation's alerts or webhook send its runs' words anywhere but the owner's own DM. */
+export function alertsLeaveOwner(a: { alertPrefix: string | null; alertRegex: string | null; alertTarget: string; webhookHost: string | null }): boolean {
+  if (a.webhookHost) return true;
+  return (!!a.alertPrefix || !!a.alertRegex) && a.alertTarget !== 'dm';
 }
 
 const LD_USER_SELECT = { id: true, googleEmail: true, displayName: true, unixUsername: true, defaultAgentProvider: true } as const;
@@ -169,7 +178,7 @@ export async function automationOutputsOf(projectId: string, workstreamId: strin
   const a = await prisma.automation.findUnique({
     where: { projectId },
     // Pending invites only: an accepted or declined one stays as a row (Bugbot, #1433); an accepted one that still counts is a share.
-    select: { spaceName: true, notifySlack: true, project: { select: { slackChannelId: true, _count: { select: { shares: true, invites: { where: { status: 'pending' } } } } } } },
+    select: { spaceName: true, notifySlack: true, alertPrefix: true, alertRegex: true, alertTarget: true, webhookHost: true, project: { select: { slackChannelId: true, _count: { select: { shares: true, invites: { where: { status: 'pending' } } } } } } },
   });
   if (!a) return null;
   const ws = workstreamId
@@ -181,7 +190,7 @@ export async function automationOutputsOf(projectId: string, workstreamId: strin
   const chatSpace = ws?.spaceId ? ws.space?.name ?? null : null;
   if (ws?.spaceId && !chatSpace) throw new Error(`the space of workstream ${workstreamId} could not be read`);
   const spaceNames = [a.spaceName, chatSpace].filter((n): n is string => typeof n === 'string');
-  return { spaceNames, notifySlack: a.notifySlack, workstreamSlack, projectSharees: a.project._count.shares + a.project._count.invites };
+  return { spaceNames, notifySlack: a.notifySlack, alertsLeaveOwner: alertsLeaveOwner(a), workstreamSlack, projectSharees: a.project._count.shares + a.project._count.invites };
 }
 
 /** BrokerMcpDeps.spaceReaders from the database: null when there is no such live space. */
@@ -217,7 +226,8 @@ export async function brokerMcpFor(target: BrokerMcpTarget, deps: BrokerMcpDeps 
     if (!target.isOwner) return none();
     const broker = deps.broker();
     // A pi turn takes only "none": its confined turns load no MCP, and its bypass turns load the owner's own.
-    if (target.engine === 'pi' || !broker) return null;
+    // Only Claude Code's turns load broker connectors: pi's and Cursor's load no MCP server here.
+    if ((target.engine && target.engine !== 'claude') || !broker) return null;
     // An automation's run or follow-up: only when all it produces stays with the owner. A lookup that fails is caught below: nothing.
     const automation = await deps.automation(target.projectId, target.workstreamId);
     if (automation && !await automationStaysWithOwner(automation, target.ownerId, deps.spaceReaders)) return null;

@@ -351,7 +351,16 @@ export interface ListenerView {
   verdict: { ok: true } | { ok: false; code: string; reason: string };
   /** The listener's process runs from the workstream's checkout. */
   inCheckout: boolean;
+  /**
+   * Every holder of the port descends from a `termag preview run` of the
+   * workstream's checkout (agent/preview-runs.js), which a `people` or `link`
+   * link needs (SR9). False from an agent too old to say.
+   */
+  confined: boolean;
 }
+
+/** A wider audience's refusal of an unconfined listener; the agent's tunnel-open says the same (agent/port-tunnel.js). */
+export const NOT_CONFINED_REASON = 'Start this app with termag preview run on its box to share it beyond the project';
 
 /** The agent's `preview-listeners` answer, as the dialog may show it: bounded, typed, anything else dropped. */
 export function parseListeners(raw: unknown): ListenerView[] | null {
@@ -374,6 +383,7 @@ export function parseListeners(raw: unknown): ListenerView[] | null {
         reason: typeof v?.reason === 'string' ? v.reason.slice(0, REASON_MAX) : 'the box refused this port',
       },
       inCheckout: inCheckout === true,
+      confined: (l as Record<string, unknown>).confined === true,
     });
   }
   return out;
@@ -447,20 +457,35 @@ export async function checkPublishable(deps: PreviewLinkDeps, caller: PreviewLin
   return { ok: true, project, isProjectOwner: s.isProjectOwner, req, workstreamId: ws.id, grantees };
 }
 
-export async function publishPreviewLinkFor(deps: PreviewLinkDeps, caller: PreviewLinkCaller, projectId: string, body: unknown): Promise<RouteResult> {
-  const checked = await checkPublishable(deps, caller, projectId, body);
-  if (!checked.ok) return checked.result;
-  const { project, req, grantees } = checked;
-  const ws = { id: checked.workstreamId };
-
-  // A debugger, shell or notebook can't be published (SR6), nor anything else
-  // the guard refuses; a port nobody listens on yet can (U5).
+/**
+ * What the box says of the port a publish names, as a refusal or null. A
+ * debugger, shell or notebook can't be published (SR6), nor anything else the
+ * guard refuses. A `people` or `link` audience also needs the listener started
+ * with `termag preview run` for this checkout (SR9): 409 `not_confined`. A port
+ * nobody listens on yet can be published (U5); whatever starts there later
+ * is checked at every tunnel-open, which is what admits a viewer.
+ */
+export async function listenerRefusal(deps: PreviewLinkDeps, project: PreviewLinkProject, req: Pick<PublishRequest, 'workstream' | 'port' | 'audience'>): Promise<RouteResult | null> {
   const refusal = boxRefusal(deps, project);
   if (refusal) return refusal;
   const listeners = await askListeners(deps, project, req.workstream, req.port);
   if (!Array.isArray(listeners)) return listeners;
   const listener = listeners.find(l => l.port === req.port);
   if (listener && !listener.verdict.ok) return err(403, 'port_refused', listener.verdict.reason);
+  if (listener && req.audience !== 'owner' && !listener.confined) {
+    return err(409, 'not_confined', `${NOT_CONFINED_REASON}: port ${req.port} runs outside it`);
+  }
+  return null;
+}
+
+export async function publishPreviewLinkFor(deps: PreviewLinkDeps, caller: PreviewLinkCaller, projectId: string, body: unknown): Promise<RouteResult> {
+  const checked = await checkPublishable(deps, caller, projectId, body);
+  if (!checked.ok) return checked.result;
+  const { project, req, grantees } = checked;
+  const ws = { id: checked.workstreamId };
+
+  const refused = await listenerRefusal(deps, project, req);
+  if (refused) return refused;
 
   if (req.requestId) {
     const r = await deps.store.findRequest(req.requestId);
@@ -476,6 +501,11 @@ export async function publishPreviewLinkFor(deps: PreviewLinkDeps, caller: Previ
     const row = await tx.readName(req.name);
     const decision = nameDecision(row, { publisherId: caller.id, projectId: project.id, workstreamId: ws.id }, now);
     if (decision.kind === 'refuse') return { kind: 'refused', result: err(decision.status, decision.code, decision.error) } as const;
+    // A request's publish makes a link for its port; it never renews another live link in place, which would move
+    // that link's port and narrow its audience with its viewers revoked (Bugbot, #1568).
+    if (req.requestId && decision.kind === 'renew') {
+      return { kind: 'refused', result: err(409, 'name_live', `"${req.name}" is a live link already; publish this request under another name`) } as const;
+    }
     // A renew changes the link's audience, people, port and token: the same
     // rule as any other change (LINK_MANAGE_POLICY), so a collaborator renews
     // only their own link, and the project's owner any. Checked before

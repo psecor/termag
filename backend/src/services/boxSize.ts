@@ -2,12 +2,17 @@
  * Box sizes: which EC2 types a box launches as, chosen per box.
  *
  * Three sizes, all arm64 (the AMI is arm64-only), each an instance type and
- * the same-shape types to try when EC2 has no capacity for it
+ * the types to try when EC2 has no capacity for it
  * (boxProvisioner.withInstanceTypes walks them in order):
  *
- *   small   m8g.large    2 vCPU,  8 GiB
- *   medium  m8g.xlarge   4 vCPU, 16 GiB
- *   large   m8g.2xlarge  8 vCPU, 32 GiB
+ *   small   m8g.large   2 vCPU,  8 GiB  (general purpose)
+ *   medium  m8g.xlarge  4 vCPU, 16 GiB  (general purpose)
+ *   large   r8g.xlarge  4 vCPU, 32 GiB  (memory optimized)
+ *
+ * Large is medium's vCPUs with twice the memory: what a box's dev stack runs
+ * short of is memory. A box asking for more vCPUs than 4 says so as
+ * requirements (`{ "vcpu": 8, "memoryGiB": 32 }`, services/boxRequirements.ts),
+ * which EC2 matches to an 8 vCPU type.
  *
  * A launch's size, in this order (decideBoxSize): the one asked for (`--size`,
  * the New box dropdown); else the repository's `.termag/environment.json` `size`,
@@ -48,20 +53,22 @@ export interface BoxSizeSpec {
 }
 
 /**
- * Each size's types when its BOX_<SIZE>_INSTANCE_TYPES is unset: the m8g, then
- * the same vCPU and at least the memory in the families beside it, then the
- * next size up, which costs more but beats no box.
+ * Each size's types when its BOX_<SIZE>_INSTANCE_TYPES is unset: the first
+ * type, then the same vCPU and at least the memory in the families beside it,
+ * then a bigger type, which costs more but beats no box. Large's fallbacks
+ * keep at least its 4 vCPU and 32 GiB: r7g.xlarge, then the 8 vCPU m types,
+ * all within the resize cap (boxResizePolicy.resizeTypeAllowed).
  */
 const DEFAULT_TYPES: Record<BoxSize, string[]> = {
   small: ['m8g.large', 'm7g.large', 'r8g.large', 'r7g.large', 'm8g.xlarge'],
   medium: ['m8g.xlarge', 'm7g.xlarge', 'r8g.xlarge', 'r7g.xlarge', 'm8g.2xlarge'],
-  large: ['m8g.2xlarge', 'm7g.2xlarge', 'r8g.2xlarge', 'r7g.2xlarge', 'm8g.4xlarge'],
+  large: ['r8g.xlarge', 'r7g.xlarge', 'm8g.2xlarge', 'm7g.2xlarge'],
 };
 
 const SHAPES: Record<BoxSize, { vcpus: number; memoryGiB: number }> = {
   small: { vcpus: 2, memoryGiB: 8 },
   medium: { vcpus: 4, memoryGiB: 16 },
-  large: { vcpus: 8, memoryGiB: 32 },
+  large: { vcpus: 4, memoryGiB: 32 },
 };
 
 export function isBoxSize(value: unknown): value is BoxSize {
@@ -90,7 +97,10 @@ export function boxSizeSpec(size: BoxSize, env: NodeJS.ProcessEnv = process.env)
 /**
  * The smallest preset at least as big as `r` in both vCPUs and memory, else
  * large: what a Retry of a requirements box launches when EC2 can't match
- * them again, so the replacement is never smaller than the box it replaces.
+ * them again, so the replacement is never smaller than the box it replaces
+ * when a preset covers it. Requirements over large's 4 vCPU (up to
+ * boxRequirements.BOX_REQUIREMENT_LIMITS' 8) have no covering preset and
+ * fall back to large, which has the memory and fewer vCPUs.
  */
 export function coveringPreset(r: BoxRequirements): BoxSize {
   return BOX_SIZES.find(s => SHAPES[s].vcpus >= r.vcpu && SHAPES[s].memoryGiB >= r.memoryGiB) ?? 'large';
@@ -157,10 +167,10 @@ export interface RepoBoxSizes {
 /**
  * The largest of several repositories' sizes (a multi-repo project's): the
  * most vCPUs and the most memory any of them asks for, each on its own, so
- * 4/32 and 8/16 make 8/32. A preset counts as its shape, and a result that
- * is a preset's shape is that preset. Each input is within the limits
- * (boxRequirements.BOX_REQUIREMENT_LIMITS is large's shape), so the result
- * is too. Null when none says anything.
+ * 4/32 and 8/16 make 8/32, requirements no preset has. A preset counts as its shape, and a
+ * result that is a preset's shape is that preset. Each input is within the
+ * limits (boxRequirements.BOX_REQUIREMENT_LIMITS), so the result is too. Null
+ * when none says anything.
  */
 export function largestBoxSize(sizes: ReadonlyArray<BoxSize | BoxRequirements | null>): BoxSize | BoxRequirements | null {
   const shapes = sizes.filter((s): s is BoxSize | BoxRequirements => s != null)

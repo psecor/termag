@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = vi.hoisted(() => ({
+  $transaction: vi.fn(),
+  automationNotice: { createMany: vi.fn(async () => ({ count: 0 })), findMany: vi.fn(async () => []) },
   automation: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   automationRun: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn(), updateMany: vi.fn(), count: vi.fn() },
   instance: { findUnique: vi.fn() },
@@ -52,6 +54,8 @@ function p2002(): Error {
 beforeEach(() => {
   vi.clearAllMocks();
   prisma.automation.update.mockResolvedValue({});
+  prisma.automation.updateMany.mockResolvedValue({ count: 1 });
+  prisma.$transaction.mockImplementation(async (fn: (tx: unknown) => unknown) => fn(prisma));
   prisma.automationRun.create.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ id: `r-${(data.scheduledFor as Date).toISOString()}`, ...data }));
   prisma.automationRun.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => ({ id: where.id, state: 'pending', trigger: 'schedule', scheduledFor: new Date('2026-10-20T09:00:00Z'), automationId: 'a1' }));
   prisma.automationRun.findMany.mockResolvedValue([]);
@@ -148,7 +152,7 @@ describe('startDue', () => {
     vi.mocked(startRun).mockResolvedValueOnce({ kind: 'failed', reason: 'launch', error: 'git worktree add failed' });
     expect(await startDue(now)).toBe(0);
     expect(prisma.automationRun.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ state: 'running' }), data: expect.objectContaining({ state: 'failed', reason: 'launch' }) }));
-    expect(prisma.automation.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ consecutiveFailures: 3, pausedReason: 'consecutive_failures' }) }));
+    expect(prisma.automation.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'a1', pausedReason: null }, data: expect.objectContaining({ consecutiveFailures: 3, pausedReason: 'consecutive_failures' }) }));
   });
 
   it('leaves the workstream link to the runner (it is written before the brief is sent)', async () => {
@@ -181,7 +185,7 @@ describe('decideAndStart', () => {
   it('pauses a t3 automation whose box is gone, rather than skipping it as flag_off for good', async () => {
     const t3 = { ...automation, kind: 't3', project: { ...automation.project, instanceId: null, instance: null } };
     expect(await decideAndStart(t3 as never, 'r1', DEFAULT_AUTOMATION_LIMITS, now)).toEqual({ kind: 'skip', reason: 'box_gone' });
-    expect(prisma.automation.update).toHaveBeenCalledWith({ where: { id: 'a1' }, data: { pausedReason: 'box_gone' } });
+    expect(prisma.automation.updateMany).toHaveBeenCalledWith({ where: { id: 'a1', pausedReason: null }, data: { pausedReason: 'box_gone' } });
   });
 
   it('reports an older runner as a skip', async () => {
@@ -280,7 +284,7 @@ describe('timeOutRuns', () => {
     vi.mocked(jsonVariation).mockResolvedValueOnce({ pauseAfterFailures: 2 });
     expect(await timeOutRuns(now)).toBe(1);
     expect(jsonVariation).toHaveBeenCalledWith('automation-limits', expect.objectContaining({ id: 'u1', unixUsername: 'me', googleEmail: 'me@x' }), null, expect.objectContaining({ id: 'box1', name: 'me-box', kind: 'ec2' }));
-    expect(prisma.automation.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ consecutiveFailures: 2, pausedReason: 'consecutive_failures' }) }));
+    expect(prisma.automation.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ consecutiveFailures: 2, pausedReason: 'consecutive_failures' }) }));
   });
 
   it('leaves a run inside its limit alone', async () => {

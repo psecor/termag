@@ -6,6 +6,7 @@ import {
   proofHeaders,
   roleArnOf,
   verifyCallerProof,
+  StsUnavailableError,
   type Fetch,
 } from './callerIdentity';
 
@@ -22,11 +23,11 @@ const proof = (over: Record<string, string> = {}) => ({
   ...over,
 });
 
-function sts(arn: string | null, status = 200) {
+function sts(arn: string | null, status = 200, errorCode = 'SignatureDoesNotMatch') {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const f: Fetch = async (url, init) => {
     calls.push({ url: String(url), init: init ?? {} });
-    const body = arn ? `<GetCallerIdentityResponse><GetCallerIdentityResult><Arn>${arn}</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>` : '<Error/>';
+    const body = arn ? `<GetCallerIdentityResponse><GetCallerIdentityResult><Arn>${arn}</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>` : `<ErrorResponse><Error><Type>Sender</Type><Code>${errorCode}</Code></Error></ErrorResponse>`;
     return new Response(body, { status });
   };
   return { f, calls };
@@ -92,6 +93,16 @@ describe('verifyCallerProof', () => {
     const none = sts(GATEWAY);
     expect(await verifyCallerProof({ authorization: 'Basic Ym94' }, cfg, none.f)).toBeNull();
     expect(none.calls).toHaveLength(0);
+  });
+
+  it('throws, rather than refusing, when STS is throttled or failing (bug cmw5ja1m)', async () => {
+    for (const [status, code] of [[400, 'Throttling'], [429, '-'], [500, 'InternalFailure'], [503, 'ServiceUnavailable']] as const) {
+      const { f } = sts(null, status, code);
+      await expect(verifyCallerProof(proof(), cfg, f)).rejects.toBeInstanceOf(StsUnavailableError);
+    }
+    // Not cached: the next request asks STS again and passes.
+    const ok = sts('arn:aws:sts::111122223333:assumed-role/termag-claude-gateway-task/s1');
+    expect(await verifyCallerProof(proof(), cfg, ok.f)).toBe(GATEWAY);
   });
 
   it('asks STS once for a proof it has verified, for five minutes', async () => {

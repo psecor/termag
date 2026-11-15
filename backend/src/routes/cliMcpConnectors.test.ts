@@ -32,7 +32,7 @@ beforeAll(async () => {
   app.use('/api/cli/v1', cliApiRouter({
     store, codes: new AuthCodeStore(), jwt: new Promise(() => {}), now: () => now,
     mcpConnectors: {
-      list: async (user) => ({ available: true, connectors: [{ id: 'c1', name: 'linear', upstream: `https://mcp.linear.app/sse?u=${user.id}`, authType: 'oauth', status: 'ready' }] }),
+      list: async (user) => ({ available: true, connectors: [{ id: 'c1', name: 'linear', upstream: `https://mcp.linear.app/sse?u=${user.id}`, authType: 'oauth', status: 'ready', blocked: null }] }),
     },
   }));
   await new Promise<void>(resolve => { server = app.listen(0, '127.0.0.1', () => resolve()); });
@@ -48,7 +48,7 @@ describe('GET /api/cli/v1/mcp-connectors', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       enabled: true, available: true,
-      connectors: [{ id: 'c1', name: 'linear', upstream: 'https://mcp.linear.app/sse?u=alice', authType: 'oauth', status: 'ready' }],
+      connectors: [{ id: 'c1', name: 'linear', upstream: 'https://mcp.linear.app/sse?u=alice', authType: 'oauth', status: 'ready', blocked: null }],
     });
     expect((await get(null)).status).toBe(401);
   });
@@ -63,5 +63,12 @@ describe('connectorStatus', () => {
     expect(connectorStatus({ ...base, authType: 'static', missingSecrets: ['TOKEN'] } as never)).toBe('needs_secrets');
     expect(connectorStatus({ ...base, authType: 'static', missingSecrets: [] } as never)).toBe('ready');
     expect(connectorStatus({ ...base, authType: 'static', secretNames: null, missingSecrets: [] } as never)).toBe('secrets_unreadable');
+  });
+
+  it('reads a connector the allowlist refuses as blocked, before its link or secrets', () => {
+    const reason = "This MCP server isn't on termag's allowlist";
+    expect(connectorStatus({ ...base, authType: 'oauth', missingSecrets: [], linkStatus: 'linked', linkError: null, oauth: null, blocked: reason } as never)).toBe('blocked');
+    expect(connectorStatus({ ...base, authType: 'static', missingSecrets: [], blocked: reason } as never)).toBe('blocked');
+    expect(connectorStatus({ ...base, authType: 'static', missingSecrets: ['TOKEN'], blocked: reason } as never)).toBe('blocked');
   });
 });

@@ -179,6 +179,26 @@ describe('from a sign-in made on a box', () => {
     expect(await c.confirmPageFor(t.deps, 'alice', idOf(r))).toMatchObject({ kind: 'extend', audience: 'people', emails: ['bob@x.test'] });
   });
 
+  // Pinning (SR9): the confirm can't widen an unconfined listener either. The
+  // box's answer is asked before the person is sent to click, and again on apply.
+  it('refuses a wider audience for an unconfined listener before any confirm, and fails an apply whose listener is no longer confined', async () => {
+    const t = setup();
+    let listeners: Array<Record<string, unknown>> = [{ port: 4000, pid: 9, command: 'node server.js', verdict: { ok: true }, inCheckout: true }];
+    t.deps.links.agent.send = async () => ({ listeners });
+    for (const body of [{ port: 4000, name: 'my-app', audience: 'link' }, { port: 4000, name: 'my-app', audience: 'people', emails: ['bob@x.test'] }]) {
+      expect(await c.publishFromBoxFor(t.deps, as(alice), PROJECT, body, box.id)).toMatchObject({ status: 409, body: { code: 'not_confined' } });
+    }
+    expect(t.rows.size).toBe(0);
+    // Confined when asked; restarted unconfined before the click: the apply refuses it.
+    listeners = [{ ...listeners[0], confined: true }];
+    const id = idOf(await c.publishFromBoxFor(t.deps, as(alice), PROJECT, { port: 4000, name: 'my-app', audience: 'link' }, box.id));
+    listeners = [{ ...listeners[0], confined: false }];
+    const page = await c.confirmPageFor(t.deps, 'alice', id);
+    expect(await c.decideConfirmationFor(t.deps, as(alice), id, 'publish', page!.csrf)).toEqual({ ok: true, state: 'failed' });
+    expect(((await c.confirmationStatusFor(t.deps, as(alice), id)).body as any)).toMatchObject({ state: 'failed', failure: expect.stringContaining('termag preview run') });
+    expect(t.mem.links).toEqual([]);
+  });
+
   it('a confirm whose publish is refused by then ends failed, with the reason for the CLI', async () => {
     const t = setup();
     const id = idOf(await c.publishFromBoxFor(t.deps, as(alice), PROJECT, { port: 5173, name: 'taken-app', audience: 'link' }, box.id));

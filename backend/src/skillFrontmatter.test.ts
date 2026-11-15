@@ -55,6 +55,8 @@ describe('SKILL.md frontmatter under deploy/ is strict YAML', () => {
     const rel = files.map((f) => relative(repo, f));
     expect(rel).toContain('deploy/claude-skills/termag-bug-report/SKILL.md');
     expect(rel).toContain('deploy/pi-skills/termag-bug-report/SKILL.md');
+    expect(rel).toContain('deploy/claude-skills/termag-feedback/SKILL.md');
+    expect(rel).toContain('deploy/pi-skills/termag-feedback/SKILL.md');
   });
 
   it('rejects an unquoted description containing ": "', () => {

@@ -445,7 +445,7 @@ describe('Codex', () => {
 });
 
 describe('the Cursor agent', () => {
-  const PIN = '2026.10.22-27dcf5f'; // cursorUpdatePolicy.ts CURSOR_PINNED_LATEST, what its latest resolves to
+  const PIN = '2026.11.05-86047df'; // cursorUpdatePolicy.ts CURSOR_PINNED_LATEST, what its latest resolves to
   const cursorRuns = () => [...runs.values()].filter(r => r.component === 'cursor' && r.reason);
   const cursorRpcs = () => rpcs().filter(c => (c[2] as { component: string }).component === 'cursor');
   const on = (...ids: string[]) => { for (const id of ids) { cursorAuto.add(id); cursorUpdate.add(id); } };
@@ -465,7 +465,7 @@ describe('the Cursor agent', () => {
   it('leaves alone a box on the newest pin, or ahead of every pin, even when it has been due for days', async () => {
     const fig = seed('fig', { lastRunH: 72, activity: 0 }), sage = seed('sage', { lastRunH: 72 });
     on(fig, sage); cursorCapable.add(fig).add(sage);
-    cursorInventory.set(fig, PIN).set(sage, '2026.10.30-abc1234');
+    cursorInventory.set(fig, PIN).set(sage, '2026.11.30-abc1234');
     expect(byBox(await runAutoUpdateSweep({ now: NOW }), 'cursor')).toEqual({ fig: 'current', sage: 'current' });
     expect(cursorRuns()).toEqual([]);
   });
@@ -762,10 +762,10 @@ describe('Node', () => {
     const fig = seed('fig', {}), olive = seed('olive', {});
     on(fig, olive); nodeCapable.add(fig).add(olive);
     nodeInventory.set(fig, '24.23.0').set(olive, '24.20.0');
-    // Below node-update-policy's floor (24.22.1) for three days, with idle floor runs all along: Claude Code would force by now.
-    states.set(`${olive}:node`, { hostKey: olive, component: 'node', firstSeenAt: ago(240), lastSeenAt: ago(0.25), breachFloor: '24.22.1', breachSince: ago(72), breachSeenAt: ago(0.25) });
+    // Below node-update-policy's floor (24.22.3) for three days, with idle floor runs all along: Claude Code would force by now.
+    states.set(`${olive}:node`, { hostKey: olive, component: 'node', firstSeenAt: ago(240), lastSeenAt: ago(0.25), breachFloor: '24.22.3', breachSince: ago(72), breachSeenAt: ago(0.25) });
     expect(byBox(await runAutoUpdateSweep({ now: NOW }), 'node')).toEqual({ fig: 'queued nightly/idle', olive: 'queued floor/idle' });
-    expect(nodeRuns().find(r => r.hostKey === olive)!.reason).toBe('24.20.0 is below the floor 24.22.1');
+    expect(nodeRuns().find(r => r.hostKey === olive)!.reason).toBe('24.20.0 is below the floor 24.22.3');
     ld.raw.mockImplementation((async () => null) as never);
   });
 

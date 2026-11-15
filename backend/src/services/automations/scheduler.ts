@@ -22,8 +22,10 @@ import { T3_CAPABILITY } from '../desktopAppFlag';
 import { boolVariation } from '../featureFlags';
 import { removeWorkstreamFor } from '../../routes/workstreams';
 import { admitRun, type AdmitDecision } from './admit';
+import { noteFailedRun, pauseAutomation } from './alerts';
 import { reportRun, settleInterruptedRun } from './complete';
 import { automationLimitsFor, type AutomationLimits } from './limits';
+import { finishRunWithEvent, startNoticeSweep } from './notices';
 import { startRun } from './runner';
 import { MAX_ENUMERATED, newestOccurrence, occurrenceMinute, occurrencesBetween, nextOccurrence } from './schedule';
 import { FINISHED_RUN_STATES } from './store';
@@ -104,9 +106,10 @@ export async function decideAndStart(a: Row, runId: string, limits: AutomationLi
     // Only a row still pending is this decision's: another leader, or Run now
     // against resolvePending, may have claimed and started it meanwhile, and
     // a live turn's row must stay `running` for completion, the timeout and Stop.
-    const skipped = await prisma.automationRun.updateMany({ where: { id: run.id, state: 'pending' }, data: { state: 'skipped', reason: decision.reason, finishedAt: now } });
-    if (skipped.count === 0) return { kind: 'skip', reason: 'previous_running' };
-    if (decision.reason === 'box_gone') await prisma.automation.update({ where: { id: a.id }, data: { pausedReason: 'box_gone' } });
+    // A box_unavailable skip raises its event with the write (finishRunWithEvent); delivery tells the first of a streak.
+    const skipped = await finishRunWithEvent({ id: run.id, automationId: a.id }, { state: 'pending' }, { state: 'skipped', reason: decision.reason, finishedAt: now });
+    if (skipped === 0) return { kind: 'skip', reason: 'previous_running' };
+    if (decision.reason === 'box_gone') await pauseAutomation(a.id, 'box_gone', { runId: run.id, error: inst ? `${inst.name} is ${inst.status}` : 'no box' });
     console.log(`[AUTOMATION] ${a.project.user.unixUsername} ${a.project.name} ${run.scheduledFor.toISOString()} → skipped ${decision.reason}`);
     return decision;
   }
@@ -161,12 +164,10 @@ export async function decideAndStart(a: Row, runId: string, limits: AutomationLi
     const skip = outcome.reason === 'runner_outdated';
     // Only a row still running is ours to fail: a fast turn may have ended
     // (and completion written the row) before the send's error came back.
-    const failed = await prisma.automationRun.updateMany({
-      where: { id: run.id, state: 'running' },
-      data: { state: skip ? 'skipped' : 'failed', reason: outcome.reason, summary: outcome.error, finishedAt: new Date() },
-    });
-    if (failed.count > 0) {
-      if (!skip) await noteFailure(a, limits);
+    const failed = await finishRunWithEvent({ id: run.id, automationId: a.id }, { state: 'running' },
+      { state: skip ? 'skipped' : 'failed', reason: outcome.reason, summary: outcome.error, finishedAt: new Date() });
+    if (failed > 0) {
+      if (!skip) await noteFailure(a, limits, { id: run.id, reason: outcome.reason });
       console.warn(`[AUTOMATION] ${a.project.name} ${run.scheduledFor.toISOString()} → ${skip ? 'skipped' : 'failed'} ${outcome.reason}: ${outcome.error}`);
       // No turn, so no turn-end: the channel hears about a failed launch from here.
       if (!skip) await reportRun(run.id).catch(err => console.warn(`[AUTOMATION] ${a.project.name}: report failed: ${(err as Error).message}`));
@@ -228,11 +229,8 @@ async function startT3Run(
   const finishedAt = new Date();
   const report = () => reportRun(run.id).catch(err => console.warn(`[AUTOMATION] ${a.project.name}: report failed: ${(err as Error).message}`));
   if (outcome.kind === 'started') {
-    const done = await prisma.automationRun.updateMany({
-      where: { id: run.id, state: 'running' },
-      data: { state: 'done', summary: `Started its T3 task on ${inst.name}`, finishedAt },
-    });
-    if (done.count > 0) {
+    const done = await finishRunWithEvent({ id: run.id, automationId: a.id }, { state: 'running' }, { state: 'done', summary: `Started its T3 task on ${inst.name}`, finishedAt });
+    if (done > 0) {
       await prisma.automation.update({
         where: { id: a.id },
         data: { consecutiveFailures: 0, lastOccurrence: run.trigger === 'schedule' ? run.scheduledFor : a.lastOccurrence },
@@ -242,26 +240,19 @@ async function startT3Run(
     }
     return { kind: 'start' };
   }
-  const failed = await prisma.automationRun.updateMany({
-    where: { id: run.id, state: 'running' },
-    data: { state: 'failed', reason: outcome.reason, summary: outcome.error, finishedAt },
-  });
-  if (failed.count > 0) {
+  const failed = await finishRunWithEvent({ id: run.id, automationId: a.id }, { state: 'running' }, { state: 'failed', reason: outcome.reason, summary: outcome.error, finishedAt });
+  if (failed > 0) {
     // A task that is gone fails every later run the same way: pause now, not after three.
-    if (outcome.pause) await prisma.automation.update({ where: { id: a.id }, data: { pausedReason: outcome.reason } });
-    else await noteFailure(a, limits);
+    if (outcome.pause) await pauseAutomation(a.id, outcome.reason, { runId: run.id, error: outcome.error });
+    else await noteFailure(a, limits, { id: run.id, reason: outcome.reason });
     console.warn(`[AUTOMATION] ${a.project.name} ${run.scheduledFor.toISOString()} → failed ${outcome.reason}: ${outcome.error}`);
     await report();
   }
   return { kind: 'failed', reason: outcome.reason, error: outcome.error };
 }
 
-async function noteFailure(a: Row, limits: AutomationLimits): Promise<void> {
-  const failures = a.consecutiveFailures + 1;
-  await prisma.automation.update({
-    where: { id: a.id },
-    data: { consecutiveFailures: failures, ...(failures >= limits.pauseAfterFailures ? { pausedReason: 'consecutive_failures' } : {}) },
-  });
+function noteFailure(a: Pick<Row, 'id' | 'consecutiveFailures'>, limits: AutomationLimits, run: { id: string; reason: string | null }): Promise<void> {
+  return noteFailedRun(a.id, a.consecutiveFailures, limits.pauseAfterFailures, run);
 }
 
 /** The owner's and box's real flag contexts for an automation whose row was read without them. */
@@ -288,11 +279,11 @@ export async function timeOutRuns(now: Date): Promise<number> {
     const limitMs = r.automation.maxRunMinutes * 60_000;
     if (!r.startedAt || now.getTime() - r.startedAt.getTime() < limitMs) continue;
     const p = r.automation.project;
-    const updated = await prisma.automationRun.updateMany({
-      where: { id: r.id, state: 'running' },
-      data: { state: 'failed', reason: 'timeout', finishedAt: now, summary: `stopped after ${r.automation.maxRunMinutes} minutes` },
-    });
-    if (updated.count === 0) continue; // finished on its own meanwhile
+    // One run's trouble must not keep the sweep from the others.
+    try {
+    const updated = await finishRunWithEvent({ id: r.id, automationId: r.automationId }, { state: 'running' },
+      { state: 'failed', reason: 'timeout', finishedAt: now, summary: `stopped after ${r.automation.maxRunMinutes} minutes` });
+    if (updated === 0) continue; // finished on its own meanwhile
     await noteAutomationRunActivity(r.instanceId, now);
     if (r.workstream && p.instanceId) {
       await sendForProject({ userId: p.userId, instanceId: p.instanceId }, 'chat-interrupt', { chatKey: chatKeyFor(p.id, r.workstream.id) }, 10_000)
@@ -300,7 +291,7 @@ export async function timeOutRuns(now: Date): Promise<number> {
     }
     n++;
     const limits = await limitsForAutomation(r.automation.userId, p.instanceId);
-    await noteFailure(r.automation as unknown as Row, limits);
+    await noteFailure(r.automation, limits, { id: r.id, reason: 'timeout' });
     console.warn(`[AUTOMATION] ${p.name} ${r.scheduledFor.toISOString()} → failed timeout`);
     // This sweep owns the run's end: its notes push takes its place in the
     // queue now, before startDue below can start the next run's pull, and
@@ -308,6 +299,9 @@ export async function timeOutRuns(now: Date): Promise<number> {
     // has stopped the turn's writes (complete.ts settleInterruptedRun); a
     // snapshot taken now would keep the turn's in-flight state as Changes.
     await settleInterruptedRun(r.id, NOTES_PUSH_DELAY_MS);
+    } catch (err) {
+      console.error(`[AUTOMATION] ${p.name}: timing out run ${r.id} failed:`, (err as Error).message);
+    }
   }
   return n;
 }
@@ -322,6 +316,8 @@ export async function timeOutRuns(now: Date): Promise<number> {
 export async function resolvePending(now: Date): Promise<void> {
   const rows = await prisma.automationRun.findMany({ where: { state: 'pending' }, select: { id: true, automationId: true, createdAt: true } });
   for (const r of rows) {
+    // One run's trouble must not keep the sweep from the others.
+    try {
     const a = await prisma.automation.findUnique({ where: { id: r.automationId }, include: ROW_INCLUDE });
     if (!a) continue;
     if (!a.enabled || a.project.archived) {
@@ -332,11 +328,15 @@ export async function resolvePending(now: Date): Promise<void> {
     const box = a.project.instance ? { id: a.project.instance.id, name: a.project.instance.name, kind: a.project.instance.kind } : null;
     const limits = await automationLimitsFor(a.project.user, box);
     if (now.getTime() - r.createdAt.getTime() > limits.pendingMinutes * 60_000) {
-      await prisma.automationRun.updateMany({ where: { id: r.id, state: 'pending' }, data: { state: 'skipped', reason: 'box_unavailable', finishedAt: now } });
-      console.log(`[AUTOMATION] ${a.project.name}: skipped box_unavailable after ${limits.pendingMinutes} min pending`);
+      // The skip and its event in one write: only the process whose skip took raises it.
+      const skipped = await finishRunWithEvent({ id: r.id, automationId: a.id }, { state: 'pending' }, { state: 'skipped', reason: 'box_unavailable', finishedAt: now });
+      if (skipped > 0) console.log(`[AUTOMATION] ${a.project.name}: skipped box_unavailable after ${limits.pendingMinutes} min pending`);
       continue;
     }
     await decideAndStart(a, r.id, limits, now).catch(err => console.error(`[AUTOMATION] ${a.project.name}: pending run failed:`, (err as Error).message));
+    } catch (err) {
+      console.error(`[AUTOMATION] pending run ${r.id} failed:`, (err as Error).message);
+    }
   }
 }
 
@@ -433,6 +433,8 @@ export async function schedulerTick(now: Date = new Date()): Promise<void> {
   await resolvePending(now).catch(err => { failRoot(err); console.error('[AUTOMATION] pending sweep failed:', (err as Error).message); });
   await startDue(now).catch(err => { failRoot(err); console.error('[AUTOMATION] due sweep failed:', (err as Error).message); });
   await retireBeyondKeep(now).catch(err => { failRoot(err); console.error('[AUTOMATION] retire sweep failed:', (err as Error).message); });
+  // Detached, with its own in-flight guard: the tick never waits on a receiver.
+  startNoticeSweep(now);
 }
 
 const tracedTick = traceSweep('automations', () => schedulerTick());

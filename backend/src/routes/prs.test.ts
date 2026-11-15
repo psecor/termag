@@ -17,7 +17,7 @@ vi.mock('../middleware/auth', () => ({
   requireAuthOrAgentToken: (req: { user?: unknown }, _res: unknown, next: () => void) => { req.user = { id: 'u1' }; next(); },
 }));
 
-const { prsRouter, loadPipeline, termagDeploys, pipelineNotes, limit, withJustOpened, _resetPipelineMemos } = await import('./prs');
+const { prsRouter, prWorkstreamProvider, prWorkstreamCopy, prWorkstreamFor, loadPipeline, termagDeploys, pipelineNotes, limit, withJustOpened, _resetPipelineMemos, LimitAbortedError } = await import('./prs');
 const { GithubApiError } = await import('../services/githubCredential');
 const { GithubRetryableError, GithubTimeoutError } = await import('../services/prPipelineGithub');
 const { deferredUntil } = await import('../services/prDeferrals');
@@ -657,5 +657,94 @@ describe('POST /api/prs/:owner/:repo/:number/workstream', () => {
     const res = await send('POST', url, { projectId: 'p1', name: 'n' });
     expect(res.status).toBe(409);
     expect(current.links.record).not.toHaveBeenCalled();
+  });
+  it('refuses a provider while simple-ui-review-chat-enabled is off for the caller, and makes nothing', async () => {
+    const res = await send('POST', url, { projectId: 'p1', name: 'n', provider: 'claude-chat' });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ code: 'review-chat-off' });
+    expect(current.createWorkstream).not.toHaveBeenCalled();
+  });
+});
+
+describe('prWorkstreamProvider (simple-ui-review-chat-enabled)', () => {
+  const on = async () => true;
+  const off = async () => false;
+  it('takes none from a body that names none, without reading the flag', async () => {
+    const flag = vi.fn(on);
+    expect(await prWorkstreamProvider({ projectId: 'p1' }, flag)).toEqual({});
+    expect(await prWorkstreamProvider({ provider: null }, flag)).toEqual({});
+    expect(await prWorkstreamProvider(undefined, flag)).toEqual({});
+    expect(flag).not.toHaveBeenCalled();
+  });
+  it('takes the chat runner\'s Claude with the flag on, and refuses it off', async () => {
+    expect(await prWorkstreamProvider({ provider: 'claude-chat' }, on)).toEqual({ provider: 'claude-chat' });
+    expect(await prWorkstreamProvider({ provider: 'claude-chat' }, off)).toMatchObject({ status: 403, body: { code: 'review-chat-off' } });
+  });
+  it('refuses any other provider, flag or not: a pane agent, or something unknown', async () => {
+    for (const provider of ['claude', 'cursor', 'devin', 'pi-chat', 'nope', 42]) {
+      expect(await prWorkstreamProvider({ provider }, on)).toMatchObject({ status: 400 });
+    }
+  });
+  it("takes Cursor's chat only on a box whose agent can run it, and reads the box only then", async () => {
+    const caps = vi.fn(async () => ['chat-runner-v1', 'chat-cursor-v1']);
+    expect(await prWorkstreamProvider({ provider: 'cursor-chat' }, on, caps)).toEqual({ provider: 'cursor-chat' });
+    expect(await prWorkstreamProvider({ provider: 'cursor-chat' }, on, async () => ['chat-runner-v1']))
+      .toMatchObject({ status: 409, body: { code: 'engine-missing', error: expect.stringContaining('Cursor') } });
+    expect(await prWorkstreamProvider({ provider: 'cursor-chat' }, off, caps)).toMatchObject({ status: 403 });
+    // An agent not connected yet (a box just woken) says nothing: the create goes on, and the first send says why.
+    expect(await prWorkstreamProvider({ provider: 'cursor-chat' }, on, async () => null)).toEqual({ provider: 'cursor-chat' });
+    caps.mockClear();
+    await prWorkstreamProvider({ provider: 'claude-chat' }, on, caps);
+    expect(caps).not.toHaveBeenCalled();
+  });
+  it("takes Devin's chat only on a box whose agent can run it (chat-devin-v1): an older agent's is engine-missing", async () => {
+    const caps = async () => ['chat-runner-v1', 'chat-cursor-v1', 'chat-devin-v1'];
+    expect(await prWorkstreamProvider({ provider: 'devin-chat' }, on, caps)).toEqual({ provider: 'devin-chat' });
+    expect(await prWorkstreamProvider({ provider: 'devin-chat' }, on, async () => ['chat-runner-v1', 'chat-cursor-v1']))
+      .toMatchObject({ status: 409, body: { code: 'engine-missing', error: expect.stringContaining('Devin') } });
+    expect(await prWorkstreamProvider({ provider: 'devin-chat' }, off, caps)).toMatchObject({ status: 403, body: { code: 'review-chat-off' } });
+    expect(await prWorkstreamProvider({ provider: 'devin-chat' }, on, async () => null)).toEqual({ provider: 'devin-chat' });
+  });
+});
+
+describe('prWorkstreamCopy (a review chat beside a session on its own PR)', () => {
+  const branchOf = async (ws: string) => (ws === 'feature' ? 'jonny/feature' : null);
+  it('takes nothing from a body that names no copy', async () => {
+    expect(await prWorkstreamCopy({ projectId: 'p1' }, 'claude-chat', branchOf)).toEqual({});
+  });
+  it("is the named session's branch, only for a review chat, and only a workstream there is", async () => {
+    expect(await prWorkstreamCopy({ copyOf: 'feature' }, 'cursor-chat', branchOf)).toEqual({ copyFrom: 'jonny/feature' });
+    expect(await prWorkstreamCopy({ copyOf: 'feature' }, undefined, branchOf)).toMatchObject({ status: 400 });
+    expect(await prWorkstreamCopy({ copyOf: 'gone' }, 'claude-chat', branchOf)).toMatchObject({ status: 404 });
+    for (const copyOf of ['../x', 'a b', 7, '']) expect(await prWorkstreamCopy({ copyOf }, 'claude-chat', branchOf)).toMatchObject({ status: 400 });
+  });
+  it("checks the PR out on a branch of its own (fetched, read-only, tracking nothing), not a second checkout of the PR's branch, and still links the PR", async () => {
+    const createWorkstream = vi.fn(async (_u: unknown, _p: string, input: { name: string }) => ({ status: 201, body: { id: 'w9', name: input.name, branch: input.name } }));
+    const links = { record: vi.fn(async () => true) } as unknown as Parameters<typeof prWorkstreamFor>[7];
+    const head = vi.fn(async () => ({ state: 'OPEN' as const, branch: 'jonny/feature', sameRepo: true, headOid: 'a'.repeat(40) }));
+    const res = await prWorkstreamFor({ id: 'u1' } as Express.User, { owner: 'example-org', repo: 'termag', number: '359' },
+      { projectId: 'p1', name: 'termag-pr359-feature-review', prompt: 'Review it.' }, { provider: 'claude-chat', copyFrom: 'jonny/feature' },
+      async () => 'tok', head, createWorkstream as never, links);
+    expect(res.status).toBe(201);
+    // The box's PR checkout (git-worktree-add-pr), which fetches pull/359/head first, so a head past the project's lands;
+    // as a fork's, so the copy tracks nothing and no push from it updates the PR.
+    expect(createWorkstream).toHaveBeenCalledWith(expect.anything(), 'p1', {
+      name: 'termag-pr359-feature-review', branch: 'termag-pr359-feature-review',
+      pr: { repo: 'example-org/termag', number: 359, sameRepo: false, headOid: 'a'.repeat(40) },
+      firstPrompt: 'Review it.', provider: 'claude-chat',
+    });
+    expect(links.record).toHaveBeenCalledWith('u1', { repo: 'example-org/termag', number: 359 }, { projectId: 'p1', workstream: 'termag-pr359-feature-review' }, 'manual');
+  });
+
+  it("a copy of your own PR's session leaves the PR's link on that session: 'created', which never replaces one", async () => {
+    const createWorkstream = vi.fn(async (_u: unknown, _p: string, input: { name: string }) => ({ status: 201, body: { id: 'w9', name: input.name, branch: input.name } }));
+    const links = { record: vi.fn(async () => true) } as unknown as Parameters<typeof prWorkstreamFor>[7];
+    const head = vi.fn(async () => ({ state: 'OPEN' as const, branch: 'jonny/feature', sameRepo: true, headOid: 'a'.repeat(40) }));
+    await prWorkstreamFor({ id: 'u1' } as Express.User, { owner: 'example-org', repo: 'termag', number: '359' },
+      { projectId: 'p1', name: 'termag-pr359-feature-review', prompt: 'Review it.' }, { provider: 'claude-chat', copyFrom: 'jonny/feature', keepLink: true },
+      async () => 'tok', head, createWorkstream as never, links);
+    expect(links.record).toHaveBeenCalledWith('u1', { repo: 'example-org/termag', number: 359 }, { projectId: 'p1', workstream: 'termag-pr359-feature-review' }, 'created');
+    expect(await prWorkstreamCopy({ copyOf: 'feat', copyKeepsLink: true }, 'claude-chat', async () => 'jonny/feature')).toEqual({ copyFrom: 'jonny/feature', keepLink: true });
+    expect(await prWorkstreamCopy({ copyOf: 'feat' }, 'claude-chat', async () => 'jonny/feature')).toEqual({ copyFrom: 'jonny/feature' });
   });
 });

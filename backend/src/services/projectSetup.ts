@@ -38,10 +38,24 @@ export type CloneRoute = 'durable' | 'pane' | 'unsupported';
 const BOOTING_BOX_STATUSES: readonly string[] = ['provisioning', 'awaiting-agent'];
 
 /**
- * Whether a new project on this box waits for its agent instead of being
- * refused: the box is on its way up and its agent is not connected yet.
+ * With box-placement-enabled, the power states a New session's create also
+ * takes: the box is woken,
+ * and the project waits for its agent as it does on a booting box.
  */
-export function waitsForBoxAgent(boxStatus: string, agentConnected: boolean): boolean {
+export const WAKEABLE_BOX_STATUSES: readonly string[] = ['stopped', 'hibernated', 'starting', 'stopping', 'hibernating'];
+/** On its way down: its agent may still be connected, but it is about to go, so nothing is sent to it. */
+export const GOING_DOWN_BOX_STATUSES: readonly string[] = ['stopping', 'hibernating'];
+
+/**
+ * Whether a new project on this box waits for its agent instead of being
+ * refused: the box is on its way up and its agent is not connected yet. With
+ * `wakes` (box-placement-enabled), a box the create wakes waits too: asleep or
+ * starting while its agent isn't connected, and on its way down even while it
+ * is, since that agent is about to go.
+ */
+export function waitsForBoxAgent(boxStatus: string, agentConnected: boolean, wakes = false): boolean {
+  if (wakes && GOING_DOWN_BOX_STATUSES.includes(boxStatus)) return true;
+  if (wakes && WAKEABLE_BOX_STATUSES.includes(boxStatus)) return !agentConnected;
   return !agentConnected && BOOTING_BOX_STATUSES.includes(boxStatus);
 }
 

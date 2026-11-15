@@ -4,8 +4,9 @@ import { termagUrlFromEnv } from '../services/claudeRunnerNotices';
 import { decideApiRequest, isApiBrokerPath } from '../services/apiBroker';
 import { decideMcpRequest } from '../services/mcpAuthz';
 import {
-  apiBrokerEnabledForBox, findConnector, listConnectors, oauthAccessToken, readConnectorSecrets,
+  apiBrokerEnabledForBox, findConnector, listConnectors, oauthAccessToken, readConnectorSecrets, upstreamAllowlistForUserId,
 } from '../services/mcpConnectorStore';
+import { upstreamRefusal } from '../services/mcpUpstreamAllowlist';
 import { upstreamTestAllow } from '../services/mcpConnectors';
 import { boxForTokenAt, gatewayCheckRouter } from './gatewayCheck';
 
@@ -36,6 +37,7 @@ export function mcpAuthzRouter(cfg: CallerProofConfig): Router {
         accessToken: oauthAccessToken,
         termagUrl: termagUrlFromEnv(),
         allow: upstreamTestAllow(),
+        upstreamRefusal: async c => upstreamRefusal(await upstreamAllowlistForUserId(c.userId), c.upstream),
       },
     );
   }, { quietAllow: true });

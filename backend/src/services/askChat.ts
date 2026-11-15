@@ -10,7 +10,8 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { askChatWorkstreamName } from './agentMessages';
 import { chatKeyFor } from './chatRunner';
-import { chatTurnChoice, defaultLaunchTier, parseClaudeChatModel, storedChatChoice, type ClaudeChatTier } from './claudeChatModel';
+import { askModelOf, type AskModel } from './askModel';
+import { chatTurnChoice, defaultLaunchTier, parseClaudeChatModel, storedChatChoice, type ChatChoice, type ClaudeChatTier } from './claudeChatModel';
 
 export const ASK_CHAT_PROVIDER = 'claude-chat';
 /** The clone's branch (deploy/termag-subagent-run); never a branch of the project's checkout. */
@@ -43,25 +44,39 @@ export async function ensureAskChat(thread: { id: string; projectId: string; cha
 }
 
 /**
- * The Claude tier an ask's turn in the thread's chat runs on:
- * `requested`
- * (`termag ask --model`), which becomes the chat's stored choice from this
- * turn on as a chat send's model does (chatTurnChoice), else the tier the
- * chat has stored (an earlier --model, or a pick in the simple UI), else null:
- * no `--model`, so the turn runs on the box's default, as asks always have.
+ * What an ask's turn in the thread's chat runs on
+ * : `requested` (`termag ask --model`, a tier or a
+ * Fireworks model already resolved to its full id), which becomes the chat's
+ * stored choice from this turn on as a chat send's does (chatTurnChoice),
+ * else the choice the chat has stored (an earlier --model, or a pick in the
+ * simple UI), else null: no `--model`, so the turn runs on the box's default,
+ * as asks always have. `stored` is what the chat had, for a caller that must
+ * refuse a stored Fireworks choice it cannot run rather than drop it.
  */
-export async function askTurnTier(workstreamId: string, requested: ClaudeChatTier | null): Promise<{ tier: ClaudeChatTier | null; save: () => Promise<void> }> {
-  const wf = await prisma.workflow.findFirst({ where: { workstreamId, type: 'agent' }, select: { id: true, model: true } });
-  const turn = chatTurnChoice(storedChatChoice(null, wf?.model), requested ? { model: requested } : {}, null);
-  if (!turn.ok) return { tier: null, save: async () => {} };
-  const tier = parseClaudeChatModel(turn.choice.model);
+export async function askTurnChoice(workstreamId: string, requested: ChatChoice | null): Promise<{ choice: ChatChoice | null; stored: ChatChoice | null; save: () => Promise<void> }> {
+  const wf = await prisma.workflow.findFirst({ where: { workstreamId, type: 'agent' }, select: { id: true, backend: true, model: true } });
+  const had = storedChatChoice(wf?.backend, wf?.model);
+  const stored = had.backend || had.model ? had : null;
+  // The requested Fireworks id was checked against the asker's and box's list already (askService resolveFireworksAskModel).
+  const fireworks = requested?.backend === 'fireworks' && requested.model ? { models: [{ id: requested.model, label: requested.model, context: null }], defaultModel: requested.model, fastModel: requested.model } : null;
+  const turn = chatTurnChoice(had, requested ? { model: requested.model, ...(requested.backend ? { backend: requested.backend } : {}) } : {}, fireworks);
+  if (!turn.ok) return { choice: null, stored, save: async () => {} };
+  const choice = turn.choice.backend || turn.choice.model ? turn.choice : null;
   return {
-    tier: tier.ok ? tier.model : null,
+    choice,
+    stored,
     // Run only once the box took the turn, as a chat send saves its choice only once the send went in.
     save: async () => {
-      if (turn.changed && wf) await prisma.workflow.update({ where: { id: wf.id }, data: { backend: null, model: turn.choice.model } });
+      if (turn.changed && wf) await prisma.workflow.update({ where: { id: wf.id }, data: { backend: turn.choice.backend, model: turn.choice.model } });
     },
   };
+}
+
+/** The Claude tier askTurnChoice settles, for callers that only run tiers: null for none or a Fireworks choice. */
+export async function askTurnTier(workstreamId: string, requested: ClaudeChatTier | null): Promise<{ tier: ClaudeChatTier | null; save: () => Promise<void> }> {
+  const { choice, save } = await askTurnChoice(workstreamId, requested ? { backend: null, model: requested } : null);
+  const tier = choice && !choice.backend ? parseClaudeChatModel(choice.model) : null;
+  return { tier: tier?.ok ? tier.model : null, save };
 }
 
 /**
@@ -76,12 +91,15 @@ export function askReportedTier(tier: string | null | undefined, ownerOnGateway:
   return (parsed.ok ? parsed.model : null) ?? defaultLaunchTier(ownerOnGateway, env);
 }
 
-/** The tier the thread's chat has stored, read only: null for none, or no chat yet. */
-export async function askChatStoredTier(workstreamId: string | null): Promise<ClaudeChatTier | null> {
+/**
+ * What the thread's chat has stored, read only, as an ask model
+ * (services/askModel.ts): a tier, or `fireworks:<id>`; null for none, or no
+ * chat yet.
+ */
+export async function askChatStoredModel(workstreamId: string | null): Promise<AskModel | null> {
   if (!workstreamId) return null;
-  const wf = await prisma.workflow.findFirst({ where: { workstreamId, type: 'agent' }, select: { model: true } });
-  const tier = parseClaudeChatModel(storedChatChoice(null, wf?.model).model);
-  return tier.ok ? tier.model : null;
+  const wf = await prisma.workflow.findFirst({ where: { workstreamId, type: 'agent' }, select: { backend: true, model: true } });
+  return askModelOf(storedChatChoice(wf?.backend, wf?.model));
 }
 
 /** Workstreams that are ask chats, among these ids: they have no worktree and no pane. */

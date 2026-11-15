@@ -23,6 +23,19 @@ interface ReviewerSpec {
   note: string;
   /** The shell line, given the prompt file as an already double-quoted shell word. */
   launch(file: string): string;
+  /**
+   * The shell line with review-pane-confined-enabled, which keeps the checkout's own startup config
+   * (its hooks, settings, MCP servers, skills) out of the reviewer: the review pane runs in the
+   * workstream's checkout, often the pull request's own, and that config is then the PR's. Gotcha
+   * review-pane-no-checkout-config.
+   *   'checkout'    the reviewer has a switch that holds, so it still runs in the checkout;
+   *   'own-folder'  it has none, so it runs in a folder of the pane's own, made afresh
+   *                 (review.ts reviewLaunchCommand), and reaches the checkout by path: `checkout`
+   *                 is it as a double-quoted shell word, or null when it can't be typed.
+   */
+  confined:
+    | { in: 'checkout'; launch(file: string): string }
+    | { in: 'own-folder'; launch(file: string, checkout: string | null): string };
   /** tmux's pane_current_command while the tool runs. */
   isForeground(cmd: string): boolean;
   /** Lines that mean "the user has to answer", looked for in the last `waitingWindow` non-blank lines. */
@@ -50,6 +63,11 @@ const SPECS: Record<ReviewerId, ReviewerSpec> = {
     // sudo always prompt in smart.
     note: 'smart mode: safe commands run unasked; staying read-only rests on the prompt',
     launch: f => `devin --permission-mode smart --prompt-file ${f}`,
+    // Devin reads hooks from its cwd's git root (.claude/, .devin/hooks.v1.json and six other
+    // tools' files), from every added directory and from HOME, whatever the folder's trust, and
+    // starts the root's .mcp.json servers (checked on Devin CLI 3000.12.57). So the checkout is
+    // neither its cwd nor an added directory; the prompt says where it is.
+    confined: { in: 'own-folder', launch: f => `devin --permission-mode smart --prompt-file ${f}` },
     isForeground: cmd => cmd.toLowerCase().includes('devin'),
     waiting: [DEVIN_APPROVAL_FOOTER, DEVIN_APPROVAL_ROW],
     waitingWindow: 6,
@@ -68,6 +86,12 @@ const SPECS: Record<ReviewerId, ReviewerSpec> = {
     // `touch` was declined). To post the review, leave plan mode in the pane.
     note: 'plan mode: read-only; to post the review, leave plan mode in the pane (Shift+Tab)',
     launch: f => `claude --permission-mode plan "$(cat ${f})"`,
+    // Only the box user's settings: none of the checkout's .claude/settings.json or
+    // settings.local.json (their hooks, apiKeyHelper, env, plugins and allow rules), and with
+    // them its skills, agents, commands and .mcp.json servers. Claude Code trusts a folder whose
+    // parent the owner trusted, and a PR's workstream is <project>/.worktrees/<name>, so without
+    // this its hooks run at start with no dialog (checked on Claude Code 2.1.325).
+    confined: { in: 'checkout', launch: f => `claude --setting-sources user --permission-mode plan "$(cat ${f})"` },
     isForeground: cmd => /^claude\b/i.test(cmd),
     waiting: [
       /^\s*(?:Do you want to (?:proceed|make this edit|create)|Would you like to proceed|Do you trust the files in this folder)\b.*\?/,
@@ -87,6 +111,12 @@ const SPECS: Record<ReviewerId, ReviewerSpec> = {
   cursor: {
     note: 'plan mode with auto-review: no file edits; safe commands run unasked',
     launch: f => `cursor-agent --mode plan --auto-review "$(cat ${f})"`,
+    // cursor-agent counts a folder under a trusted one as trusted, and runs a trusted workspace's
+    // .cursor/hooks.json and .claude/settings*.json hooks at start, plan mode included; no switch
+    // turns them off. It reads them from the workspace only, not from an --add-dir (the gotcha on
+    // Cursor chat turns), so the checkout goes in as one. No --trust: the pane's folder asks once,
+    // and the Review tab answers it.
+    confined: { in: 'own-folder', launch: (f, c) => `cursor-agent${c ? ` --add-dir ${c}` : ''} --mode plan --auto-review "$(cat ${f})"` },
     isForeground: cmd => /cursor-agent|^agent$/i.test(cmd),
     waiting: [
       /^\s*Run this command\?/,
@@ -112,8 +142,19 @@ export function reviewerNote(id: ReviewerId): string {
   return SPECS[id].note;
 }
 
-export function reviewerLaunch(id: ReviewerId, file: string): string {
-  return SPECS[id].launch(file);
+/** Confined (review-pane-confined-enabled), where the reviewer runs: the checkout, or a folder of the pane's own. */
+export function reviewerConfinedIn(id: ReviewerId): 'checkout' | 'own-folder' {
+  return SPECS[id].confined.in;
+}
+
+/**
+ * `confined`: review-pane-confined-enabled, with the checkout as a double-quoted shell word (null when it can't be
+ * typed). The line alone: review.ts reviewLaunchCommand puts an own-folder reviewer in its folder first.
+ */
+export function reviewerLaunch(id: ReviewerId, file: string, confined: { checkout: string | null } | null = null): string {
+  const spec = SPECS[id];
+  if (!confined) return spec.launch(file);
+  return spec.confined.in === 'checkout' ? spec.confined.launch(file) : spec.confined.launch(file, confined.checkout);
 }
 
 /** Which reviewer a pane's foreground command is, for a pane whose record and tmux option are both gone. */

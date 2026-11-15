@@ -2,7 +2,13 @@
  * The simple UI's chat lifecycle (services/chatLifecycle.ts), on the existing
  * project archive and box power paths:
  *
- *   GET    /api/chats/archived       the owner's archived chats, with their box
+ *   GET    /api/chats/archived       the owner's archived chats, with their box,
+ *                                    their main session's title and what it ran on
+ *   GET    /api/chats/:id/archive-plan  what archiving would do to the box (the
+ *                                    archive's dry run): { box: { action: 'stop',
+ *                                    id, name } } when it would stop it, else
+ *                                    { box: { action: null, reason } }. The
+ *                                    sidebar asks first only when it stops one.
  *   POST   /api/chats/:id/archive    archive the chat, stop (or hibernate) its box
  *   POST   /api/chats/:id/reopen     start the box again; unarchive only once
  *                                    a connected chat-clear has dropped the
@@ -13,12 +19,19 @@
  *                                    once when its transcript is stored
  *                                    (`storedHistory` on the archived list),
  *                                    and reads from the store.
+ *   POST   /api/chats/:id/title      { workstream?, title }: a person's name for
+ *                                    one of the chat's sessions, as the desktop's
+ *                                    rename (cliChatsPrisma.ts title) gives it.
  *   DELETE /api/chats/:id            { confirmed: true }: from the archive only.
  *                                    The box is terminated, and the history on
  *                                    it goes, only when this chat is the last
  *                                    project on it. A shared box stays. The
  *                                    archived list reports `otherProjects` so
  *                                    the confirm says which of those happens.
+ *
+ * The archive plan and the rename are the redesigned sidebar's card actions,
+ * behind user-projects-enabled: off, they answer
+ * 404 `chat_actions_disabled`.
  *
  * A chat is a project whose agent runs in the chat runner (claude-chat). The
  * archive keeps its workflow rows, so an archived chat is still one. Owner
@@ -44,7 +57,11 @@ import { isBoxProvisioningConfigured } from '../services/boxProvisioner';
 import { revokeChats } from '../services/chatRevoke';
 import { projectsWithStoredHistory } from '../services/chatTranscriptSync';
 import { archivePowerFor, deleteTerminatesBox, otherProjectsFromTotal, reopenPlanFor, reopenRelease, storedReopenRelease } from '../services/chatLifecycle';
-import { powerOwnedBox, terminateOwnedBox } from './instances';
+import { renameSessionFor } from '../services/chatRunner';
+import { recordSessionTitle } from '../services/sessionTitleEvent';
+import { userProjectsEnabled } from '../services/userProjects';
+import { notifyWorkspaceChange } from '../services/workspaceEvents';
+import { cloudSessionStopRefusal, powerOwnedBox, terminateOwnedBox } from './instances';
 import { relaunchChatOrRestore } from './chatReopen';
 import { archiveOwnedProject, ensureDataSessions } from './projects';
 import { sendResult, type RouteResult } from './routeResult';
@@ -70,12 +87,28 @@ export async function archivedChatsFor(user: Express.User): Promise<RouteResult>
   const rows = await prisma.project.findMany({
     // Never a space orchestrator's project (projectKind.ts inProjectLists): it is the space's, not a chat.
     where: { userId, archived: true, kind: { in: LISTED_PROJECT_KINDS }, workflows: { some: { type: 'agent', provider: { not: null } } } },
-    include: { instance: { select: BOX_SELECT }, workflows: { select: { type: true, provider: true } } },
+    include: {
+      instance: { select: BOX_SELECT },
+      workflows: { select: { type: true, provider: true, backend: true, model: true, workstreamId: true } },
+      // Its main session's title, for the redesigned sidebar's card (chat/sessionTitle.ts decides which name shows).
+      workstreams: { where: { name: 'main' }, select: { id: true, sessionTitle: true, sessionTitleSource: true } },
+    },
     orderBy: { updatedAt: 'desc' },
   });
   const chats = rows
     .filter(p => p.workflows.some(w => w.type === 'agent' && isChatRunnerProvider(w.provider)))
-    .map(p => ({ id: p.id, name: p.name, repoUrl: p.repoUrl, archivedAt: p.updatedAt, box: p.instance }));
+    .map(p => {
+      const main = p.workstreams[0];
+      // Main's own agent, as the card is main's: another session can run another model. Else a project-level one.
+      const agents = p.workflows.filter(w => w.type === 'agent' && isChatRunnerProvider(w.provider));
+      const agent = (main && agents.find(w => w.workstreamId === main.id)) ?? agents.find(w => w.workstreamId === null) ?? agents[0];
+      return {
+        id: p.id, name: p.name, repoUrl: p.repoUrl, archivedAt: p.updatedAt, box: p.instance,
+        sessionTitle: main?.sessionTitle ?? null, sessionTitleSource: main?.sessionTitleSource ?? null,
+        // What it ran on, for the card's model mark (chat/modelMark.ts).
+        agent: { provider: agent.provider, backend: agent.backend, model: agent.model },
+      };
+    });
   // Same count deleteChatFor uses: every other project on the box, archived
   // ones included. The confirm copies this, so it does not claim a shared
   // box is terminated.
@@ -98,6 +131,58 @@ export async function archivedChatsFor(user: Express.User): Promise<RouteResult>
   };
 }
 
+type OwnedChat = NonNullable<Awaited<ReturnType<typeof ownedChat>>>;
+
+/**
+ * What archiving the chat does to its box (services/chatLifecycle.ts archivePowerFor), counting every other
+ * live project on it. The archive and its dry run (archivePlanFor) both decide here, so they can't disagree.
+ */
+async function archivePowerOf(chat: Pick<OwnedChat, 'id' | 'instance'>) {
+  const others = chat.instance
+    ? await prisma.project.count({ where: { instanceId: chat.instance.id, archived: false, id: { not: chat.id } } })
+    : 0;
+  return archivePowerFor(chat.instance, others);
+}
+
+export const CHAT_ACTIONS_DISABLED = 'chat_actions_disabled';
+const actionsOff = (): RouteResult => ({ status: 404, body: { error: 'Card actions are not on for you', code: CHAT_ACTIONS_DISABLED } });
+
+/** GET /api/chats/:id/archive-plan: the archive's dry run, so the sidebar asks first only when it stops a box. */
+export async function archivePlanFor(user: Express.User, id: string): Promise<RouteResult> {
+  if (!await userProjectsEnabled(user)) return actionsOff();
+  const chat = await ownedChat(user.id, id);
+  if (!chat) return { status: 404, body: { error: 'Chat not found' } };
+  if (chat.archived) return { status: 409, body: { error: 'This chat is archived already' } };
+  const power = await archivePowerOf(chat);
+  if (!power.action) return { status: 200, body: { box: { action: null, reason: power.reason } } };
+  // The archive's stop goes through the box's own guard, which refuses it while a cloud session runs there: the
+  // chat is archived and its box stays up, so the dry run says so rather than promising a stop.
+  const box = chat.instance!;
+  if (await cloudSessionStopRefusal(user, box)) {
+    return { status: 200, body: { box: { action: null, reason: 'a Claude Code cloud session still runs on this box' } } };
+  }
+  return { status: 200, body: { box: { action: power.action, id: box.id, name: box.name } } };
+}
+
+/**
+ * POST /api/chats/:id/title: a person's name for one of their own sessions in the chat (`workstream`,
+ * main by default), cut and cleaned as Claude's are, and kept against Claude's later titles. The same
+ * steps as the desktop's rename (cliChatsPrisma.ts title); the person's other tabs reload the list.
+ */
+export async function renameChatFor(user: Express.User, projectId: string, body: unknown): Promise<RouteResult> {
+  if (!await userProjectsEnabled(user)) return actionsOff();
+  const { workstream, title } = (body && typeof body === 'object' ? body : {}) as { workstream?: unknown; title?: unknown };
+  const name = typeof workstream === 'string' && workstream ? workstream : 'main';
+  // Only the owner renames: a collaborator reads the chat.
+  const ws = await prisma.workstream.findFirst({ where: { name, archived: false, project: { id: projectId, userId: user.id } }, select: { id: true } });
+  if (!ws) return { status: 404, body: { error: 'Session not found' } };
+  const renamed = await renameSessionFor(projectId, ws.id, title);
+  if (!renamed) return { status: 400, body: { error: 'title is required', code: 'invalid_request' } };
+  void recordSessionTitle({ projectId, workstream: name, title: renamed.title, source: 'person' });
+  notifyWorkspaceChange(user.id, 'projects');
+  return { status: 200, body: { ...renamed, titleSource: 'person' } };
+}
+
 export async function archiveChatFor(user: Express.User, id: string, opts: { powerBox?: boolean } = {}): Promise<RouteResult> {
   const chat = await ownedChat(user.id, id);
   if (!chat) return { status: 404, body: { error: 'Chat not found' } };
@@ -110,10 +195,7 @@ export async function archiveChatFor(user: Express.User, id: string, opts: { pow
   // The desktop's archive leaves the box alone: its other threads may be running on it.
   if (opts.powerBox === false) return { status: 200, body: { archived: true, box: { action: null, reason: 'kept' } } };
 
-  const others = chat.instance
-    ? await prisma.project.count({ where: { instanceId: chat.instance.id, archived: false, id: { not: id } } })
-    : 0;
-  const power = archivePowerFor(chat.instance, others);
+  const power = await archivePowerOf(chat);
   if (!power.action) return { status: 200, body: { archived: true, box: { action: null, reason: power.reason } } };
   // The chat is archived either way; a box that would not go down says why.
   const powered = await powerOwnedBox(user, chat.instance!.id, power.action);
@@ -244,7 +326,9 @@ export async function deleteChatFor(user: Express.User, id: string, confirmed: b
 export function chatsRouter(): Router {
   const router = Router();
   router.get('/archived', requireAuth, asyncHandler(async (req, res) => sendResult(res, await archivedChatsFor(req.user!))));
+  router.get('/:id/archive-plan', requireAuth, asyncHandler(async (req, res) => sendResult(res, await archivePlanFor(req.user!, req.params.id))));
   router.post('/:id/archive', requireAuth, asyncHandler(async (req, res) => sendResult(res, await archiveChatFor(req.user!, req.params.id))));
+  router.post('/:id/title', requireAuth, asyncHandler(async (req, res) => sendResult(res, await renameChatFor(req.user!, req.params.id, req.body))));
   router.post('/:id/reopen', requireAuth, asyncHandler(async (req, res) => sendResult(res, await reopenChatFor(req.user!, req.params.id))));
   router.delete('/:id', requireAuth, asyncHandler(async (req, res) => {
     sendResult(res, await deleteChatFor(req.user!, req.params.id, (req.body as { confirmed?: unknown })?.confirmed === true));

@@ -9,7 +9,7 @@ vi.mock('../db', () => ({
     workstream: { updateMany: db.workstreamUpdateMany },
   },
 }));
-import { renameSessionFor, saveSessionTitle, sessionTitleOf, SESSION_TITLE_MAX, chatContextAction, chatContextActions, chatContextRefusals, chatInterruptRpcPayload, chatKeyFor, chatRequireCheckout, chatResumeClaimPayload, chatRpcFailure, chatSendRpcPayload, chatSendsLive, chatStopScope, chatStopsTurn, chatTargetError, chatTextError, clearChatsOnBox, historyTerminalHolds, isIdleShell, mayReceiveChat, paneProbeKind, paneStillHolds, permissionModeForAgent, probeFromForeground, reconcileChatStatus, resumeCommandFor, resumeDecision, statusForChatEvent, sweepStaleChatStatus, terminalHoldsChat, toolCallLabel, CHAT_INTERRUPT_CAPABILITY, CHAT_LIVE_CAPABILITY, CHAT_ORCHESTRATOR_CAPABILITY, CHAT_CONTEXT_CAPABILITY, CHAT_RUNNER_CAPABILITY, CHAT_STATUS_SOURCE, CHAT_TRUST_CAPABILITY, SPACE_MEMORY_CAPABILITY, chatHistoryFromStore, CHAT_BOX_NOTICE_CAPABILITY, ownerOnlyChatEvent, chatPushRoute } from './chatRunner';
+import { renameSessionFor, saveSessionTitle, sessionTitleOf, SESSION_TITLE_MAX, chatContextAction, chatContextActions, chatContextRefusals, chatInterruptRpcPayload, chatKeyFor, chatRequireCheckout, chatResumeClaimPayload, chatRpcFailure, chatSendRpcPayload, chatSendsLive, chatStopScope, chatStopsTurn, chatTargetError, chatTextError, clearChatsOnBox, historyTerminalHolds, isIdleShell, mayReceiveChat, paneProbeKind, paneStillHolds, permissionModeForAgent, probeFromForeground, reconcileChatStatus, resumeCommandFor, resumeDecision, statusForChatEvent, sweepStaleChatStatus, terminalHoldsChat, toolCallLabel, CHAT_INTERRUPT_CAPABILITY, CHAT_LIVE_CAPABILITY, CHAT_ORCHESTRATOR_CAPABILITY, CHAT_CONTEXT_CAPABILITY, CHAT_RUNNER_CAPABILITY, CHAT_STATUS_SOURCE, CHAT_TRUST_CAPABILITY, SPACE_MEMORY_CAPABILITY, chatHistoryFromStore, CHAT_BOX_NOTICE_CAPABILITY, ownerOnlyChatEvent, chatPushRoute, chatEngineRefusal, chatEngineTakesImages, chatTerminalRefusal, CHAT_CURSOR_CAPABILITY, CHAT_DEVIN_CAPABILITY, SENT_CHAT_ENGINES, chatEnginesOf } from './chatRunner';
 import { sessionBelongsToUser, sessionName } from './tmux';
 import { getStatus, setStatus } from './status';
 import { settleTurnPost } from './sessionTurns';
@@ -479,6 +479,22 @@ describe('chatSendRpcPayload', () => {
     expect(chatSendRpcPayload(target, 'hi')).toEqual({ ...target, text: 'hi' });
   });
 
+  it("names a Cursor chat's engine, and sends none of Claude's model, backend or effort with it", () => {
+    const caps = [CHAT_CURSOR_CAPABILITY, 'chat-effort-v1', 'chat-backend-v1'];
+    const cursor = { ...target, engine: 'cursor', model: 'sonnet', backend: 'fireworks', fastModel: 'x' } as Parameters<typeof chatSendRpcPayload>[0];
+    const p = chatSendRpcPayload(cursor, 'review it', caps, { effort: 'high' });
+    expect(p).toMatchObject({ engine: 'cursor', text: 'review it' });
+    for (const k of ['model', 'backend', 'fastModel', 'effort']) expect(p, k).not.toHaveProperty(k);
+    // Claude's chat names no engine, and pi's still names none (its engine isn't one a send names yet).
+    expect(chatSendRpcPayload({ ...target, engine: 'claude', model: 'sonnet' }, 'hi', caps)).toEqual({ ...target, text: 'hi', model: 'sonnet' });
+    expect(chatSendRpcPayload({ ...target, engine: 'pi' }, 'hi', caps)).not.toHaveProperty('engine');
+    expect(Object.keys(SENT_CHAT_ENGINES)).toEqual(['cursor', 'devin']);
+    // Devin's the same way: named, with none of Claude's.
+    const devin = chatSendRpcPayload({ ...cursor, engine: 'devin' }, 'review it', [...caps, CHAT_DEVIN_CAPABILITY], { effort: 'high' });
+    expect(devin).toMatchObject({ engine: 'devin', text: 'review it' });
+    for (const k of ['model', 'backend', 'fastModel', 'effort']) expect(devin, k).not.toHaveProperty(k);
+  });
+
   it('names the project for the turn\'s telemetry resource, and leaves it out when the caller has none', () => {
     expect(chatSendRpcPayload({ ...target, project: 'webapp' }, 'hi')).toMatchObject({ project: 'webapp', workstream: 'main' });
     expect(chatSendRpcPayload({ ...target, project: null }, 'hi')).not.toHaveProperty('project');
@@ -596,5 +612,40 @@ describe('chat stop scope', () => {
     expect(chatInterruptRpcPayload('k', [CHAT_INTERRUPT_CAPABILITY], 'turn')).toEqual({ chatKey: 'k', scope: 'turn' });
     expect(chatInterruptRpcPayload('k', [CHAT_INTERRUPT_CAPABILITY], 'all')).toEqual({ chatKey: 'k' });
     expect(chatInterruptRpcPayload('k', [CHAT_LIVE_CAPABILITY], 'turn')).toEqual({ chatKey: 'k' });
+  });
+});
+
+describe('a Devin chat (chat-devin-v1)', () => {
+  it('is an engine a send names: refused on an older agent and with images, no terminal, no images in the composer', () => {
+    expect(SENT_CHAT_ENGINES.devin).toEqual({ capability: 'chat-devin-v1', name: 'Devin' });
+    expect(chatEngineRefusal('devin', [CHAT_RUNNER_CAPABILITY, CHAT_CURSOR_CAPABILITY])).toMatchObject({ status: 409, body: { code: 'engine-missing', error: expect.stringContaining('Devin') } });
+    expect(chatEngineRefusal('devin', [CHAT_RUNNER_CAPABILITY, CHAT_DEVIN_CAPABILITY])).toBeNull();
+    expect(chatEngineRefusal('devin', [CHAT_DEVIN_CAPABILITY], 1)).toMatchObject({ status: 409, body: { code: 'image-refused' } });
+    expect(chatEngineTakesImages('devin')).toBe(false);
+    expect(chatTerminalRefusal('devin')).toMatchObject({ status: 409, body: { code: 'engine-no-terminal' } });
+  });
+  it('the box list names the engines its agent runs, from what it announced', () => {
+    expect(chatEnginesOf([CHAT_RUNNER_CAPABILITY])).toEqual([]);
+    expect(chatEnginesOf([CHAT_RUNNER_CAPABILITY, CHAT_DEVIN_CAPABILITY])).toEqual(['devin']);
+    expect(chatEnginesOf([CHAT_CURSOR_CAPABILITY, CHAT_DEVIN_CAPABILITY, 'chat-pi-v1'])).toEqual(['cursor', 'devin']);
+  });
+});
+
+describe('chatEngineRefusal', () => {
+  it("refuses a Cursor chat's message on a box whose agent can't run Cursor, or with images; nothing for Claude or pi", () => {
+    expect(chatEngineRefusal('cursor', [CHAT_RUNNER_CAPABILITY])).toMatchObject({ status: 409, body: { code: 'engine-missing' } });
+    expect(chatEngineRefusal('cursor', [CHAT_RUNNER_CAPABILITY, CHAT_CURSOR_CAPABILITY])).toBeNull();
+    expect(chatEngineRefusal('cursor', [CHAT_CURSOR_CAPABILITY], 1)).toMatchObject({ status: 409, body: { code: 'image-refused' } });
+    for (const engine of ['claude', 'pi', null, undefined]) expect(chatEngineRefusal(engine, [], 2)).toBeNull();
+    // The composer offers images only where the engine takes them (GET …/chat imageInput).
+    expect(chatEngineTakesImages('cursor')).toBe(false);
+    for (const engine of ['claude', 'pi', null]) expect(chatEngineTakesImages(engine)).toBe(true);
+  });
+});
+
+describe('chatTerminalRefusal (Open in full UI)', () => {
+  it("continues only Claude Code's session in the pane; another engine's chat is refused with why", () => {
+    for (const engine of ['claude', 'pi', null, undefined]) expect(chatTerminalRefusal(engine)).toBeNull();
+    expect(chatTerminalRefusal('cursor')).toMatchObject({ status: 409, body: { code: 'engine-no-terminal' } });
   });
 });

@@ -88,6 +88,9 @@ vi.mock('./boxStartFallback', () => ({
 }));
 
 const events: Array<{ name: string; ctx: any; detail: any }> = [];
+const redispatch = vi.hoisted(() => ({ clones: vi.fn(async () => {}), workspaces: vi.fn(async () => {}) }));
+vi.mock('./projectClone', () => ({ redispatchClones: redispatch.clones }));
+vi.mock('./workspaceSetup', () => ({ onHello: redispatch.workspaces }));
 vi.mock('./productEvents', () => ({ recordProductEvent: (name: string, ctx: any, detail: any) => { events.push({ name, ctx, detail }); } }));
 
 const { onAutoParkSettled, powerRequestedAt, requestPower, sweepPowerStates, instanceStatus, PowerRequestConflict } = await import('./boxPower');
@@ -516,6 +519,20 @@ describe('sweepPowerStates', () => {
     await sweepPowerStates(t0 + 60_000);
     expect(statusOf()).toBe('ready');
     expect(rows.get('inst_1')!.provisioningError).toMatch(/Stop did not complete/);
+  });
+
+  it("runs a box's held checkouts when its stop times out back to ready, since no hello comes", async () => {
+    redispatch.clones.mockClear();
+    redispatch.workspaces.mockClear();
+    process.env.BOX_STOP_TIMEOUT_SECONDS = '60';
+    seed('stopping', { id: 'inst_1' });
+    const t0 = Date.now() + 3_600_000;
+    await sweepPowerStates(t0);
+    expect(redispatch.clones).not.toHaveBeenCalled();
+    await sweepPowerStates(t0 + 60_000);
+    expect(statusOf()).toBe('ready');
+    await vi.waitFor(() => expect(redispatch.clones).toHaveBeenCalledWith(expect.objectContaining({ instance: { id: 'inst_1' } })));
+    expect(redispatch.workspaces).toHaveBeenCalled();
   });
 
   it("forgets the sweep's auto-park when its stop times out back to ready: the box was never parked", async () => {

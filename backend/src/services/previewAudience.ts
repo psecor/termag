@@ -356,3 +356,31 @@ export const prismaAudienceEndDeps: AudienceEndDeps = {
   },
   deliveries: () => [...deliveries.values()],
 };
+
+// ── Wakes (row 6b) ────────────────────────────────────────────────────────
+//
+// A viewer opening a link to a parked box may wake it, within the box owner's
+// guest wake budget, which is one for their preview shares and links alike
+// (PRD U4, SR20): services/previewShares.ts holds the budget and calls these
+// for the links' half. A wake is an audience event of kind `woke`, on the
+// link's audience, at the moment it was claimed.
+
+/** When links of projects `ownerId` owns woke their box, since `since`. */
+export async function linkWakesSince(tx: Prisma.TransactionClient, ownerId: string, since: Date): Promise<Date[]> {
+  const rows = await tx.previewAudienceEvent.findMany({ where: { kind: 'woke', at: { gt: since }, audience: { project: { userId: ownerId } } }, select: { at: true } });
+  return rows.map(r => r.at);
+}
+
+/** Record a link's wake; its id, for a refund. */
+export async function recordLinkWake(tx: Prisma.TransactionClient, input: { audienceId: string; linkId: string; viewerId: string; at: Date }): Promise<string> {
+  const ev = await tx.previewAudienceEvent.create({
+    data: { audienceId: input.audienceId, kind: 'woke', actorId: input.viewerId, deliveryKind: 'link', deliveryId: input.linkId, at: input.at },
+    select: { id: true },
+  });
+  return ev.id;
+}
+
+/** A wake whose start failed gives its budget back. */
+export async function dropLinkWake(id: string): Promise<void> {
+  await prisma.previewAudienceEvent.delete({ where: { id } }).catch(() => {});
+}

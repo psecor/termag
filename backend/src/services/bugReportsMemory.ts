@@ -3,40 +3,24 @@
  * routes/admin/bugs.test.ts). Filters the way bugReportsPrisma.ts asks
  * Postgres to: case-insensitive substring search, newest first.
  */
-import type { BugFilter, BugReportEventRow, BugReportRow, BugReportStore, Reporter } from './bugReports';
+import type { BugFilter, BugReportEventRow, BugReportRow, BugReportStore } from './bugReports';
+import { memoryNames, memoryReporterWorld, memoryResolveReporter, type MemoryReporterWorld } from './cliReporterMemory';
 
-export interface MemoryBugReports extends BugReportStore {
+export interface MemoryBugReports extends BugReportStore, MemoryReporterWorld {
   rows: BugReportRow[];
   eventRows: BugReportEventRow[];
-  /** Projects as `id → { owner, box, name }`; threads as `id → owner`. */
-  projects: Map<string, { userId: string; instanceId: string | null; name: string }>;
-  threads: Map<string, string>;
-  users: Map<string, string>;
-  boxes: Map<string, string>;
 }
 
 export function memoryBugReports(now: () => Date = () => new Date()): MemoryBugReports {
   let seq = 0;
+  const world = memoryReporterWorld();
   const m: MemoryBugReports = {
-    rows: [], eventRows: [], projects: new Map(), threads: new Map(), users: new Map(), boxes: new Map(),
+    rows: [], eventRows: [], ...world,
+    resolveReporter: memoryResolveReporter(world),
+    names: memoryNames(world),
 
     async countRecent({ boxId, userId }, since) {
       return m.rows.filter(r => r.createdAt >= since && (boxId ? r.boxId === boxId : r.reporterUserId === userId && r.boxId === null)).length;
-    },
-
-    async resolveReporter(base, claimed): Promise<Reporter> {
-      const p = claimed.projectId ? m.projects.get(claimed.projectId) : undefined;
-      const ok = p && p.userId === base.reporterUserId && (!base.boxId || p.instanceId === base.boxId);
-      const thread = ok ? claimed.workstream?.match(/^ask-([A-Za-z0-9]{8,40})$/)?.[1] : undefined;
-      return {
-        ...base,
-        boxId: base.boxId ?? (ok ? p!.instanceId : null),
-        projectId: ok ? claimed.projectId : null,
-        workstream: ok ? claimed.workstream : null,
-        threadId: thread && m.threads.get(thread) === base.reporterUserId ? thread : null,
-        boxAgentCommit: null,
-        boxAgentCapabilities: [],
-      };
     },
 
     async create(input, reporter) {
@@ -91,12 +75,6 @@ export function memoryBugReports(now: () => Date = () => new Date()): MemoryBugR
       const out: Record<string, number> = {};
       for (const r of m.rows) out[r.status] = (out[r.status] ?? 0) + 1;
       return out;
-    },
-
-    async names({ users, boxes, projects }) {
-      const pick = <V>(ids: string[], map: Map<string, V>, f: (v: V) => string) =>
-        Object.fromEntries(ids.flatMap(id => map.has(id) ? [[id, f(map.get(id)!)]] : []));
-      return { users: pick(users, m.users, v => v), boxes: pick(boxes, m.boxes, v => v), projects: pick(projects, m.projects, v => v.name) };
     },
   };
   return m;

@@ -6,7 +6,7 @@
 import { prisma } from '../db';
 import { instanceAgentTransport } from '../services/agentRegistry';
 import { PARKED_STATUSES } from '../services/boxPowerPolicy';
-import { PORT_FORWARD_CAPABILITY, portForwardEnabled } from '../services/portForwardFlag';
+import { PORT_FORWARD_CAPABILITY } from '../services/portForwardFlag';
 import type { ForwardAccess, ForwardBoxes } from './cliForward';
 
 const NOT_FOUND: ForwardAccess = { ok: false, status: 404, error: 'No such box', code: 'not_found' };
@@ -14,12 +14,10 @@ const NOT_FOUND: ForwardAccess = { ok: false, status: 404, error: 'No such box',
 interface ForwardBoxesDeps {
   /** Overridable for tests. */
   transport?: typeof instanceAgentTransport;
-  flag?: typeof portForwardEnabled;
 }
 
 export function createPrismaForwardBoxes(deps: ForwardBoxesDeps = {}): ForwardBoxes {
   const transport = deps.transport ?? instanceAgentTransport;
-  const flag = deps.flag ?? portForwardEnabled;
   const parked = (status: string) => (PARKED_STATUSES as readonly string[]).includes(status);
 
   return {
@@ -30,8 +28,6 @@ export function createPrismaForwardBoxes(deps: ForwardBoxesDeps = {}): ForwardBo
         select: { id: true, name: true, kind: true, status: true },
       });
       if (!box || box.status === 'terminated') return NOT_FOUND;
-      const owner = await prisma.user.findUnique({ where: { id: user.id } });
-      if (!owner || !(await flag(owner, box))) return NOT_FOUND;
       // Never started for a forward: the CLI says so and the owner starts it.
       if (parked(box.status)) return { ok: false, status: 409, error: `The box is ${box.status}; start it first`, code: 'box_parked' };
       const agent = transport(box.id);

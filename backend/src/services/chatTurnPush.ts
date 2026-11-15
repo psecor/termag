@@ -19,6 +19,7 @@ import { prisma } from '../db';
 import type { AgentStatus } from '../types/index';
 import { boolVariation } from './featureFlags';
 import { appBaseUrl, buildChatTurnPayload, defaultSendDeps, sendToUser, type SendDeps } from './webPush';
+import { loadSessionTitle } from './sessionTitle';
 
 /** The same chat finishing again inside this window does not re-notify. */
 export const CHAT_TURN_COOLDOWN_MS = 10_000;
@@ -37,7 +38,7 @@ export function isChatTurnEnd(prev: AgentStatus['status'] | undefined, next: Age
 /**
  * Pure: the notification's preview, the first line of a `result`'s answer, as
  * the open tab's `turnPreview` (frontend chat/turnNotify.ts) reads it; null
- * for a turn-end, so both paths say `Done · your turn` then.
+ * for a turn-end, so both paths say `Idle · your turn` then.
  */
 export function chatTurnPreview(event: unknown): string | null {
   const text = (event && typeof event === 'object' ? event : {}) as { type?: unknown; result?: unknown };
@@ -87,6 +88,8 @@ export interface ChatTurnAudience {
 export interface ChatTurnDeps {
   send: SendDeps;
   loadAudience: (projectId: string) => Promise<ChatTurnAudience | null>;
+  /** The session's one title (services/sessionTitle.ts); absent, the names' fallback. */
+  loadTitle?: (projectId: string, projectName: string, workstream: string) => Promise<string>;
   /** chat-turn-notifications-enabled, for this person. */
   allowed: (person: ChatTurnPerson) => Promise<boolean>;
 }
@@ -107,7 +110,7 @@ async function allowed(person: ChatTurnPerson): Promise<boolean> {
 }
 
 function defaultDeps(): ChatTurnDeps {
-  return { send: defaultSendDeps(), loadAudience, allowed };
+  return { send: defaultSendDeps(), loadAudience, allowed, loadTitle: loadSessionTitle };
 }
 
 const lastPushedAt = new Map<string, number>();
@@ -151,6 +154,7 @@ export function pushOnChatTurn(t: ChatTurnTransition, deps?: ChatTurnDeps): bool
       workstream: t.workstream,
       session: t.session,
       message: chatTurnPreview(t.event),
+      title: d.loadTitle ? await d.loadTitle(t.projectId, audience.projectName, t.workstream).catch(() => null) : null,
     });
     for (const person of chatTurnRecipients(audience.owner, audience.collaborators)) {
       if (!await d.allowed(person).catch(() => false)) continue;

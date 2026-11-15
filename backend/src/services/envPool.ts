@@ -20,8 +20,8 @@
  * only while the row is `env-preparing` (services/githubAuthz.ts), and runs
  * `setup` with no secrets. Its `environment-status` frames (project `pool`)
  * come here: success records `preparedCommit` and stops the box plainly
- * (`env-stopping`), failure is `env-failed` with the log, and the box is
- * terminated, its row kept for the environment's page.
+ * (`env-stopping`); failure terminates the box, its row kept `terminated`
+ * with the log for the environment's page (failPrepare).
  *
  * The claim is envPoolClaim.ts.
  *
@@ -35,16 +35,17 @@
  * does. Only the refresh's own success counts (`prepareId`): the agent re-sends
  * the earlier prepare's state at its hello. A start refused (capacity or
  * otherwise) puts the row back `env-stopped` as it was, checked again next
- * interval; a `setup` that fails is `env-failed`, as a prepare's is. A claim
+ * interval; a refresh that fails is terminated, as a prepare's is. A claim
  * takes only `env-stopped` rows, so a box is never handed out half-refreshed.
  */
 
+import { ec2For, startBox } from './ec2Box';
 import { createHash, randomBytes } from 'crypto';
-import { DescribeInstancesCommand, EC2Client, StartInstancesCommand, StopInstancesCommand } from '@aws-sdk/client-ec2';
+import { DescribeInstancesCommand, StopInstancesCommand } from '@aws-sdk/client-ec2';
 import { Prisma, type Instance } from '@prisma/client';
 import { prisma } from '../db';
 import { envPoolConfigFromEnv, type EnvPoolConfig } from '../config/env';
-import { awsClientConfig, getBoxConfig, isCapacityRefusal, provisionEnvPoolBox, terminateBox } from './boxProvisioner';
+import { getBoxConfig, isCapacityRefusal, provisionEnvPoolBox, terminateBox } from './boxProvisioner';
 import { decideBoxSize, poolDefaultSize, type BoxSize } from './boxSize';
 import { decideBoxDisk, defaultDiskGiB } from './boxDiskSize';
 import { environmentRepoUrl, prismaEnvironmentStore, reposOutsideOrgs, type EnvironmentRecord, type EnvironmentStore } from './environments';
@@ -56,9 +57,10 @@ import { getGithubBrokerUrl } from './githubBroker';
 import { currentPoolSpecHash } from './warmPool';
 import { ENV_POOL_STATUSES } from './instanceLifecycle';
 import { envPoolTargets } from './envPoolSizes';
-import { attemptAt, envPoolRetryAt, nextRefreshAt, planEnvironmentPool, planEnvPoolRefresh, type EnvPoolCurrent, type EnvPoolRowView, type EnvPoolStatus } from './envPoolPlanner';
+import { attemptAt, failureHold, holdingFailure, nextRefreshAt, planEnvironmentPool, planEnvPoolRefresh, type EnvPoolCurrent, type EnvPoolFailureView, type EnvPoolRowView, type EnvPoolStatus } from './envPoolPlanner';
 import { dropInstanceAgent, isInstanceAgentConnected, onPoolBoxFrame, sendToInstanceAgent, type PoolBoxEvent } from './agentRegistry';
 import { recordProductEvent } from './productEvents';
+import { describeOnWarmRun, envPoolOnWarmUpdate, parseOnWarmReport } from './onWarmStatus';
 import { failRoot } from './tracing/spans';
 
 /** The agent's capability for the environment-prepare RPC (agent/environment-prepare.js). */
@@ -67,11 +69,10 @@ export const ENV_PREPARE_CAPABILITY = 'environment-prepare-v1';
 /** The project id a pool box's prepare chain reports under: no real project is ever called this. */
 export const POOL_PROJECT_ID = 'pool';
 
-const RESOLVE_CACHE_MS = 60_000;
 const MAX_LOG_CHARS = 4000;
 const PREPARE_RPC_TIMEOUT_MS = 30_000;
-/** After a prepare that failed for anything but its setup (a launch, the image, a clone, a timeout), the next launch waits this long. */
-export const ENV_POOL_RETRY_MS = 10 * 60 * 1000;
+/** How long a failed prepare or refresh holds its pool at the setup hash and heads it ran at (envPoolPlanner failureHold). */
+export const ENV_POOL_RETRY_MS = 60 * 60 * 1000;
 
 // ── What an environment is now ───────────────────────────────────────────────
 
@@ -197,44 +198,44 @@ export async function resolveEnvPoolDefinition(env: EnvironmentRecord, deps: Env
   };
 }
 
-const resolveCache = new Map<string, { at: number; value: EnvPoolResolution; env: EnvironmentRecord | null }>();
-
-/** The environment named `name`, as its pool sees it now, cached a minute: a claim reads it, and so does each tick. */
-export async function envPoolDefinitionByName(name: string, deps: EnvPoolDeps = defaultEnvPoolDeps): Promise<EnvPoolResolution> {
-  const hit = resolveCache.get(name);
-  if (hit && Date.now() - hit.at < RESOLVE_CACHE_MS) return hit.value;
-  let value: EnvPoolResolution;
-  try {
-    const env = await deps.store.byName(name);
-    value = env ? await resolveEnvPoolDefinition(env, deps) : { ok: false, reason: `there is no environment named ${name}` };
-  } catch (err) {
-    value = { ok: false, reason: errMsg(err) };
-  }
-  resolveCache.set(name, { at: Date.now(), value, env: null });
-  return value;
-}
+/**
+ * Each pooled environment's resolution from the tick's last pass, by name (as lastWarmPoolTick() is the warm pool's):
+ * what a claim (POST /api/instances) and the polled GET /api/environments/:id/pool read, so neither waits on GitHub.
+ * The tick replaces it every pass; a stale hash only makes a claim miss, since the claim statement filters on it.
+ */
+/** Keyed by name; `of` is the `updatedAt` of the environment row each was resolved from. */
+const lastResolutions = new Map<string, { of: Date; value: EnvPoolResolution }>();
 
 /**
- * The environment as a preparing box's hello needs it: read afresh, past the cache, from the row the hello has, and,
- * when it is a success or a permanent refusal, kept in the cache for the claims and the tick. A stale cached refusal (one an edit has since fixed) must not fail a
- * box that would prepare.
+ * The tick's last resolution of the environment; null before the tick has resolved it, and null when the environment's
+ * row changed after (an edit of its setup, repositories or size): a box must never be prepared, nor claimed, for a
+ * definition the environment no longer has. A hello then resolves afresh; a claim misses until the next tick.
+ * `updatedAt` is the row's as the caller read it.
  */
-export async function resolveForHello(env: EnvironmentRecord, deps: EnvPoolDeps = defaultEnvPoolDeps): Promise<EnvPoolResolution> {
+export function lastEnvPoolResolution(env: Pick<EnvironmentRecord, 'name' | 'updatedAt'>): EnvPoolResolution | null {
+  const stored = lastResolutions.get(env.name);
+  if (!stored || stored.of.getTime() < env.updatedAt.getTime()) return null;
+  return stored.value;
+}
+
+/** Resolve the environment now (GitHub, with the pool credential) and keep it for the readers above. The tick's only. */
+export async function resolveForTick(env: EnvironmentRecord, deps: EnvPoolDeps = defaultEnvPoolDeps): Promise<EnvPoolResolution> {
   let value: EnvPoolResolution;
   try {
     value = await resolveEnvPoolDefinition(env, deps);
   } catch (err) {
     value = { ok: false, reason: errMsg(err) };
   }
-  // A success or a permanent refusal is what the environment is; a transient failure (GitHub, the credential) is this
-  // hello's alone, and must not hide a ready pool from the claims for the cache's minute.
-  if (value.ok || value.permanent) resolveCache.set(env.name, { at: Date.now(), value, env: null });
+  // Stamped with the row it was resolved from: any edit after that row, landing before or during the resolve, is newer,
+  // so the readers above take this resolution as stale.
+  lastResolutions.set(env.name, { of: env.updatedAt, value });
   return value;
 }
 
-/** Test hook. */
-export function resetEnvPoolCache(): void {
-  resolveCache.clear();
+/** Test hook: what the tick would have stored. */
+export function setLastEnvPoolResolutionForTests(name: string, value: EnvPoolResolution | null, of: Date = new Date()): void {
+  if (value) lastResolutions.set(name, { of, value });
+  else lastResolutions.delete(name);
 }
 
 /** A branch's head commit, read from GitHub with the pool credential. */
@@ -272,31 +273,39 @@ export function noteClaimInFlight(instanceId: string, inFlight: boolean): void {
   else claimsInFlight.delete(instanceId);
 }
 
+/**
+ * Rows an earlier pool left `env-failed` (a status the one failure rule replaced): moved to `terminated`, as the rule
+ * writes a failure, so the teardown sweep cleans up what they hold and nothing else reads them. Done by the tick, not
+ * only the migration, since deploys sync the schema with `prisma db push`. How many it moved.
+ */
+export async function retireEnvFailedRows(db: { instance: { updateMany(q: Prisma.InstanceUpdateManyArgs): Promise<{ count: number }> } }, now: Date): Promise<number> {
+  const stamped = await db.instance.updateMany({ where: { status: 'env-failed', terminatedAt: null }, data: { status: 'terminated', terminatedAt: now } });
+  const rest = await db.instance.updateMany({ where: { status: 'env-failed' }, data: { status: 'terminated' } });
+  return stamped.count + rest.count;
+}
+
 /** One tick of every environment pool. Never throws. */
 export async function reconcileEnvPools(now = new Date()): Promise<void> {
   if (!getBoxConfig()) return;
   const policy = envPoolConfigFromEnv(process.env);
   try {
+    const legacy = await retireEnvFailedRows(prisma, now);
+    if (legacy) console.log(`[ENV-POOL] ${legacy} env-failed row(s) moved to terminated; the teardown sweep cleans them up`);
     const rows = await selectEnvPoolRows();
     const targets = await envPoolTargets();
-    if (!targets.length && rows.every(r => r.status === 'env-failed')) {
-      await retireFailedWithoutPool(rows, targets.map(t => t.name));
-      return;
-    }
+    if (!targets.length && !rows.length) return;
 
     await settleStops(rows.filter(r => r.status === 'env-stopping'));
     await putBackStrandedStarts(rows.filter(r => r.status === 'env-starting'), now, policy);
 
     // Every environment with a target, then any still holding boxes, at target 0 so its plan drains them.
-    const byId = new Map<string, { name: string | null; target: number }>();
-    const names = new Map<string, string>();
+    const byId = new Map<string, { env: EnvironmentRecord | null; target: number }>();
     for (const t of targets) {
       const env = await prismaEnvironmentStore.byName(t.name);
       if (!env) { console.warn(`[ENV-POOL] ${t.name}: there is no environment by that name; no pool`); continue; }
-      byId.set(env.id, { name: env.name, target: t.target });
-      names.set(env.id, env.name);
+      byId.set(env.id, { env, target: t.target });
     }
-    for (const r of rows) if (!byId.has(r.poolEnvironmentId)) byId.set(r.poolEnvironmentId, { name: null, target: 0 });
+    for (const r of rows) if (!byId.has(r.poolEnvironmentId)) byId.set(r.poolEnvironmentId, { env: null, target: 0 });
 
     let inFlight = rows.filter(r => r.status === 'env-preparing').length;
     const subnets = (() => { const c = getBoxConfig()!; return [c.subnetId, ...c.fallbackSubnetIds]; })();
@@ -304,18 +313,20 @@ export async function reconcileEnvPools(now = new Date()): Promise<void> {
       const own = rows.filter(r => r.poolEnvironmentId === environmentId);
       let current: EnvPoolCurrent = { ok: false, reason: 'no longer pooled' };
       let def: EnvPoolDefinition | null = null;
-      if (group.name && group.target > 0) {
-        const res = await envPoolDefinitionByName(group.name);
+      const name = group.env?.name ?? null;
+      if (group.env && group.target > 0) {
+        const res = await resolveForTick(group.env);
         if (res.ok) { def = res.def; current = { ok: true, hash: def.setupHash, heads: def.heads }; }
-        else { current = { ok: false, reason: res.reason }; console.warn(`[ENV-POOL] ${group.name}: ${res.reason}; holding its pool as it is`); }
+        else { current = { ok: false, reason: res.reason }; console.warn(`[ENV-POOL] ${name}: ${res.reason}; holding its pool as it is`); }
       }
       const plan = planEnvironmentPool({
         rows: own, current, target: group.target,
         headroom: Math.max(0, policy.maxInFlight - inFlight),
-        subnets, prepareTimeoutMs: policy.prepareTimeoutMs, retryAfterMs: ENV_POOL_RETRY_MS, now,
+        subnets, prepareTimeoutMs: policy.prepareTimeoutMs,
+        lastFailure: def ? await lastFailureOf(environmentId, now, current) : null, holdMs: ENV_POOL_RETRY_MS, now,
       });
       inFlight += plan.launch.length;
-      console.log(`[ENV-POOL] tick ${group.name ?? environmentId} target=${group.target} stopped=${plan.supply.stopped} preparing=${plan.supply.preparing} launch=${plan.launch.length} retire=${plan.retire.length} fail=${plan.fail.length}${plan.blocked ? ` blocked-by=${plan.blocked.rowId}` : ''}`);
+      console.log(`[ENV-POOL] tick ${name ?? environmentId} target=${group.target} stopped=${plan.supply.stopped} preparing=${plan.supply.preparing} launch=${plan.launch.length} retire=${plan.retire.length} fail=${plan.fail.length}${plan.held ? ` held-by=${plan.held.rowId} until=${plan.held.until.toISOString()}` : ''}`);
       for (const f of plan.fail) await failPrepare(f.id, f.reason, null);
       for (const r of plan.retire) await retireRow(own.find(o => o.id === r.id)!, r.reason);
       let launched = 0;
@@ -323,15 +334,15 @@ export async function reconcileEnvPools(now = new Date()): Promise<void> {
 
       // The refresh: what the launches leave of the in-flight cap, oldest prepared first.
       if (!def) continue;
-      const check = planEnvPoolRefresh({ rows: own, stoppedRows: plan.stoppedRows, current, blocked: !!plan.blocked, retryAt: plan.retryAt, intervalMs: policy.refreshMs, now, launched });
+      const check = planEnvPoolRefresh({ rows: own, stoppedRows: plan.stoppedRows, current, held: plan.held, intervalMs: policy.refreshMs, now, launched });
       if (check.skip.length) {
         await prisma.instance.updateMany({ where: { id: { in: check.skip.map(k => k.id) }, userId: null, status: 'env-stopped' }, data: { refreshCheckedAt: now } });
-        for (const k of check.skip) console.log(`[ENV-POOL] refresh ${group.name}: skip ${k.id} (every default branch is where it was prepared)`);
+        for (const k of check.skip) console.log(`[ENV-POOL] refresh ${name}: skip ${k.id} (every default branch is where it was prepared)`);
       }
       // Held rows stay due (no refreshCheckedAt): the tick line's blocked-by says why, and they go once it lifts.
       for (const id of check.refresh) {
         if (inFlight >= policy.maxInFlight) {
-          console.log(`[ENV-POOL] refresh ${group.name}: ${check.refresh.length - check.refresh.indexOf(id)} due, waiting for the in-flight cap (${policy.maxInFlight})`);
+          console.log(`[ENV-POOL] refresh ${name}: ${check.refresh.length - check.refresh.indexOf(id)} due, waiting for the in-flight cap (${policy.maxInFlight})`);
           break;
         }
         if (await refreshEnvPoolBox(own.find(o => o.id === id)!, def, policy, now) === 'started') inFlight++;
@@ -347,8 +358,7 @@ async function selectEnvPoolRows(): Promise<EnvPoolRow[]> {
   const rows = await prisma.instance.findMany({
     where: { userId: null, status: { in: [...ENV_POOL_STATUSES] }, poolEnvironmentId: { not: null } },
     select: {
-      id: true, status: true, poolSetupHash: true, preparedCommit: true, preparedAt: true, createdAt: true, subnetId: true, terminatedAt: true,
-      poolSetupFailed: true,
+      id: true, status: true, poolSetupHash: true, preparedCommit: true, preparedAt: true, createdAt: true, subnetId: true,
       poolEnvironmentId: true, ec2InstanceId: true, region: true, claimedAt: true, cleanedUpAt: true,
       refreshStartedAt: true, refreshCheckedAt: true,
     },
@@ -356,7 +366,6 @@ async function selectEnvPoolRows(): Promise<EnvPoolRow[]> {
   return rows.map(r => ({
     ...r,
     status: r.status as EnvPoolStatus,
-    setupFailed: r.poolSetupFailed,
     poolEnvironmentId: r.poolEnvironmentId!,
     preparedCommit: commitsOf(r.preparedCommit),
   }));
@@ -369,17 +378,32 @@ export function commitsOf(v: Prisma.JsonValue | null | undefined): Record<string
   return out;
 }
 
-/** With no pool wanted anywhere, a failed row has nothing left to explain once a day has passed. */
-async function retireFailedWithoutPool(rows: EnvPoolRow[], _names: string[]): Promise<void> {
-  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-  for (const r of rows) if (r.status === 'env-failed' && r.createdAt.getTime() < dayAgo) await retireRow(r, 'drain');
+/**
+ * A failed prepare or refresh of a pool: a `terminated` row of the environment that keeps the reason and the log it
+ * failed with (failPrepare, and boxProvisioner's markFailed for a launch). A retired row has no reason; a claim's
+ * abandoned start clears the log (envPoolClaim.ts). Ownerless only: a claimed box keeps its pool columns, and a
+ * failure after its claim is its owner's box's, not the pool's.
+ */
+export function poolFailureWhere(environmentId: string, since: Date): Prisma.InstanceWhereInput {
+  return { userId: null, poolEnvironmentId: environmentId, status: 'terminated', provisioningError: { not: null }, poolLog: { not: null }, terminatedAt: { gte: since } };
 }
 
-function ec2For(region: string | null): EC2Client {
-  const cfg = getBoxConfig();
-  if (!cfg) throw new Error('Box provisioning is not configured');
-  return new EC2Client(awsClientConfig(cfg, region ?? cfg.region));
+/**
+ * The failure within the hold at what the environment is now (its setup hash and heads), for the planner's one failure
+ * rule: the newest of those, not the newest overall, so a branch reset to heads that failed is still held after a
+ * newer failure at other heads.
+ */
+async function lastFailureOf(environmentId: string, now: Date, current: EnvPoolCurrent): Promise<EnvPoolFailureView | null> {
+  if (!current.ok) return null;
+  const rows = await prisma.instance.findMany({
+    where: { ...poolFailureWhere(environmentId, new Date(now.getTime() - ENV_POOL_RETRY_MS)), poolSetupHash: current.hash },
+    orderBy: { terminatedAt: 'desc' },
+    select: { id: true, poolSetupHash: true, preparedCommit: true, terminatedAt: true },
+  });
+  return holdingFailure(rows.flatMap(r => r.terminatedAt
+    ? [{ id: r.id, poolSetupHash: r.poolSetupHash, preparedCommit: commitsOf(r.preparedCommit), failedAt: r.terminatedAt }] : []), current);
 }
+
 
 /** `env-stopping` → `env-stopped` once EC2 says the box is stopped. */
 /**
@@ -409,7 +433,7 @@ async function settleStops(rows: EnvPoolRow[]): Promise<void> {
   for (const r of rows) {
     if (!r.ec2InstanceId) continue;
     try {
-      const ec2 = ec2For(r.region);
+      const ec2 = ec2For(r);
       const res = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [r.ec2InstanceId] }));
       const next = stopSettlement(res.Reservations?.[0]?.Instances?.[0]?.State?.Name);
       if (next === 'restop') {
@@ -450,7 +474,7 @@ export async function stopBack(id: string, ec2InstanceId: string | null, region:
   try {
     const moved = await prisma.instance.updateMany({ where: { id, userId: null, status: from }, data: { ...data, status: 'env-stopping', claimedAt: null } });
     if (!moved.count) return false;
-    if (ec2InstanceId) await ec2For(region).send(new StopInstancesCommand({ InstanceIds: [ec2InstanceId] }));
+    if (ec2InstanceId) await ec2For({ region }).send(new StopInstancesCommand({ InstanceIds: [ec2InstanceId] }));
     console.log(`[ENV-POOL] ${id}: stopping (${why})`);
     return true;
   } catch (err) {
@@ -461,13 +485,12 @@ export async function stopBack(id: string, ec2InstanceId: string | null, region:
 
 async function retireRow(row: EnvPoolRow, reason: string): Promise<void> {
   const changed = await prisma.instance.updateMany({
-    where: { id: row.id, userId: null, status: { in: ['env-preparing', 'env-stopping', 'env-stopped', 'env-failed'] } },
-    data: { status: 'terminated', terminatedAt: new Date() },
+    where: { id: row.id, userId: null, status: { in: ['env-preparing', 'env-stopping', 'env-stopped'] } },
+    // No reason: a retired box is no failure (poolFailureWhere).
+    data: { status: 'terminated', terminatedAt: new Date(), provisioningError: null },
   });
   if (!changed.count) return;
   console.log(`[ENV-POOL] retire ${row.id}: ${reason}`);
-  // A failed box was terminated when it failed; the teardown is idempotent, and the provisioning sweep retries what's left.
-  if (row.status === 'env-failed' && row.cleanedUpAt) return;
   const instance = await prisma.instance.findUnique({ where: { id: row.id } });
   if (instance) void terminateBox(instance);
 }
@@ -534,8 +557,8 @@ export async function refreshEnvPoolBox(row: EnvPoolRow, def: EnvPoolDefinition,
       if (await tx.instance.count({ where: { userId: null, status: 'env-preparing' } }) >= policy.maxInFlight) return false;
       const moved = await tx.instance.updateMany({
         where: { id: row.id, userId: null, status: 'env-stopped', poolSetupHash: def.setupHash },
-        // preparedCommit is what this attempt is at, as a launch's is: a failed refresh keeps it with the hash, and
-        // failPrepare's poolSetupFailed says whether it holds the pool (setup ran) or only delays a retry (envPoolPlanner).
+        // preparedCommit is what this attempt is at, as a launch's is: a failed refresh keeps it with the hash, and holds
+        // the pool at them (envPoolPlanner failureHold).
         data: { status: 'env-preparing', refreshStartedAt: now, refreshCheckedAt: now, preparedCommit: def.heads },
       });
       return moved.count > 0;
@@ -553,7 +576,11 @@ export async function refreshEnvPoolBox(row: EnvPoolRow, def: EnvPoolDefinition,
     .map(([repo, sha]) => `${repo} ${row.preparedCommit?.[repo]?.slice(0, 7) ?? 'none'}→${sha.slice(0, 7)}`).join(', ');
   try {
     if (!row.ec2InstanceId) throw new Error('it has no EC2 instance');
-    await ec2For(row.region).send(new StartInstancesCommand({ InstanceIds: [row.ec2InstanceId] }));
+    // The same start as a claim's: no capacity for its type tries another of the same shape (ec2Box.startBox).
+    const box = await prisma.instance.findUnique({ where: { id: row.id } });
+    if (!box) throw new Error('its row is gone');
+    const { fallbackType } = await startBox(ec2For(box), box);
+    if (fallbackType) console.log(`[ENV-POOL] refresh ${row.id}: started on fallback ${fallbackType}`);
   } catch (err) {
     const why = isCapacityRefusal(err) ? 'no capacity' : 'start failed';
     // Back as it was: still stopped, still prepared at its old commits.
@@ -615,7 +642,9 @@ async function onPoolHello(ev: PoolBoxEvent): Promise<void> {
     return;
   }
   const env = await prismaEnvironmentStore.get(row.poolEnvironmentId);
-  const res = env ? await resolveForHello(env) : null;
+  // The tick's last resolution, else one now: a restart loses it, and an edit of the environment since the tick makes
+  // it stale. A retry reads it again, so it sees what the next tick resolved.
+  const res = env ? lastEnvPoolResolution(env) ?? await resolveForTick(env) : null;
   const action = helloAction(row.poolSetupHash, res);
   if (action.kind === 'retire') {
     await retireRow({ ...(row as unknown as EnvPoolRow), status: 'env-preparing' }, action.reason);
@@ -660,7 +689,7 @@ export function prepareSendOutcome(sent: { answer: Record<string, unknown> | nul
 }
 
 /** The pool chain's own environment-status (project `pool`): setup done stops the box, failed fails it. */
-export function parsePoolStatus(msg: Record<string, unknown>): { state: string; setup: string; setupCommit: Record<string, string> | null; log: string; error: string | null; exitCode: number | null; prepareId: string | null } | null {
+export function parsePoolStatus(msg: Record<string, unknown>): { state: string; setup: string; setupCommit: Record<string, string> | null; log: string; error: string | null; exitCode: number | null; prepareId: string | null; onWarm: { onWarmStatus: string; onWarmSeconds: number } | null } | null {
   if (msg.projectId !== POOL_PROJECT_ID || !msg.status || typeof msg.status !== 'object') return null;
   const s = msg.status as Record<string, unknown>;
   const setup = s.setup && typeof s.setup === 'object' ? s.setup as Record<string, unknown> : {};
@@ -673,7 +702,16 @@ export function parsePoolStatus(msg: Record<string, unknown>): { state: string; 
     // Set only when a setup step ran and exited: a clone or start failure before the chain carries none.
     exitCode: typeof setup.exitCode === 'number' && Number.isInteger(setup.exitCode) ? setup.exitCode : null,
     prepareId: typeof s.prepareId === 'string' ? s.prepareId : null,
+    // This prepare's own on-warm outcome (a refresh's skip included), from an agent that sends it.
+    onWarm: onWarmOfFrame(s.onWarm),
   };
+}
+
+function onWarmOfFrame(v: unknown): { onWarmStatus: string; onWarmSeconds: number } | null {
+  if (!v || typeof v !== 'object') return null;
+  const w = v as Record<string, unknown>;
+  if (typeof w.state !== 'string' || !['succeeded', 'failed', 'skipped'].includes(w.state)) return null;
+  return { onWarmStatus: w.state, onWarmSeconds: typeof w.seconds === 'number' && Number.isFinite(w.seconds) ? Math.max(0, Math.round(w.seconds)) : 0 };
 }
 
 /**
@@ -686,6 +724,42 @@ export function poolStatusOutcome(status: NonNullable<ReturnType<typeof parsePoo
   if ((status.setup === 'succeeded' || status.setup === 'none') && status.state === 'ready') return 'prepared';
   if (status.state === 'failed' || status.setup === 'failed') return 'failed';
   return 'pending';
+}
+
+/**
+ * A preparing box's on-warm run (the warm pool's hook, which its prepare runs before setup): recorded on the row,
+ * never failing it. A failure is kept with the box when it stops (poolLog), for the pool page.
+ */
+async function onPoolOnWarm(ev: PoolBoxEvent): Promise<void> {
+  const report = parseOnWarmReport(ev.msg);
+  if (!report) return;
+  const changed = await prisma.instance.updateMany(envPoolOnWarmUpdate(ev.instance.id, report));
+  if (!changed.count || report.state === 'running') return;
+  console.log(`[ENV-POOL] ${ev.instance.id}: on-warm ${describeOnWarmRun(report)}`);
+  // A failure that arrives after the box was prepared (its setup was quicker than the forwarder): kept for the page.
+  if (report.state === 'failed') {
+    const row = await prisma.instance.findUnique({ where: { id: ev.instance.id }, select: { onWarmStatus: true, onWarmLog: true } });
+    if (row) await prisma.instance.updateMany({ where: { id: ev.instance.id, userId: null, status: { in: ['env-stopping', 'env-stopped'] } }, data: { poolLog: onWarmPoolLog(row) } });
+  }
+}
+
+/** What the pool page keeps of a prepared box's on-warm run: its failure, with the log; nothing when it succeeded. */
+export function onWarmPoolLog(row: { onWarmStatus: string | null; onWarmLog: string | null }): string | null {
+  return row.onWarmStatus === 'failed' ? `termag's warm-up (on-warm) failed; the box was prepared anyway\n\n${row.onWarmLog ?? ''}`.slice(-MAX_LOG_CHARS) : null;
+}
+
+/**
+ * The pool page's view of a box's on-warm run, from its own on-warm columns (which every on-warm frame writes), so a
+ * failure's log shows whatever the box's poolLog holds. Null when none ran.
+ */
+export function onWarmView(row: { onWarmStatus: string | null; onWarmSeconds: number | null; onWarmLog: string | null }): EnvPoolView['onWarm'] {
+  if (!row.onWarmStatus) return null;
+  return { state: row.onWarmStatus, seconds: row.onWarmSeconds, log: onWarmPoolLog(row) };
+}
+
+/** The on-warm run's part of a prepare event: whether it ran, how it ended, how long it took. */
+export function onWarmEventProps(row: { onWarmStatus: string | null; onWarmSeconds: number | null }): { onWarm: string; onWarmSec: number | null } {
+  return { onWarm: row.onWarmStatus ?? 'none', onWarmSec: row.onWarmSeconds ?? null };
 }
 
 async function onPoolStatus(ev: PoolBoxEvent): Promise<void> {
@@ -705,42 +779,49 @@ async function onPoolStatus(ev: PoolBoxEvent): Promise<void> {
     const commits = status.setupCommit ?? commitsOf(row.preparedCommit) ?? {};
     const why = status.setup === 'none' ? 'cloned; the environment has no setup' : 'setup succeeded';
     const stopped = await stopBack(row.id, row.ec2InstanceId, row.region, 'env-preparing', refreshing ? `refresh: ${why}` : why, {
-      preparedCommit: commits, preparedAt, poolLog: null, refreshStartedAt: null,
+      preparedCommit: commits, preparedAt, poolLog: onWarmPoolLog(row), refreshStartedAt: null,
     });
     if (stopped) {
       const took = Math.round((preparedAt.getTime() - (refreshing ?? row.createdAt).getTime()) / 1000);
       console.log(`[ENV-POOL] ${row.id}: ${refreshing ? 'refreshed' : 'prepared'} at ${Object.entries(commits).map(([r, s]) => `${r}@${s.slice(0, 7)}`).join(' ')} in ${took}s`);
+      // The prepare's own on-warm outcome when its frame says it; else the on-warm columns as they are now (its frames
+      // come separately, and the settled one may have landed since `row`).
+      const onWarm = await prisma.instance.findUnique({ where: { id: row.id }, select: { onWarmStatus: true, onWarmSeconds: true } }).catch(() => null);
       recordProductEvent('environment.setup', { user: null, box: row.id }, {
         outcome: 'succeeded', where: refreshing ? 'refresh' : 'pool', incremental: !!refreshing, environmentId: row.poolEnvironmentId, prepareSec: took,
+        ...onWarmEventProps(status.onWarm ?? onWarm ?? row),
       });
     }
     return;
   }
   if (outcome === 'failed') {
     // Only a setup step that ran and exited says the setup is broken (and holds the pool until it or a head changes).
-    await failPrepare(row.id, status.error ?? 'setup failed', status.log || null, { setupRan: status.exitCode !== null });
+    await failPrepare(row.id, status.error ?? 'setup failed', status.log || null, { onWarm: status.onWarm });
   }
 }
 
 /**
- * `env-preparing` → `env-failed` with its log, and the box goes; the row stays for the environment's page, with the
- * hash and heads it launched at. A failure of setup itself (`setupRan`, Instance.poolSetupFailed) holds the pool
- * until the setup or a head changes (envPoolPlanner); anything else (an old image, the environment not resolving, a
- * clone, a timeout) only delays the next launch for that same hash and heads (ENV_POOL_RETRY_MS).
+ * A failed prepare or refresh: `env-preparing` → `terminated`, keeping the reason, the log, and the setup hash and
+ * heads it ran at, and the box goes. Whatever failed (the image, the environment not resolving, a clone, setup, a
+ * timeout), it holds the pool at that hash and heads until either changes or ENV_POOL_RETRY_MS passes
+ * (envPoolPlanner failureHold), and the environment's page shows its log.
  */
-async function failPrepare(id: string, reason: string, log: string | null, opts: { setupRan?: boolean } = {}): Promise<void> {
+async function failPrepare(id: string, reason: string, log: string | null, opts: { onWarm?: { onWarmStatus: string; onWarmSeconds: number } | null } = {}): Promise<void> {
   const changed = await prisma.instance.updateMany({
     where: { id, userId: null, status: 'env-preparing' },
     data: {
-      status: 'env-failed', provisioningError: reason.slice(0, 1000), poolLog: (log ? `${reason}\n\n${log}` : reason).slice(-MAX_LOG_CHARS), terminatedAt: new Date(),
-      poolSetupFailed: opts.setupRan === true,
+      status: 'terminated', provisioningError: reason.slice(0, 1000), poolLog: (log ? `${reason}\n\n${log}` : reason).slice(-MAX_LOG_CHARS), terminatedAt: new Date(),
     },
   });
   if (!changed.count) return;
   console.warn(`[ENV-POOL] ${id}: prepare failed: ${reason}`);
   const row = await prisma.instance.findUnique({ where: { id } });
   const refresh = !!row?.refreshStartedAt;
-  recordProductEvent('environment.setup', { user: null, box: id }, { outcome: 'failed', where: refresh ? 'refresh' : 'pool', incremental: refresh, environmentId: row?.poolEnvironmentId ?? null });
+  recordProductEvent('environment.setup', { user: null, box: id }, {
+    outcome: 'failed', where: refresh ? 'refresh' : 'pool', incremental: refresh, environmentId: row?.poolEnvironmentId ?? null,
+    // The prepare's own on-warm outcome when its frame says it (a refresh's skip), else the box's last run.
+    ...(opts.onWarm ? onWarmEventProps(opts.onWarm) : row ? onWarmEventProps(row) : {}),
+  });
   dropInstanceAgent(id, 'its environment prepare failed');
   if (row) void terminateBox(row);
 }
@@ -752,7 +833,8 @@ export function startEnvPool(): () => void {
   if (stopListening) return stopListening;
   const offHello = onPoolBoxFrame('hello', ev => { onPoolHello(ev).catch(err => console.error('[ENV-POOL] hello:', errMsg(err))); });
   const offStatus = onPoolBoxFrame('environment-status', ev => { onPoolStatus(ev).catch(err => console.error('[ENV-POOL] status:', errMsg(err))); });
-  stopListening = () => { offHello(); offStatus(); stopListening = null; };
+  const offOnWarm = onPoolBoxFrame('on-warm-status', ev => { onPoolOnWarm(ev).catch(err => console.error('[ENV-POOL] on-warm:', errMsg(err))); });
+  stopListening = () => { offHello(); offStatus(); offOnWarm(); stopListening = null; };
   return stopListening;
 }
 
@@ -767,38 +849,55 @@ export interface EnvPoolView {
   preparedAt: string | null;
   preparedCommit: Record<string, string> | null;
   lastFailure: { at: string; log: string } | null;
+  /** The newest ready box's on-warm run (the warm pool's hook, run during its prepare); null when none recorded one. */
+  onWarm: { state: string; seconds: number | null; log: string | null } | null;
   /** When its stopped boxes are next checked for a refresh (ENV_POOL_REFRESH_MINUTES after each was prepared or last checked); null with none. */
   nextRefreshAt: string | null;
 }
 
-export async function envPoolView(environmentId: string, name: string): Promise<EnvPoolView | null> {
+/**
+ * The rows a claim would take now, newest prepared first: `env-stopped` at the current setup hash. The claim
+ * (routes/instances.ts) takes from the tick's last resolution only, and misses without one (a restart, a new replica,
+ * before the first tick) or with an unresolved one, so the pool card counts none ready then either.
+ */
+export function claimableRows<R extends { status: string; poolSetupHash: string | null; preparedAt: Date | null }>(rows: R[], res: EnvPoolResolution | null): R[] {
+  if (!res?.ok) return [];
+  const hash = res.def.setupHash;
+  return rows.filter(r => r.status === 'env-stopped' && r.poolSetupHash === hash)
+    .sort((a, b) => (b.preparedAt?.getTime() ?? 0) - (a.preparedAt?.getTime() ?? 0));
+}
+
+export async function envPoolView(environmentId: string, name: string, updatedAt: Date): Promise<EnvPoolView | null> {
   const target = (await envPoolTargets()).find(t => t.name === name)?.target ?? 0;
   const rows = await prisma.instance.findMany({
-    where: { userId: null, poolEnvironmentId: environmentId, status: { in: ['env-preparing', 'env-stopping', 'env-stopped', 'env-failed'] } },
+    where: { userId: null, poolEnvironmentId: environmentId, status: { in: ['env-preparing', 'env-stopping', 'env-stopped'] } },
     select: {
-      id: true, status: true, preparedAt: true, preparedCommit: true, poolLog: true, createdAt: true, poolSetupHash: true, refreshCheckedAt: true, refreshStartedAt: true,
-      subnetId: true, terminatedAt: true, poolSetupFailed: true,
+      status: true, preparedAt: true, preparedCommit: true, poolLog: true, createdAt: true, poolSetupHash: true, refreshCheckedAt: true, refreshStartedAt: true,
+      onWarmStatus: true, onWarmSeconds: true, onWarmLog: true,
     },
   });
   if (target <= 0 && !rows.length) return null;
-  const res = target > 0 ? await envPoolDefinitionByName(name) : null;
-  const hash = res?.ok ? res.def.setupHash : null;
-  const ready = rows.filter(r => r.status === 'env-stopped' && (!hash || r.poolSetupHash === hash))
-    .sort((a, b) => (b.preparedAt?.getTime() ?? 0) - (a.preparedAt?.getTime() ?? 0));
-  // The tick checks nothing while a failure that wasn't setup's is being waited out (planEnvPoolRefresh): nor does the page.
+  // The tick's last resolution: this is polled by every open page, and never reads GitHub.
+  const res = target > 0 ? lastEnvPoolResolution({ name, updatedAt }) : null;
+  const ready = claimableRows(rows, res);
+  // The newest failure of the last week, until a box prepares after it.
+  const failure = await prisma.instance.findFirst({
+    where: poolFailureWhere(environmentId, new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)), orderBy: { terminatedAt: 'desc' }, select: { terminatedAt: true, poolLog: true },
+  });
+  const failed = failure?.terminatedAt && !(ready[0]?.preparedAt && ready[0].preparedAt > failure.terminatedAt) ? failure : null;
+  // The tick checks nothing while a failure holds the pool (planEnvPoolRefresh): nor does the page.
   const now = new Date();
-  const views: EnvPoolRowView[] = rows.map(r => ({ ...r, status: r.status as EnvPoolStatus, preparedCommit: commitsOf(r.preparedCommit), setupFailed: r.poolSetupFailed }));
-  const retryAt = res?.ok ? envPoolRetryAt(views, { ok: true, hash: res.def.setupHash, heads: res.def.heads }, ENV_POOL_RETRY_MS, now) : null;
-  // A refresh's failure dates from the refresh, not the box's launch.
-  const failed = rows.filter(r => r.status === 'env-failed').sort((a, b) => attemptAt(b).getTime() - attemptAt(a).getTime())[0];
+  const current: EnvPoolCurrent | null = res?.ok ? { ok: true, hash: res.def.setupHash, heads: res.def.heads } : null;
+  const held = current ? failureHold({ current, lastFailure: await lastFailureOf(environmentId, now, current), holdMs: ENV_POOL_RETRY_MS, now }) : null;
   return {
     target,
     ready: ready.length,
     preparing: rows.filter(r => r.status === 'env-preparing' || r.status === 'env-stopping').length,
     preparedAt: ready[0]?.preparedAt?.toISOString() ?? null,
     preparedCommit: commitsOf(ready[0]?.preparedCommit),
-    lastFailure: failed ? { at: attemptAt(failed).toISOString(), log: failed.poolLog ?? '' } : null,
-    nextRefreshAt: target > 0 ? nextRefreshAt(ready, envPoolConfigFromEnv(process.env).refreshMs, now, retryAt)?.toISOString() ?? null : null,
+    lastFailure: failed?.terminatedAt ? { at: failed.terminatedAt.toISOString(), log: failed.poolLog ?? '' } : null,
+    onWarm: ready[0] ? onWarmView(ready[0]) : null,
+    nextRefreshAt: target > 0 ? nextRefreshAt(ready, envPoolConfigFromEnv(process.env).refreshMs, now, held?.until ?? null)?.toISOString() ?? null : null,
   };
 }
 

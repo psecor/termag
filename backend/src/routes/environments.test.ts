@@ -7,8 +7,8 @@ import type {
 } from '../services/environments';
 
 // Environments are personal or shared: a personal one
-// is its owner's alone, a shared one anyone signed in reads, uses, edits and
-// deletes, and every change leaves an event with who, when, and the stored
+// is its owner's alone, a shared one anyone signed in reads and uses and only
+// an admin (u1 here; u2 isn't) creates, edits and deletes, and every change leaves an event with who, when, and the stored
 // fields before and after. An environment is an inline definition or a
 // pointer (repo : branch : path). The store is in memory here, with the same
 // contract as the Prisma one; services/environmentVisibility.test.ts has
@@ -101,6 +101,9 @@ const PEOPLE = [
   { id: 'u2', email: 'sam@example.com', name: 'Sam' },
 ];
 
+// u1 is an admin, u2 isn't.
+const ADMIN = async (id: string) => id === 'u1';
+
 let server: Server;
 let base: string;
 let cliBase: string;
@@ -110,7 +113,7 @@ beforeAll(async () => {
   const app = express();
   app.use(express.json());
   app.use('/api/environments', (req, res, next) => environmentsRouter({
-    store, people: async ids => PEOPLE.filter(p => ids.includes(p.id)), github: GITHUB,
+    store, people: async ids => PEOPLE.filter(p => ids.includes(p.id)), github: GITHUB, isAdmin: ADMIN,
     resolve: async (_user, env) => (env.kind === 'inline'
       ? { repos: (env.definition.repos as Array<{ repo: string }>), sizes: { size: 'large' }, warnings: [] }
       : { repos: [{ repo: env.file.repo }], sizes: null, warnings: ['not read in this test'] }),
@@ -126,7 +129,7 @@ beforeAll(async () => {
   };
   app.use('/api/cli/v1', (req, res, next) => {
     const r = express.Router();
-    mountCliEnvironmentRoutes(r, { store, people: async ids => PEOPLE.filter(p => ids.includes(p.id)), github: GITHUB }, bearer);
+    mountCliEnvironmentRoutes(r, { store, people: async ids => PEOPLE.filter(p => ids.includes(p.id)), github: GITHUB, isAdmin: ADMIN }, bearer);
     r(req, res, next);
   });
   void cli;
@@ -196,33 +199,49 @@ describe('environments routes', () => {
     expect((await call('GET', '/', 'u1')).body.environments).toEqual([]);
   });
 
-  it('lets anyone list, read, edit and delete a shared environment, and only its owner make it personal', async () => {
+  it('lets anyone list and read a shared environment, and only an admin create, edit, share, unshare or delete one', async () => {
     const created = (await call('POST', '/', 'u1', SHARED)).body.environment;
     expect(created).toMatchObject({ visibility: 'shared', owner: PEOPLE[0] });
     expect((await call('GET', '/', 'u2')).body.environments.map((e: { name: string }) => e.name)).toEqual(['shared-stack']);
-    const edited = await call('PUT', `/${created.id}`, 'u2', { ...POINTER, name: 'shared-stack', file: { ...POINTER.file, path: 'other.json' } });
-    expect(edited.body.environment).toMatchObject({ visibility: 'shared', updatedBy: PEOPLE[1], createdBy: PEOPLE[0], owner: PEOPLE[0] });
-    expect(await call('POST', `/${created.id}/visibility`, 'u2', { visibility: 'personal' })).toMatchObject({ status: 403, body: { code: 'environment_not_owner' } });
-    expect(await call('PUT', `/${created.id}`, 'u2', { ...FULL_STACK, name: 'shared-stack' })).toMatchObject({ status: 400, body: { code: 'environment_not_shareable' } });
+    expect((await call('GET', `/${created.id}`, 'u2')).status).toBe(200);
+    const edited = await call('PUT', `/${created.id}`, 'u1', { ...POINTER, name: 'shared-stack', file: { ...POINTER.file, path: 'other.json' } });
+    expect(edited.body.environment).toMatchObject({ visibility: 'shared', updatedBy: PEOPLE[0], createdBy: PEOPLE[0], owner: PEOPLE[0] });
+    expect(await call('PUT', `/${created.id}`, 'u1', { ...FULL_STACK, name: 'shared-stack' })).toMatchObject({ status: 400, body: { code: 'environment_not_shareable' } });
     const personal = await call('POST', `/${created.id}/visibility`, 'u1', { visibility: 'personal' });
     expect(personal.body.environment.visibility).toBe('personal');
     expect((await call('GET', `/${created.id}`, 'u2')).status).toBe(404);
     expect((await call('POST', `/${created.id}/visibility`, 'u1', { visibility: 'shared' })).body.environment.visibility).toBe('shared');
-    expect((await call('DELETE', `/${created.id}`, 'u2')).status).toBe(200);
+    expect((await call('DELETE', `/${created.id}`, 'u1')).status).toBe(200);
     expect(store.log.map(e => e.action)).toEqual(['environment.create', 'environment.update', 'environment.visibility', 'environment.visibility', 'environment.delete']);
+  });
+
+  it("refuses a non-admin's every change to a shared environment with 403 environment_admin_only, and writes nothing", async () => {
+    const refused = { status: 403, body: { code: 'environment_admin_only', error: 'Only admins can change shared environments; make a personal one' } };
+    expect(await call('POST', '/', 'u2', SHARED)).toMatchObject(refused);
+    const created = (await call('POST', '/', 'u1', SHARED)).body.environment;
+    // Repointing its file, changing its repositories (a new file), renaming it: all refused.
+    expect(await call('PUT', `/${created.id}`, 'u2', { ...SHARED, file: { ...POINTER.file, repo: 'acme/elsewhere' } })).toMatchObject(refused);
+    expect(await call('PUT', `/${created.id}`, 'u2', { ...SHARED, file: { ...POINTER.file, path: 'other.json' } })).toMatchObject(refused);
+    expect(await call('PUT', `/${created.id}`, 'u2', { ...SHARED, name: 'renamed' })).toMatchObject(refused);
+    expect(await call('POST', `/${created.id}/visibility`, 'u2', { visibility: 'personal' })).toMatchObject(refused);
+    expect(await call('DELETE', `/${created.id}`, 'u2')).toMatchObject(refused);
+    const mine = (await call('POST', '/', 'u2', { ...POINTER, name: 'sams' })).body.environment;
+    expect(await call('POST', `/${mine.id}/visibility`, 'u2', { visibility: 'shared' })).toMatchObject(refused);
+    expect(store.log.map(e => [e.action, e.actorUserId])).toEqual([['environment.create', 'u1'], ['environment.create', 'u2']]);
+    expect((await call('GET', `/${created.id}`, 'u2')).body.environment).toMatchObject({ name: 'shared-stack', file: { path: POINTER.file.path } });
   });
 
   it('keeps an audit log of every change across environments, newest first, with who and the stored fields before and after', async () => {
     const a = (await call('POST', '/', 'u1', SHARED)).body.environment;
-    await call('POST', '/', 'u2', { ...POINTER, visibility: 'shared' });
+    await call('POST', '/', 'u1', { ...POINTER, visibility: 'shared' });
     await call('POST', '/', 'u2', { ...FULL_STACK, name: 'sams-own' });
-    await call('PUT', `/${a.id}`, 'u2', { ...SHARED, file: { ...POINTER.file, path: 'moved.json' } });
+    await call('PUT', `/${a.id}`, 'u1', { ...SHARED, file: { ...POINTER.file, path: 'moved.json' } });
     const all = await call('GET', '/events', 'u1');
     expect(all.body.events.map((e: { action: string; environmentName: string }) => [e.action, e.environmentName])).toEqual([
       ['environment.update', 'shared-stack'], ['environment.create', 'from-file'], ['environment.create', 'shared-stack'],
     ]);
     const [update] = all.body.events;
-    expect(update.actor).toEqual(PEOPLE[1]);
+    expect(update.actor).toEqual(PEOPLE[0]);
     expect(update.before.file.path).toBe('.termag/full-stack/environment.json');
     expect(update.after.file.path).toBe('moved.json');
     expect((await call('GET', '/events', 'u2')).body.events).toHaveLength(4);
@@ -233,8 +252,8 @@ describe('environments routes', () => {
 
   it('keeps the history of a deleted environment', async () => {
     const created = (await call('POST', '/', 'u1', SHARED)).body.environment;
-    await call('DELETE', `/${created.id}`, 'u2');
-    expect((await call('GET', `/${created.id}`, 'u1')).status).toBe(404);
+    await call('DELETE', `/${created.id}`, 'u1');
+    expect((await call('GET', `/${created.id}`, 'u2')).status).toBe(404);
     expect((await call('GET', `/events?environment=${created.id}`, 'u1')).body.events.map((e: { action: string; environmentName: string }) => [e.action, e.environmentName]))
       .toEqual([['environment.delete', 'shared-stack'], ['environment.create', 'shared-stack']]);
     const mine = (await call('POST', '/', 'u1', FULL_STACK)).body.environment;
@@ -260,7 +279,7 @@ describe('environments routes', () => {
 
   it('refuses an edit made from an older version (409 environment_changed), and takes one made from the current', async () => {
     const created = (await call('POST', '/', 'u1', SHARED)).body.environment;
-    const first = await call('PUT', `/${created.id}`, 'u2', { ...SHARED, name: 'stack', updatedAt: created.updatedAt });
+    const first = await call('PUT', `/${created.id}`, 'u1', { ...SHARED, name: 'stack', updatedAt: created.updatedAt });
     expect(first.status).toBe(200);
     const stale = await call('PUT', `/${created.id}`, 'u1', { ...SHARED, name: 'other', updatedAt: created.updatedAt });
     expect(stale).toMatchObject({ status: 409, body: { code: 'environment_changed' } });
@@ -348,19 +367,23 @@ describe('the CLI routes (termag environment, routes/cliEnvironments.ts)', () =>
     expect(store.log[0]).toMatchObject({ actorUserId: 'u1', action: 'environment.create' });
     expect((await cliCall('GET', '/full-stack', AS_ADA)).body.environment).toMatchObject({ name: 'full-stack', kind: 'inline' });
     expect((await cliCall('GET', '/full-stack', AS_SAM)).status).toBe(404);
-    await cliCall('POST', '', AS_SAM, SHARED);
+    expect(await cliCall('POST', '', AS_SAM, SHARED)).toMatchObject({ status: 403, body: { code: 'environment_admin_only' } });
+    await cliCall('POST', '', AS_ADA, SHARED);
     expect((await cliCall('GET', '', AS_ADA)).body.environments.map((e: { name: string; visibility: string }) => [e.name, e.visibility]))
       .toEqual([['full-stack', 'personal'], ['shared-stack', 'shared']]);
   });
 
   it('edits, reads the history of and deletes by name, each change an event as in the UI', async () => {
     await cliCall('POST', '', AS_ADA, { ...SHARED, name: 'full-stack' });
-    const edited = await cliCall('PUT', '/full-stack', AS_SAM, { ...POINTER_AS('full-stack'), file: { ...POINTER.file, path: 'moved.json' } });
-    expect(edited.body.environment).toMatchObject({ kind: 'pointer', updatedBy: PEOPLE[1] });
+    const moved = { ...POINTER_AS('full-stack'), file: { ...POINTER.file, path: 'moved.json' } };
+    expect(await cliCall('PUT', '/full-stack', AS_SAM, moved)).toMatchObject({ status: 403, body: { code: 'environment_admin_only' } });
+    const edited = await cliCall('PUT', '/full-stack', AS_ADA, moved);
+    expect(edited.body.environment).toMatchObject({ kind: 'pointer', updatedBy: PEOPLE[0] });
     expect((await cliCall('GET', '/full-stack/events', AS_SAM)).body.events.map((e: { action: string }) => e.action)).toEqual(['environment.update', 'environment.create']);
-    expect((await cliCall('DELETE', '/full-stack', AS_SAM)).status).toBe(200);
+    expect(await cliCall('DELETE', '/full-stack', AS_SAM)).toMatchObject({ status: 403, body: { code: 'environment_admin_only' } });
+    expect((await cliCall('DELETE', '/full-stack', AS_ADA)).status).toBe(200);
     expect((await cliCall('GET', '/full-stack', AS_SAM)).body.code).toBe('environment_not_found');
-    expect(store.log.map(e => [e.action, e.actorUserId])).toEqual([['environment.create', 'u1'], ['environment.update', 'u2'], ['environment.delete', 'u2']]);
+    expect(store.log.map(e => [e.action, e.actorUserId])).toEqual([['environment.create', 'u1'], ['environment.update', 'u1'], ['environment.delete', 'u1']]);
   });
 
   it("refuses an invalid definition with the schema's path and message, and validates without saving", async () => {

@@ -151,7 +151,7 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
       payload: {
         sessionName: 'alice-research-agent',
         // The pane's project and workstream ride ahead of the box script (services/launchCommand.ts).
-        keys: `git clone x && TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials telemetry-launch ${replaySessionId})"`,
+        keys: `git clone x && TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=research TERMAG_WORKSTREAM=main TERMAG_INFERENCE_BACKEND=default termag-credentials telemetry-launch ${replaySessionId})"`,
         withEnter: true,
       },
     }]);
@@ -167,7 +167,7 @@ describe('ensureAgentSessionsAndLaunch session gate', () => {
     state.capabilities = ['telemetry-replay-v1'];
     expect(await ensureAgentSessionsAndLaunch(launch)).toBe('launched');
     expect(state.sent.filter(s => s.type === 'tmux-send-keys').map(s => s.payload.keys))
-      .toEqual(['TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=research TERMAG_WORKSTREAM=main termag-credentials telemetry-launch -)"']);
+      .toEqual(['TERMAG_SESSION_KIND=interactive claude --settings "$(TERMAG_SESSION_KIND=interactive TERMAG_PROJECT=research TERMAG_WORKSTREAM=main TERMAG_INFERENCE_BACKEND=default termag-credentials telemetry-launch -)"']);
     state.sent = [];
     state.capabilities = ['credentials-v1'];
     expect(await ensureAgentSessionsAndLaunch(launch)).toBe('launched');

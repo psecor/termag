@@ -47,14 +47,17 @@ import { REPLY_CHANNEL, ReplyHandoff, chunkReply } from './askReplyBus';
 import { startReplyListener, stopReplyListener } from './askReplyListener';
 import { readReply, sealReply, storeReply, sweepReplies, type SealedReply } from './askReplyStore';
 import { getTranscriptStoreConfig } from './chatTranscriptStore';
-import { askChatStoredTier, askTurnTier, ensureAskChat, type AskChat } from './askChat';
+import { askChatStoredModel, askTurnChoice, ensureAskChat, type AskChat } from './askChat';
+import { askChoiceOf, askFireworksRefusal, askModelOf, FIREWORKS_UNAVAILABLE_CODE, isFireworksAskModel, parseAskModel, resolveFireworksAskModel } from './askModel';
 import { chatLaunchFor } from './chatLaunch';
 import { parseClaudeChatModel } from './claudeChatModel';
-import { ASK_MODEL_OFF_REASON, askModelChoiceOn } from './askModelFlag';
+import { ASK_MODEL_OFF_REASON, askFireworksOn, askModelChoiceOn } from './askModelFlag';
+import { fireworksModelsForBox } from './fireworksFlag';
+import { getFireworksGatewayConfig } from './fireworksGateway';
 import { turnMemorySpace } from './chatSpace';
 import { askTelemetryFor } from './askTelemetry';
 import { recordProductEvent } from './productEvents';
-import { CHAT_AUTO_CAPABILITY, SPACE_MEMORY_CAPABILITY } from './chatRunner';
+import { backendFields, CHAT_AUTO_CAPABILITY, SPACE_MEMORY_CAPABILITY, type ChatBackend } from './chatRunner';
 import { RUN_FOLLOW_UP_MODE, UNTRUSTED_MODE } from './chatTrust';
 import { isWorkspace } from './projectRepos';
 import { multiRepoEnabled } from './multiRepoFlag';
@@ -427,7 +430,7 @@ async function recordPushes(messageId: string, pushes: NonNullable<RunResult['pu
   if (!token) {
     return { publish: 'failed', detail: `${t.originUser.unixUsername} has no GitHub token stored in termag, so the run's pushes can't be looked up; connect GitHub in Settings${left}` };
   }
-  const rows = await prisma.agentThreadPr.findMany({ where: { threadId: t.id }, select: { key: true, branch: true } });
+  const rows = await prisma.agentThreadPr.findMany({ where: { threadId: t.id }, select: { key: true, branch: true, headSha: true } });
   const outcomes = await confirmPushes(githubConfigFromEnv(), {
     repo: t.repo, token, pushes, ownBranch, prefix, rows,
   });
@@ -585,11 +588,11 @@ async function replayAsk(m: MessageWithThread, branchOwner: string, notify: Noti
  */
 async function adoptRecordedModel(m: MessageWithThread): Promise<void> {
   if (!m.model || m.modelIgnored) return;
-  const tier = parseClaudeChatModel(m.model);
-  if (!tier.ok || !tier.model) return;
+  const choice = askChoiceOf(m.model);
+  if (!choice) return;
   const thread = await prisma.agentThread.findUnique({ where: { id: m.threadId }, select: { chatWorkstreamId: true } });
   if (!thread?.chatWorkstreamId) return;
-  await (await askTurnTier(thread.chatWorkstreamId, tier.model)).save();
+  await (await askTurnChoice(thread.chatWorkstreamId, choice)).save();
 }
 
 /** The last message of a superseded message's chain (each points at the follow-up that joined its turn). */
@@ -725,6 +728,16 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
   // Who asked, for the turn's telemetry resource (services/askTelemetry.ts); only a chat turn carries it.
   const telemetry = chat ? await askTelemetryFor(thread, message.hop) : null;
   const turnModel = await askTurnModel(r, chat, caps);
+  // A Fireworks turn this box can't run as asked fails here, with the reason: never on Claude instead.
+  if (turnModel.refused) {
+    const failed = await prisma.agentMessage.updateMany({
+      where: { id: message.id, status: 'submitted' },
+      data: { status: 'failed', error: turnModel.refused.slice(0, 1000), completedAt: new Date(), queuedUntil: null },
+    });
+    if (failed.count) wake(message.id);
+    console.warn(`[ASK] message ${message.id}: ${turnModel.refused}`);
+    return { error: turnModel.refused };
+  }
   // A runner with ask-push-v1 clones normally and the run pushes itself, on the
   // thread's branch, or on the head branch of the PR the thread updates.
   const push = caps.includes(ASK_PUSH_CAPABILITY);
@@ -769,6 +782,8 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
       ...(steerOf ? { steerOf } : {}),
       // The tier's launch string (claudeLaunchModel): only to an agent that takes it, else it is dropped there.
       ...(turnModel.launch ? { model: turnModel.launch } : {}),
+      // On Fireworks: the backend, its fast model, window and menu, as a chat-send carries them (an agent with ask-backend-v1).
+      ...(turnModel.backend ? backendFields(turnModel.backend, caps) : {}),
     }, START_RPC_MS);
   } catch (e) {
     const state = await runState(instanceId, message.id);
@@ -827,43 +842,86 @@ async function startRun(r: RunStart): Promise<{ status: string; steered?: boolea
 
 /**
  * The model a turn launches on ("Choosing the
- * model"). In the thread's chat: the tier askTurnTier settles (the one asked
- * for, which the chat keeps, else the chat's stored one), as the launch
- * string a chat send gets for it (chatLaunchFor: the gateway's pinned
- * profile, or the alias off it). `tier` is what the turn ran on, null for no
- * `--model` (the box's default), or with `ignored` the one asked for. `ignored`
- * says why a `--model` asked for does not reach the turn: a headless run, or an
- * agent from before ask-model-v1, which would drop the field. Then nothing is
+ * model"). In the thread's chat: the choice
+ * askTurnChoice settles (the one asked for, which the chat keeps, else the
+ * chat's stored one), as the launch a chat send gets for it (chatLaunchFor:
+ * the gateway's pinned profile or the alias for a tier; Fireworks' model, fast
+ * model, window and menu). `tier` is what the turn ran on as an ask model (a
+ * tier or `fireworks:<id>`), null for no `--model` (the box's default), or
+ * with `ignored` the one asked for. `ignored` says why a Claude `--model`
+ * asked for does not reach the turn: a headless run, the flag off, or an agent
+ * from before ask-model-v1, which would drop the field. Then nothing is
  * stored on the thread's chat: its next turns keep the choice it had.
+ * `refused` is a turn on Fireworks that cannot run as asked or stored: it
+ * fails, never runs on Claude instead.
  */
-type TurnModel = { tier: string | null; launch: string | null; ignored: string | null; save: () => Promise<void> };
+type TurnModel = { tier: string | null; launch: string | null; backend: ChatBackend | null; ignored: string | null; refused?: string; save: () => Promise<void> };
 const unsaved = async () => {};
 
-/** What askTurnModel reads of a start: the message's asked-for tier, the asker (for the flag), the project and its box. */
+/**
+ * What askTurnModel reads of a start: the message's asked-for model, the asker
+ * (for the flags), the project and its box, and the thread (its chat's stored
+ * choice, for a run that cannot be its chat's turn).
+ */
 type TurnModelInput = {
   message: { model?: string | null };
   sender: Parameters<typeof askModelChoiceOn>[0];
   project: { userId: string; instance: { name: string; kind: string } };
   instanceId: string;
+  thread?: { chatWorkstreamId: string | null };
 };
 
-async function askTurnModel(r: TurnModelInput, chat: { workstreamId: string } | null, caps: readonly string[]): Promise<TurnModel> {
-  const parsed = parseClaudeChatModel(r.message.model);
+export async function askTurnModel(r: TurnModelInput, chat: { workstreamId: string } | null, caps: readonly string[]): Promise<TurnModel> {
+  const parsed = parseAskModel(r.message.model);
   const requested = parsed.ok ? parsed.model : null;
   const box = r.project.instance.name;
-  if (!chat) return { tier: requested, launch: null, ignored: requested ? modelIgnoredReason('headless', box) : null, save: unsaved };
+  const ldBox = { id: r.instanceId, name: box, kind: r.project.instance.kind };
+  const refuse = (reason: string): TurnModel => ({ tier: requested, launch: null, backend: null, ignored: null, refused: reason, save: unsaved });
+  const fireworksRefusal = async () => askFireworksRefusal({
+    box, modelChoiceOn: await askModelChoiceOn(r.sender, ldBox), fireworksOn: await askFireworksOn(r.sender, ldBox),
+    gatewayConfigured: !!getFireworksGatewayConfig(), caps,
+  });
+  if (!chat) {
+    const headless = `the run on ${box} is headless, outside the thread's chat, and cannot run on Fireworks; update the box (termag-box-update), or ask on a Claude model`;
+    if (isFireworksAskModel(requested)) return refuse(headless);
+    // The thread's chat still keeps its choice, and a headless run can neither apply nor change it: a
+    // Fireworks thread is refused, never run on the box's default (Claude) instead.
+    const stored = await askChatStoredModel(r.thread?.chatWorkstreamId ?? null);
+    if (isFireworksAskModel(stored)) return refuse(`this thread runs on ${stored}, and ${headless}`);
+    return { tier: requested, launch: null, backend: null, ignored: requested ? modelIgnoredReason('headless', box) : null, save: unsaved };
+  }
+  const modelOn = await askModelChoiceOn(r.sender, ldBox);
   // Off for the asker and box: as an older agent, and the thread's stored tier is not applied either.
-  if (!await askModelChoiceOn(r.sender, { id: r.instanceId, name: box, kind: r.project.instance.kind })) {
-    return { tier: requested, launch: null, ignored: requested ? modelIgnoredReason('off', box) : null, save: unsaved };
+  // A Fireworks model, asked for or stored, is refused instead: dropping it would run the turn on Claude.
+  if (!modelOn || !caps.includes(ASK_MODEL_CAPABILITY)) {
+    const stored = isFireworksAskModel(requested) ? null : await askChatStoredModel(chat.workstreamId);
+    if (isFireworksAskModel(requested) || isFireworksAskModel(stored)) {
+      const why = await fireworksRefusal() ?? `${box}'s agent predates --model (it needs a newer termag agent)`;
+      return refuse(isFireworksAskModel(requested) ? why : `this thread runs on ${stored}, and ${why}`);
+    }
+    return { tier: requested, launch: null, backend: null, ignored: requested ? modelIgnoredReason(modelOn ? 'agent' : 'off', box) : null, save: unsaved };
   }
-  // Before askTurnTier: a turn that can't take the model leaves the thread's choice as it was.
-  if (!caps.includes(ASK_MODEL_CAPABILITY)) {
-    return { tier: requested, launch: null, ignored: requested ? modelIgnoredReason('agent', box) : null, save: unsaved };
+  const { choice, save } = await askTurnChoice(chat.workstreamId, askChoiceOf(requested));
+  if (!choice) return { tier: null, launch: null, backend: null, ignored: null, save };
+  if (choice.backend === 'fireworks') {
+    const asked = askModelOf(choice);
+    const why = await fireworksRefusal();
+    if (why) return refuse(requested ? why : `this thread runs on ${asked}, and ${why}`);
+    const l = await chatLaunchFor(choice, { ownerId: r.project.userId, instanceId: r.instanceId, capabilities: caps });
+    if (!l.ok) return refuse(`${l.body.error.replace(/ Switch the chat to a Claude model\.$/, '')} Ask with --model opus|sonnet|haiku to switch the thread back to Claude.`);
+    const { model, ...backend } = l.launch;
+    // A chat's stored pick falls back to the flag's default when the list changes; an ask may not. The
+    // sender chose this id, so a list that no longer offers it (a queued ask starting after the change)
+    // fails the turn with the reason rather than run on a model they never selected.
+    if (choice.model && model !== choice.model) {
+      return refuse(`${asked} is no longer one of your Fireworks models on ${box}. Ask with --model opus|sonnet|haiku to switch the thread back to Claude.`);
+    }
+    return { tier: model ? `fireworks:${model}` : asked, launch: model, backend, ignored: null, save };
   }
-  const { tier, save } = await askTurnTier(chat.workstreamId, requested);
-  if (!tier) return { tier: null, launch: null, ignored: null, save };
-  const l = await chatLaunchFor({ backend: null, model: tier }, { ownerId: r.project.userId, instanceId: r.instanceId, capabilities: caps });
-  return { tier, launch: l.ok ? l.launch.model : tier, ignored: null, save };
+  const tier = parseClaudeChatModel(choice.model);
+  if (!tier.ok || !tier.model) return { tier: null, launch: null, backend: null, ignored: null, save };
+  const l = await chatLaunchFor({ backend: null, model: tier.model }, { ownerId: r.project.userId, instanceId: r.instanceId, capabilities: caps });
+  return { tier: tier.model, launch: l.ok ? l.launch.model : tier.model, backend: null, ignored: null, save };
 }
 
 /**
@@ -1251,6 +1309,25 @@ export const prismaCliAsk: CliAsk = {
     // 409 is. One queued for a box that isn't connected yet is checked again when it starts (startRun).
     const modeCapRefusal = transport ? askCapRefusal(project, project.instance.name, transport.capabilities) : null;
     if (modeCapRefusal) return rejection(409, modeCapRefusal, 'ask-mode-cap', req);
+    // On Fireworks: refused with the reason when it can't run as asked, never run on Claude.
+    // The box's capabilities are checked again when a queued ask starts (askTurnModel), and its own setup by the box.
+    const ldBox = { id: project.instance.id, name: project.instance.name, kind: project.instance.kind };
+    const fireworksRefusal = async () => askFireworksRefusal({
+      box: project.instance!.name, modelChoiceOn: modelOn, fireworksOn: await askFireworksOn(user, ldBox),
+      gatewayConfigured: !!getFireworksGatewayConfig(), caps: transport ? transport.capabilities : null,
+    });
+    if (req.model && isFireworksAskModel(req.model)) {
+      const why = await fireworksRefusal();
+      if (why) return rejection(409, why, FIREWORKS_UNAVAILABLE_CODE, req);
+      // The models listed for the asker on this box (fireworks-models, user + box), as a chat turn's launch reads them.
+      const listed = await fireworksModelsForBox(user.id, instanceId).catch((e: unknown) => {
+        console.warn(`[ASK] fireworks-models for ${user.unixUsername} on ${project.instance!.name} unreadable: ${errMsg(e)}`);
+        return null;
+      });
+      const resolvedModel = resolveFireworksAskModel(req.model, listed, project.instance.name);
+      if (!resolvedModel.ok) return rejection(409, resolvedModel.error, FIREWORKS_UNAVAILABLE_CODE, req);
+      req = { ...req, model: resolvedModel.model };
+    }
     const unready = setupRefusal(project);
     if (unready) return rejection(409, unready.error, unready.code, req);
     const askChat = await prisma.workstream.findFirst({
@@ -1269,6 +1346,30 @@ export const prismaCliAsk: CliAsk = {
       if (prior.projectId !== access.project.id || prior.workstream !== req.workstream || (prior.repoName ?? null) !== repoName) {
         return fail(409, 'That thread talks to another project, workstream or repository', 'thread_mismatch');
       }
+      // A follow-up on a thread whose chat keeps a Fireworks model runs on it, or is refused here: without
+      // --model, or with a --model this box cannot apply (choice off, an older agent, headless), the turn
+      // would otherwise fall back to Claude. askTurnModel refuses it too; a 409 says so before the 202.
+      const honours = modelOn && (!transport
+        || (transport.capabilities.includes(ASK_CHAT_CAPABILITY) && transport.capabilities.includes(ASK_MODEL_CAPABILITY)));
+      if (prior.chatWorkstreamId && !isFireworksAskModel(req.model) && (!req.model || !honours)) {
+        const stored = await askChatStoredModel(prior.chatWorkstreamId);
+        if (isFireworksAskModel(stored)) {
+          const why = await fireworksRefusal();
+          if (why) return rejection(409, `this thread runs on ${stored}, and ${why}`, FIREWORKS_UNAVAILABLE_CODE, req);
+          // Ask chats and --model are on for the box, but its agent predates --model: the stored choice cannot ride.
+          if (transport && !transport.capabilities.includes(ASK_MODEL_CAPABILITY)) {
+            return rejection(409, `this thread runs on ${stored}, and ${project.instance.name}'s agent predates --model (it needs a newer termag agent)`, FIREWORKS_UNAVAILABLE_CODE, req);
+          }
+          // The models listed for the asker and box now, rechecked as a new Fireworks ask is: one the flag no
+          // longer offers is refused here, not a 202 whose turn fails at its start (askTurnModel).
+          const listed = await fireworksModelsForBox(user.id, instanceId).catch((e: unknown) => {
+            console.warn(`[ASK] fireworks-models for ${user.unixUsername} on ${project.instance!.name} unreadable: ${errMsg(e)}`);
+            return null;
+          });
+          const offered = resolveFireworksAskModel(stored, listed, project.instance.name);
+          if (!offered.ok) return rejection(409, `this thread runs on ${stored}, and ${offered.error}`, FIREWORKS_UNAVAILABLE_CODE, req);
+        }
+      }
       // The newest active one: a follow-up steers into the turn the thread's latest message is in.
       const busy = await prisma.agentMessage.findFirst({
         where: { threadId: prior.id, status: { in: ACTIVE_STATES } },
@@ -1286,7 +1387,7 @@ export const prismaCliAsk: CliAsk = {
           // Unknown (undefined) while the busy turn's box isn't connected: steerDecision then queues on that, not on a model.
           const turnTier = !busyBox ? undefined
             : modelOn && busyBox.capabilities.includes(ASK_MODEL_CAPABILITY)
-              ? req.model ?? await askChatStoredTier(prior.chatWorkstreamId)
+              ? req.model ?? await askChatStoredModel(prior.chatWorkstreamId)
               : null;
           const steer = steerDecision(
             // What its claude -p runs on: an ignored --model kept the tier asked for, but the turn has none (the box's default).
@@ -1439,6 +1540,8 @@ export const prismaCliAsk: CliAsk = {
     // One per message taken, by its sender, for an ask-delegation chart.
     recordProductEvent('ask.sent', { user: user.id, box: instanceId }, {
       thread: thread.id, hop: message.hop, followUp: !!prior, via: senderInstanceId ? 'box' : 'cli', queued,
+      // The backend its --model asked for (a follow-up without one runs on the thread's, not counted here).
+      ...(req.model ? { backend: isFireworksAskModel(req.model) ? 'fireworks' : 'default' } : {}),
     });
     const branch = thread.targetBranch ?? askBranch(user.unixUsername, thread.id);
     // Whether this session will hear of the finish, so the CLI can say it need not poll (askNoticeSweep.ts decides again then).

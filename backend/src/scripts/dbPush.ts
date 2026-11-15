@@ -14,7 +14,10 @@
  *                                       Tokens live 15 minutes — plenty for a push.
  *
  * DB_PUSH_MODE=additive refuses data-losing changes instead of applying them
- * (../config/schemaSync.ts); the default keeps --accept-data-loss.
+ * (../config/schemaSync.ts); the default keeps --accept-data-loss. Either way it
+ * then exits 3 if the database still lacks a table, column or enum value the
+ * schema declares, or has a column of another type than its field
+ * (../config/schemaCoverage.ts), so a skipped sync fails the boot.
  *
  * Why `db push` and not `migrate deploy`: the migration history has known
  * drift from schema.prisma; `db push`
@@ -37,6 +40,7 @@ import {
 
 import { postgresTrustAnchor } from '../config/pgTrustAnchor';
 import { classifyPushResult, prismaPushArgs, schemaSyncMode } from '../config/schemaSync';
+import { expectedShape, missingFromDatabase, readDatabaseShape } from '../config/schemaCoverage';
 
 const backendRoot = join(__dirname, '..', '..');
 const localBin = join(backendRoot, 'node_modules', '.bin', 'prisma');
@@ -103,14 +107,36 @@ async function main(): Promise<number> {
   const outcome = classifyPushResult(mode, result.status, `${result.stdout ?? ''}\n${result.stderr ?? ''}`);
   switch (outcome.kind) {
     case 'applied':
-      return 0;
+      break;
     case 'skipped-data-loss':
       console.warn('[db:push] additive mode: schema sync SKIPPED, nothing was applied. The database is ahead of this');
       console.warn('[db:push] image, or the change drops data; destructive changes are a manual step. Prisma reported:');
       for (const w of outcome.warnings) console.warn(`[db:push]   - ${w}`);
-      return 0;
+      break;
     case 'failed':
       return outcome.status;
+  }
+  return checkCoverage(url);
+}
+
+// A skip is fine only if the database already has everything this image reads
+// (../config/schemaCoverage.ts); otherwise fail so the host never serves.
+async function checkCoverage(url: string): Promise<number> {
+  const { Prisma, PrismaClient } = await import('@prisma/client');
+  const prisma = new PrismaClient({ datasourceUrl: url });
+  try {
+    const db = await readDatabaseShape(prisma.$queryRaw.bind(prisma) as Parameters<typeof readDatabaseShape>[0]);
+    const missing = missingFromDatabase(expectedShape(Prisma.dmmf.datamodel), db);
+    if (missing.length === 0) {
+      console.log('[db:push] schema check: the database has every table, column (of its type) and enum value this image reads');
+      return 0;
+    }
+    console.error(`[db:push] schema check FAILED: the database lacks or mistypes ${missing.length} thing(s) this image reads, so it would error at runtime:`);
+    for (const m of missing) console.error(`[db:push]   - ${m}`);
+    console.error('[db:push] Fix the database (or the change that blocked the sync) before deploying this image.');
+    return 3;
+  } finally {
+    await prisma.$disconnect();
   }
 }
 

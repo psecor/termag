@@ -72,12 +72,21 @@ export const prismaCliStore: CliStore = {
       }),
       prisma.user.findUnique({ where: { id: userId } }),
     ]);
-    const resizes = await latestBoxEvents(rows.map(r => r.id), 'resize');
+    const ids = rows.map(r => r.id);
+    const [resizes, shares] = await Promise.all([
+      latestBoxEvents(ids, 'resize'),
+      // A share of any project on the box, archived ones included (cliAdminBoxPrisma's boxHasSharedProject).
+      ids.length
+        ? prisma.projectShare.findMany({ where: { project: { instanceId: { in: ids } } }, select: { project: { select: { instanceId: true } } } })
+        : Promise.resolve([]),
+    ]);
+    const shared = new Set(shares.map(s => s.project.instanceId));
     return Promise.all(rows.map(async r => shapeBox({
       ...r,
       projects: await withManagedLabels(r.projects),
       resizeEvent: resizes.get(r.id) ?? null,
       lifecycle: owner ? await lifecycleViewFor(owner, r) : null,
+      shared: shared.has(r.id),
     }, isInstanceAgentConnected(r.id))));
   },
 

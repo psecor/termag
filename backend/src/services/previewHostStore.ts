@@ -72,7 +72,7 @@ export interface PreviewHostStore {
   user(userId: string): Promise<HostUser | null>;
   createCode(row: CodeRow): Promise<void>;
   /** Delete the code and hand it back, when it exists and hasn't expired: one statement, so it works once (SR10). */
-  takeCode(codeHash: string, now: Date): Promise<CodeRow | null>;
+  takeCode(codeHash: string, now: Date, opts?: { rebound?: string }): Promise<CodeRow | null>;
   createSession(row: Omit<SessionRow, 'revokedAt' | 'createdAt'> & { createdAt?: Date }): Promise<void>;
   findSession(idHash: string): Promise<SessionRow | null>;
   /** Move a live session's verifiedAt on (a reverify's exchange). False when it is no longer live. */
@@ -150,10 +150,23 @@ export const prismaPreviewHostStore: PreviewHostStore = {
   async createCode(row) {
     await prisma.previewLinkCode.create({ data: row });
   },
-  async takeCode(codeHash, now) {
+  async takeCode(codeHash, now, opts = {}) {
+    if (!opts.rebound) {
+      const rows = await prisma.$queryRaw<RawCode[]>`
+        DELETE FROM "preview_link_codes" WHERE "codeHash" = ${codeHash} AND "expiresAt" > ${now}
+        RETURNING "codeHash", "linkId", "userId", "basis", "tokenHash", "sessionIdHash", "next", "expiresAt"`;
+      return rows[0] ?? null;
+    }
+    // The code and its rebound in one statement, so a repeat of the code never finds neither.
     const rows = await prisma.$queryRaw<RawCode[]>`
-      DELETE FROM "preview_link_codes" WHERE "codeHash" = ${codeHash} AND "expiresAt" > ${now}
-      RETURNING "codeHash", "linkId", "userId", "basis", "tokenHash", "sessionIdHash", "next", "expiresAt"`;
+      WITH taken AS (
+        DELETE FROM "preview_link_codes" WHERE "codeHash" = ${codeHash} AND "expiresAt" > ${now}
+        RETURNING "codeHash", "linkId", "userId", "basis", "tokenHash", "sessionIdHash", "next", "expiresAt"
+      ), kept AS (
+        INSERT INTO "preview_link_codes" ("codeHash", "linkId", "userId", "basis", "tokenHash", "sessionIdHash", "next", "expiresAt")
+        SELECT ${opts.rebound}, "linkId", "userId", "basis", "tokenHash", "sessionIdHash", "next", "expiresAt" FROM taken
+      )
+      SELECT * FROM taken`;
     return rows[0] ?? null;
   },
   async createSession(row) {

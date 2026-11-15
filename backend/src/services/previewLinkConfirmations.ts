@@ -28,10 +28,11 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'crypto';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../db';
+import { notifyWorkspaceChange } from './workspaceEvents';
 import type { RouteResult } from '../routes/routeResult';
 import { prismaAudienceOps, type AudienceOps } from './previewAudience';
 import {
-  changeable, checkPublishable, defaultPreviewLinkDeps, extendPreviewLinkFor, publishPreviewLinkFor,
+  changeable, checkPublishable, declinePreviewLinkRequestFor, defaultPreviewLinkDeps, landingUrl, extendPreviewLinkFor, listenerRefusal, publishPreviewLinkFor,
   type PreviewLinkCaller, type PreviewLinkDeps,
 } from './previewLinks';
 
@@ -66,6 +67,8 @@ export interface ConfirmationStore {
   find(idHash: string): Promise<ConfirmationRow | null>;
   /** Move the row from one of `from` to the new fields; false when it wasn't in one of them (someone else moved it). */
   move(idHash: string, from: ConfirmationState[], data: Partial<ConfirmationRow>): Promise<boolean>;
+  /** Whether a confirmation was ever made for agent request `requestId` (its owner was asked), whatever became of it. */
+  askedFor(requestId: string): Promise<boolean>;
 }
 
 export interface ConfirmationDeps {
@@ -81,6 +84,8 @@ export interface ConfirmationDeps {
   audienceOps?: AudienceOps;
   /** These users' emails, in order (for an extend's named people); unset: from prisma. */
   emailsOf?(userIds: string[]): Promise<string[]>;
+  /** An agent's request was answered here: the owner's open links lists reload. Unset: the workspace push. */
+  requestsChanged?(ownerId: string): void;
 }
 
 /**
@@ -183,6 +188,21 @@ async function ask(deps: ConfirmationDeps, caller: PreviewLinkCaller, input: { p
 }
 
 /**
+ * An agent's request (services/previewLinkRequests.ts), held for its owner's
+ * one click: the defaults it publishes, "only me" with the request's id, as a
+ * confirmation in the owner's name. The confirm URL, for the owner's Slack DM
+ * only; the agent never sees it, and couldn't use it without the owner's
+ * browser session.
+ */
+export async function askForAgentRequest(
+  deps: ConfirmationDeps, owner: PreviewLinkCaller,
+  input: { projectId: string; fromBoxId: string; request: { workstream: string; port: number; name: string; audience: 'owner'; requestId: string } },
+): Promise<string> {
+  const asked = await ask(deps, owner, { projectId: input.projectId, kind: 'publish', request: input.request, fromBoxId: input.fromBoxId, audience: 'owner', emails: [] });
+  return (asked.body as { confirm: { url: string } }).confirm.url;
+}
+
+/**
  * A publish (or renew) from a box-made sign-in: applied at once for "only me",
  * held for a confirm otherwise. Every check that needs no box runs first, so a
  * request that could never apply is refused now, not after the click.
@@ -190,10 +210,19 @@ async function ask(deps: ConfirmationDeps, caller: PreviewLinkCaller, input: { p
 export async function publishFromBoxFor(deps: ConfirmationDeps, caller: PreviewLinkCaller, projectId: string, body: unknown, fromBoxId: string): Promise<RouteResult> {
   const checked = await checkPublishable(deps.links, caller, projectId, body);
   if (!checked.ok) return checked.result;
+  // An agent's request is answered by its owner, in the browser (the Share dialog or the ask's own confirm): a
+  // box-made sign-in naming one would borrow the ask's framing and note on the confirm page (#1568).
+  if (checked.req.requestId) {
+    return { status: 400, body: { error: "A box can't answer an agent's request; its owner does, in the browser", code: 'not_allowed' } };
+  }
   if (checked.req.audience === 'owner') return publishPreviewLinkFor(deps.links, caller, projectId, body);
+  // An unconfined listener can't serve a wider audience (SR9): say so before
+  // the person is asked to click. The apply checks again.
+  const refused = await listenerRefusal(deps.links, checked.project, checked.req);
+  if (refused) return refused;
   // Exactly what was asked, normalised: nothing the request didn't name.
-  const { workstream, port, name, audience, emails, ttlHours, hostMode, requestId } = checked.req;
-  const request = { workstream, port, name, audience, emails, ttlHours, hostMode, requestId };
+  const { workstream, port, name, audience, emails, ttlHours, hostMode } = checked.req;
+  const request = { workstream, port, name, audience, emails, ttlHours, hostMode };
   return ask(deps, caller, { projectId: checked.project.id, kind: 'publish', request, fromBoxId, audience, emails });
 }
 
@@ -279,17 +308,65 @@ export interface ConfirmPageView {
   failure: string | null;
   shareUrl: string | null;
   csrf: string;
+  /** Asked by an agent (`termag preview request`), with its note: the agent's words, shown only as quoted text. */
+  agentAsk: { note: string | null; expiresAt: Date; /** The request still waits in Share: pending and not past its 24 h (Bugbot, #1568). */ waiting: boolean } | null;
+  /** Once confirmed: the published link's address, for an agent's request, whose asker is never shown one. */
+  linkUrl: string | null;
+}
+
+/**
+ * An agent's ask: a publish only askForAgentRequest makes, for "only me", from a box. Its request is checked in
+ * agentAskOf: of this project and asked from this box (#1568).
+ */
+function isAgentAsk(row: ConfirmationRow): boolean {
+  return row.kind === 'publish' && typeof row.request.requestId === 'string' && row.request.audience === 'owner' && !!row.fromBoxId;
+}
+
+function requestsChanged(deps: ConfirmationDeps, ownerId: string): void {
+  try { (deps.requestsChanged ?? ((id: string) => notifyWorkspaceChange(id, 'preview-links')))(ownerId); } catch { /* a push is best effort */ }
+}
+
+/** The agent's request a confirmation was made for, with its note and state; null for one asked from a sign-in. */
+async function agentAskOf(deps: ConfirmationDeps, row: ConfirmationRow): Promise<(Omit<NonNullable<ConfirmPageView['agentAsk']>, 'waiting'> & { state: string }) | null> {
+  if (!isAgentAsk(row)) return null;
+  const r = await deps.links.store.findRequest(String(row.request.requestId));
+  return r && r.projectId === row.projectId && r.boxId === row.fromBoxId ? { note: r.note, state: r.state, expiresAt: new Date(r.createdAt.getTime() + 24 * 3600_000) } : null;
+}
+
+/**
+ * An agent's request answered elsewhere (published or declined in the Share
+ * dialog, or expired) settles its pending confirmation: neither button may
+ * then contradict the answer (Bugbot, #1568). The row, as it now stands.
+ */
+async function settleAnsweredAsk(deps: ConfirmationDeps, row: ConfirmationRow): Promise<ConfirmationRow> {
+  // Expired too: once the 10-minute link lapses, the page must still say the request was answered elsewhere,
+  // not that it waits (Bugbot, #1568). An expiry is the request's own answer only when it expired.
+  if (row.state !== 'pending' && row.state !== 'expired') return row;
+  const ask = await agentAskOf(deps, row);
+  if (!ask || ask.state === 'pending' || (row.state === 'expired' && ask.state === 'expired')) return row;
+  const failure = `This request was already answered in the project's Share dialog (${ask.state})`;
+  if (await deps.store.move(row.idHash, ['pending', 'expired'], { state: 'failed', failure, decidedAt: deps.links.now() })) audit(deps, 'failed', row, 'request-answered');
+  return (await deps.store.find(row.idHash)) ?? row;
+}
+
+/** A link's share URL (its landing page): "only me" links have no token, so this is the whole of it. */
+async function linkUrlOf(deps: ConfirmationDeps, linkId: string): Promise<string | null> {
+  const link = await deps.links.store.findLink(linkId);
+  return link ? landingUrl(deps.links, link.name) : null;
 }
 
 /** What the confirm page shows; null for the 404 (unknown, someone else's, or a project gone). */
 export async function confirmPageFor(deps: ConfirmationDeps, userId: string, id: string): Promise<ConfirmPageView | null> {
-  const row = await rowFor(deps, id, userId);
-  if (!row) return null;
+  const found = await rowFor(deps, id, userId);
+  if (!found) return null;
+  const row = await settleAnsweredAsk(deps, found);
   const project = await deps.links.findProject(row.projectId);
   if (!project) return null;
   const r = row.request;
   let link = null;
   if (row.kind === 'extend') link = await deps.links.store.findLink(String(r.linkId));
+  const ask = await agentAskOf(deps, row);
+  const agentAsk = ask ? { note: ask.note, expiresAt: ask.expiresAt, waiting: ask.state === 'pending' && ask.expiresAt > deps.links.now() } : null;
   return {
     state: row.state,
     kind: row.kind,
@@ -310,6 +387,8 @@ export async function confirmPageFor(deps: ConfirmationDeps, userId: string, id:
     // The page's request carries the raw id, so it can open the seal too, until the CLI has read it.
     shareUrl: openShareUrl(id, row.shareUrlSealed),
     csrf: confirmCsrf(deps.secret(), row.idHash, userId),
+    agentAsk,
+    linkUrl: agentAsk && row.state === 'confirmed' && row.linkId ? await linkUrlOf(deps, row.linkId) : null,
   };
 }
 
@@ -322,14 +401,25 @@ export async function confirmPageFor(deps: ConfirmationDeps, userId: string, id:
 export async function decideConfirmationFor(
   deps: ConfirmationDeps, caller: PreviewLinkCaller, id: string, decision: unknown, csrf: unknown,
 ): Promise<{ ok: true; state: ConfirmationState } | { ok: false; status: 403 | 404 | 409; reason: string }> {
-  const row = await rowFor(deps, id, caller.id);
-  if (!row) return { ok: false, status: 404, reason: 'not_found' };
-  if (!confirmCsrfOk(deps.secret(), row.idHash, caller.id, csrf)) return { ok: false, status: 403, reason: 'csrf' };
+  const found = await rowFor(deps, id, caller.id);
+  if (!found) return { ok: false, status: 404, reason: 'not_found' };
+  if (!confirmCsrfOk(deps.secret(), found.idHash, caller.id, csrf)) return { ok: false, status: 403, reason: 'csrf' };
+  const row = await settleAnsweredAsk(deps, found);
   if (decision !== 'publish' && decision !== 'decline') return { ok: false, status: 409, reason: 'decision' };
   const now = deps.links.now();
   if (decision === 'decline') {
+    // An agent's request is declined first: if that can't happen (answered meanwhile, or the write failed), the
+    // confirmation isn't marked declined while the request could still be published (Bugbot, #1568).
+    if (row.state === 'pending' && isAgentAsk(row)) {
+      const r = await declinePreviewLinkRequestFor(deps.links, caller, String(row.request.requestId)).catch(() => null);
+      if (!r || r.status !== 200) {
+        const settled = await settleAnsweredAsk(deps, row);
+        return { ok: false, status: 409, reason: settled.state === 'pending' ? 'try_again' : settled.state };
+      }
+    }
     if (!(await deps.store.move(row.idHash, ['pending'], { state: 'declined', decidedAt: now }))) return { ok: false, status: 409, reason: row.state };
     audit(deps, 'declined', row);
+    if (isAgentAsk(row)) requestsChanged(deps, caller.id);
     if (row.kind === 'extend') await linkEvent(deps, String(row.request.linkId), 'refused', caller.id, { confirm: 'declined' });
     return { ok: true, state: 'declined' };
   }
@@ -358,6 +448,8 @@ export async function decideConfirmationFor(
   // From `interrupted` too: a slow apply that did publish is reported as it is, with its token.
   await deps.store.move(row.idHash, ['applying', 'interrupted'], { state: 'confirmed', linkId: body.link.id, shareUrlSealed: minted ? sealShareUrl(id, minted, deps.random) : null });
   audit(deps, 'confirmed', row, `link=${body.link.id}`);
+  // An open Share dialog drops the request it no longer offers (Bugbot, #1568).
+  if (isAgentAsk(row)) requestsChanged(deps, caller.id);
   await linkEvent(deps, body.link.id, 'confirmed', caller.id, { confirm: row.kind, fromBoxId: row.fromBoxId });
   return { ok: true, state: 'confirmed' };
 }
@@ -383,6 +475,9 @@ export const prismaConfirmationStore: ConfirmationStore = {
       data: { ...rest, ...(request ? { request: request as Prisma.InputJsonValue } : {}) },
     });
     return n.count === 1;
+  },
+  async askedFor(requestId) {
+    return (await prisma.previewLinkConfirmation.count({ where: { kind: 'publish', request: { path: ['requestId'], equals: requestId } } })) > 0;
   },
 };
 

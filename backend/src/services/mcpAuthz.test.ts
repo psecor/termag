@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { AuthzBox } from './gatewayAuthz';
 import { decideMcpRequest, type McpAuthzDeps, type McpConnectorRecord } from './mcpAuthz';
 import { McpNeedsLinkError } from './mcpOAuth';
@@ -18,6 +18,7 @@ function deps(over: Partial<McpAuthzDeps> = {}): McpAuthzDeps {
     accessToken: async () => { throw new McpNeedsLinkError('not linked'); },
     termagUrl: 'https://termag.example/termag',
     allow: new Set(),
+    upstreamRefusal: async () => null,
     ...over,
   };
 }
@@ -51,6 +52,36 @@ describe('decideMcpRequest', () => {
   it('refuses without a token, or with an unknown one, with 403 so Claude Code does not start OAuth', async () => {
     expect(await decideMcpRequest({ path: '/c/c1', authorization: undefined }, deps())).toMatchObject({ allow: false, status: 403, audit: 'no box token' });
     expect(await decideMcpRequest({ path: '/c/c1', authorization: 'Bearer nope' }, deps())).toMatchObject({ allow: false, status: 403, audit: 'unknown box token' });
+  });
+
+  it('refuses a connector off the owner\'s allowlist with a readable 403, before reading any token or secret', async () => {
+    const secrets = vi.fn(async () => ({ token: 'up-secret' }));
+    const accessToken = vi.fn(async () => 'tok');
+    const d = await decideMcpRequest({ path: '/c/c1/mcp', authorization: AUTH }, deps({ secrets, accessToken, upstreamRefusal: async () => "This MCP server isn't on termag's allowlist" }));
+    expect(d).toEqual({
+      allow: false,
+      status: 403,
+      message: 'MCP server "figma": This MCP server isn\'t on termag\'s allowlist, so the termag MCP broker does not forward to it',
+      audit: "user=u1 instance=i1 connector=c1 upstream refused: This MCP server isn't on termag's allowlist",
+    });
+    expect(secrets).not.toHaveBeenCalled();
+    expect(accessToken).not.toHaveBeenCalled();
+  });
+
+  it('says so when termag could not load its allowlist', async () => {
+    const d = await decideMcpRequest({ path: '/c/c1/mcp', authorization: AUTH }, deps({ upstreamRefusal: async () => "termag couldn't load its MCP server allowlist" }));
+    expect(d).toMatchObject({ allow: false, status: 403, message: 'MCP server "figma": termag couldn\'t load its MCP server allowlist, so the termag MCP broker does not forward to it' });
+  });
+
+  it('checks the allowlist for the connector it found, and forwards when it allows it', async () => {
+    const upstreamRefusal = vi.fn(async () => null);
+    expect((await decideMcpRequest({ path: '/c/c1/mcp', authorization: AUTH }, deps({ upstreamRefusal }))).allow).toBe(true);
+    expect(upstreamRefusal).toHaveBeenCalledWith(FIGMA);
+  });
+
+  it('still answers 404 for someone else\'s connector, whatever the allowlist says', async () => {
+    const d = await decideMcpRequest({ path: '/c/c2', authorization: AUTH }, deps({ upstreamRefusal: async () => "This MCP server isn't on termag's allowlist" }));
+    expect(d).toMatchObject({ allow: false, status: 404 });
   });
 
   it('refuses a box that is not managed', async () => {

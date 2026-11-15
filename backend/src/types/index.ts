@@ -23,6 +23,10 @@ declare global {
       onboardedAt: Date | null;
       // termag (`simple`) or Lab (`full`), under onboarding-refresh-enabled; null: not chosen.
       uiMode: string | null;
+      /** When Lab's toast recommending termag's chat was answered, under chat-ui-nudge-enabled; null: not yet. */
+      chatNudgeDismissedAt: Date | null;
+      /** New sessions' default box, reuse-first or fresh-first, under box-placement-enabled; null: the org default. */
+      boxPlacement: string | null;
       /** The IANA zone this person's clients last reported; working time banks by its days. Null: the orchestrator's. */
       timeZone: string | null;
       /** The last "Claude Cloud N" handed to this owner. */
@@ -39,6 +43,10 @@ declare global {
       telemetryTitles: boolean;
       /** Settings > Box notices: DMs before and after termag stops a box on its own (services/boxIdleNotices.ts). */
       boxIdleNotify: boolean;
+      /** Their My files space, under project-files-enabled (services/projectFiles.ts); null until it's made or chosen. */
+      myFilesSpaceId: string | null;
+      /** Settings > My files: My files is granted to the boxes they own (services/projectFiles.ts). */
+      myFilesOnBoxes: boolean;
     }
 
     interface Request {

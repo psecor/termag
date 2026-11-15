@@ -12,6 +12,7 @@ import { deliverToUserBoxes } from '../services/credentialDelivery';
 import {
   connectorSecretNames, consumeOAuthState, CONNECTOR_SELECT, createOAuthState, deleteConnector, findConnector, forgetConnectorOAuth,
   apiBrokerEnabledForUser, catalogForUser, listConnectors, scopeLabelsForUser, readConnectorSecrets, readOAuth, setLinkStatus, updateConnectorDroppingOAuth, withOAuthLock, writeConnectorSecrets,
+  upstreamAllowlistForUser, upstreamAllowlistForUserId,
 } from '../services/mcpConnectorStore';
 import {
   applySecretsPatch, assertPatchFitsAuth, connectorNameTaken, connectorNaming, getMcpBrokerUrl, McpConnectorError, referencedSecrets, upstreamTestAllow,
@@ -24,6 +25,8 @@ import {
 import { checkOAuthUrl, safeOAuthHttp } from '../services/mcpOAuthHttp';
 import { authorizeTeam } from '../services/mcpOAuthSlackTeam';
 import { getSlackApp } from '../slack/app';
+import { upstreamAllowed, upstreamRefusal, type UpstreamAllowlist } from '../services/mcpUpstreamAllowlist';
+import type { FlagUser } from '../services/featureFlags';
 import { connectorScopes, grantedScopesFrom, parseScopeLabels, scopeChoice, scopeLabel, scopesToRequest, type ScopeLabels } from '../services/mcpOAuthScopes';
 
 const STORE_OFF = 'The credential store is not configured on this orchestrator, so connector secrets cannot be saved.';
@@ -32,12 +35,28 @@ const stateSecret = () => process.env.SESSION_SECRET ?? 'dev-secret';
 
 type Row = NonNullable<Awaited<ReturnType<typeof findConnector>>>;
 
+/** A connector URL the owner's mcp-upstream-allowlist refuses (services/mcpUpstreamAllowlist.ts), with why. */
+class UpstreamNotAllowedError extends McpConnectorError {
+  readonly code = 'mcp_upstream_not_allowed';
+  constructor(reason: string) {
+    super(reason, 403);
+  }
+}
+
+/** Throws UpstreamNotAllowedError when the user's allowlist doesn't allow `upstream`. */
+async function assertUpstreamAllowed(user: FlagUser, upstream: string): Promise<void> {
+  const refusal = upstreamRefusal(await upstreamAllowlistForUser(user), upstream);
+  if (refusal) throw new UpstreamNotAllowedError(refusal);
+}
+
 /**
  * A connector as Settings → MCP servers shows it; also the CLI API's read-only
  * list (routes/cliMcpConnectors.ts). `labels` is the user's scope label table
- * (scopeLabelsForUser); without it, the built-in Slack labels.
+ * (scopeLabelsForUser); without it, the built-in Slack labels. `allowlist` is
+ * the owner's mcp-upstream-allowlist; without it, it is read for the owner.
  */
-export async function view(row: Row, broker: string | null, labels: ScopeLabels = parseScopeLabels(null)) {
+export async function view(row: Row, broker: string | null, labels: ScopeLabels = parseScopeLabels(null), allowlist?: UpstreamAllowlist) {
+  const list = allowlist === undefined ? await upstreamAllowlistForUserId(row.userId) : allowlist;
   const base = {
     id: row.id,
     // The connector name: the mcpServers key and the mcp__<name>__ tool prefix.
@@ -50,6 +69,10 @@ export async function view(row: Row, broker: string | null, labels: ScopeLabels 
     // never delivered to a box as an MCP server, so it has no broker URL.
     kind: isApiConnector(row) ? 'api' : 'mcp',
     brokerUrl: broker && !isApiConnector(row) ? `${broker}/c/${row.id}` : null,
+    // Why the owner's mcp-upstream-allowlist refuses it, or null: the broker
+    // refuses every call and Settings shows this instead of Connect. API
+    // connectors aren't checked.
+    blocked: isApiConnector(row) ? null : upstreamRefusal(list, row.upstream),
     updatedAt: row.updatedAt,
   };
   if (row.authType === 'oauth') {
@@ -89,6 +112,12 @@ export async function view(row: Row, broker: string | null, labels: ScopeLabels 
     secretNames,
     missingSecrets: secretNames === null ? [] : needed.filter(n => !secretNames.includes(n)),
   };
+}
+
+/** view() for the signed-in user's own connector, with their scope labels and allowlist. */
+async function viewFor(user: FlagUser, row: Row) {
+  const [labels, allowlist] = await Promise.all([scopeLabelsForUser(user), upstreamAllowlistForUser(user)]);
+  return view(row, getMcpBrokerUrl(), labels, allowlist);
 }
 
 function authType(raw: unknown): 'static' | 'oauth' {
@@ -178,7 +207,7 @@ function fail(res: Response, err: unknown, naming?: Naming): boolean {
       res.status(err.status).json({ error: err.message, redirectUri: err.redirectUri });
       return true;
     }
-    res.status(err.status).json({ error: err.message });
+    res.status(err.status).json({ error: err.message, ...(err instanceof UpstreamNotAllowedError ? { code: err.code } : {}) });
     return true;
   }
   if ((err as { code?: string }).code === 'P2002') {
@@ -186,6 +215,11 @@ function fail(res: Response, err: unknown, naming?: Naming): boolean {
     return true;
   }
   return false;
+}
+
+/** Whether a catalog entry may be offered: API providers aren't MCP servers, so the allowlist doesn't apply to them. */
+function catalogEntryAllowed(allowlist: UpstreamAllowlist, entry: { upstream: string; kind?: string }): boolean {
+  return entry.kind === 'api' || upstreamAllowed(allowlist, entry.upstream);
 }
 
 /** The flag's catalog, then the API providers this user may connect (api-broker-enabled). */
@@ -238,16 +272,16 @@ export function mcpConnectorsRouter(): Router {
   router.get('/', asyncHandler(async (req, res) => {
     const broker = getMcpBrokerUrl();
     const rows = await listConnectors(req.user!.id);
-    const labels = await scopeLabelsForUser(req.user!);
-    const catalog = await fullCatalog(req.user!);
+    const [labels, catalog, allowlist] = await Promise.all([scopeLabelsForUser(req.user!), fullCatalog(req.user!), upstreamAllowlistForUser(req.user!)]);
     res.json({
       available: broker !== null,
       storeAvailable: getCredentialStoreConfig() !== null,
-      connectors: await Promise.all(rows.map(r => view(r, broker, labels))),
-      // The orchestrator's servers this user hasn't connected yet, which Settings
-      // offers under "Available to connect". Once the user has a connector for a
-      // server's URL, it is one of their connectors instead and drops out of here.
-      catalog: catalog.filter(d => !rows.some(r => r.upstream === d.upstream)),
+      connectors: await Promise.all(rows.map(r => view(r, broker, labels, allowlist))),
+      // The orchestrator's servers this user hasn't connected yet and may
+      // (catalogEntryAllowed), which Settings offers under "Available to connect".
+      // Once the user has a connector for a server's URL, it is one of their
+      // connectors instead and drops out of here.
+      catalog: catalog.filter(d => !rows.some(r => r.upstream === d.upstream) && catalogEntryAllowed(allowlist, d)),
     });
   }));
 
@@ -269,6 +303,7 @@ export function mcpConnectorsRouter(): Router {
     }
     const existing = async () => (await listConnectors(userId)).find(r => r.authType === 'oauth' && r.upstream === def.upstream) ?? null;
     try {
+      if (def.kind !== 'api') await assertUpstreamAllowed(req.user!, def.upstream);
       if (!getCredentialStoreConfig()) throw new McpConnectorError(STORE_OFF, 503);
       termagUrlOrFail();
       let connector = await existing();
@@ -292,7 +327,7 @@ export function mcpConnectorsRouter(): Router {
           }
         }
       }
-      const shown = await view(connector, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!));
+      const shown = await viewFor(req.user!, connector);
       if (req.body?.chooseScopes === true && req.body?.scopes === undefined && 'oauth' in shown && shown.oauth?.scopeChoice) {
         res.json({ id: connector.id, authorizeUrl: null, connector: shown });
         return;
@@ -318,13 +353,14 @@ export function mcpConnectorsRouter(): Router {
         }
         termagUrlOrFail();
         const upstream = await validateUpstream(req.body?.upstream);
+        await assertUpstreamAllowed(req.user!, upstream.url);
         const meta = await discover(upstream.url);
         const row = await prisma.mcpConnector.create({
           data: { userId, name, displayName, upstream: upstream.url, authType: 'oauth', oauthMetadata: meta as object, linkStatus: 'needs_link' },
           select: CONNECTOR_SELECT,
         });
         void deliverToUserBoxes(userId);
-        res.status(201).json(await view(row, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!)));
+        res.status(201).json(await viewFor(req.user!, row));
         return;
       }
       const headers = staticAuth(req.body?.auth);
@@ -335,6 +371,7 @@ export function mcpConnectorsRouter(): Router {
         return;
       }
       const upstream = await validateUpstream(req.body?.upstream);
+      await assertUpstreamAllowed(req.user!, upstream.url);
       const row = await prisma.mcpConnector.create({
         data: { userId, name, displayName, upstream: upstream.url, authType: 'static', headerTemplates: headers },
         select: CONNECTOR_SELECT,
@@ -346,7 +383,7 @@ export function mcpConnectorsRouter(): Router {
         throw err;
       }
       void deliverToUserBoxes(userId);
-      res.status(201).json(await view(row, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!)));
+      res.status(201).json(await viewFor(req.user!, row));
     } catch (err) {
       if (!fail(res, err, naming)) throw err;
     }
@@ -435,6 +472,10 @@ export function mcpConnectorsRouter(): Router {
       }
       if (req.body?.upstream !== undefined && !isApiConnector(existing)) {
         data.upstream = (await validateUpstream(req.body.upstream)).url;
+      }
+      // Every edit of an MCP connector, so one off the list can only be moved onto it or deleted.
+      if (!isApiConnector(existing)) await assertUpstreamAllowed(req.user!, data.upstream ?? existing.upstream);
+      if (data.upstream !== undefined) {
         if (existing.authType === 'oauth' && data.upstream !== existing.upstream) {
           data.oauthMetadata = await discover(data.upstream) as object;
           data.linkStatus = 'needs_link';
@@ -472,7 +513,7 @@ export function mcpConnectorsRouter(): Router {
         }
       }
       void deliverToUserBoxes(userId);
-      res.json(await view(row, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!)));
+      res.json(await viewFor(req.user!, row));
     } catch (err) {
       if (!fail(res, err, naming)) throw err;
     }
@@ -489,6 +530,7 @@ export function mcpConnectorsRouter(): Router {
       return;
     }
     try {
+      if (!isApiConnector(connector)) await assertUpstreamAllowed(req.user!, connector.upstream);
       res.json({ authorizeUrl: await startLink(userId, connector, req.body?.scopes, returnToOf(req.body)) });
     } catch (err) {
       if (!fail(res, err)) throw err;
@@ -547,7 +589,7 @@ export function mcpConnectorsRouter(): Router {
       res.status(404).json({ error: 'No such OAuth MCP connector' });
       return;
     }
-    res.json(await view(row, getMcpBrokerUrl(), await scopeLabelsForUser(req.user!)));
+    res.json(await viewFor(req.user!, row));
   }));
 
   router.delete('/:id', asyncHandler(async (req, res) => {

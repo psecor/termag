@@ -17,6 +17,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import { McpConnectorError } from './mcpConnectors';
 import type { OAuthHttp } from './mcpOAuthHttp';
 import { redirectRefusedError } from './mcpOAuthRedirectHelp';
+import { requestableScopes } from './mcpOAuthScopes';
 
 export interface DiscoveredOAuth {
   // RFC 8707 resource indicator: the protected resource's own identifier.
@@ -360,13 +361,15 @@ export async function registerClient(
     return { clientId: pre!.clientId, authMethod: preregisteredAuthMethod(d), via: 'preregistered', redirectUri: opts.redirectUri, issuer: d.issuer, resource: pre!.resource };
   }
   if (path === 'cimd') return { clientId: opts.cimdClientId!, authMethod: 'none', via: 'cimd', redirectUri: opts.redirectUri, issuer: d.issuer };
+  // Registered with every scope a sign-in may ask for, so a later one can ask for more (not the withheld ones).
+  const scopes = requestableScopes(d);
   const body = {
     client_name: 'termag',
     redirect_uris: [opts.redirectUri],
     grant_types: ['authorization_code', 'refresh_token'],
     response_types: ['code'],
     token_endpoint_auth_method: 'none',
-    ...(d.scopes.length ? { scope: d.scopes.join(' ') } : {}),
+    ...(scopes.length ? { scope: scopes.join(' ') } : {}),
   };
   const res = await opts.http(d.registrationEndpoint!, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),

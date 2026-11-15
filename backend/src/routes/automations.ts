@@ -17,6 +17,7 @@
  * the owner and the box (403 automations_disabled). The run's conversation is
  * the project's chat routes (routes/chat.ts) with the run's workstream.
  */
+import type { Prisma } from '@prisma/client';
 import { Router } from 'express';
 import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
@@ -28,7 +29,7 @@ import { settleInterruptedRun } from '../services/automations/complete';
 import { isRunTier } from '../services/automations/brief';
 import { automationLimitsFor, type AutomationLimits } from '../services/automations/limits';
 import { estimateMinutesPerDay, minGapMinutes, nextOccurrence, nextOccurrences, occurrenceMinute, parseSchedule, parseTimezone } from '../services/automations/schedule';
-import { automationFor, automationView, automationsFor, runsFor, type AutomationRow } from '../services/automations/store';
+import { AUTOMATION_INCLUDE, automationFor, automationView, automationsFor, runsFor, type AutomationRow } from '../services/automations/store';
 import { chatKeyFor } from '../services/chatRunner';
 import { fireworksOfferedTo } from '../services/fireworksFlag';
 import { mainAgentRow, namesModelChoice, parseModelChoice } from '../services/automations/model';
@@ -40,6 +41,11 @@ import { isReservedProjectName, RESERVED_NAME_ERROR } from './projectNames';
 import { archiveOwnedProject, createProjectFor } from './projects';
 import { RouteResult, sendResult } from './routeResult';
 import { removeWorkstreamFor } from './workstreams';
+import { parseAlertSettings, type AlertSettings } from '../services/automations/alerts';
+import { ALERTS_FLAG } from '../services/automations/alertsFlag';
+import { checkAlertChannel } from '../services/automations/alertChannel';
+import { finishRunWithEvent } from '../services/automations/notices';
+import { forgetWebhook, forgetWebhookWrite, parseWebhookField, sealWebhook, webhookStoreReady, WebhookStoreUnavailable } from '../services/automations/webhook';
 import { forgetT3Hook, parseT3Fields, saveT3Hook, T3_AUTOMATION_KIND, t3HookStoreReady, T3HookStoreUnavailable } from '../services/automations/t3Hook';
 
 const MAX_PROMPT = 20_000;
@@ -59,7 +65,7 @@ function parseScheduleFields(body: Record<string, unknown>, limits: AutomationLi
   return { ok: true, value: { schedule: s.schedule, timezone: tz.timezone } };
 }
 
-interface Settings {
+interface Settings extends AlertSettings {
   prompt?: string; tier?: string; enabled?: boolean; prOnChange?: boolean; wakeBox?: boolean; notifySlack?: boolean; maxRunMinutes?: number; keepRuns?: number; spaceName?: string | null;
 }
 
@@ -95,8 +101,57 @@ function parseSettings(body: Record<string, unknown>, limits: AutomationLimits, 
     if (body.spaceName !== null && (typeof body.spaceName !== 'string' || !/^[a-z0-9-]{2,40}$/.test(body.spaceName))) return { ok: false, error: 'spaceName must be a space name or null' };
     out.spaceName = body.spaceName as string | null;
   }
+  const alerts = parseAlertSettings(body);
+  if (!alerts.ok) return alerts;
+  Object.assign(out, alerts.value);
   return { ok: true, value: out };
 }
+
+/**
+ * Keyword alerts, a non-DM target and the webhook are new things to do, so
+ * they are refused while automation-alerts-enabled is off for the owner and
+ * box. A body that carries the defaults or the row's own values back (a form
+ * saving its view) goes through, and so does healthAlerts, which nothing
+ * reads with the flag off.
+ */
+async function alertsRefused(
+  user: Express.User, box: { id: string; name: string; kind: string } | null, s: AlertSettings, webhook: { url: string } | null | undefined,
+  current: { alertPrefix: string | null; alertRegex: string | null; alertTarget: string } = { alertPrefix: null, alertRegex: null, alertTarget: 'dm' },
+): Promise<RouteResult | null> {
+  // What the row already has is not a new ask: a form saving its view back still saves.
+  const asks = (!!s.alertPrefix && s.alertPrefix !== current.alertPrefix) || (!!s.alertRegex && s.alertRegex !== current.alertRegex)
+    || (s.alertTarget !== undefined && s.alertTarget !== 'dm' && s.alertTarget !== current.alertTarget) || !!webhook;
+  if (!asks || await boolVariation(ALERTS_FLAG, user, false, box)) return null;
+  return { status: 403, body: { error: 'Automation alerts and webhooks are not enabled for you on this box', code: 'automation_alerts_disabled' } };
+}
+
+/**
+ * A Slack channel as the alert target is checked on every save that leaves
+ * one in place, chosen now or kept from before (services/automations/
+ * alertChannel.ts): the owner must still be a member and the bot able to post
+ * there, or the save is refused. Delivery checks the owner again before each
+ * post (notices.ts ownedChannelOf), so leaving the channel between saves
+ * stops the alerts too. `dm` and `project` need no check, and neither does a
+ * pause (a save that turns the automation off and leaves the target alone):
+ * a pause must never be refused because Slack is down or the owner left the
+ * channel. Any other save of an automation that is off is still checked,
+ * since Run now runs it and its alerts go to the channel.
+ */
+async function alertChannelRefused(user: Express.User, target: string | undefined, pausing: boolean): Promise<RouteResult | null> {
+  if (pausing || target === undefined || target === 'dm' || target === 'project') return null;
+  const owner = await prisma.user.findUnique({ where: { id: user.id }, select: { id: true, slackUserId: true, googleEmail: true } });
+  if (!owner) return { status: 400, body: { error: 'Your user could not be read', code: 'alert_channel_unchecked' } };
+  const check = await checkAlertChannel(owner, target);
+  return check.ok ? null : { status: 400, body: { error: check.error, code: check.code } };
+}
+
+/** `webhook` from a body: undefined when absent, else the parsed URL or null (remove). */
+function webhookField(body: Record<string, unknown>): Parsed<{ url: string } | null | undefined> {
+  if (body.webhook === undefined) return { ok: true, value: undefined };
+  return parseWebhookField(body.webhook);
+}
+
+const webhookStoreOff: RouteResult = { status: 503, body: { error: 'This termag has no credential store, so it cannot keep a webhook URL and its secret', code: 'credential_store_off' } };
 
 async function flagFor(user: Express.User, instanceId: string | null): Promise<boolean> {
   const box = instanceId ? await prisma.instance.findUnique({ where: { id: instanceId }, select: { id: true, name: true, kind: true } }) : null;
@@ -135,6 +190,11 @@ export async function createAutomationFor(user: Express.User, raw: unknown): Pro
   if (!sched.ok) return { status: 400, body: { error: sched.error } };
   const settings = parseSettings(body, limits, true);
   if (!settings.ok) return { status: 400, body: { error: settings.error } };
+  const webhook = webhookField(body);
+  if (!webhook.ok) return { status: 400, body: { error: webhook.error } };
+  const alertRefusal = await alertsRefused(user, box, settings.value, webhook.value) ?? await alertChannelRefused(user, settings.value.alertTarget, false);
+  if (alertRefusal) return alertRefusal;
+  if (webhook.value && !webhookStoreReady()) return webhookStoreOff;
   if (settings.value.spaceName) {
     const space = await checkSpaceForOwner(user.id, settings.value.spaceName);
     if (!space.ok) return { status: 400, body: { error: SYNC_REFUSAL_TEXT[space.reason], code: space.reason } };
@@ -198,6 +258,8 @@ export async function createAutomationFor(user: Express.User, raw: unknown): Pro
         wakeBox: settings.value.wakeBox ?? false, notifySlack: settings.value.notifySlack ?? false,
         maxRunMinutes: Math.min(settings.value.maxRunMinutes ?? 60, limits.maxRunMinutes),
         keepRuns: settings.value.keepRuns ?? 20, spaceName: settings.value.spaceName ?? null,
+        alertPrefix: settings.value.alertPrefix ?? null, alertRegex: settings.value.alertRegex ?? null,
+        alertTarget: settings.value.alertTarget ?? 'dm', healthAlerts: settings.value.healthAlerts ?? true,
         nextRunAt: nextOccurrence(sched.value.schedule, sched.value.timezone, now), lastOccurrence: now,
       },
       include: { project: { select: { name: true, instanceId: true, repoUrl: true, repoDefaultBranch: true, archived: true, userId: true } } },
@@ -219,13 +281,41 @@ export async function createAutomationFor(user: Express.User, raw: unknown): Pro
       throw err;
     }
   }
+  // The secret is minted with the id, and shown once, in this answer. The
+  // credential and the row's webhookHost are written in one transaction.
+  let webhookSecret: string | null = null;
+  if (webhook.value) {
+    try {
+      const sealed = await sealWebhook(user.id, automation.id, webhook.value.url);
+      const [, withHost] = await prisma.$transaction([
+        sealed.write,
+        prisma.automation.update({ where: { id: automation.id }, data: { webhookHost: new URL(webhook.value.url).host }, include: AUTOMATION_INCLUDE }),
+      ]);
+      automation = withHost;
+      webhookSecret = sealed.secret;
+    } catch (err) {
+      // Asked for a webhook and could not keep it: no automation, rather than one that silently sends nothing.
+      // Nor a T3 hook sealed for it (the webhook's own write went with the failed transaction).
+      if (t3?.ok) await forgetT3Hook(user.id, automation.id).catch(() => {});
+      await prisma.automation.delete({ where: { id: automation.id } }).catch(() => {});
+      await archiveOwnedProject(user, project.id).catch(() => {});
+      if (err instanceof WebhookStoreUnavailable) return webhookStoreOff;
+      throw err;
+    }
+  }
   // The folder is derived from the id, which the row has only now.
   if (automation.spaceName) {
     automation = await prisma.automation.update({ where: { id: automation.id }, data: { spaceFolder: spaceFolderFor(automation.id) }, include: { project: { select: { name: true, instanceId: true, repoUrl: true, repoDefaultBranch: true, archived: true, userId: true } } } });
   }
   console.log(`[AUTOMATION] ${user.unixUsername} created ${name} (${sched.value.schedule} ${sched.value.timezone}, ${tier})`);
   if (automation.spaceName && await boolVariation(SPACE_FOLDER_FLAG, user, false)) void publishReadmeFor(automation.id);
-  return { status: 201, body: { project: created.body, automation: await automationView(automation as AutomationRow, user.id, now), next: nextOccurrences(sched.value.schedule, sched.value.timezone, now, 3).map(d => d.toISOString()) } };
+  return {
+    status: 201,
+    body: {
+      project: created.body, automation: await automationView(automation as AutomationRow, user.id, now), next: nextOccurrences(sched.value.schedule, sched.value.timezone, now, 3).map(d => d.toISOString()),
+      ...(webhookSecret ? { webhookSecret } : {}),
+    },
+  };
 }
 
 export async function previewScheduleFor(user: Express.User, raw: unknown): Promise<RouteResult> {
@@ -292,6 +382,11 @@ export async function updateAutomationFor(user: Express.User, id: string, raw: u
   const settings = parseSettings(body, limits, false);
   if (!settings.ok) return { status: 400, body: { error: settings.error } };
   const rest = settings.value;
+  const webhook = webhookField(body);
+  if (!webhook.ok) return { status: 400, body: { error: webhook.error } };
+  const alertRefusal = await alertsRefused(user, box, rest, webhook.value, a) ?? await alertChannelRefused(user, rest.alertTarget ?? a.alertTarget, rest.enabled === false && rest.alertTarget === undefined);
+  if (alertRefusal) return alertRefusal;
+  if (webhook.value && !webhookStoreReady()) return webhookStoreOff;
   const folders = await boolVariation(SPACE_FOLDER_FLAG, user, false);
   // The fixed folder, or the one the row still has from before it (until the move script moves it).
   const refused = folderRefused(body.spaceFolder, a.spaceFolder ?? spaceFolderFor(a.id));
@@ -343,18 +438,40 @@ export async function updateAutomationFor(user: Express.User, id: string, raw: u
     await prisma.workflow.update({ where: { id: agentChange.id }, data: { backend: agentChange.backend, model: agentChange.model } });
     console.log(`[AUTOMATION] ${user.unixUsername} ${a.project.name}: next runs on ${agentChange.backend ?? 'default'} ${agentChange.model ?? '(default model)'}`);
   }
+  // The webhook's credential and the row change in one transaction, after
+  // every check that can refuse the save: a refused or failed save changes
+  // neither, so there is no rollback. A new URL mints a new secret (sealed
+  // first, outside the transaction, so a KMS failure writes nothing; shown
+  // once, below); null deletes the credential with the row's webhookHost.
+  let webhookSecret: string | null = null;
+  let credentialWrite: Prisma.PrismaPromise<unknown> | null = null;
+  if (webhook.value) {
+    try {
+      const sealed = await sealWebhook(user.id, a.id, webhook.value.url);
+      webhookSecret = sealed.secret;
+      credentialWrite = sealed.write;
+    } catch (err) {
+      if (err instanceof WebhookStoreUnavailable) return webhookStoreOff;
+      throw err;
+    }
+    data.webhookHost = new URL(webhook.value.url).host;
+  } else if (webhook.value === null) {
+    credentialWrite = forgetWebhookWrite(user.id, a.id);
+    data.webhookHost = null;
+  }
   const now = new Date();
   const schedule = (data.schedule as string | undefined) ?? a.schedule;
   const timezone = (data.timezone as string | undefined) ?? a.timezone;
   // Any save clears a pause and restarts the clock: occurrences before now are not owed.
-  const updated = await prisma.automation.update({
+  const rowWrite = prisma.automation.update({
     where: { id: a.id },
     data: { ...data, pausedReason: null, consecutiveFailures: 0, nextRunAt: nextOccurrence(schedule, timezone, now), lastOccurrence: now },
-    include: { project: { select: { name: true, instanceId: true, repoUrl: true, repoDefaultBranch: true, archived: true, userId: true } } },
+    include: AUTOMATION_INCLUDE,
   });
+  const updated = credentialWrite ? (await prisma.$transaction([credentialWrite, rowWrite]))[1] : await rowWrite;
   // The README says what the automation is: a save may have changed that.
   if (folders && updated.spaceName) void publishReadmeFor(updated.id);
-  return { status: 200, body: await automationView(updated as AutomationRow, user.id, now) };
+  return { status: 200, body: { ...(await automationView(updated as AutomationRow, user.id, now)), ...(webhookSecret ? { webhookSecret } : {}) } };
 }
 
 export async function runNowFor(user: Express.User, id: string): Promise<RouteResult> {
@@ -400,8 +517,8 @@ export async function stopRunFor(user: Express.User, id: string, runId: string):
   if (run.state !== 'running') return { status: 409, body: { error: 'This run is not live' } };
   // The row first, then the interrupt: the turn-end the interrupt causes
   // would otherwise race this write (services/automations/scheduler.ts timeOutRuns).
-  const stopped = await prisma.automationRun.updateMany({ where: { id: run.id, state: 'running' }, data: { state: 'failed', reason: 'interrupted', finishedAt: new Date() } });
-  if (stopped.count === 0) return { status: 409, body: { error: 'This run is not live' } };
+  const stopped = await finishRunWithEvent({ id: run.id, automationId: a.id }, { state: 'running' }, { state: 'failed', reason: 'interrupted', finishedAt: new Date() });
+  if (stopped === 0) return { status: 409, body: { error: 'This run is not live' } };
   if (run.workstream && a.project.instanceId) {
     await sendForProject({ userId: a.userId, instanceId: a.project.instanceId }, 'chat-interrupt', { chatKey: chatKeyFor(a.projectId, run.workstream.id) }, 10_000)
       .catch(err => console.warn(`[AUTOMATION] ${a.project.name}: interrupt failed: ${(err as Error).message}`));
@@ -451,6 +568,9 @@ export async function deleteAutomationFor(user: Express.User, id: string): Promi
   const archived = await archiveOwnedProject(user, a.projectId);
   // Its webhook can start the T3 task on the box: an archived automation keeps none.
   if (a.kind === T3_AUTOMATION_KIND && archived.status < 300) await forgetT3Hook(user.id, a.id).catch(() => {});
+  // Nor a webhook: its URL and secret go with it, whatever the row says (a
+  // credential a failed save left behind included; forgetting none is a no-op).
+  if (archived.status < 300) await forgetWebhook(user.id, a.id).catch(() => {});
   return archived;
 }
 

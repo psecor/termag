@@ -15,11 +15,11 @@ import { getAllStatuses } from '../services/status';
 import { statusKey } from '../services/statusKey';
 import {
   chooseGuess, chooseReviewSlot, guessRepoIndex, isPrNumber, parseGhPrView, prFromText, reviewLaunchCommand, urlForPr, probeReviewPane, PR_OPTION, encodePrOption,
-  buildGroupReviewPrompt, buildReviewPrompt, parseGroupReview, parseReviewBody, reviewPromptPath, reviewPromptFooter, reviewTemplateCandidates, chooseReviewTemplate,
+  buildGroupReviewPrompt, buildReviewPrompt, homeRelative, parseGroupReview, parseReviewBody, reviewPromptPath, reviewPromptFooter, reviewTemplateCandidates, chooseReviewTemplate,
   type ResolvedReviewTemplate,
   type ReviewPaneState,
 } from '../services/review';
-import { DEFAULT_REVIEWER, REVIEWER_IDS, isReviewerId, reviewerName, reviewerNote } from '../services/reviewers';
+import { DEFAULT_REVIEWER, REVIEWER_IDS, isReviewerId, reviewerConfinedIn, reviewerName, reviewerNote } from '../services/reviewers';
 import { prUrlFor, reviewTarget, workspaceRepos, workstreamRepo, type WorkstreamRepo } from '../services/reviewRepo';
 import { isWorkspace, repoCheckoutDir, repoSlug } from '../services/projectRepos';
 import {
@@ -50,7 +50,8 @@ import {
 // is per unix user) and gated by assertSessionAccess (owner-or-share, legal
 // session name rebuilt server-side). The review pane is the `review` role:
 // `<user>-<project>[-<ws>]-review`, created in the workstream's directory so
-// `gh` sees the right repo.
+// `gh` sees the right repo. With review-pane-confined-enabled, Devin and Cursor
+// then start in a folder of the pane's own (gotcha review-pane-no-checkout-config).
 //
 // Since the review ring the panes' live state ALSO
 // rides on the AGENT session's status (`AgentStatus.reviews`, and slot 1's as
@@ -111,6 +112,8 @@ export interface ReviewRouteDeps {
   parallelOn: (user: Express.User) => Promise<boolean>;
   /** box-wake-on-action-enabled for the user starting the review: a parked box of theirs is woken, the start held. */
   wakeOn: (user: Express.User) => Promise<boolean>;
+  /** review-pane-confined-enabled for the user starting the review: the reviewer loads none of the checkout's own startup config. */
+  confinedOn: (user: Express.User) => Promise<boolean>;
   /** Asks a box of the user's to start: the owner-only path POST /instances/:id/start takes. */
   startBox: (user: Express.User, instanceId: string) => Promise<StartAnswer>;
   /** A box's status now, from the database; null when it's gone. */
@@ -130,6 +133,7 @@ const boxStatusOf = (id: string) => prisma.instance.findUnique({ where: { id }, 
 const defaultDeps: ReviewRouteDeps = {
   parallelOn: user => boolVariation('parallel-reviews-enabled', user, false),
   wakeOn: user => boolVariation('box-wake-on-action-enabled', user, false),
+  confinedOn: user => boolVariation('review-pane-confined-enabled', user, false),
   // Imported when first used: routes/instances.ts pulls in the provisioning stack.
   startBox: async (user, instanceId) => (await import('./instances')).powerOwnedBox(user, instanceId, 'start'),
   boxStatus: boxStatusOf,
@@ -421,7 +425,7 @@ export function reviewRouter(overrides: Partial<ReviewRouteDeps> = {}): Router {
     if (!body.ok) { res.status(400).json({ error: body.error }); return; }
     const wsAccess = await accessOr404(req, res, 'review');
     if (!wsAccess) return;
-    const parallel = await deps.parallelOn(req.user!);
+    const [parallel, confined] = await Promise.all([deps.parallelOn(req.user!), deps.confinedOn(req.user!)]);
     // The checkout's remote is read while the checks below run: on an agent
     // that is connected but slow it can take seconds (services/reviewRepo.ts).
     // Nothing is awaited on an early return, so neither promise may reject unseen.
@@ -463,6 +467,10 @@ export function reviewRouter(overrides: Partial<ReviewRouteDeps> = {}): Router {
     // reviewer see it; a PR of none of them opens at the workstream folder.
     const cwd = paths.repos ? repoCheckoutDir(paths.cwd, paths.repos, target.repo) ?? paths.cwd : paths.cwd;
     const cleanUrl = target.url;
+    // Confined, a reviewer with no switch of its own runs in the pane's own folder (services/reviewers.ts), and the
+    // checkout is reached by path: an --add-dir where the reviewer has a safe one, and a line in the prompt.
+    const checkoutAt = homeRelative(home, cwd);
+    const shownCheckout = confined && reviewerConfinedIn(reviewer) === 'own-folder' ? checkoutAt?.display ?? cwd : null;
     // No edited body (unedited dialog, mobile, older client): the same
     // template the dialog would have shown, resolved again now.
     const template = body.body == null && !group ? await resolveTemplate(wsAccess, cwd, home) : null;
@@ -500,8 +508,8 @@ export function reviewRouter(overrides: Partial<ReviewRouteDeps> = {}): Router {
         // The prompt goes in a file Devin reads (--prompt-file), never through
         // shell quoting, so an edited prompt may hold quotes and newlines.
         const content = group
-          ? buildGroupReviewPrompt(group, reviewerName(reviewer))
-          : buildReviewPrompt(pr, cleanUrl, body.body ?? template!.template, reviewerName(reviewer));
+          ? buildGroupReviewPrompt(group, reviewerName(reviewer), shownCheckout)
+          : buildReviewPrompt(pr, cleanUrl, body.body ?? template!.template, reviewerName(reviewer), shownCheckout);
         await sendForProject(access.host, 'write-file', { path: promptPath, content, mode: 0o600 }, 5000);
         // A review in this pane already (off: any review; on: this PR's) is replaced: fresh shell, fresh reviewer.
         // Exact targets throughout: a bare name prefix-matches a sibling slot once its own pane is gone.
@@ -515,7 +523,7 @@ export function reviewRouter(overrides: Partial<ReviewRouteDeps> = {}): Router {
         await sendForProject(access.host, 'tmux-set-user-option', { sessionName: pane, name: PR_OPTION, value: encodePrOption(pr, cleanUrl, reviewer) }, 5000).catch(() => {});
         await new Promise(r => setTimeout(r, SHELL_SETTLE_MS));
         await sendForProject(access.host, 'tmux-send-keys', {
-          sessionName: pane, keys: reviewLaunchCommand(access.session, reviewer), withEnter: true, literal: true,
+          sessionName: pane, keys: reviewLaunchCommand(access.session, reviewer, confined ? { checkout: checkoutAt?.shell ?? null } : null), withEnter: true, literal: true,
         }, 5000);
       } catch (err) {
         res.status(503).json({ error: `Could not start the review: ${(err as Error).message}` });
@@ -524,7 +532,7 @@ export function reviewRouter(overrides: Partial<ReviewRouteDeps> = {}): Router {
       const rec = registerReviewRecord(identityFor(access), { pr, url: cleanUrl, reviewer }, { startedByUserId: req.user!.id });
       const startedAt = rec.startedAt;
       const slots = parallel ? ` (slot ${access.slot} of ${workstreamReviews(access).length} running${replaced ? ', restarted' : ''})` : '';
-      console.log(`[REVIEW] ${access.session}: ${reviewer} review of PR #${pr} started by ${req.user!.id}${slots}${target.mismatch ? ` (checkout is ${target.mismatch})` : ''}${group ? ` (review group "${group.name}", ${group.members.length} PRs)` : body.body ? ' (edited prompt)' : ` (prompt: ${template!.label ?? 'built-in'})`}`);
+      console.log(`[REVIEW] ${access.session}: ${reviewer} review of PR #${pr} started by ${req.user!.id}${slots}${confined ? ' (confined)' : ''}${target.mismatch ? ` (checkout is ${target.mismatch})` : ''}${group ? ` (review group "${group.name}", ${group.members.length} PRs)` : body.body ? ' (edited prompt)' : ` (prompt: ${template!.label ?? 'built-in'})`}`);
       res.status(201).json({ ok: true, session: access.session, slot: access.slot, replaced, pr, url: cleanUrl, reviewer, startedAt });
     });
   };

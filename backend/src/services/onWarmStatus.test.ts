@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
+  envPoolOnWarmUpdate,
+  onWarmSecondsOf,
   describeOnWarmRun,
   onWarmRunUpdate,
   parseOnWarmReport,
@@ -194,10 +196,10 @@ describe('onWarmRunUpdate', () => {
 
   it('names a timeout as the reason rather than an exit code alone', () => {
     const report = parseOnWarmReport({
-      ...failedFile, reason: 'timeout', exitCode: 124, script: '20-docker-images.sh',
+      ...failedFile, reason: 'timeout', exitCode: 124, script: '20-image-pulls.sh',
     })!;
     expect(onWarmRunUpdate('box-1', report).data.provisioningError)
-      .toBe('on-warm timeout at 20-docker-images.sh exit 124');
+      .toBe('on-warm timeout at 20-image-pulls.sh exit 124');
   });
 
   it('still records a failure a runner could not describe', () => {
@@ -272,5 +274,26 @@ describe('describeOnWarmRun', () => {
   it('reports a failure with no reason at all', () => {
     expect(describeOnWarmRun(parseOnWarmReport({ state: 'failed', exitCode: 124 })!))
       .toBe('failed unknown exit 124');
+  });
+});
+
+describe('envPoolOnWarmUpdate: an environment pool box runs the hook during its prepare', () => {
+  const failed = parseOnWarmReport({
+    schema: 1, state: 'failed', script: '20-image-pulls.sh', exitCode: 1, reason: 'script-failed',
+    durations: [{ script: '10-dotfiles.sh', seconds: 40, exitCode: 0 }, { script: '20-image-pulls.sh', seconds: 5, exitCode: 1 }],
+    logTail: 'pull access denied',
+  })!;
+
+  it('records a failure without failing the box, with its total time', () => {
+    const u = envPoolOnWarmUpdate('i1', failed);
+    expect(u.data).not.toHaveProperty('status');
+    expect(u.data.onWarmStatus).toBe('failed');
+    expect(u.data.onWarmSeconds).toBe(45);
+    expect(u.data.onWarmLog).toMatch(/^on-warm script-failed at 20-image-pulls.sh exit 1\npull access denied$/);
+    expect(onWarmSecondsOf(failed)).toBe(45);
+  });
+
+  it('only on an ownerless pool box, including one a quick setup already started stopping', () => {
+    expect(envPoolOnWarmUpdate('i1', failed).where).toEqual({ id: 'i1', userId: null, status: { in: ['env-preparing', 'env-stopping', 'env-stopped'] } });
   });
 });

@@ -66,7 +66,9 @@ vi.mock('../db', () => {
       return { count: hit.length };
     }),
   };
-  const prisma: any = { previewShare, previewShareEvent, previewShareViewer };
+  // The owner's one wake budget also counts preview links' wakes (row 6b, claimGuestWake): none here.
+  const previewAudienceEvent = { findMany: vi.fn(async () => []) };
+  const prisma: any = { previewShare, previewShareEvent, previewShareViewer, previewAudienceEvent };
   prisma.$transaction = vi.fn(async (fn: any) => fn(prisma));
   prisma.$executeRaw = vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => { db.locks.push(String(values[0])); return 1; });
   return { prisma };

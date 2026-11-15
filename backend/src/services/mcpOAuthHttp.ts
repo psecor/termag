@@ -23,7 +23,16 @@ export interface HttpRequest {
   method?: 'GET' | 'POST';
   headers?: Record<string, string>;
   body?: string;
+  /**
+   * A hard limit on the whole exchange, connect to last byte. The socket's
+   * `timeout` is an idle timeout only, so a peer that trickles a byte every
+   * few seconds never trips it; past this, the request is destroyed.
+   */
+  deadlineMs?: number;
 }
+
+/** https.request's shape, for a test that serves plain http on loopback. */
+export type RequestFn = (url: URL, options: https.RequestOptions, callback: (res: import('node:http').IncomingMessage) => void) => import('node:http').ClientRequest;
 
 export type OAuthHttp = (url: string, req?: HttpRequest) => Promise<HttpResponse>;
 
@@ -62,7 +71,7 @@ function publicOnlyLookup(allowed: boolean): LookupFunction {
   };
 }
 
-export function safeOAuthHttp(allow: Set<string> = upstreamTestAllow()): OAuthHttp {
+export function safeOAuthHttp(allow: Set<string> = upstreamTestAllow(), request: RequestFn = https.request): OAuthHttp {
   return (raw, req = {}) => new Promise((resolve, reject) => {
     let u: URL;
     try {
@@ -72,7 +81,7 @@ export function safeOAuthHttp(allow: Set<string> = upstreamTestAllow()): OAuthHt
       return;
     }
     const allowed = allow.has(`${u.hostname.toLowerCase()}:${u.port || '443'}`);
-    const r = https.request(u, {
+    const r = request(u, {
       method: req.method ?? 'GET',
       headers: { accept: 'application/json', 'user-agent': 'termag-mcp-broker', ...req.headers },
       lookup: publicOnlyLookup(allowed),
@@ -96,6 +105,11 @@ export function safeOAuthHttp(allow: Set<string> = upstreamTestAllow()): OAuthHt
       res.on('error', reject);
     });
     r.on('timeout', () => r.destroy(new McpConnectorError(`${u.origin} did not answer in time`)));
+    if (req.deadlineMs !== undefined) {
+      const deadline = setTimeout(() => r.destroy(new McpConnectorError(`${u.origin} did not finish within ${Math.round(req.deadlineMs! / 1000)} s`)), req.deadlineMs);
+      deadline.unref?.();
+      r.on('close', () => clearTimeout(deadline));
+    }
     r.on('error', err => reject(err instanceof McpConnectorError ? err
       : new McpConnectorError(`${u.origin} could not be reached (${(err as NodeJS.ErrnoException).code ?? err.message})`)));
     if (req.body !== undefined) r.write(req.body);

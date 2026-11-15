@@ -6,7 +6,10 @@ const NOW = new Date('2026-10-09T12:00:00Z').getTime();
 const rows = new Map<string, Record<string, any>>();
 const runnerSessions: Array<{ instanceId: string; endedAt: Date | null; startedAt?: Date }> = [];
 /** Automations by the box their project lives on (the terminate pass asks for the enabled ones). */
-const automations: Array<{ id: string; name: string; instanceId: string; enabled: boolean }> = [];
+const automations: Array<{ id: string; name: string; instanceId: string; enabled: boolean; pausedReason?: string | null }> = [];
+/** The group pause writes, and whether the next one fails. */
+const pauseWrites: Array<{ ids: string[]; reason: string }> = [];
+const pauseFail = { next: false, owner: false };
 const hostSamples: Array<{ instanceId: string; at: Date; load1: number | null; cores: number | null }> = [];
 const matches = (row: Record<string, any>, where: Record<string, any>): boolean => Object.entries(where).every(([k, v]) => {
   if (k === 'OR') return (v as Record<string, any>[]).some(w => matches(row, w));
@@ -29,11 +32,16 @@ vi.mock('../db', () => ({
       update: async ({ where, data }: any) => Object.assign(rows.get(where.id)!, data),
       findUnique: async ({ where }: any) => rows.get(where.id) ?? null,
     },
-    user: { findUnique: async ({ where }: any) => ({ id: where.id, slackUserId: 'U1', googleEmail: 'z@example.com' }) },
+    user: { findUnique: async ({ where }: any) => { if (pauseFail.owner) throw new Error('db down'); return { id: where.id, slackUserId: 'U1', googleEmail: 'z@example.com' }; } },
     automation: {
       findMany: async ({ where }: any) => automations
         .filter(a => a.enabled === where.enabled && a.instanceId === where.project.instanceId)
-        .map(a => ({ id: a.id, project: { name: a.name } })),
+        .map(a => ({ id: a.id, pausedReason: a.pausedReason ?? null, updatedAt: null, project: { name: a.name } })),
+      updateMany: async ({ where, data }: any) => {
+        if (pauseFail.next) { pauseFail.next = false; throw new Error('db down'); }
+        pauseWrites.push({ ids: where.id.in, reason: data.pausedReason });
+        return { count: where.id.in.length };
+      },
     },
     claudeRunnerSession: {
       findMany: async ({ where }: any) => runnerSessions.filter(s => where.instanceId.in.includes(s.instanceId) && s.endedAt === null
@@ -106,12 +114,25 @@ vi.mock('./boxPower', () => {
 const notices: Array<{ kind: string; box: string; message: any }> = [];
 vi.mock('./boxIdleNotices', () => ({
   automationsSkippedWhileParked: async () => 0,
+  automationsPausedMessage: (box: any, names: string[]) => ({ text: `paused ${box.name}: ${names.join(', ')}`, blocks: [] }),
   warningMessage: (box: any, facts: any) => ({ text: `warn ${box.name} ${facts.action} ${facts.parkAt.toISOString()}`, blocks: [] }),
   parkedMessage: (box: any, result: string, limit: any) => ({ text: `parked ${box.name} ${result} ${limit.hours}${limit.source === 'default' ? ' default' : ''}`, blocks: [] }),
   stuckStartMessage: (box: any) => ({ text: `stuck ${box.name}`, blocks: [] }),
   stuckStartWarningMessage: (box: any) => ({ text: `stuck warning ${box.name}`, blocks: [] }),
   sendIdleNotice: async (kind: string, _owner: unknown, box: any, message: any) => { notices.push({ kind, box: box.id, message }); return true; },
 }));
+const announced: Array<{ id: string; reason: string; cause: any }> = [];
+// The pauses and their notices are one transaction in alerts.ts; here, what the terminate asks of it.
+vi.mock('./automations/alerts', () => ({
+  pauseAutomations: async (ids: string[], reason: string, cause: any) => {
+    if (pauseFail.next) { pauseFail.next = false; throw new Error('db down'); }
+    pauseWrites.push({ ids, reason });
+    for (const id of ids) announced.push({ id, reason, cause });
+    return ids;
+  },
+  pauseDmFallback: async (ids: string[], reason: string, cause: any) => { for (const id of ids) dmFallback.push({ id, reason, cause }); },
+}));
+const dmFallback: Array<{ id: string; reason: string; cause: any }> = [];
 const events: Array<{ name: string; box: string; detail: any }> = [];
 vi.mock('./productEvents', () => ({ recordProductEvent: (name: string, ctx: any, detail: any) => { events.push({ name, box: ctx.box, detail }); } }));
 
@@ -132,7 +153,7 @@ vi.mock('./agentRegistry', () => ({
   },
 }));
 
-const { applyAskBoxPolicy, lifecycleViewFor, recentAutoTerminations, registerBoxBusyCheck, runLifecycleSweep, setBoxLifecycle, setLiveTunnels } = await import('./boxLifecycle');
+const { applyAskBoxPolicy, lifecycleViewFor, pauseAutomationsForTerminate, recentAutoTerminations, registerBoxBusyCheck, runLifecycleSweep, setBoxLifecycle, setLiveTunnels } = await import('./boxLifecycle');
 const { AgentTunnels } = await import('./agentTunnels');
 const { setWorkspaceChangeCallback } = await import('./workspaceEvents');
 
@@ -164,6 +185,11 @@ beforeEach(() => {
   rows.clear();
   runnerSessions.length = 0;
   automations.length = 0;
+  pauseWrites.length = 0;
+  announced.length = 0;
+  dmFallback.length = 0;
+  pauseFail.next = false;
+  pauseFail.owner = false;
   hostSamples.length = 0;
   statuses.clear();
   Object.assign(flag, { on: true, hours: undefined, warnMinutes: undefined, asked: [] });
@@ -651,6 +677,42 @@ describe('automatic terminate', () => {
 
     automations[0].enabled = false;
     expect((await runLifecycleSweep(NOW, terminator))[0]).toMatchObject({ outcome: 'terminated' });
+  });
+
+  it('a terminate pauses all of a box\'s automations, with their notices, in one transaction, then DMs the owner the summary', async () => {
+    automations.push({ id: 'auto1', name: 'pr-babysitter', instanceId: 'a', enabled: true }, { id: 'auto2', name: 'triage', instanceId: 'a', enabled: true });
+    expect(await pauseAutomationsForTerminate({ id: 'a', name: 'box-a', userId: 'u1' }, 'lifecycle')).toEqual(['pr-babysitter', 'triage']);
+    expect(pauseWrites).toEqual([{ ids: ['auto1', 'auto2'], reason: 'box_gone' }]);
+    expect(notices.map(n => n.kind)).toContain('automation-paused');
+    expect(announced).toEqual([
+      { id: 'auto1', reason: 'box_gone', cause: { error: 'box-a was terminated', ownerTold: true } },
+      { id: 'auto2', reason: 'box_gone', cause: { error: 'box-a was terminated', ownerTold: true } },
+    ]);
+  });
+
+  it('a failed owner lookup skips the summary DM only: every pause still has its notices, and each one\'s own DM is queued instead', async () => {
+    automations.push({ id: 'auto1', name: 'pr-babysitter', instanceId: 'a', enabled: true });
+    pauseFail.owner = true;
+    expect(await pauseAutomationsForTerminate({ id: 'a', name: 'box-a', userId: 'u1' }, 'lifecycle')).toEqual(['pr-babysitter']);
+    expect(notices).toEqual([]);
+    // The pause and its channel/webhook notices went in the transaction; the owner's own DM follows as a fallback.
+    expect(announced.map(a => a.id)).toEqual(['auto1']);
+    expect(dmFallback).toEqual([{ id: 'auto1', reason: 'box_gone', cause: { error: 'box-a was terminated', ownerTold: true } }]);
+  });
+
+  it('one already paused is neither paused again nor announced again', async () => {
+    automations.push({ id: 'auto1', name: 'pr-babysitter', instanceId: 'a', enabled: true, pausedReason: 'consecutive_failures' }, { id: 'auto2', name: 'triage', instanceId: 'a', enabled: true });
+    await pauseAutomationsForTerminate({ id: 'a', name: 'box-a', userId: 'u1' }, 'lifecycle');
+    expect(pauseWrites).toEqual([{ ids: ['auto2'], reason: 'box_gone' }]);
+    expect(announced.map(a => a.id)).toEqual(['auto2']);
+  });
+
+  it('a group pause that fails pauses none and announces none', async () => {
+    automations.push({ id: 'auto1', name: 'pr-babysitter', instanceId: 'a', enabled: true }, { id: 'auto2', name: 'triage', instanceId: 'a', enabled: true });
+    pauseFail.next = true;
+    expect(await pauseAutomationsForTerminate({ id: 'a', name: 'box-a', userId: 'u1' }, 'lifecycle')).toEqual([]);
+    expect(pauseWrites).toEqual([]);
+    expect(announced).toEqual([]);
   });
 
   it('keeps a box with unsaved work, an unknown scan or activity after the scan for the long limit', async () => {

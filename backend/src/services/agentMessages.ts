@@ -15,7 +15,7 @@
  * This module holds body validation, the branch name, the reply envelope and
  * the run's system prompt. services/askService.ts owns Prisma and the RPCs.
  */
-import { parseClaudeChatModel, type ClaudeChatTier } from './claudeChatModel';
+import { parseAskModel, type AskModel } from './askModel';
 
 /** What a box's agent must announce before an ask is sent there (agent/ask-run.js). */
 export const ASK_AGENT_CAPABILITY = 'ask-v1';
@@ -511,11 +511,13 @@ export interface AskRequest {
    */
   notify: boolean;
   /**
-   * `termag ask --model`: the Claude tier this turn runs on, and the thread's
-   * chat from then on (its stored choice, Workflow.model). Null for none: the
-   * turn runs on the chat's stored tier, else the box's default.
+   * `termag ask --model`: the Claude tier this turn runs on, or `fireworks:<id>`
+   * (services/askModel.ts; the POST resolves it to the full id), and the
+   * thread's chat from then on (its stored choice, Workflow.backend and
+   * Workflow.model). Null for none: the turn runs on the chat's stored choice,
+   * else the box's default.
    */
-  model: ClaudeChatTier | null;
+  model: AskModel | null;
 }
 
 /** A PR named by `termag ask --update-pr`: its number, and its owner/name when the caller said. */
@@ -642,7 +644,7 @@ export function parseAskBody(body: unknown): AskRequest | { error: string } {
   if ('error' in pr) return pr;
   if (b.newBox !== undefined && typeof b.newBox !== 'boolean') return { error: 'newBox must be true or false' };
   if (b.notify !== undefined && typeof b.notify !== 'boolean') return { error: 'notify must be true or false' };
-  const model = parseClaudeChatModel(b.model);
+  const model = parseAskModel(b.model);
   if (!model.ok) return { error: model.error };
   return {
     ref, projectId: projectId || null, workstream, repo, prompt, threadId, messageId, title: titled.title, sender: parseAskSender(b.sender), senderClaudeSession: parseAskClaudeSession(b.sender), targetPr: pr.targetPr,
@@ -1181,8 +1183,9 @@ function pushSystemPrompt(input: {
     t
       ? `- This thread updates pull request #${t.number} in ${t.repo}. Its branch \`${own}\` is checked out, tracking \`origin/${own}\`. Run \`git pull --ff-only\` before you change anything: someone may have pushed to it since.`
       : `- You are on the thread's branch \`${own}\`. Commit there.`,
-    `- If the request needs code changes, publish them yourself: catch up with \`git fetch origin && git merge origin/<default branch>\` if you need to, then \`git push origin HEAD:${own}\`, then open a draft pull request for it with the termag-pr skill (\`termag-pr-create <title file> <body file> --draft\`) unless it already has one. Push before you finish: termag lists the pull requests of the branches this clone pushed, and says so in the reply when a branch has commits that were not pushed.`,
+    `- If the request needs code changes, publish them yourself: catch up with \`git fetch origin && git merge origin/<default branch>\` if you need to, then push with exactly \`git push origin HEAD:${own}\` — that exact form: the auto permission rule allows it, and a variant (\`-u\`, an appended \`2>&1\`) goes back to the classifier, which nobody is there to answer. Then open a draft pull request for it with the termag-pr skill (\`termag-pr-create <title file> <body file> --draft\`) unless it already has one. Push before you finish: termag lists the pull requests of the branches this clone pushed, and says so in the reply when a branch has commits that were not pushed.`,
     `- A separate pull request goes on its own branch from the default branch: \`git switch -c ${input.branch}-<name> origin/<default branch>\` (<name>: lowercase letters, digits and hyphens), pushed and opened the same way. To work on another existing pull request of the sender's, \`gh pr checkout <n>\`, commit, and \`git push\`.`,
+    `- A stacked pull request, one that builds on another of this thread's branches (or on another open pull request of the sender's) and is reviewed after it, goes on its own \`${input.branch}-<name>\` branch cut from its parent. Stack only when asked to or when one change truly needs the other; independent changes go on the default branch. A follow-up turn starts on \`${own}\`, so switch to the branch a step names before you run it. In this order: (1) only when the parent is one of this thread's branches with commits not on GitHub yet, switch to it and push it (\`git push origin HEAD:<parent branch>\`); never push to a parent that is another pull request, only read it; (2) \`git fetch origin <parent branch>\` (another pull request's branch is not in this clone until you do); (3) \`git switch -c ${input.branch}-<name> origin/<parent branch>\` and commit there; (4) with it still checked out, push it (\`git push origin HEAD:${input.branch}-<name>\`) and only then open it with \`termag-pr-create <title file> <body file> --draft --base <parent branch>\`, so its diff shows only its own commits. Say in each body what it is stacked on. While the parent is open and moves: \`git switch ${input.branch}-<name>\`, \`git fetch origin <parent branch>\`, \`git merge origin/<parent branch>\`, push. This repository squash-merges, so once the parent has merged, the stacked branch still carries the parent's original commits: \`git switch ${input.branch}-<name>\`, \`git fetch origin <default branch>\`, fetch the parent pull request's final head (\`git fetch origin pull/<parent n>/head\`, there even once its branch is deleted), take the last parent commit this branch has with \`git merge-base HEAD FETCH_HEAD\` (the parent may have moved after you last merged it), move only the stacked branch's own commits with \`git rebase --onto origin/<default branch> <that commit>\`, check \`git log origin/<default branch>..HEAD\` lists only them, push with \`git push --force-with-lease origin HEAD:${input.branch}-<name>\` (the one force push allowed, and only to this thread's own branch), and set its base with \`gh pr edit <n> --base <default branch>\` if GitHub has not retargeted it.`,
     '- Never push to the default branch (the clone\'s pre-push hook refuses it), to someone else\'s pull request, or with --force to a branch someone else has pushed to. Do not change credentials, permissions or CI workflows unless the request is about them.',
     '- A pull request\'s title and body come from files, through the termag-pr skill; its body names this thread (TERMAG_ASK_THREAD). To change an existing pull request\'s description, write it to a file and run `termag-pr-body <file> > <marked> && gh pr edit <n> --body-file <marked>` (the termag-pr skill). Never pipe it into `gh pr edit --body-file -`: gh still runs when termag-pr-body fails, say because the file is gone, and an empty stdin blanks the description. termag reads no description file at the end of the turn (there is no TERMAG_ASK_PR_BODY_FILE here). When the change spans several pull requests, link each from the others\' bodies.',
     BUG_REPORT_LINE,

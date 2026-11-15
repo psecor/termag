@@ -51,6 +51,46 @@ export interface RunView {
   durationSec: number | null;
 }
 
+type SendError = { error: string; at: string };
+
+function sendError(error: string | null, at: Date | null): SendError | null {
+  return error && at ? { error, at: at.toISOString() } : null;
+}
+
+type AlertErrorColumns = {
+  lastSlackError: string | null; lastSlackErrorAt: Date | null;
+  lastWebhookError: string | null; lastWebhookErrorAt: Date | null;
+  /** The single error these replaced (`Slack: …` / `webhook: …`): still on rows from before them, and still written by an old orchestrator during an overlapping deploy. */
+  lastAlertError: string | null; lastAlertErrorAt: Date | null;
+};
+
+const LEGACY_PREFIX = { slack: 'Slack: ', webhook: 'webhook: ' } as const;
+
+/**
+ * One channel's last failure: the newer of its own column and the legacy
+ * single error, when the legacy one names this channel. The channel's own At
+ * is set by a success too, so a legacy failure counts only when it is newer
+ * than the channel's last outcome of either kind: a failure from before the
+ * per-channel columns, or a fresh one an old orchestrator writes during an
+ * overlapping deploy (deploys run `db push`, so no backfill runs), shows, and
+ * a stale one can't come back after a newer success or hide a newer failure.
+ */
+function channelError(channel: keyof typeof LEGACY_PREFIX, error: string | null, at: Date | null, a: AlertErrorColumns): SendError | null {
+  const own = sendError(error, at);
+  const legacy = a.lastAlertError;
+  const prefix = LEGACY_PREFIX[channel];
+  if (!legacy?.startsWith(prefix) || !a.lastAlertErrorAt) return own;
+  if (at && a.lastAlertErrorAt <= at) return own;
+  return sendError(legacy.slice(prefix.length), a.lastAlertErrorAt);
+}
+
+export function alertErrorsView(a: AlertErrorColumns): Pick<AutomationView, 'lastAlertErrors' | 'lastAlertError'> {
+  const slack = channelError('slack', a.lastSlackError, a.lastSlackErrorAt, a);
+  const webhook = channelError('webhook', a.lastWebhookError, a.lastWebhookErrorAt, a);
+  const newer = slack && (!webhook || slack.at >= webhook.at) ? { error: `Slack: ${slack.error}`, at: slack.at } : webhook ? { error: `webhook: ${webhook.error}`, at: webhook.at } : null;
+  return { lastAlertErrors: { slack, webhook }, lastAlertError: newer };
+}
+
 export interface AutomationView {
   id: string;
   projectId: string;
@@ -75,6 +115,15 @@ export interface AutomationView {
   /** The folder of spaceName the automation lives in; null with no space. */
   spaceFolder: string | null;
   notifySlack: boolean;
+  /** Keyword alert (alerts.ts): a run whose summary starts with alertPrefix or matches alertRegex pings alertTarget. */
+  alertPrefix: string | null;
+  alertRegex: string | null;
+  /** dm (the owner's Slack DM), project (the project's channel) or a Slack channel id. */
+  alertTarget: string;
+  /** Pauses (with their cause) and box_unavailable streaks go to alertTarget. */
+  healthAlerts: boolean;
+  /** The outbound webhook's host; its URL and secret are never shown again after the save that set them. */
+  webhook: { host: string } | null;
   /** What the next run starts on (model.ts): main's agent row; backend null is Claude's default, model a tier or null for Sonnet. */
   chatProvider: string | null;
   backend: string | null;
@@ -83,6 +132,10 @@ export interface AutomationView {
   consecutiveFailures: number;
   /** Wakes of its box EC2 refused in a row, since when, and the last error; null while its starts take. */
   boxStartFailures: { count: number; since: string | null; lastError: string | null } | null;
+  /** Each channel's last failed alert send, until a send on that channel goes; null when none is failing. */
+  lastAlertErrors: { slack: SendError | null; webhook: SendError | null };
+  /** The newer of the two, with its channel named (`Slack: not_in_channel`): for CLIs from before lastAlertErrors. */
+  lastAlertError: SendError | null;
   nextRunAt: string | null;
   /** The next three occurrences from now, for the sidebar and the page. */
   next: string[];
@@ -152,7 +205,10 @@ export async function automationView(a: AutomationRow, viewerId: string, now: Da
     repoUrl: a.project.repoUrl, defaultBranch: a.project.repoDefaultBranch,
     schedule: a.schedule, timezone: a.timezone, prompt: a.prompt, kind: a.kind, t3TaskId: a.t3TaskId, tier: a.tier, enabled: a.enabled,
     prOnChange: a.prOnChange, wakeBox: a.wakeBox, maxRunMinutes: a.maxRunMinutes, keepRuns: a.keepRuns,
-    spaceName: a.spaceName, spaceFolder: a.spaceName ? folderOf(a) : null, notifySlack: a.notifySlack, ...modelView(agent), pausedReason: a.pausedReason, consecutiveFailures: a.consecutiveFailures,
+    spaceName: a.spaceName, spaceFolder: a.spaceName ? folderOf(a) : null, notifySlack: a.notifySlack,
+    alertPrefix: a.alertPrefix, alertRegex: a.alertRegex, alertTarget: a.alertTarget, healthAlerts: a.healthAlerts, webhook: a.webhookHost ? { host: a.webhookHost } : null,
+    ...modelView(agent), pausedReason: a.pausedReason, consecutiveFailures: a.consecutiveFailures,
+    ...alertErrorsView(a),
     boxStartFailures: a.boxStartFailures > 0 ? { count: a.boxStartFailures, since: iso(a.boxStartFailingSince), lastError: a.boxStartError } : null,
     nextRunAt: iso(a.nextRunAt), next, lastRun: last ? runView(last, now) : null,
     createdAt: a.createdAt.toISOString(), updatedAt: a.updatedAt.toISOString(),

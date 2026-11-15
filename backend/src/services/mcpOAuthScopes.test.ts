@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DiscoveredOAuth, PreregisteredClient } from './mcpOAuth';
 import { GOOGLE_OAUTH } from './apiBroker';
 import { authorizeUrl } from './mcpOAuth';
-import { connectorScopes, grantedScopesFrom, offlineScope, parseScopeLabels, scopeChoice, scopeLabel, scopesToRequest } from './mcpOAuthScopes';
+import { connectorScopes, grantedScopesFrom, isWithheld, offlineScope, parseScopeLabels, scopeChoice, scopeLabel, scopesToRequest } from './mcpOAuthScopes';
 
 // What the flag serves while it doesn't exist: null, so the built-in Slack table.
 const BUILT_IN = parseScopeLabels(null);
@@ -117,6 +117,40 @@ describe('scopesToRequest', () => {
     const pinned = { ...PRE, scopes: ['search:read.public', 'channels:history'] };
     expect(scopesToRequest(SLACK, undefined, pinned)).toEqual(['search:read.public', 'channels:history']);
     expect(() => scopesToRequest(SLACK, ['chat:write'], pinned)).toThrow(/set by this orchestrator/);
+  });
+});
+
+describe('withheld scopes', () => {
+  // What https://mcp.slack.com advertises, the four scopes termag withholds included.
+  const WITHHELD = ['channels:write', 'groups:write', 'mpim:write', 'im:write'];
+  const ALL: DiscoveredOAuth = { ...SLACK, scopes: ['search:read.public', 'channels:write', 'chat:write', 'groups:write', 'mpim:write', 'im:write', 'reactions:write'] };
+
+  it("withholds Slack's channels:write, groups:write, mpim:write and im:write, keyed by issuer", () => {
+    for (const s of WITHHELD) {
+      expect(isWithheld(SLACK.issuer, s), s).toBe(true);
+      expect(isWithheld(`${SLACK.issuer}/`, s), s).toBe(true);
+      // Another server's scope of the same name is asked for as usual.
+      expect(isWithheld('https://auth.example.test', s), s).toBe(false);
+    }
+    expect(isWithheld(SLACK.issuer, 'chat:write')).toBe(false);
+  });
+
+  it('leaves them off the checklist', () => {
+    expect(scopeChoice(ALL, null, BUILT_IN)?.options.map(o => o.name)).toEqual(['search:read.public', 'chat:write', 'reactions:write']);
+    // Two advertised scopes, one of them withheld, leave nothing to choose.
+    expect(scopeChoice({ ...SLACK, scopes: ['chat:write', 'channels:write'] }, null, BUILT_IN)).toBeNull();
+  });
+
+  it('never asks for them: not by default, not when chosen, not when a pre-registered client pins them', () => {
+    expect(scopesToRequest(ALL, undefined, null)).toEqual(['search:read.public', 'chat:write', 'reactions:write']);
+    expect(scopesToRequest(ALL, ['chat:write', ...WITHHELD], null)).toEqual(['chat:write']);
+    expect(() => scopesToRequest(ALL, WITHHELD, null)).toThrow(/at least one scope that termag asks for/);
+    expect(scopesToRequest(ALL, undefined, { ...PRE, scopes: ['search:read.public', 'groups:write'] })).toEqual(['search:read.public']);
+  });
+
+  it("drops them from Change permissions on a grant that holds them, whose current scopes are posted back", () => {
+    const granted = ['search:read.public', 'channels:write', 'mpim:write', 'chat:write', 'im:write'];
+    expect(scopesToRequest(ALL, granted, null)).toEqual(['search:read.public', 'chat:write']);
   });
 });
 

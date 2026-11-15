@@ -79,6 +79,38 @@ export function powerRequestError(
   return null;
 }
 
+export interface LiveCloudSessionRefusal {
+  status: 409;
+  error: string;
+  code: 'box_busy';
+  blockers: Array<{ check: 'claude-runner'; reason: string; forceable: boolean }>;
+  forceable: boolean;
+}
+
+/**
+ * A stop of a box that runs Claude Code cloud sessions ends them: the runner
+ * dies with the box and claude.ai says "Self-hosted runner stopped responding".
+ * The idle sweep already waits for them (the `claude-runner` busy check); a
+ * person may stop the box anyway with `force`, a call from a box (an agent
+ * tidying up boxes: its agent token, or a sign-in made on that box) never.
+ * Null to go ahead.
+ */
+export function liveCloudSessionRefusal(
+  box: { name: string; status: string },
+  liveSessions: number,
+  opts: { force?: boolean; boxCredential?: boolean } = {},
+): LiveCloudSessionRefusal | null {
+  if (liveSessions <= 0 || box.status !== 'ready') return null;
+  const forceable = !opts.boxCredential;
+  if (forceable && opts.force) return null;
+  const sessions = liveSessions === 1 ? 'a Claude Code cloud session' : `${liveSessions} Claude Code cloud sessions`;
+  const reason = `${box.name} is running ${sessions}, and stopping it ends ${liveSessions === 1 ? 'it' : 'them'}`;
+  const error = forceable
+    ? `${reason}. Stop it anyway to end ${liveSessions === 1 ? 'it' : 'them'}.`
+    : `${reason}. A stop sent from a box can't end a cloud session; its owner can, from termag or a \`termag login\` off the box.`;
+  return { status: 409, error, code: 'box_busy', blockers: [{ check: 'claude-runner', reason, forceable }], forceable };
+}
+
 /**
  * The error to show when something needs a box's agent and the box is powered
  * down or on its way up or down; null for every other status, where the

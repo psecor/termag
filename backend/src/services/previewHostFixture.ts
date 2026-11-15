@@ -132,7 +132,10 @@ export async function landingCode(f: Fixture, name: string, userId: string, basi
   return code;
 }
 
-/** Sign in through the exchange: the session cookie's pair, as the browser would send it back, and its id hash. */
+/**
+ * Sign in through the exchange, and the first open's clean step after it, as a browser does: the cookie pairs
+ * it would send back (the session's, then the clear's marker), and the session's id hash.
+ */
 export async function signIn(f: Fixture, name: string, userId: string, basis = 'owner', extra: { tokenHash?: string | null; next?: string } = {}): Promise<{ cookie: string; idHash: string; answer: Answer }> {
   const code = await landingCode(f, name, userId, basis, extra);
   const answer = await request(f.port, `/__termag/auth?code=${code}`, { headers: previewHeaders(name) });
@@ -140,7 +143,14 @@ export async function signIn(f: Fixture, name: string, userId: string, basis = '
   const pair = set.split(';')[0];
   const value = pair.slice(PREVIEW_COOKIE.length + 1);
   const id = value.split('.')[0];
-  return { cookie: pair, idHash: id ? sessionIdHash(id) : '', answer };
+  let cookie = pair;
+  const to = String(answer.headers.location ?? '');
+  if (to.startsWith('/__termag/clean')) {
+    const clean = await request(f.port, to, { headers: previewHeaders(name, { cookie }) });
+    const marker = ([] as string[]).concat(clean.headers['set-cookie'] ?? [])[0]?.split(';')[0];
+    if (marker) cookie = `${pair}; ${marker}`;
+  }
+  return { cookie, idHash: id ? sessionIdHash(id) : '', answer };
 }
 
 /** A cookie for a session the test made itself (no exchange). */

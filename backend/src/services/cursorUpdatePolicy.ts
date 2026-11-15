@@ -48,7 +48,7 @@ export const CURSOR_TARGET_TAGS: readonly string[] = ['latest'];
  * cursorUpdatePolicy.test.ts reads the recipe's PINS and fails until this
  * moves with them.
  */
-export const CURSOR_PINNED_LATEST = '2026.10.22-27dcf5f';
+export const CURSOR_PINNED_LATEST = '2026.11.05-86047df';
 
 const VERSION = /^\d{4}\.\d{2}\.\d{2}-[0-9a-f]{6,40}$/;
 /** An exact Cursor agent build, `YYYY.MM.DD-<hex>`, nothing before or after it. */

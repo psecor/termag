@@ -181,6 +181,13 @@ describe('client registration', () => {
     expect(JSON.parse(calls[0].req.body!)).toMatchObject({ redirect_uris: [CLIENT.redirectUri], token_endpoint_auth_method: 'none', scope: 'read' });
   });
 
+  it('registers by DCR without the scopes termag withholds', async () => {
+    const { http, calls } = fakeHttp({ 'https://mcp.slack.com/register': () => status(201, { client_id: 'new-id' }) });
+    const slack = { ...DISCOVERED, issuer: 'https://mcp.slack.com', registrationEndpoint: 'https://mcp.slack.com/register', scopes: ['chat:write', 'channels:write', 'groups:write', 'mpim:write', 'im:write'] };
+    await registerClient(slack, { http, cimdClientId: null, redirectUri: CLIENT.redirectUri, preregistered: null });
+    expect(JSON.parse(calls[0].req.body!).scope).toBe('chat:write');
+  });
+
   it('keeps a confidential client the server insists on, and refuses one without its secret', async () => {
     const { http } = fakeHttp({ 'https://auth.example/register': () => ok({ client_id: 'x', client_secret: 's', token_endpoint_auth_method: 'client_secret_post' }) });
     expect(await registerClient(DISCOVERED, { http, cimdClientId: null, redirectUri: 'r' })).toMatchObject({ clientSecret: 's', authMethod: 'client_secret_post' });

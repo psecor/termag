@@ -4,9 +4,9 @@ const registry = vi.hoisted(() => ({ agent: null as unknown, sent: [] as unknown
 const db = vi.hoisted(() => ({ updates: [] as { where: { id: string }; data: { githubDeliveredAt: Date | null } }[], status: 'ready' }));
 vi.mock('../db', () => ({
   prisma: {
-    user: { findUnique: async () => ({ claudeGatewayEnabled: true }) },
+    user: { findUnique: async () => ({ id: 'u', googleEmail: 'u@example.com', displayName: 'U', unixUsername: 'u', defaultAgentProvider: 'claude', claudeGatewayEnabled: true }) },
     instance: {
-      findUnique: async () => ({ status: db.status }),
+      findUnique: async () => ({ id: 'i', name: 'box', kind: 'ec2', status: db.status }),
       update: async (args: { where: { id: string }; data: { githubDeliveredAt: Date | null } }) => {
         db.updates.push(args);
         return {};
@@ -28,6 +28,15 @@ vi.mock('./credentialStore', () => ({
       const secret = await store.read();
       return secret ? { secret, ciphertext: Buffer.alloc(0), updatedAt: new Date('2026-10-28T10:00:00.000Z') } : null;
     },
+  }),
+}));
+
+const ld = vi.hoisted(() => ({ contextTokens: undefined as number | undefined, reads: [] as unknown[][] }));
+vi.mock('./featureFlags', async importOriginal => ({
+  ...(await importOriginal<typeof import('./featureFlags')>()),
+  numberVariation: vi.fn(async (...args: unknown[]) => {
+    ld.reads.push(args);
+    return ld.contextTokens ?? (args[2] as number);
   }),
 }));
 
@@ -184,6 +193,48 @@ describe('deliverToInstance', () => {
       store.config = null;
       store.read = async () => null;
     }
+  });
+
+  describe('the auto-compact window (claude-context-tokens)', () => {
+    const env = {
+      CLAUDE_GATEWAY_URL: 'https://claude-gateway.termag.example.com',
+      CLAUDE_BEDROCK_REGION: 'us-east-2',
+      CLAUDE_BEDROCK_MODELS: 'opus=us.anthropic.claude-opus-5-5,sonnet=us.anthropic.claude-sonnet-5-5,haiku=us.anthropic.claude-haiku-4-5',
+    };
+    const gatewayEnv = async (tokens: number | undefined) => {
+      const saved = Object.fromEntries(Object.keys(env).map(k => [k, process.env[k]]));
+      Object.assign(process.env, env);
+      ld.contextTokens = tokens;
+      ld.reads = [];
+      registry.agent = { conn: ec2Box, capabilities: V1 };
+      registry.sent = [];
+      try {
+        await deliverToInstance('i', 'u');
+      } finally {
+        for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+        ld.contextTokens = undefined;
+      }
+      const claude = sentSteps().find(s => (s as { provider?: string }).provider === 'claude-gateway') as { payload: { env: Record<string, string> } };
+      return claude.payload.env;
+    };
+
+    it('is 400K with no flag value, read for the owner and the box', async () => {
+      expect((await gatewayEnv(undefined)).CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('400000');
+      expect(ld.reads[0]?.slice(0, 3)).toEqual(['claude-context-tokens', expect.objectContaining({ id: 'u', unixUsername: 'u' }), 400000]);
+      expect(ld.reads[0]?.[3]).toEqual({ id: 'i', name: 'box', kind: 'ec2' });
+    });
+
+    it("is the flag's value, clamped to Claude Code's range", async () => {
+      expect((await gatewayEnv(350_000)).CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('350000');
+      expect((await gatewayEnv(5_000)).CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('100000');
+      expect((await gatewayEnv(4_000_000)).CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('1000000');
+    });
+
+    it("is left out at 0, the model's full window", async () => {
+      const out = await gatewayEnv(0);
+      expect(out.CLAUDE_CODE_USE_BEDROCK).toBe('1');
+      expect(out).not.toHaveProperty('CLAUDE_CODE_AUTO_COMPACT_WINDOW');
+    });
   });
 
   it('sends nothing to an agent that predates credentials-v1', async () => {

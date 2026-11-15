@@ -99,7 +99,7 @@ describe('backfillBoxEcrPullPolicies', () => {
     box('gone', 'terminated');
     box('ext', 'ready', { kind: 'external', iamRoleName: null });
     await backfillBoxEcrPullPolicies();
-    expect(queries[0]).toEqual({ kind: 'ec2', iamRoleName: { not: null }, status: { not: 'terminated' } });
+    expect(queries[0]).toEqual({ kind: 'ec2', iamRoleName: { not: null }, iamRoleShared: false, status: { not: 'terminated' } });
     expect(puts()).toEqual(['termag-boxes-a', 'termag-boxes-b', 'termag-boxes-c']);
     const doc = JSON.parse(decodeURIComponent(policies.get('termag-boxes-a')!));
     expect(doc.Statement.find((s: any) => s.Sid === 'BoxEcrPull').Resource).toEqual([`${REPO}/example-org/dev/*`, `${REPO}/docker.io/*`]);
@@ -120,6 +120,15 @@ describe('backfillBoxEcrPullPolicies', () => {
     iam.sent = [];
     await backfillBoxEcrPullPolicies();
     expect(puts()).toEqual(['termag-boxes-a']);
+  });
+
+  it('never writes onto the shared role, which terraform grants its ECR pull', async () => {
+    Object.assign(process.env, { BOX_SHARED_ROLE_NAME: 'termag-termag-box-instance', BOX_INSTANCE_PROFILE_NAME: 'termag-termag-box-instance' });
+    box('own');
+    // The query leaves iamRoleShared rows out; a row under the shared name is skipped too.
+    box('shared', 'ready', { iamRoleName: 'termag-termag-box-instance', iamRoleShared: false });
+    await backfillBoxEcrPullPolicies();
+    expect(puts()).toEqual(['termag-boxes-own']);
   });
 
   it('keeps going past a box whose role errors or has already gone', async () => {

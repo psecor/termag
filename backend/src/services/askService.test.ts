@@ -44,6 +44,8 @@ vi.mock('./askPushes', async (orig) => ({ ...(await orig<typeof import('./askPus
 vi.mock('./askReplyListener', () => ({ startReplyListener: vi.fn(), stopReplyListener: vi.fn() }));
 // Sharing on for everyone: an ask must stay owner-only whatever a flag says.
 vi.mock('./featureFlags', () => ({ boolVariation: vi.fn(async () => true), stringVariation: vi.fn(async () => ''), isLdEnabled: vi.fn(() => true) }));
+// fireworks-models for the asker and box (services/askModel.ts resolveFireworksAskModel); none unless a test lists some.
+vi.mock('./fireworksFlag', () => ({ fireworksModelsForBox: vi.fn(async () => null), fireworksOfferedTo: vi.fn(async () => null), fireworksModelsForUser: vi.fn(async () => null) }));
 // A pane's session resolves to its project and workstream (services/sessionResolver.ts); the role stays in the name.
 vi.mock('./sessionResolver', () => ({
   isAmbiguousSession: vi.fn(() => false),
@@ -1254,5 +1256,207 @@ describe('prismaCliAsk: a run that pushes itself (ask-push-v1, docs/ask-direct-p
       expect(data.publishDetail).toContain('no pull request yet');
       expect(prisma.agentThreadPr.upsert).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe("prismaCliAsk: an ask on Fireworks (termag ask --model fireworks:<id>)", () => {
+  const KIMI = 'accounts/fireworks/models/kimi-k3';
+  const FAST = 'accounts/fireworks/models/deepseek-v4p1-flash';
+  const LISTED = {
+    models: [{ id: KIMI, label: 'Kimi K3', context: 262144 }, { id: FAST, label: 'DeepSeek V4.1 Flash', context: 1048576 }],
+    defaultModel: KIMI, fastModel: FAST,
+  };
+  const FW_CAPS = ['ask-v1', 'ask-cancel-v1', 'ask-chat-v1', 'ask-model-v1', 'ask-backend-v1', 'chat-backend-v1', 'fireworks-v1'];
+  const caps = (list: string[]) => vi.mocked(instanceAgentTransport).mockReturnValue({ capabilities: list, helloReceived: true, conn: { kind: 'owned-box' } } as never);
+  const job = () => askRunCalls()[0][2] as Record<string, unknown>;
+  const startedWith = () => prisma.agentMessage.updateMany.mock.calls.find(c => c[0].data?.status === 'working')?.[0].data;
+  function onThread(stored: { backend: string | null; model: string | null }) {
+    prisma.agentThread.findUnique.mockResolvedValue({
+      id: 'thr0000000001', originUserId: 'u-ada', projectId: 'p1', workstream: 'main', instanceId: 'box1',
+      hopCount: 1, chatWorkstreamId: 'ws-ask', claudeSessionId: null, baseSha: null,
+    });
+    prisma.agentThread.updateMany.mockResolvedValue({ count: 1 });
+    prisma.workstream.findUnique.mockResolvedValue({ id: 'ws-ask', name: 'ask-thr0000000001' });
+    prisma.agentMessage.findFirst.mockResolvedValue(null);
+    prisma.workflow.findFirst.mockResolvedValue({ id: 'wf-ask', ...stored } as never);
+  }
+  const follow = (over: Partial<AskRequest> = {}) => req({ threadId: 'thr0000000001', messageId: 'msgb00000001', ...over });
+  const flagsOn = (off: string[] = []) => vi.mocked(boolVariation).mockImplementation(async (key: string) => !off.includes(key));
+
+  beforeEach(async () => {
+    setup(projectRow()); caps(FW_CAPS); flagsOn();
+    vi.stubEnv('FIREWORKS_GATEWAY_URL', 'https://gateway.example.test/fireworks');
+    const { fireworksModelsForBox } = await import('./fireworksFlag');
+    vi.mocked(fireworksModelsForBox).mockResolvedValue(LISTED);
+    prisma.instance.findUnique.mockResolvedValue({ id: 'box1', name: 'devbox', kind: 'ec2' } as never);
+    prisma.workflow.findFirst.mockResolvedValue({ id: 'wf-ask', backend: null, model: null } as never);
+  });
+  afterEach(() => { vi.unstubAllEnvs(); caps(['ask-v1', 'ask-cancel-v1']); prisma.workflow.findFirst.mockResolvedValue(null); flagsOn(); });
+
+  it('runs the turn on the Fireworks model, sends the backend with it, and the thread keeps it', async () => {
+    const r = await prismaCliAsk.ask(ada, null, req({ model: 'fireworks:kimi-k3' }));
+    // The short name is resolved against the asker's fireworks-models on the box, and answered as the full id.
+    expect(r).toMatchObject({ status: 202, body: { status: 'working', model: `fireworks:${KIMI}` } });
+    expect(r.body).not.toHaveProperty('modelIgnored');
+    expect(prisma.agentMessage.create.mock.calls[0][0].data).toMatchObject({ model: `fireworks:${KIMI}` });
+    expect(job()).toMatchObject({ model: KIMI, backend: 'fireworks', fastModel: FAST, context: 262144, chat: { workstreamId: 'ws-ask' } });
+    expect(prisma.workflow.update).toHaveBeenCalledWith({ where: { id: 'wf-ask' }, data: { backend: 'fireworks', model: KIMI } });
+    expect(startedWith()).toMatchObject({ model: `fireworks:${KIMI}`, modelIgnored: null });
+  });
+
+  it('`fireworks` alone is the list\'s default', async () => {
+    const r = await prismaCliAsk.ask(ada, null, req({ model: 'fireworks' }));
+    expect(r.body).toMatchObject({ model: `fireworks:${KIMI}` });
+    expect(job()).toMatchObject({ model: KIMI, backend: 'fireworks' });
+  });
+
+  it('a follow-up without --model stays on Fireworks; one with a Claude tier switches the thread back', async () => {
+    onThread({ backend: 'fireworks', model: KIMI });
+    await prismaCliAsk.ask(ada, null, follow());
+    expect(job()).toMatchObject({ model: KIMI, backend: 'fireworks' });
+    expect(prisma.workflow.update).not.toHaveBeenCalled();
+    expect(startedWith()).toMatchObject({ model: `fireworks:${KIMI}` });
+    setup(projectRow()); caps(FW_CAPS); flagsOn(); onThread({ backend: 'fireworks', model: KIMI });
+    await prismaCliAsk.ask(ada, null, follow({ model: 'sonnet' }));
+    expect(job()).toMatchObject({ model: 'sonnet' });
+    expect(job()).not.toHaveProperty('backend');
+    expect(prisma.workflow.update).toHaveBeenCalledWith({ where: { id: 'wf-ask' }, data: { backend: null, model: 'sonnet' } });
+  });
+
+  it('refuses a model the asker has not got, naming the ones they have', async () => {
+    const r = await prismaCliAsk.ask(ada, null, req({ model: 'fireworks:glm-5p3' }));
+    expect(r).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining('glm-5p3 is not one of your Fireworks models on devbox: fireworks:kimi-k3, fireworks:deepseek-v4p1-flash') } });
+    expect(askRunCalls()).toHaveLength(0);
+    expect(prisma.agentMessage.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses when fireworks-models lists none for the asker on the box', async () => {
+    const { fireworksModelsForBox } = await import('./fireworksFlag');
+    vi.mocked(fireworksModelsForBox).mockResolvedValue(null);
+    const r = await prismaCliAsk.ask(ada, null, req({ model: 'fireworks:kimi-k3' }));
+    expect(r).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining('fireworks-models lists no Fireworks models for you on devbox') } });
+    expect(askRunCalls()).toHaveLength(0);
+  });
+
+  it('refuses, never runs on Claude, on a box whose agent lacks the capabilities', async () => {
+    for (const missing of ['ask-backend-v1', 'chat-backend-v1', 'fireworks-v1', 'ask-chat-v1']) {
+      setup(projectRow()); flagsOn(); caps(FW_CAPS.filter(c => c !== missing));
+      const r = await prismaCliAsk.ask(ada, null, req({ model: 'fireworks:kimi-k3' }));
+      expect(r).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining(`devbox's agent cannot run an ask on Fireworks yet (it lacks ${missing})`) } });
+      expect(askRunCalls()).toHaveLength(0);
+    }
+  });
+
+  it('refuses with ask-fireworks-enabled or ask-model-choice-enabled off, and on an orchestrator with no Fireworks gateway', async () => {
+    flagsOn(['ask-fireworks-enabled']);
+    expect(await prismaCliAsk.ask(ada, null, req({ model: 'fireworks:kimi-k3' }))).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining('ask-fireworks-enabled') } });
+    flagsOn(['ask-model-choice-enabled']);
+    expect(await prismaCliAsk.ask(ada, null, req({ model: 'fireworks:kimi-k3' }))).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining('ask-model-choice-enabled') } });
+    flagsOn();
+    vi.stubEnv('FIREWORKS_GATEWAY_URL', '');
+    expect(await prismaCliAsk.ask(ada, null, req({ model: 'fireworks:kimi-k3' }))).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining('no Fireworks gateway') } });
+    expect(askRunCalls()).toHaveLength(0);
+  });
+
+  it('a follow-up without --model on a Fireworks thread is refused once the box or flag can no longer run it', async () => {
+    onThread({ backend: 'fireworks', model: KIMI });
+    flagsOn(['ask-fireworks-enabled']);
+    const r = await prismaCliAsk.ask(ada, null, follow());
+    expect(r).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining(`this thread runs on fireworks:${KIMI}, and asks on Fireworks are not on`) } });
+    expect(askRunCalls()).toHaveLength(0);
+  });
+
+  it('a follow-up without --model is refused when fireworks-models no longer lists the thread\'s model', async () => {
+    const GLM = 'accounts/fireworks/models/glm-5p3';
+    const fewer = { models: [{ id: GLM, label: 'GLM 5.3', context: 262144 }], defaultModel: GLM, fastModel: GLM };
+    const { fireworksModelsForBox } = await import('./fireworksFlag');
+    // A follow-up is checked against the list as a new Fireworks ask is: a 409 before a message is made,
+    // not a 202 whose turn fails at its start.
+    onThread({ backend: 'fireworks', model: KIMI });
+    vi.mocked(fireworksModelsForBox).mockResolvedValue(fewer);
+    const gone = await prismaCliAsk.ask(ada, null, follow());
+    expect(gone).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining(`this thread runs on fireworks:${KIMI}, and ${KIMI} is not one of your Fireworks models on devbox: fireworks:glm-5p3`) } });
+    expect(prisma.agentMessage.create).not.toHaveBeenCalled();
+    expect(askRunCalls()).toHaveLength(0);
+    // None listed at all is the same refusal, as it is for a new ask.
+    setup(projectRow()); flagsOn(); onThread({ backend: 'fireworks', model: KIMI });
+    vi.mocked(fireworksModelsForBox).mockResolvedValue(null);
+    const none = await prismaCliAsk.ask(ada, null, follow());
+    expect(none).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining(`this thread runs on fireworks:${KIMI}, and fireworks-models lists no Fireworks models for you on devbox`) } });
+    expect(prisma.agentMessage.create).not.toHaveBeenCalled();
+  });
+
+  it('a follow-up without --model is refused when the list has only another account\'s model with the same name', async () => {
+    // The flag replaced alpha's kimi-k3 with beta's: the same last segment, a different model. The thread's
+    // stored full id is matched exactly, so this is a 409 now, not a 202 whose turn fails at its start.
+    const replacement = 'accounts/beta/models/kimi-k3';
+    const { fireworksModelsForBox } = await import('./fireworksFlag');
+    onThread({ backend: 'fireworks', model: KIMI });
+    vi.mocked(fireworksModelsForBox).mockResolvedValue({ models: [{ id: replacement, label: 'Kimi K3', context: 262144 }], defaultModel: replacement, fastModel: replacement });
+    const r = await prismaCliAsk.ask(ada, null, follow());
+    expect(r).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining(`this thread runs on fireworks:${KIMI}, and ${KIMI} is not one of your Fireworks models on devbox: fireworks:kimi-k3`) } });
+    expect(prisma.agentMessage.create).not.toHaveBeenCalled();
+    expect(askRunCalls()).toHaveLength(0);
+  });
+
+  it('a queued Fireworks ask whose model the flag no longer lists fails at its start, never on another model', async () => {
+    const GLM = 'accounts/fireworks/models/glm-5p3';
+    const { fireworksModelsForBox } = await import('./fireworksFlag');
+    onThread({ backend: 'fireworks', model: KIMI });
+    // The ask was taken with Kimi listed; by its start the flag lists only GLM, whose default launch
+    // chatLaunchFor would otherwise substitute.
+    vi.mocked(fireworksModelsForBox).mockResolvedValue({ models: [{ id: GLM, label: 'GLM 5.3', context: 262144 }], defaultModel: GLM, fastModel: GLM });
+    const { askTurnModel } = await import('./askService');
+    const t = await askTurnModel(
+      { message: { model: null }, sender: ada, project: { userId: 'u-ada', instance: { name: 'devbox', kind: 'ec2' } }, instanceId: 'box1', thread: { chatWorkstreamId: 'ws-ask' } },
+      { workstreamId: 'ws-ask' }, FW_CAPS,
+    );
+    expect(t.refused).toContain(`fireworks:${KIMI} is no longer one of your Fireworks models on devbox`);
+    expect(t.launch).toBeNull();
+  });
+
+  it('a queued Fireworks ask whose box comes back without the capability fails at its start, with the reason', async () => {
+    onThread({ backend: 'fireworks', model: KIMI });
+    caps(['ask-v1', 'ask-cancel-v1', 'ask-chat-v1', 'ask-model-v1']);
+    // POST time saw a capable agent; the start reads the box as it is now.
+    const { askTurnModel } = await import('./askService');
+    const t = await askTurnModel(
+      { message: { model: null }, sender: ada, project: { userId: 'u-ada', instance: { name: 'devbox', kind: 'ec2' } }, instanceId: 'box1', thread: { chatWorkstreamId: 'ws-ask' } },
+      { workstreamId: 'ws-ask' }, ['ask-v1', 'ask-chat-v1', 'ask-model-v1'],
+    );
+    expect(t.refused).toContain(`this thread runs on fireworks:${KIMI}, and devbox's agent cannot run an ask on Fireworks yet`);
+    expect(t.launch).toBeNull();
+    // With ask-model-choice-enabled off a stored Fireworks choice is refused too, never dropped to the box's default.
+    flagsOn(['ask-model-choice-enabled']);
+    const off = await askTurnModel(
+      { message: { model: null }, sender: ada, project: { userId: 'u-ada', instance: { name: 'devbox', kind: 'ec2' } }, instanceId: 'box1', thread: { chatWorkstreamId: 'ws-ask' } },
+      { workstreamId: 'ws-ask' }, FW_CAPS,
+    );
+    expect(off.refused).toContain('ask-model-choice-enabled');
+  });
+
+  it('a headless start on a Fireworks thread fails the turn, never running it on the box\'s default', async () => {
+    onThread({ backend: 'fireworks', model: KIMI });
+    const { askTurnModel } = await import('./askService');
+    const t = await askTurnModel(
+      { message: { model: null }, sender: ada, project: { userId: 'u-ada', instance: { name: 'devbox', kind: 'ec2' } }, instanceId: 'box1', thread: { chatWorkstreamId: 'ws-ask' } },
+      null, FW_CAPS,
+    );
+    expect(t.refused).toContain(`this thread runs on fireworks:${KIMI}, and the run on devbox is headless`);
+    expect(t.launch).toBeNull();
+  });
+
+  it('refuses at POST a --model this box cannot apply on a Fireworks thread, not a 202 that fails at its start', async () => {
+    // ask-model-choice-enabled off: the Claude tier cannot be applied, so the turn would fall back to the stored choice.
+    flagsOn(['ask-model-choice-enabled']);
+    onThread({ backend: 'fireworks', model: KIMI });
+    const off = await prismaCliAsk.ask(ada, null, follow({ model: 'sonnet' }));
+    expect(off).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining(`this thread runs on fireworks:${KIMI}, and choosing the model is not on`) } });
+    // The box's agent has no ask chats: headless, where --model is ignored and the stored choice would govern.
+    // (The flags are back on: this case is the agent's capabilities, not ask-model-choice-enabled.)
+    flagsOn(); setup(projectRow()); caps(['ask-v1', 'ask-cancel-v1', 'ask-model-v1']); onThread({ backend: 'fireworks', model: KIMI });
+    const headless = await prismaCliAsk.ask(ada, null, follow({ model: 'sonnet' }));
+    expect(headless).toMatchObject({ status: 409, body: { code: 'fireworks_unavailable', error: expect.stringContaining(`this thread runs on fireworks:${KIMI}, and devbox's agent cannot run an ask on Fireworks yet`) } });
+    expect(askRunCalls()).toHaveLength(0);
   });
 });

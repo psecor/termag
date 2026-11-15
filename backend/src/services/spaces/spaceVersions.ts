@@ -6,7 +6,7 @@
  * written then, and the answer says what the file is now and who wrote it.
  *
  * The orchestrator checks three times, so the guard doesn't rest on storage
- * alone (S3, and Floci 2.1.0 on the e2e stack, enforce a signed PUT's If-Match;
+ * alone (S3, and Floci 2.2.0 on the e2e stack, enforce a signed PUT's If-Match;
  * not every S3-compatible store does, nor every path):
  *   1. before it signs: the file's current version (HEAD) must match;
  *   2. when the write is confirmed (`files/uploaded`, multipart `complete`):

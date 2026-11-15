@@ -52,7 +52,12 @@ export function iamPoolConfig(env: NodeJS.ProcessEnv): PoolConfig {
       : ssl.mode === 'verify'
         ? { ca: readFileSync(ssl.caFile, 'utf8'), rejectUnauthorized: true }
         : { rejectUnauthorized: false },
-    max: parseInt(env.PG_POOL_MAX ?? '10', 10),
+    // 20: at 10 the token-usage sweep alone could take every connection for
+    // seconds (2026-11-13). The writer is reached directly (not through the RDS
+    // Proxy) and Aurora Serverless v2 at max_capacity 2 allows a few hundred
+    // connections, so two orchestrators during an overlapping deploy, 40 in all,
+    // leave plenty. services/dbPoolMetrics.ts reports how full it is.
+    max: parseInt(env.PG_POOL_MAX ?? '20', 10),
     idleTimeoutMillis: 30_000,
   };
 }

@@ -15,6 +15,7 @@
     "db:push": "node dist/scripts/dbPush.js",
     "db:guard": "node dist/scripts/dbGuard.js",
     "automations:move-folders": "node dist/scripts/moveAutomationFolders.js",
+    "user-projects:backfill": "node dist/scripts/userProjectsBackfill.js",
     "push:vapid": "node -e \"const k=require('web-push').generateVAPIDKeys();console.log('VAPID_PUBLIC_KEY='+k.publicKey+'\\\\nVAPID_PRIVATE_KEY='+k.privateKey+'\\\\nVAPID_SUBJECT=mailto:you@example.com')\""
   },
   "dependencies": {

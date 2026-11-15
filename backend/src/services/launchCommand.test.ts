@@ -3,12 +3,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { AGENT_TELEMETRY_CAPABILITY, launchCommandFor, PANE_KIND_ENV, replaySessionIdFrom, resourceEnvPrefix, RESUME_FALLBACK_NOTICE, resumeOrFresh, spawnEnvPrefix, TELEMETRY_REPLAY_CAPABILITY } from './launchCommand';
+import { AGENT_TELEMETRY_CAPABILITY, filesEnvPrefix, inferenceEnvPrefix, launchCommandFor, PANE_KIND_ENV, replaySessionIdFrom, resourceEnvPrefix, RESUME_FALLBACK_NOTICE, resumeOrFresh, spawnEnvPrefix, TELEMETRY_REPLAY_CAPABILITY } from './launchCommand';
 
 const RID = 'huuhcqcev124emZ9urmRjjPSNXLl';
 const can = ['credentials-v1', 'telemetry-v1', TELEMETRY_REPLAY_CAPABILITY];
 // Every agent command a pane types starts with it.
 const K = PANE_KIND_ENV;
+// What every Claude launch on the harness's own backend tells the box script (inferenceEnvPrefix).
+const I = 'TERMAG_INFERENCE_BACKEND=default ';
 
 describe('resourceEnvPrefix', () => {
   it('names the project and workstream for the box scripts, both or neither, ids only', () => {
@@ -24,9 +26,9 @@ describe('resourceEnvPrefix', () => {
 describe('launchCommandFor: the project and workstream on the resource', () => {
   it('types them ahead of the Claude settings, with or without a replay', () => {
     expect(launchCommandFor('claude', { replaySessionId: RID, capabilities: can, project: 'webapp', workstream: 'main' }))
-      .toBe(`${K}claude --settings "$(${K}TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main termag-credentials telemetry-launch ${RID})"`);
+      .toBe(`${K}claude --settings "$(${K}TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main TERMAG_INFERENCE_BACKEND=default termag-credentials telemetry-launch ${RID})"`);
     expect(launchCommandFor('claude', { capabilities: can, project: 'webapp', workstream: 'feature-x' }))
-      .toBe(`${K}claude --settings "$(${K}TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=feature-x termag-credentials telemetry-launch -)"`);
+      .toBe(`${K}claude --settings "$(${K}TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=feature-x TERMAG_INFERENCE_BACKEND=default termag-credentials telemetry-launch -)"`);
   });
 
   it('types them ahead of termag-agent-otel for the wrapped agents', () => {
@@ -38,15 +40,15 @@ describe('launchCommandFor: the project and workstream on the resource', () => {
   it('leaves a bare command bare on an older box, and drops a name that is not an id', () => {
     expect(launchCommandFor('claude', { capabilities: ['credentials-v1'], project: 'webapp', workstream: 'main' })).toBe(`${K}claude`);
     expect(launchCommandFor('claude', { capabilities: can, project: 'gon falon', workstream: 'main' }))
-      .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch -)"`);
+      .toBe(`${K}claude --settings "$(${K}${I}termag-credentials telemetry-launch -)"`);
   });
 
   it('gives a resume, a brief and a first prompt the settings too, right after the harness\'s word', () => {
     const env = 'TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main ';
     expect(launchCommandFor('claude --continue', { capabilities: can, project: 'webapp', workstream: 'main' }))
-      .toBe(`${K}claude --settings "$(${K}${env}termag-credentials telemetry-launch -)" --continue`);
+      .toBe(`${K}claude --settings "$(${K}${env}${I}termag-credentials telemetry-launch -)" --continue`);
     expect(launchCommandFor('claude "$(cat "$HOME/.termag/spawn/x.md")"', { capabilities: can, project: 'webapp', workstream: 'main', model: 'opus' }))
-      .toBe(`${K}claude --settings "$(${K}${env}termag-credentials telemetry-launch -)" --model opus "$(cat "$HOME/.termag/spawn/x.md")"`);
+      .toBe(`${K}claude --settings "$(${K}${env}${I}TERMAG_INFERENCE_MODEL=opus termag-credentials telemetry-launch -)" --model opus "$(cat "$HOME/.termag/spawn/x.md")"`);
   });
 });
 
@@ -68,7 +70,7 @@ describe('spawnEnvPrefix: a spawned agent\'s spawn on the resource', () => {
   it('goes to the box script with the project and workstream, for Claude and the wrapped agents', () => {
     const env = `TERMAG_PROJECT=child TERMAG_WORKSTREAM=main ${spawnEnvPrefix(spawn)}`;
     expect(launchCommandFor('claude', { capabilities: can, project: 'child', workstream: 'main', spawn }))
-      .toBe(`${K}claude --settings "$(${K}${env}termag-credentials telemetry-launch -)"`);
+      .toBe(`${K}claude --settings "$(${K}${env}${I}termag-credentials telemetry-launch -)"`);
     expect(launchCommandFor('devin', { capabilities: [...can, AGENT_TELEMETRY_CAPABILITY], provider: 'devin', project: 'child', workstream: 'main', spawn }))
       .toBe(`${K}${env}termag-agent-otel devin -- devin`);
   });
@@ -90,7 +92,7 @@ describe('launchCommandFor: the session\'s kind in the agent\'s environment', ()
   });
 
   it('names it to the box script that prints Claude Code\'s settings too, so an inherited kind never names a pane', () => {
-    expect(launchCommandFor('claude', { replaySessionId: RID, capabilities: can })).toContain(`"$(${K}termag-credentials telemetry-launch ${RID})"`);
+    expect(launchCommandFor('claude', { replaySessionId: RID, capabilities: can })).toContain(`"$(${K}${I}termag-credentials telemetry-launch ${RID})"`);
     const fw = [...otel, 'fireworks-v1'];
     expect(launchCommandFor('claude', { capabilities: fw, provider: 'claude', backend: 'fireworks' }))
       .toBe(`termag_settings=$(${K}termag-credentials launch-settings --backend fireworks -) && ${K}claude --settings "$termag_settings"`);
@@ -130,17 +132,17 @@ describe('replaySessionIdFrom', () => {
 describe('launchCommandFor', () => {
   it('types the replay settings for a Claude launch from a browser onto a box that can print them', () => {
     expect(launchCommandFor('claude', { replaySessionId: RID, capabilities: can }))
-      .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch ${RID})"`);
+      .toBe(`${K}claude --settings "$(${K}${I}termag-credentials telemetry-launch ${RID})"`);
   });
 
   it('types `-` for no replay or a bad id, and the bare command on an older box or for another provider', () => {
-    const none = `${K}claude --settings "$(${K}termag-credentials telemetry-launch -)"`;
+    const none = `${K}claude --settings "$(${K}${I}termag-credentials telemetry-launch -)"`;
     expect(launchCommandFor('claude', { capabilities: can })).toBe(none);
     expect(launchCommandFor('claude', { replaySessionId: null, capabilities: can })).toBe(none);
     expect(launchCommandFor('claude', { replaySessionId: `${RID};id`, capabilities: can })).toBe(none);
     expect(launchCommandFor('claude', { replaySessionId: RID, capabilities: ['credentials-v1', 'telemetry-v1'] })).toBe(`${K}claude`);
     expect(launchCommandFor('claude --continue', { replaySessionId: RID, capabilities: can }))
-      .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch ${RID})" --continue`);
+      .toBe(`${K}claude --settings "$(${K}${I}termag-credentials telemetry-launch ${RID})" --continue`);
     expect(launchCommandFor('codex --no-alt-screen -a on-request', { replaySessionId: RID, capabilities: can }))
       .toBe(`${K}codex --no-alt-screen -a on-request`);
   });
@@ -169,7 +171,7 @@ describe('launchCommandFor: the other agents', () => {
       .toBe(`${K}codex --no-alt-screen -a on-request`);
     expect(launchCommandFor('claude --continue', { capabilities: ['credentials-v1', AGENT_TELEMETRY_CAPABILITY], provider: 'claude' })).toBe(`${K}claude --continue`);
     expect(launchCommandFor('claude', { replaySessionId: RID, capabilities: otel, provider: 'claude' }))
-      .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch ${RID})"`);
+      .toBe(`${K}claude --settings "$(${K}${I}termag-credentials telemetry-launch ${RID})"`);
   });
 });
 
@@ -196,7 +198,7 @@ describe('launchCommandFor: a workstream on a non-default model backend', () => 
   });
 
   it('leaves the default backend, an unknown backend and a command that is not the harness alone', () => {
-    const plain = `${K}claude --settings "$(${K}termag-credentials telemetry-launch -)"`;
+    const plain = `${K}claude --settings "$(${K}${I}termag-credentials telemetry-launch -)"`;
     expect(launchCommandFor('claude', { capabilities: fw, provider: 'claude', backend: null })).toBe(plain);
     expect(launchCommandFor('claude', { capabilities: fw, provider: 'claude', backend: 'bedrock' })).toBe(plain);
     expect(launchCommandFor('devin', { capabilities: ['credentials-v1'], provider: 'devin', backend: 'fireworks' })).toBe(`${K}devin`);
@@ -211,9 +213,9 @@ describe('launchCommandFor: the workstream\'s model', () => {
   it('puts --model right after the harness, on every launch form', () => {
     expect(launchCommandFor('claude', { capabilities: ['credentials-v1'], provider: 'claude', model: 'sonnet' })).toBe(`${K}claude --model sonnet`);
     expect(launchCommandFor('claude --continue', { capabilities: can, provider: 'claude', model: 'haiku' }))
-      .toBe(`${K}claude --settings "$(${K}termag-credentials telemetry-launch -)" --model haiku --continue`);
+      .toBe(`${K}claude --settings "$(${K}${I}TERMAG_INFERENCE_MODEL=haiku termag-credentials telemetry-launch -)" --model haiku --continue`);
     expect(launchCommandFor('claude', { capabilities: can, provider: 'claude', model: 'opus', project: 'p', workstream: 'w' }))
-      .toBe(`${K}claude --settings "$(${K}TERMAG_PROJECT=p TERMAG_WORKSTREAM=w termag-credentials telemetry-launch -)" --model opus`);
+      .toBe(`${K}claude --settings "$(${K}TERMAG_PROJECT=p TERMAG_WORKSTREAM=w TERMAG_INFERENCE_BACKEND=default TERMAG_INFERENCE_MODEL=opus termag-credentials telemetry-launch -)" --model opus`);
   });
 
   it('on a backend: to the box script with the fast model and window, which keeps no model list', () => {
@@ -290,3 +292,49 @@ describe('resumeOrFresh: a resume with nothing to continue starts fresh', () => 
     });
   }
 });
+
+describe('inferenceEnvPrefix: the inference backend on the resource', () => {
+  it('asks the box script to name the default backend, with the launch model when it is an id', () => {
+    expect(inferenceEnvPrefix()).toBe('TERMAG_INFERENCE_BACKEND=default ');
+    expect(inferenceEnvPrefix('us.anthropic.claude-opus-5-5')).toBe('TERMAG_INFERENCE_BACKEND=default TERMAG_INFERENCE_MODEL=us.anthropic.claude-opus-5-5 ');
+    expect(inferenceEnvPrefix('opus; rm -rf ~')).toBe('TERMAG_INFERENCE_BACKEND=default ');
+  });
+
+  it('is on a Claude launch through telemetry-launch only: a model backend names its own, the other agents none', () => {
+    const fw = [...can, AGENT_TELEMETRY_CAPABILITY, 'fireworks-v1'];
+    expect(launchCommandFor('claude', { capabilities: fw, provider: 'claude', backend: 'fireworks', model: 'accounts/fireworks/models/kimi-k3' })).not.toContain('TERMAG_INFERENCE_');
+    expect(launchCommandFor('devin', { capabilities: fw, provider: 'devin' })).not.toContain('TERMAG_INFERENCE_');
+    expect(launchCommandFor('claude', { capabilities: ['credentials-v1'], provider: 'claude' })).not.toContain('TERMAG_INFERENCE_');
+  });
+});
+
+describe('a pane\'s Project files and My files', () => {
+  const files = { project: 'ana-termag', mine: 'ana-my-files' };
+  it('go in the agent\'s own environment, right after its kind, on every launch shape', () => {
+    expect(filesEnvPrefix(files)).toBe('TERMAG_SPACE=ana-termag TERMAG_MY_FILES=ana-my-files ');
+    const claude = launchCommandFor('claude', { capabilities: can, provider: 'claude', files });
+    expect(claude.startsWith(`${PANE_KIND_ENV}TERMAG_SPACE=ana-termag TERMAG_MY_FILES=ana-my-files claude --settings`)).toBe(true);
+    const wrapped = launchCommandFor('cursor-agent', { capabilities: [...can, AGENT_TELEMETRY_CAPABILITY], provider: 'cursor', files });
+    expect(wrapped.startsWith(`${PANE_KIND_ENV}TERMAG_SPACE=ana-termag TERMAG_MY_FILES=ana-my-files `)).toBe(true);
+    const bare = launchCommandFor('codex', { capabilities: [], provider: 'codex', files });
+    expect(bare).toBe(`${PANE_KIND_ENV}TERMAG_SPACE=ana-termag TERMAG_MY_FILES=ana-my-files codex`);
+  });
+
+  it('go on the agent, not the settings assignment, on Fireworks, and never inside the box script', () => {
+    const line = launchCommandFor('claude', { capabilities: [...can, 'fireworks-v1'], provider: 'claude', backend: 'fireworks', files });
+    expect(line).toBe(`termag_settings=$(${PANE_KIND_ENV}termag-credentials launch-settings --backend fireworks -) && ${PANE_KIND_ENV}TERMAG_SPACE=ana-termag TERMAG_MY_FILES=ana-my-files claude --settings "$termag_settings"`);
+    // Claude's own launch: once, on the agent; the settings subshell keeps its env as it was.
+    expect(launchCommandFor('claude', { capabilities: can, provider: 'claude', files }).match(/TERMAG_SPACE=/g)).toHaveLength(1);
+    // A refusal types no agent, so it gets nothing.
+    expect(launchCommandFor('claude', { capabilities: can, provider: 'claude', backend: 'fireworks', files })).not.toContain('TERMAG_SPACE');
+  });
+
+  it('leaves the launch as it was without them, and drops a name that isn\'t a space name', () => {
+    expect(launchCommandFor('codex', { capabilities: [], provider: 'codex' })).toBe(`${PANE_KIND_ENV}codex`);
+    expect(launchCommandFor('codex', { capabilities: [], provider: 'codex', files: null })).toBe(`${PANE_KIND_ENV}codex`);
+    expect(filesEnvPrefix({ project: 'ana-termag', mine: null })).toBe('TERMAG_SPACE=ana-termag ');
+    expect(filesEnvPrefix({ project: 'x; rm -rf ~', mine: '$(id)' })).toBe('');
+    expect(launchCommandFor('', { capabilities: [], provider: 'codex', files })).toBe('');
+  });
+});
+

@@ -42,11 +42,13 @@ export function memoryHostStore() {
     },
     async user(userId) { return users.get(userId) ?? null; },
     async createCode(row) { codes.set(row.codeHash, { ...row }); },
-    async takeCode(hash, now) {
+    async takeCode(hash, now, opts = {}) {
       const row = codes.get(hash);
       if (!row) return null;
       codes.delete(hash);
-      return row.expiresAt.getTime() > now.getTime() ? row : null;
+      if (row.expiresAt.getTime() <= now.getTime()) return null;
+      if (opts.rebound) codes.set(opts.rebound, { ...row, codeHash: opts.rebound });
+      return row;
     },
     async createSession(row) { sessions.set(row.idHash, { ...row, revokedAt: null, createdAt: row.createdAt ?? new Date() }); },
     async findSession(idHash) { const s = sessions.get(idHash); return s ? { ...s } : null; },

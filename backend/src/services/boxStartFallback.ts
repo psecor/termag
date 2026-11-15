@@ -74,7 +74,8 @@ async function shapesOf(ec2: EC2Client, types: string[]): Promise<Map<string, Ty
 export async function startOnFallbackType(ec2: EC2Client, instance: Instance, refusal: unknown): Promise<string> {
   // `env-starting`: an environment pool's claim starting a stopped pool box (services/envPoolClaim.ts),
   // which stopped plainly so it can be retyped like any stopped box.
-  if ((instance.status !== 'stopped' && instance.status !== 'env-starting') || !isCapacityRefusal(refusal)) throw refusal;
+  // `env-preparing` with a refresh: the environment pool's refresh starting a stopped pool box (services/envPool.ts).
+  if ((instance.status !== 'stopped' && instance.status !== 'env-starting' && instance.status !== 'env-preparing') || !isCapacityRefusal(refusal)) throw refusal;
   const current = instance.instanceType;
   if (!current) throw refusal;
   const types = configuredTypes(instance);

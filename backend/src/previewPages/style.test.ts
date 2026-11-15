@@ -5,7 +5,7 @@ import { join, resolve } from 'path';
 import express from 'express';
 import type { AddressInfo } from 'net';
 import { describe, expect, it } from 'vitest';
-import { DARK, LIGHT, PAGE_STYLE, PALETTE_TOKENS, UI_FONT } from './style';
+import { DARK, HANDOFF_FALLBACK_S, LIGHT, PAGE_STYLE, PALETTE_TOKENS, UI_FONT } from './style';
 import { PAGE_CSP, PREVIEW_PAGES, renderHandoff, renderLandingRefusal, renderPage, type PreviewPageKind } from './index';
 import { confirmPageBody, previewLinkConfirmRouter, WIDER_WARNING } from '../routes/previewLinkConfirm';
 import type { ConfirmPageView } from '../services/previewLinkConfirmations';
@@ -57,6 +57,18 @@ describe("the preview pages' style", () => {
     expect(html).toContain('<meta http-equiv="refresh" content="1;url=https://shop--k3x9q.preview.test/__termag/auth?code=a&amp;b">');
     expect(html).toContain('<a class="continue" href="https://shop--k3x9q.preview.test/__termag/auth?code=a&amp;b">Continue</a>');
   });
+
+  it('has one navigation to its single-use code: the link stays hidden, so unclickable, until the refresh is long overdue (pl-bounce)', () => {
+    // A click on the link while the refresh's exchange is on its way cancels it after the code is used,
+    // and sends the viewer round the landing page again (previewHost.browser.test.ts shows it in Chromium).
+    const html = renderHandoff('Ana', 'https://shop--k3x9q.preview.test/__termag/auth?code=a');
+    expect(html.match(/__termag\/auth\?code=/g)).toHaveLength(2);
+    expect(html).toMatch(/<p class="handoff-fallback">[^<]*<a class="continue" href="https:\/\/shop--k3x9q\.preview\.test\/__termag\/auth\?code=a">Continue<\/a><\/p>/);
+    expect(PAGE_STYLE).toContain(`.handoff-fallback{visibility:hidden;animation:handoff-fallback 0s ${HANDOFF_FALLBACK_S}s forwards}`);
+    expect(PAGE_STYLE).toContain('@keyframes handoff-fallback{to{visibility:visible}}');
+    // Well past the refresh's 1 s, and the exchange it starts.
+    expect(HANDOFF_FALLBACK_S).toBeGreaterThanOrEqual(5);
+  });
 });
 
 describe('the confirm page', () => {
@@ -97,5 +109,13 @@ describe('the confirm page', () => {
 
   it("matches the Share dialog's words for the warning", () => {
     expect(readFileSync(join(ROOT, 'frontend/src/previewLinks/PublishPreviewLink.tsx'), 'utf8')).toContain(`"${WIDER_WARNING}"`);
+  });
+});
+
+describe('the not-found page', () => {
+  it('says to open the link again, in words alike for every name and reason (A4)', () => {
+    // One constant text, on the landing page's and the preview host's not-found page alike.
+    expect(renderLandingRefusal('not_found').html).toContain('Open the link you were sent again');
+    expect(renderPage('not_found').html).toContain('Open the link you were sent again');
   });
 });

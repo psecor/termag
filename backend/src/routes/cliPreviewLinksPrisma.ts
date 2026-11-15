@@ -10,6 +10,7 @@ import {
 import {
   confirmationStatusFor, defaultConfirmationDeps, extendFromBoxFor, publishFromBoxFor, type ConfirmationDeps,
 } from '../services/previewLinkConfirmations';
+import { defaultRequestDeps, requestPreviewLinkFor, type RequestDeps } from '../services/previewLinkRequests';
 import type { CliUser } from '../services/cliStore';
 import type { CliPreviewLinks } from './cliPreviewLinks';
 import type { RouteResult } from './routeResult';
@@ -17,7 +18,8 @@ import type { RouteResult } from './routeResult';
 const PROJECT_ID = /^[a-z0-9]{8,40}$/;
 const badProject: RouteResult = { status: 400, body: { error: 'project must be a project id', code: 'invalid_request' } };
 
-export function createCliPreviewLinks(confirm: ConfirmationDeps): CliPreviewLinks {
+/** `requests`: tests' stand-ins for the request service's store, projects and notices. */
+export function createCliPreviewLinks(confirm: ConfirmationDeps, requests: Partial<RequestDeps> = {}): CliPreviewLinks {
   const deps = confirm.links;
   const caller = (u: CliUser): PreviewLinkCaller => ({ id: u.id, googleEmail: u.googleEmail });
   return {
@@ -40,6 +42,7 @@ export function createCliPreviewLinks(confirm: ConfirmationDeps): CliPreviewLink
     revoke: (user, linkId) => revokePreviewLinkFor(deps, caller(user), linkId),
     removeViewer: (user, linkId, userId) => removePreviewLinkViewerFor(deps, caller(user), linkId, userId),
     confirmation: (user, id) => confirmationStatusFor(confirm, caller(user), id),
+    request: (boxId, body) => requestPreviewLinkFor({ ...defaultRequestDeps, ...requests, confirm }, boxId, body),
   };
 }
 

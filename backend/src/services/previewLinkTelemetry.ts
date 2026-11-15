@@ -45,6 +45,11 @@ export function linkPublished(userId: string, boxId: string | null, detail: { au
   recordProductEvent('preview_link.published', { user: userId, box: boxId }, detail);
 }
 
+/** `termag preview request`: an agent on the box asked the owner (services/previewLinkRequests.ts). */
+export function linkRequested(userId: string, boxId: string | null, detail: { port: number; hasNote: boolean }): void {
+  recordProductEvent('preview_link.requested_by_agent', { user: userId, box: boxId }, detail);
+}
+
 export function linkOpened(userId: string, boxId: string | null, detail: { basis: string; firstOpen: boolean; audience: string }): void {
   recordProductEvent('preview_link.opened', { user: userId, box: boxId }, detail);
 }
@@ -73,6 +78,7 @@ interface Instruments {
   bytes: Counter;
   refusals: Counter;
   requests: Counter;
+  bounces: Counter;
 }
 
 let instruments: Instruments | null = null;
@@ -90,6 +96,7 @@ function inst(): Instruments {
     bytes: meter.createCounter('termag.preview.bytes_relayed', { unit: 'By', description: 'Bytes relayed, by direction: up (viewer to app) or down' }),
     refusals: meter.createCounter('termag.preview.refusals', { description: 'Preview requests and sockets refused, by code' }),
     requests: meter.createCounter('termag.preview.requests', { description: 'Preview HTTP requests answered, by status class' }),
+    bounces: meter.createCounter('termag.preview.handoff_bounces', { description: 'Used codes back in their minute from a browser with no session for the link: a hand-off that went round again' }),
   };
   if (liveGaugeFor !== meter) {
     liveGaugeFor = meter;
@@ -142,4 +149,18 @@ export function answered(status: number): void {
 export function setLiveLinks(n: number): void {
   liveLinks = n;
   safely(() => inst());
+}
+
+// ── Hand-off bounces ──────────────────────────────────────────────────────
+
+/**
+ * A hand-off that went round again: a used code back, within its minute, from a browser that holds no session
+ * for the link, so the exchange that used it made no session the browser kept (its navigation was dropped, or
+ * its cookie lost). A repeat open in another tab has a code of its own, a second click from a browser that kept
+ * its session goes on to the app, and a stale bookmark or unknown code has no rebound left: none counts. Each
+ * one buys a ticket back. Ids alone, never a code or cookie (SR21).
+ */
+export function handoffBounced(a: { viewer: string | null; linkId: string; name: string; boxId: string | null }): void {
+  console.log(`[PREVIEW-LINK] handoff_bounce viewer=${field(a.viewer)} link=${field(a.linkId)} name=${field(a.name)} box=${field(a.boxId)}`);
+  safely(() => inst().bounces.add(1, attrs({})));
 }

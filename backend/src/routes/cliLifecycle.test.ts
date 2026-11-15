@@ -15,12 +15,19 @@ const { AuthCodeStore, sha256Hex } = await import('../services/cliAuth');
 
 const alice: CliUser = { id: 'alice', googleEmail: 'alice@example.com', unixUsername: 'alice', displayName: 'Alice' };
 const DEVICE = 'tmcli_' + 'd'.repeat(64);
+const DEVICE_ON_BOX = 'tmcli_' + 'e'.repeat(64);
 const BOX = 'tmag_box';
 const USER_AGENT = 'tmag_user_agent';
 const now = new Date('2026-10-05T00:00:00Z');
 
 const store: CliStore = {
   async findSessionByHash(hash) {
+    if (hash === sha256Hex(DEVICE_ON_BOX)) {
+      return {
+        id: 's2', userId: 'alice', user: alice, deviceName: 'devbox', tokenPrefix: 'tmcli_eee',
+        createdAt: now, lastUsedAt: now, revokedAt: null, issuedOnBoxId: 'i-devbox',
+      } satisfies CliSessionRecord;
+    }
     if (hash !== sha256Hex(DEVICE)) return null;
     return {
       id: 's1', userId: 'alice', user: alice, deviceName: 'mbp', tokenPrefix: 'tmcli_ddd',
@@ -46,15 +53,18 @@ const ok = (status = 200, body: unknown = { ok: true }): RouteResult => ({ statu
 
 const parents: Record<string, string | null> = { 'i-child': 'i-devbox', 'i-other': null };
 let sources: Record<string, { repoUrl: string } | RouteResult>;
+/** Live Claude Code cloud sessions per box id (liveCloudSessions). */
+let cloudSessions: Record<string, number>;
 
 const lifecycle: CliLifecycle = {
   async createBox(user, input, parent, createdFor) { calls.push(['createBox', user.id, input, parent, ...(createdFor ? [createdFor] : [])]); return next; },
   async boxParent(_user, id) { return parents[id]; },
+  async liveCloudSessions(_user, id) { return cloudSessions[id] ?? 0; },
   async projectRepoUrl(user, box, project) {
     calls.push(['projectRepoUrl', user.id, box, project]);
     return sources[`${box}/${project}`] ?? { status: 404, body: { error: 'no such project', code: 'not_found' } };
   },
-  async powerBox(user, id, action) { calls.push(['powerBox', user.id, id, action]); return next; },
+  async powerBox(user, id, action, opts) { calls.push(['powerBox', user.id, id, action, opts]); return next; },
   async setBoxLifecycle(user, id, settings) { calls.push(['setBoxLifecycle', user.id, id, settings]); return next; },
   async keepBoxRunning(user, id) { calls.push(['keepBoxRunning', user.id, id]); return next; },
   async boxCosts(user) { calls.push(['boxCosts', user.id]); return next; },
@@ -91,6 +101,7 @@ beforeEach(() => {
   calls = [];
   next = ok();
   sources = {};
+  cloudSessions = {};
 });
 
 function call(method: string, path: string, token: string | null, body?: unknown) {
@@ -109,6 +120,8 @@ describe('lifecycle routes', () => {
 
     next = ok(202, { box: { id: 'i-devbox' } });
     expect((await call('POST', '/boxes/i-devbox/stop', DEVICE)).status).toBe(202);
+    expect((await call('POST', '/boxes/i-devbox/stop', BOX, { force: true })).status).toBe(202);
+    expect((await call('POST', '/boxes/i-devbox/stop', DEVICE_ON_BOX, { force: true })).status).toBe(202);
     expect((await call('POST', '/boxes/i-devbox/start', DEVICE)).status).toBe(202);
     expect((await call('POST', '/boxes/i-devbox/hibernate', DEVICE)).status).toBe(202);
     next = ok();
@@ -122,9 +135,11 @@ describe('lifecycle routes', () => {
 
     expect(calls).toEqual([
       ['createBox', 'alice', { name: 'devbox' }, null],
-      ['powerBox', 'alice', 'i-devbox', 'stop'],
-      ['powerBox', 'alice', 'i-devbox', 'start'],
-      ['powerBox', 'alice', 'i-devbox', 'hibernate'],
+      ['powerBox', 'alice', 'i-devbox', 'stop', { force: false, boxCredential: false }],
+      ['powerBox', 'alice', 'i-devbox', 'stop', { force: true, boxCredential: true }],
+      ['powerBox', 'alice', 'i-devbox', 'stop', { force: true, boxCredential: true }],
+      ['powerBox', 'alice', 'i-devbox', 'start', { force: false, boxCredential: false }],
+      ['powerBox', 'alice', 'i-devbox', 'hibernate', { force: false, boxCredential: false }],
       ['setBoxLifecycle', 'alice', 'i-devbox', { idleHibernateHours: 1 }],
       ['renameBox', 'alice', 'i-devbox', 'heavy'],
       ['removeBox', 'alice', 'i-devbox', true],
@@ -541,6 +556,49 @@ describe('box credentials', () => {
     const res = await call('DELETE', '/boxes/i-other', USER_AGENT, { confirmed: true });
     expect(res.status).toBe(403);
     expect(calls).toEqual([]);
+  });
+
+  it('may not stop, hibernate or remove a box that runs Claude Code cloud sessions; the owner signed in may', async () => {
+    cloudSessions = { 'i-child': 2 };
+    for (const [method, path, verb] of [
+      ['POST', '/boxes/i-child/stop', 'stop'],
+      ['POST', '/boxes/i-child/hibernate', 'hibernate'],
+      ['DELETE', '/boxes/i-child', 'rm'],
+    ] as const) {
+      for (const token of [BOX, USER_AGENT]) {
+        if (method === 'DELETE' && token === USER_AGENT) continue; // the parent check refuses that one first
+        const res = await call(method, path, token, method === 'DELETE' ? { confirmed: true } : undefined);
+        expect(res.status, `${method} ${path}`).toBe(409);
+        expect(await res.json()).toEqual({
+          code: 'cloud_sessions',
+          error: expect.stringMatching(new RegExp(`^The box runs 2 Claude Code cloud sessions, .* run \\\`termag box ${verb}\\\` where you've run \\\`termag login\\\`$`)),
+        });
+      }
+    }
+    expect(calls).toEqual([]);
+    // Starting is fine, and so is the owner's own sign-in.
+    expect((await call('POST', '/boxes/i-child/start', BOX)).status).toBe(200);
+    expect((await call('POST', '/boxes/i-child/stop', DEVICE)).status).toBe(200);
+    expect((await call('DELETE', '/boxes/i-child', DEVICE, { confirmed: true })).status).toBe(200);
+    expect(calls).toEqual([['powerBox', 'alice', 'i-child', 'start', { force: false, boxCredential: true }], ['powerBox', 'alice', 'i-child', 'stop', { force: false, boxCredential: false }], ['removeBox', 'alice', 'i-child', true]]);
+  });
+
+  it('may not resize a box that runs Claude Code cloud sessions, --force or not (Devin on #1597)', async () => {
+    cloudSessions = { 'i-child': 1 };
+    for (const force of [false, true]) {
+      const res = await call('POST', '/boxes/i-child/resize', BOX, { size: 'large', force });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ code: 'cloud_sessions', error: expect.stringContaining("can't resize it while it runs") });
+    }
+    expect(calls).toEqual([]);
+    expect((await call('POST', '/boxes/i-child/resize', DEVICE, { size: 'large', force: true })).status).toBe(200);
+    expect(calls).toEqual([['resizeBox', 'alice', 'i-child', { size: 'large', force: true }]]);
+  });
+
+  it('may stop and remove a box it made once its cloud sessions have ended', async () => {
+    expect((await call('POST', '/boxes/i-child/stop', BOX)).status).toBe(200);
+    expect((await call('DELETE', '/boxes/i-child', BOX, { confirmed: true })).status).toBe(200);
+    expect(calls).toEqual([['powerBox', 'alice', 'i-child', 'stop', { force: false, boxCredential: true }], ['removeBox', 'alice', 'i-child', true]]);
   });
 });
 

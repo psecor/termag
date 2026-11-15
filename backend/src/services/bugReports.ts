@@ -5,6 +5,9 @@
  * the store, routes/cliBugReports.ts and routes/admin/bugs.ts the thin routes.
  */
 import { redactSecrets } from './secretPatterns';
+import { parseClaimedPlace, parseClientContext, redactor, shortField, SHORT_FIELD, type Reporter, type ResolveReporter } from './cliReporter';
+
+export { threadIdOf, type Reporter } from './cliReporter';
 
 export const SEVERITIES = ['low', 'medium', 'high'] as const;
 export const AREAS = ['spaces', 'asks', 'publish', 'boxes', 'chat', 'cli', 'broker', 'other'] as const;
@@ -22,7 +25,7 @@ export const LIMITS = {
   body: 20_000,
   command: 2_000,
   errorOutput: 20_000,
-  short: 200,
+  short: SHORT_FIELD,
   capabilities: 100,
   search: 200,
   note: 2_000,
@@ -45,18 +48,6 @@ export interface BugReportInput {
   workstream: string | null;
   /** The kinds of secret-shaped strings replaced in any field. */
   redacted: string[];
-}
-
-/** Where a report came from, as the orchestrator itself resolved it. */
-export interface Reporter {
-  reporterUserId: string;
-  credential: 'box' | 'device';
-  boxId: string | null;
-  projectId: string | null;
-  workstream: string | null;
-  threadId: string | null;
-  boxAgentCommit: string | null;
-  boxAgentCapabilities: string[];
 }
 
 export interface BugReportRow extends Omit<BugReportInput, 'projectId' | 'workstream'>, Reporter {
@@ -100,7 +91,7 @@ export interface BugReportStore {
   /** Reports filed since `since` by this box, or by this person with no box. */
   countRecent(key: { boxId: string | null; userId: string }, since: Date): Promise<number>;
   /** Where the report comes from: the project and thread only when they are the reporter's. */
-  resolveReporter(base: { reporterUserId: string; credential: 'box' | 'device'; boxId: string | null }, claimed: { projectId: string | null; workstream: string | null }): Promise<Reporter>;
+  resolveReporter: ResolveReporter;
   create(input: BugReportInput, reporter: Reporter): Promise<BugReportRow>;
   /** At most `limit`, new reports first, then the rest, newest first within each (sortNewFirst's order). */
   list(filter: BugFilter): Promise<BugReportRow[]>;
@@ -124,12 +115,6 @@ function str(v: unknown): string | null {
   return typeof v === 'string' ? v : null;
 }
 
-/** A short single-line field: trimmed, at most LIMITS.short, null when empty or absent. */
-function shortField(v: unknown): string | null {
-  const s = str(v)?.replace(/\s+/g, ' ').trim();
-  return s ? s.slice(0, LIMITS.short) : null;
-}
-
 /**
  * Validate and normalise a report. Every free-text field is scanned for
  * secret-shaped strings, which are replaced (`[redacted: GitHub token]`) and
@@ -138,13 +123,7 @@ function shortField(v: unknown): string | null {
  */
 export function parseBugReportInput(raw: unknown): Parsed<BugReportInput> {
   const b = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
-  const redacted = new Set<string>();
-  const clean = (s: string | null): string | null => {
-    if (s === null) return null;
-    const r = redactSecrets(s);
-    for (const k of r.redacted) redacted.add(k);
-    return r.text;
-  };
+  const { clean, redacted } = redactor();
 
   const title = str(b.title)?.replace(/\s+/g, ' ').trim() ?? '';
   if (!title) return { error: 'title is required' };
@@ -166,8 +145,6 @@ export function parseBugReportInput(raw: unknown): Parsed<BugReportInput> {
     ? (errorRaw.length > LIMITS.errorOutput ? '…' + errorRaw.slice(-LIMITS.errorOutput) : errorRaw)
     : null;
 
-  const projectId = str(b.projectId)?.trim() || null;
-  const workstream = str(b.workstream)?.trim() || null;
   return {
     ok: {
       title: clean(title)!,
@@ -176,22 +153,12 @@ export function parseBugReportInput(raw: unknown): Parsed<BugReportInput> {
       area: area as Area,
       command: clean(command),
       errorOutput,
-      cliVersion: clean(shortField(b.cliVersion)),
-      agentProvider: clean(shortField(b.agentProvider)),
-      agentModel: clean(shortField(b.agentModel)),
-      agentVersion: clean(shortField(b.agentVersion)),
+      ...parseClientContext(b, clean),
       boxImage: clean(shortField(b.boxImage)),
-      projectId: projectId && /^[A-Za-z0-9_-]{1,80}$/.test(projectId) ? projectId : null,
-      workstream: workstream && /^[A-Za-z0-9_.-]{1,100}$/.test(workstream) ? workstream : null,
+      ...parseClaimedPlace(b),
       redacted: [...redacted],
     },
   };
-}
-
-/** The ask thread a workstream belongs to: an ask runs in `ask-<thread id>`. */
-export function threadIdOf(workstream: string | null): string | null {
-  const m = workstream?.match(/^ask-([A-Za-z0-9]{8,40})$/);
-  return m ? m[1] : null;
 }
 
 /** True when this box (or person) may file another report now. */

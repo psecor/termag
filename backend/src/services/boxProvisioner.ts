@@ -111,6 +111,7 @@ import { failRoot, rootSpan, traceSweep } from './tracing/spans';
 import { boxVolumeInitRate, isVolumeInitRateRefusal } from './boxVolumeInitRate';
 import { boxVolumePerformance, effectiveVolumePerformance, isVolumePerformanceRefusal, volumePerformanceFor, type VolumePerformance } from './boxVolumePerformance';
 import { recordImageFloor } from './boxImageFloor';
+import { parseSharedBoxRole, rolesWithExpiredDenies, scheduleSharedRoleDenyRelease, sweepSharedRoleDenies, usesSharedRole, type SharedBoxRole } from './boxSharedRole';
 
 
 const SSM_CORE_POLICY_ARN = 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore';
@@ -134,6 +135,7 @@ export interface BoxConfig {
   rootVolumeGb: number;
   gitTokenSecretArn?: string;  // optional: private-repo PAT, read at boot via SSM/SM
   ecrPull?: BoxEcrPullConfig;  // optional: pull-only ECR repositories for the box role (boxEcrPolicy.ts)
+  sharedRole?: SharedBoxRole;  // optional: the role + instance profile every new box launches with (boxSharedRole.ts)
 }
 
 /**
@@ -185,6 +187,7 @@ export function getBoxConfig(env: NodeJS.ProcessEnv = process.env): BoxConfig | 
     rootVolumeGb,
     gitTokenSecretArn: env.BOX_GIT_TOKEN_SECRET_ARN || undefined,
     ecrPull: parseBoxEcrPull(env),
+    sharedRole: parseSharedBoxRole(env),
   };
 }
 
@@ -663,7 +666,7 @@ export interface ProvisionEnvPoolArgs {
 export async function provisionEnvPoolBox(args: ProvisionEnvPoolArgs): Promise<boolean> {
   const cfg = getBoxConfig();
   if (!cfg) {
-    await markFailed(args.instance.id, NOT_CONFIGURED, 'env-failed');
+    await markFailed(args.instance.id, NOT_CONFIGURED, 'env-pool');
     return false;
   }
   const userData = buildWarmCloudInit({
@@ -681,7 +684,7 @@ export async function provisionEnvPoolBox(args: ProvisionEnvPoolArgs): Promise<b
       { Key: 'BoxName', Value: args.instance.name },
       { Key: 'Pool', Value: 'environment' },
     ],
-  }, 'env-failed');
+  }, 'env-pool');
   if (launched) {
     console.log(`[ENV-POOL] booted ${args.instance.id} (${args.instance.name}) ec2=${launched.ec2InstanceId} for environment ${args.environmentId}`);
   } else {
@@ -691,10 +694,10 @@ export async function provisionEnvPoolBox(args: ProvisionEnvPoolArgs): Promise<b
 }
 
 /**
- * A failed pool launch's row is env-failed at once, kept for its pool's page, and nobody retries it: what the launch
- * had created (its security group, IAM role, any instance) is torn down now, as a failed prepare's box is
- * (services/envPool.ts failPrepare). A row the launch didn't fail (quarantined, whose containment runs on its own, or
- * gone) is left alone.
+ * A failed pool launch's row is terminated at once (markFailed), kept for its pool's page, and nobody retries it: what
+ * the launch had created (its security group, IAM role, any instance) is torn down now, as a failed prepare's box is
+ * (services/envPool.ts failPrepare), not when the teardown sweep next comes round. A row the launch didn't fail
+ * (quarantined, whose containment runs on its own, already cleaned up, or gone) is left alone.
  */
 export async function cleanUpFailedPoolLaunch(
   instanceId: string,
@@ -704,7 +707,7 @@ export async function cleanUpFailedPoolLaunch(
   },
 ): Promise<void> {
   const row = await deps.find(instanceId).catch(() => null);
-  if (row?.status !== 'env-failed') return;
+  if (row?.status !== 'terminated' || row.cleanedUpAt || !row.provisioningError) return;
   await deps.terminate(row).catch(err => console.error(`[ENV-POOL] ${instanceId}: tearing down the failed launch failed:`, errMsg(err)));
 }
 
@@ -730,17 +733,17 @@ interface LaunchedBox {
 
 /**
  * The AWS half of a box launch, shared by the cold path and the warm pool: SG,
- * host ingress, per-box IAM identity, RunInstances, private DNS. Only the
+ * host ingress, IAM identity (the shared role, or one of its own), RunInstances, private DNS. Only the
  * cloud-init and a couple of tags differ between the two, which is why they
  * share this rather than a copy.
  *
  * Returns null when the launch failed, having already recorded the error on
  * the Instance row. Neither caller throws, because both are fired un-awaited.
  */
-async function launchBox(cfg: BoxConfig, a: LaunchBoxArgs, failedStatus: 'failed' | 'env-failed' = 'failed'): Promise<LaunchedBox | null> {
+async function launchBox(cfg: BoxConfig, a: LaunchBoxArgs, failedKind: 'box' | 'env-pool' = 'box'): Promise<LaunchedBox | null> {
   launchesInFlight.add(a.instanceId);
   try {
-    return await runLaunch(cfg, a, failedStatus);
+    return await runLaunch(cfg, a, failedKind);
   } finally {
     launchesInFlight.delete(a.instanceId);
   }
@@ -754,7 +757,7 @@ async function launchBox(cfg: BoxConfig, a: LaunchBoxArgs, failedStatus: 'failed
  */
 const launchesInFlight = new Set<string>();
 
-async function runLaunch(cfg: BoxConfig, a: LaunchBoxArgs, failedStatus: 'failed' | 'env-failed'): Promise<LaunchedBox | null> {
+async function runLaunch(cfg: BoxConfig, a: LaunchBoxArgs, failedKind: 'box' | 'env-pool'): Promise<LaunchedBox | null> {
   // Globally-unique physical name (box names are only unique per user). Still
   // matches the grant's `<prefix>-*` resource condition. Human-readable detail
   // lives in the Owner/BoxName tags.
@@ -809,12 +812,25 @@ async function runLaunch(cfg: BoxConfig, a: LaunchBoxArgs, failedStatus: 'failed
       console.log(`[BOX] HOST_SECURITY_GROUP_ID unset; relying on the agent endpoint's own ingress rules for ${a.boxName}`);
     }
 
-    // 4. Per-box IAM identity (role WITH the permissions boundary — denied
-    //    otherwise) → SSM core → optional git-token read → optional ECR pull → instance profile.
-    const iamRoleName = await createBoxRole(iam, name, cfg, tags, {
-      onRoleCreated: () => record({ iamRoleName: name }),
-      onProfileCreated: () => record({ iamInstanceProfileName: name }),
-    });
+    // 4. The box's IAM identity. With the shared role configured, the shared
+    //    instance profile, made and granted by terraform: nothing is created,
+    //    and the row records that the role is shared, so teardown never
+    //    deletes it. Otherwise a role of the box's own (WITH the permissions
+    //    boundary — denied otherwise) → SSM core → optional git-token read →
+    //    optional ECR pull → instance profile.
+    let iamRoleName: string;
+    let instanceProfileName: string;
+    if (cfg.sharedRole) {
+      iamRoleName = cfg.sharedRole.roleName;
+      instanceProfileName = cfg.sharedRole.instanceProfileName;
+      await record({ iamRoleShared: true, iamRoleName, iamInstanceProfileName: instanceProfileName });
+    } else {
+      iamRoleName = await createBoxRole(iam, name, cfg, tags, {
+        onRoleCreated: () => record({ iamRoleName: name }),
+        onProfileCreated: () => record({ iamInstanceProfileName: name }),
+      });
+      instanceProfileName = name;
+    }
 
     // 5. Launch, hibernation-capable when the AMI and the type allow it.
     //    EC2 only takes HibernationOptions here, never later. A capacity
@@ -837,7 +853,7 @@ async function runLaunch(cfg: BoxConfig, a: LaunchBoxArgs, failedStatus: 'failed
     //    request's would have ended long before the instance is up.
     const launched = await rootSpan('termag.box.launch', { 'termag.box.flavor': a.flavor }, async (span) => {
       const l = await runInstanceWithFallback(ec2, a.boxName, true,
-        { ami, name, securityGroupId, iamRoleName, userData: a.userData, cfg, tags, volumeInitRate, volumePerformance }, a.startSubnetId);
+        { ami, name, securityGroupId, instanceProfileName, userData: a.userData, cfg, tags, volumeInitRate, volumePerformance }, a.startSubnetId);
       const perf = effectiveVolumePerformance(l.volumePerformance);
       span.setAttributes({
         'termag.box.instance_type': l.instanceType,
@@ -883,7 +899,7 @@ async function runLaunch(cfg: BoxConfig, a: LaunchBoxArgs, failedStatus: 'failed
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[BOX] Provisioning failed for ${a.boxName}:`, msg);
-    await markFailed(a.instanceId, msg, failedStatus);
+    await markFailed(a.instanceId, msg, failedKind);
     return null;
   }
 }
@@ -1210,7 +1226,7 @@ interface RunArgs {
   ami: BoxAmi;
   name: string;
   securityGroupId: string;
-  iamRoleName: string;
+  instanceProfileName: string;
   userData: string;
   cfg: BoxConfig;
   tags: Tag[];
@@ -1395,7 +1411,7 @@ async function runInstanceOnce(ec2: EC2Client, a: RunArgs, hibernate: boolean): 
     MaxCount: 1,
     SubnetId: a.subnetId,
     SecurityGroupIds: [a.securityGroupId],
-    IamInstanceProfile: { Name: a.iamRoleName },
+    IamInstanceProfile: { Name: a.instanceProfileName },
     MetadataOptions: {
       HttpEndpoint: 'enabled',
       HttpTokens: 'required',          // IMDSv2 only
@@ -1449,16 +1465,18 @@ async function describePrivateDns(ec2: EC2Client, instanceId: string): Promise<s
   }
 }
 
-async function markFailed(instanceId: string, error: string, status: 'failed' | 'env-failed' = 'failed'): Promise<void> {
+async function markFailed(instanceId: string, error: string, kind: 'box' | 'env-pool' = 'box'): Promise<void> {
   // Never over a terminated row: a launch that fails after the user deleted
   // the box would otherwise move it out of `terminated`, where neither the
   // user nor the teardown sweep would look for its resources again. Nor over
   // a quarantined one, which `failed` would hand back to its owner's Retry.
   await prisma.instance.updateMany({
     where: { id: instanceId, status: { notIn: ['terminated', QUARANTINED] } },
-    // An environment pool box's failure is its pool's (env-failed, with the reason as its log).
-    // An environment pool box's launch failed, not its setup: it only delays the next launch (services/envPoolPlanner.ts).
-    data: { status, provisioningError: error.slice(0, 1000), ...(status === 'env-failed' ? { poolLog: error.slice(0, 4000), poolSetupFailed: false, terminatedAt: new Date() } : {}) },
+    // An environment pool box's failed launch is a failed prepare (services/envPool.ts failPrepare): terminated at once,
+    // with the reason as its log, holding its pool for ENV_POOL_RETRY_MS. cleanUpFailedPoolLaunch tears it down.
+    data: kind === 'env-pool'
+      ? { status: 'terminated', terminatedAt: new Date(), provisioningError: error.slice(0, 1000), poolLog: error.slice(0, 4000) }
+      : { status: 'failed', provisioningError: error.slice(0, 1000) },
   }).catch(e => console.error(`[BOX] Failed to mark instance ${instanceId} failed:`, e.message));
 }
 
@@ -1664,8 +1682,10 @@ export async function terminateBox(instance: Instance): Promise<boolean> {
 
   // 1. Terminate the EC2 instance and wait for it to go away — the SG can't be
   //    deleted while an ENI references it.
+  let instanceGone = true;
   if (instance.ec2InstanceId) {
-    clean = (await terminateInstance(ec2, instance.ec2InstanceId)) && clean;
+    instanceGone = await terminateInstance(ec2, instance.ec2InstanceId);
+    clean = instanceGone && clean;
   }
 
   // 2. Revoke every :3040 ingress rule that still points at the box SG, then
@@ -1685,8 +1705,21 @@ export async function terminateBox(instance: Instance): Promise<boolean> {
     clean = (await releaseSecurityGroup(ec2, cfg, instance.securityGroupId)) && clean;
   }
 
-  // 3. Detach/delete the role + instance profile.
-  clean = (await deleteBoxRole(iam, name, profileName)) && clean;
+  // 3. A role of its own: detach/delete it and its instance profile. The
+  //    shared role and profile are never deleted. A quarantined box's entry
+  //    in the shared role's deny list stays: once EC2 reports its instance
+  //    terminated, its release is scheduled for after the retention, when no
+  //    credential the instance was issued can still be valid
+  //    (boxSharedRole.SHARED_DENY_RETENTION_MS), and the provisioning sweep
+  //    removes it then.
+  if (usesSharedRole(instance, cfg.sharedRole)) {
+    const sharedRoleName = instance.iamRoleName ?? cfg.sharedRole?.roleName;
+    if (instance.quarantinedAt && instance.ec2InstanceId && sharedRoleName) {
+      clean = (instanceGone && await scheduleSharedRoleDeny(sharedRoleName, instance.ec2InstanceId)) && clean;
+    }
+  } else {
+    clean = (await deleteBoxRole(iam, name, profileName)) && clean;
+  }
 
   if (!clean) {
     console.error(`[BOX] Teardown of ${instance.name} (${instance.id}) incomplete; the provisioning sweep retries it`);
@@ -1720,6 +1753,39 @@ export async function terminateBox(instance: Instance): Promise<boolean> {
   }
   console.log(`[BOX] Terminated box resources for ${instance.name}`);
   return true;
+}
+
+/** Schedule a terminated quarantined instance's release from the shared role's deny list (terminateBox step 3). */
+async function scheduleSharedRoleDeny(roleName: string, ec2InstanceId: string): Promise<boolean> {
+  try {
+    await scheduleSharedRoleDenyRelease(roleName, ec2InstanceId, new Date());
+    return true;
+  } catch (err) {
+    console.error(`[BOX] scheduling the release of ${ec2InstanceId} from the deny list on ${roleName} failed:`, errMsg(err));
+    return false;
+  }
+}
+
+/**
+ * Take the entries whose retention has passed off the shared role's deny list
+ * (boxSharedRole.sweepSharedRoleDenies). Run by the provisioning sweep. A
+ * role that fails is logged and left for the next tick.
+ */
+export async function sweepExpiredSharedRoleDenies(now: Date): Promise<number> {
+  const cfg = getBoxConfig();
+  if (!cfg) return 0;
+  const iam = new IAMClient(awsClientConfig(cfg));
+  let removed = 0;
+  for (const roleName of await rolesWithExpiredDenies(now)) {
+    try {
+      const n = await sweepSharedRoleDenies(iam, roleName, now);
+      if (n > 0) console.log(`[BOX] ${n} terminated quarantined instance(s) taken off the deny list on ${roleName}`);
+      removed += n;
+    } catch (err) {
+      console.error(`[BOX] taking expired entries off the deny list on ${roleName} failed; the next sweep retries:`, errMsg(err));
+    }
+  }
+  return removed;
 }
 
 /** Revoke every :3040 ingress rule that points at the box SG, then delete it (terminateBox step 2). */
@@ -1819,6 +1885,9 @@ async function inlinePolicyNames(iam: IAMClient, roleName: string): Promise<stri
  * each role's policy first and writes only when it differs. Run once at
  * startup; a box launched after that gets the policy from createBoxRole.
  *
+ * Boxes on the shared role are skipped: terraform grants that role its ECR
+ * pull, alongside the rest of its policies.
+ *
  * With the setting unset this does nothing, and in particular does not strip
  * policies a previous config wrote: turning the grant off for existing boxes
  * is a deliberate IAM change, not a side effect of a missing env var.
@@ -1829,13 +1898,15 @@ export async function backfillBoxEcrPullPolicies(): Promise<void> {
   const desired = boxEcrPullPolicyDocument(cfg.ecrPull);
 
   const boxes = await prisma.instance.findMany({
-    where: { kind: 'ec2', iamRoleName: { not: null }, status: { not: 'terminated' } },
-    select: { id: true, name: true, region: true, iamRoleName: true },
+    where: { kind: 'ec2', iamRoleName: { not: null }, iamRoleShared: false, status: { not: 'terminated' } },
+    select: { id: true, name: true, region: true, iamRoleName: true, iamRoleShared: true, iamInstanceProfileName: true },
   });
 
   let updated = 0;
   let failed = 0;
   for (const box of boxes) {
+    // terraform grants the shared role its ECR pull; never write it here.
+    if (usesSharedRole(box, cfg.sharedRole)) continue;
     const roleName = box.iamRoleName!;
     const iam = new IAMClient(awsClientConfig(cfg, box.region ?? cfg.region));
     try {
@@ -1938,7 +2009,9 @@ const WARMING_FAILURE_TEXT: Readonly<Record<StuckWarmingReason, string>> = {
  * boxes get the same treatment with their own two windows. Terminated boxes
  * whose teardown never finished get it re-run (sweepUncleanedTeardowns), and
  * failed launches that never got an instance give back their SG and IAM role
- * (sweepFailedLaunches).
+ * (sweepFailedLaunches). Deny-list entries of terminated quarantined boxes on
+ * the shared role leave it once their retention has passed
+ * (sweepExpiredSharedRoleDenies).
  */
 export function startProvisioningSweep(intervalMs = provisioningSweepIntervalMs()): void {
   if (sweepTimer) return;
@@ -1967,6 +2040,12 @@ export function startProvisioningSweep(intervalMs = provisioningSweepIntervalMs(
     } catch (err) {
       failRoot(err);
       console.error('[BOX] Failed-launch sweep failed:', errMsg(err));
+    }
+    try {
+      await sweepExpiredSharedRoleDenies(new Date());
+    } catch (err) {
+      failRoot(err);
+      console.error('[BOX] Shared-role deny sweep failed:', errMsg(err));
     }
     try {
       const { sweepUncontainedQuarantines } = await import('./boxQuarantine');
@@ -2074,7 +2153,8 @@ export async function releaseFailedLaunch(instance: Instance): Promise<boolean> 
 
   let clean = true;
   if (instance.securityGroupId) clean = (await releaseSecurityGroup(ec2, cfg, instance.securityGroupId)) && clean;
-  clean = (await deleteBoxRole(iam, name, profileName)) && clean;
+  // The shared role and profile stay: other boxes use them.
+  if (!usesSharedRole(instance, cfg.sharedRole)) clean = (await deleteBoxRole(iam, name, profileName)) && clean;
   if (!clean) {
     console.error(`[BOX] Releasing failed launch ${instance.name} (${instance.id}) incomplete; the provisioning sweep retries it`);
     return false;

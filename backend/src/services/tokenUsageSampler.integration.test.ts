@@ -30,10 +30,14 @@ describe.skipIf(!adminUrl)('persistHost against Postgres', () => {
   let q: typeof import('./admin/usageQueries');
   let range: import('./admin/range').Range;
 
-  const scan = async (raw: unknown) => {
+  const scan = async (raw: unknown, at = NOW) => {
     const norm = s.normalizeScanResponse(raw);
-    await s.persistHost('u1', 'box1', norm, s.resolveRows(norm.rows, 'u1', []), s.resolveRows(norm.modelRows, 'u1', []), NOW);
+    await s.persistHost('u1', 'box1', norm, s.resolveRows(norm.rows, 'u1', []), s.resolveRows(norm.modelRows, 'u1', []), at);
   };
+  // xmin changes whenever Postgres writes a new version of the row.
+  const versions = async (table: 'token_usage_days' | 'token_usage_model_days') =>
+    (await prisma.$queryRawUnsafe<Array<{ id: string; xmin: string; scannedAt: Date; updatedAt: Date }>>(
+      `SELECT id, xmin::text AS xmin, "scannedAt", "updatedAt" FROM ${table} ORDER BY "sourceKey", id`));
   const models = async () => (await prisma.tokenUsageModelDay.findMany({ where: { userId: 'u1' }, orderBy: [{ sourceKey: 'asc' }, { model: 'asc' }] }))
     .map(r => [r.sourceKey, r.model, Number(r.input)]);
   const expectReportsAgree = async () => {
@@ -96,5 +100,53 @@ describe.skipIf(!adminUrl)('persistHost against Postgres', () => {
     expect(await prisma.tokenUsageDay.count({ where: { userId: 'u1', sourceKey: { not: '' } } })).toBe(0);
     expect(await models()).toEqual([]);
     await expectReportsAgree();
+  });
+
+  it('writes the scannedAt it is given as Prisma does (UTC), and ids and updatedAt for new rows', async () => {
+    await scan({ schema: 2, sources: { claude: { buckets: [bucket('dir-a', { opus: 20 })] } } });
+    const [d] = await prisma.tokenUsageDay.findMany({ where: { userId: 'u1' } });
+    expect(d.scannedAt.toISOString()).toBe(NOW.toISOString());
+    expect(d.id).toBeTruthy();
+    expect(Math.abs(d.updatedAt.getTime() - Date.now())).toBeLessThan(60_000);
+    expect(d.estimated).toBe(false);
+    expect(Number(d.input)).toBe(20);
+    const [m] = await prisma.tokenUsageModelDay.findMany({ where: { userId: 'u1' } });
+    expect(m.scannedAt.toISOString()).toBe(NOW.toISOString());
+  });
+
+  it('a rescan with the same numbers rewrites no row; a changed day is rewritten, its neighbours are not', async () => {
+    const raw = (opusA: number) => ({ schema: 2, sources: { claude: { buckets: [bucket('dir-a', { opus: opusA }), bucket('dir-b', { opus: 5 })] } } });
+    await scan(raw(20));
+    const days0 = await versions('token_usage_days');
+    const models0 = await versions('token_usage_model_days');
+    await scan(raw(20), new Date(NOW.getTime() + 300_000));
+    expect(await versions('token_usage_days')).toEqual(days0);
+    expect(await versions('token_usage_model_days')).toEqual(models0);
+
+    const later = new Date(NOW.getTime() + 600_000);
+    await scan(raw(25), later);
+    const days1 = await versions('token_usage_days');
+    expect(days1[0].xmin).not.toBe(days0[0].xmin);       // dir-a changed
+    expect(days1[0].scannedAt.toISOString()).toBe(later.toISOString());
+    expect(days1[1]).toEqual(days0[1]);                  // dir-b didn't
+    expect((await models()).map(r => r[2])).toEqual([25, 5]);
+    await expectReportsAgree();
+  });
+
+  it('a scan that reports one bucket-day twice keeps the last, as the per-row upserts did', async () => {
+    await scan({ schema: 2, sources: { codex: { buckets: [
+      { cwdHint: '/w/a', days: { [D]: day(1) } },
+      { cwdHint: '/w/a', days: { [D]: day(7) } },
+    ] } } });
+    const rows = await prisma.tokenUsageDay.findMany({ where: { userId: 'u1' } });
+    expect(rows.map(r => Number(r.input))).toEqual([7]);
+  });
+
+  it('writes a host of 2,500 rows (more than one statement) in full', async () => {
+    const days: Record<string, ReturnType<typeof day>> = {};
+    for (let i = 0; i < 250; i++) days[new Date(Date.UTC(2026, 0, 1) + i * 86_400_000).toISOString().slice(0, 10)] = day(i + 1);
+    const buckets = Array.from({ length: 10 }, (_, k) => ({ dir: `dir-${k}`, cwdHint: null, days }));
+    await scan({ schema: 2, sources: { claude: { buckets } } });
+    expect(await prisma.tokenUsageDay.count({ where: { userId: 'u1' } })).toBe(2500);
   });
 });

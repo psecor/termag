@@ -6,7 +6,7 @@ import { isParkedSpawn } from '../agentSpawnStore';
 import { boolVariation, jsonVariation } from '../featureFlags';
 import { recordChatNotices } from '../chatNotices';
 import {
-  afterReport, boxPolicy, previewTarget, pumpFleet, recordBoxChatNotices, recordToolUpdateReport, relaunchReportedPanes, requestFleetUpdate, requestFloorRun, requestHostUpdate, sendToolUpdate, updatePreview,
+  afterReport, boxPolicy, previewTarget, pumpFleet, recordBoxChatNotices, recordToolUpdateReport, relaunchReportedPanes, requestFleetUpdate, requestFloorRun, requestHostUpdate, runActive, sendToolUpdate, updatePreview,
 } from './runs';
 import { parseToolUpdateReport, type ToolUpdateReport } from './run';
 import { TOOL_REGISTRY } from './components';
@@ -242,6 +242,10 @@ describe('one run in flight per box and component (Bugbot on #975)', () => {
       const waiting = [...rows.values()].find(r => r.hostKey === 'box-10')!;
       expect(waiting.status).toBe('requested');
       vi.setSystemTime(Date.now() + 20 * 60_000);
+      // runActive, which the Software tab's matrix reads too (Devin on #1607): the queued run, 20 minutes
+      // old, is still active; isInFlight alone would have let it go.
+      expect(runActive(waiting as never, Date.now())).toBe(true);
+      expect(runActive({ ...waiting, id: 'not-queued' } as never, Date.now())).toBe(false);
       // The ten sent ones expired unfetched; the queued one did not, and it still holds box-10.
       expect(await requestHostUpdate(claude, 'box-10', 'force', admin)).toEqual({ status: 409, body: { code: 'run_in_flight' } });
       await requestFloorRun(claude, box('box-10'), ada);

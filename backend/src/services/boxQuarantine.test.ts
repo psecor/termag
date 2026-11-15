@@ -3,6 +3,38 @@ import type { EC2Client } from '@aws-sdk/client-ec2';
 import type { IAMClient } from '@aws-sdk/client-iam';
 
 // In-memory instances, tokens and projects with the Prisma semantics boxQuarantine uses.
+
+/** An in-memory `shared_role_denies` table, with the Prisma calls boxSharedRole makes. */
+const sharedRoleDenyTable = vi.hoisted(() => function sharedRoleDenyTable() {
+  const rows: Array<Record<string, any>> = [];
+  const hit = (r: Record<string, any>, where: Record<string, any>) => Object.entries(where).every(([k, v]) => {
+    if (v && typeof v === 'object' && !(v instanceof Date)) {
+      if ('in' in v) return v.in.includes(r[k]);
+      if ('lte' in v) return r[k] != null && r[k] <= v.lte;
+    }
+    return (r[k] ?? null) === v;
+  });
+  const delegate = {
+    findMany: async ({ where }: any) => rows.filter(r => hit(r, where)).map(r => ({ ...r })),
+    upsert: async ({ where: { roleName_ec2InstanceId: key }, create, update }: any) => {
+      const row = rows.find(r => r.roleName === key.roleName && r.ec2InstanceId === key.ec2InstanceId);
+      if (row) Object.assign(row, update); else rows.push({ releaseAfter: null, ...create });
+      return {};
+    },
+    updateMany: async ({ where, data }: any) => {
+      const hits = rows.filter(r => hit(r, where));
+      for (const r of hits) Object.assign(r, data);
+      return { count: hits.length };
+    },
+    deleteMany: async ({ where }: any) => {
+      const gone = rows.filter(r => hit(r, where));
+      for (const r of gone) rows.splice(rows.indexOf(r), 1);
+      return { count: gone.length };
+    },
+  };
+  return { rows, delegate };
+});
+const denies = vi.hoisted(() => ({ table: null as null | { rows: Array<Record<string, any>>; delegate: any } }));
 const db = {
   instances: new Map<string, Record<string, any>>(),
   tokens: [] as Array<Record<string, any>>,
@@ -27,6 +59,9 @@ const prismaFake = {
   agentToken: { updateMany: (args: any) => updateMany(db.tokens)(args) },
   project: { updateMany: (args: any) => updateMany(db.projects)(args) },
   $transaction: async (arg: any) => (typeof arg === 'function' ? arg(prismaFake) : Promise.all(arg)),
+  // The shared role's deny list (boxSharedRole.withSharedRoleLock) and its table.
+  $executeRaw: async () => 0,
+  get sharedRoleDeny() { return denies.table!.delegate; },
 };
 vi.mock('../db', () => ({ prisma: prismaFake }));
 
@@ -38,10 +73,13 @@ vi.mock('./workspaceEvents', () => ({
   notifyWorkspaceChange: (owner: string, what: string) => { notified.push([owner, what]); },
 }));
 
-const provisioner = { configured: true, referencing: [] as string[], terminated: [] as string[] };
+const provisioner = {
+  configured: true, referencing: [] as string[], terminated: [] as string[],
+  sharedRole: undefined as { roleName: string; instanceProfileName: string } | undefined,
+};
 vi.mock('./boxProvisioner', () => ({
   getBoxConfig: () => (provisioner.configured
-    ? { region: 'us-east-2', managedTag: 'termag-box', hostSecurityGroupId: 'sg-host', resourcePrefix: 'termag-box' }
+    ? { region: 'us-east-2', managedTag: 'example-termag', hostSecurityGroupId: 'sg-host', resourcePrefix: 'termag-box', sharedRole: provisioner.sharedRole }
     : null),
   awsClientConfig: () => ({ region: 'us-east-2' }),
   findSecurityGroupsReferencing: async () => {
@@ -66,6 +104,9 @@ function fakeAws() {
   let snapshots = 0;
   const state = { ec2: 'running' as string, settleAfter: 0 };
   const existing: Array<{ SnapshotId: string; VolumeId: string; State?: string }> = [];
+  // Inline role policies by `<role>/<policy>`, and the instance profile associations by instance.
+  const policies = new Map<string, string>();
+  const associations = new Map<string, string>([['i-0123456789abcdef0', 'iip-assoc-1']]);
   const send = async (cmd: { constructor: { name: string }; input: any }) => {
     const name = cmd.constructor.name.replace(/Command$/, '');
     sent.push({ name, input: cmd.input });
@@ -85,13 +126,27 @@ function fakeAws() {
           IpPermissionsEgress: [{ IpProtocol: '-1', IpRanges: [{ CidrIp: '0.0.0.0/0' }] }],
         }] };
       case 'StopInstances': state.ec2 = 'stopping'; return {};
+      case 'PutRolePolicy': policies.set(`${cmd.input.RoleName}/${cmd.input.PolicyName}`, cmd.input.PolicyDocument); return {};
+      case 'GetRolePolicy': {
+        const doc = policies.get(`${cmd.input.RoleName}/${cmd.input.PolicyName}`);
+        if (!doc) throw Object.assign(new Error('no such policy (fake)'), { name: 'NoSuchEntityException' });
+        return { PolicyDocument: encodeURIComponent(doc) };
+      }
+      case 'DescribeIamInstanceProfileAssociations': {
+        const id = cmd.input.Filters[0].Values[0];
+        const assoc = associations.get(id);
+        return { IamInstanceProfileAssociations: assoc ? [{ AssociationId: assoc, InstanceId: id, State: 'associated' }] : [] };
+      }
+      case 'DisassociateIamInstanceProfile':
+        for (const [id, assoc] of associations) if (assoc === cmd.input.AssociationId) associations.delete(id);
+        return {};
       case 'DescribeSnapshots': return { Snapshots: existing };
       case 'CreateSnapshot': return { SnapshotId: `snap-${++snapshots}` };
       default: return {};
     }
   };
   const clients = { ec2: { send } as unknown as EC2Client, iam: { send } as unknown as IAMClient };
-  return { sent, refuse, state, existing, clients, names: () => sent.map(c => c.name) };
+  return { sent, refuse, state, existing, policies, associations, clients, names: () => sent.map(c => c.name) };
 }
 
 const admin = { id: 'admin-1', googleEmail: 'admin@example.com' };
@@ -116,7 +171,7 @@ beforeEach(() => {
   db.projects = [{ id: 'p1', instanceId: 'box-1', archived: false }];
   dropped.length = 0;
   notified.length = 0;
-  Object.assign(provisioner, { configured: true, referencing: ['sg-host', 'sg-old-host'], terminated: [] });
+  Object.assign(provisioner, { configured: true, referencing: ['sg-host', 'sg-old-host'], terminated: [], sharedRole: undefined });
   Object.assign(quarantineTiming, { stopWaitMs: 0, pollMs: 0 });
 });
 
@@ -522,5 +577,51 @@ describe('terminateQuarantinedBox', () => {
     expect(row().quarantineSteps).not.toBeNull();
     expect(db.projects[0].archived).toBe(true);
     expect(provisioner.terminated).toEqual(['box-1']);
+  });
+});
+
+describe('quarantineBox on a box with the shared role', () => {
+  const SHARED = { roleName: 'termag-termag-box-instance', instanceProfileName: 'termag-termag-box-instance' };
+  const DENY = `${SHARED.roleName}/termag-quarantine-deny-instances`;
+  const OTHER = 'i-0ccccccccccccccc3';
+  const deniedIds = (aws: ReturnType<typeof fakeAws>) =>
+    JSON.parse(aws.policies.get(DENY)!).Statement[0].Condition.StringLike['aws:userid'];
+  const sharedBox = () => seedBox({ iamRoleShared: true, iamRoleName: SHARED.roleName, iamInstanceProfileName: SHARED.instanceProfileName });
+
+  beforeEach(() => { provisioner.sharedRole = SHARED; denies.table = sharedRoleDenyTable(); });
+
+  it('cuts off only that instance: denies its sessions on the shared role and takes its instance profile off', async () => {
+    sharedBox();
+    const aws = fakeAws();
+    // Another box on the shared role, quarantined earlier, stays held.
+    denies.table!.rows.push({ roleName: SHARED.roleName, ec2InstanceId: OTHER, boxId: 'box-other', releaseAfter: null });
+    aws.associations.set(OTHER, 'iip-assoc-other');
+
+    await quarantineBox('box-1', admin, 'r', aws.clients);
+
+    expect(outcomes().iam).toBe('done');
+    // Never the deny-all, which would cut off every box on the role.
+    expect(aws.policies.has(`${SHARED.roleName}/termag-quarantine-deny-all`)).toBe(false);
+    const doc = JSON.parse(aws.policies.get(DENY)!);
+    expect(doc.Statement).toEqual([{
+      Sid: 'QuarantinedBoxes', Effect: 'Deny', Action: '*', Resource: '*',
+      Condition: { StringLike: { 'aws:userid': ['*:i-0123456789abcdef0', `*:${OTHER}`] } },
+    }]);
+    expect(aws.sent.find(c => c.name === 'DisassociateIamInstanceProfile')!.input).toEqual({ AssociationId: 'iip-assoc-1' });
+    expect(aws.associations.has('i-0123456789abcdef0')).toBe(false);
+    expect(aws.associations.get(OTHER)).toBe('iip-assoc-other');
+    expect(denies.table!.rows).toContainEqual(expect.objectContaining({ ec2InstanceId: 'i-0123456789abcdef0', boxId: 'box-1', releaseAfter: null }));
+    // The role's policy is never read back to be edited: IAM reads can lag a write.
+    expect(aws.names()).not.toContain('GetRolePolicy');
+    expect((row().quarantineSteps as any[]).find(s => s.step === 'iam').detail).toMatch(/denies i-0123456789abcdef0 \(2 held\); instance profile removed/);
+  });
+
+  it('fails the step, for a Retry, when the instance profile cannot be taken off, and still writes the deny', async () => {
+    sharedBox();
+    const aws = fakeAws();
+    aws.refuse.set('DisassociateIamInstanceProfile', 'UnauthorizedOperation');
+    await quarantineBox('box-1', admin, 'r', aws.clients);
+    expect(outcomes().iam).toBe('failed');
+    expect(deniedIds(aws)).toEqual(['*:i-0123456789abcdef0']);
   });
 });

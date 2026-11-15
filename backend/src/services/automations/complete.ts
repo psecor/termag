@@ -26,6 +26,8 @@ import { prisma } from '../../db';
 import { noteAutomationRunActivity } from '../boxActivity';
 import { onChatEvent, type ChatEventSeen } from '../chatRunner';
 import { parseRunReport } from './brief';
+import { noteFailedRun } from './alerts';
+import { finishRunWithEvent } from './notices';
 import { automationLimitsFor } from './limits';
 import { memoryDir } from './runner';
 import { changesLabel, postRunReport, summarizeBranch, type BranchSummary } from './report';
@@ -350,14 +352,12 @@ function findRunById(id: string) {
 
 /** Write the run's final fields and the automation's failure count, if the row is still running; true when this call did. */
 async function finishRow(run: RunRow, p: PendingResult | undefined, fields: ReturnType<typeof finishFields>, finishedAt: Date): Promise<boolean> {
-  const updated = await prisma.automationRun.updateMany({
-    where: { id: run.id, state: 'running' },
-    data: {
-      state: fields.state, reason: fields.reason, summary: fields.summary, prUrl: fields.prUrl, finishedAt,
-      chatSessionId: p?.sessionId ?? run.chatSessionId, costUsd: p?.costUsd ?? null, inputTokens: p?.inputTokens ?? null, outputTokens: p?.outputTokens ?? null,
-    },
+  // The finish and its run.finished event (the alerts' and webhook's, expanded at delivery) in one write.
+  const updated = await finishRunWithEvent(run, { state: 'running' }, {
+    state: fields.state, reason: fields.reason, summary: fields.summary, prUrl: fields.prUrl, finishedAt,
+    chatSessionId: p?.sessionId ?? run.chatSessionId, costUsd: p?.costUsd ?? null, inputTokens: p?.inputTokens ?? null, outputTokens: p?.outputTokens ?? null,
   });
-  if (updated.count === 0) return false;
+  if (updated === 0) return false;
   // The run's end is the box in use, as its start was: the idle window counts from here.
   await noteAutomationRunActivity(run.instanceId, finishedAt);
   const a = run.automation;
@@ -366,13 +366,7 @@ async function finishRow(run: RunRow, p: PendingResult | undefined, fields: Retu
     const user = await prisma.user.findUnique({ where: { id: a.userId }, select: { id: true, unixUsername: true, googleEmail: true, displayName: true, defaultAgentProvider: true } });
     const box = a.project.instanceId ? await prisma.instance.findUnique({ where: { id: a.project.instanceId }, select: { id: true, name: true, kind: true } }) : null;
     const limits = user ? await automationLimitsFor(user, box) : null;
-    const failures = a.consecutiveFailures + 1;
-    const pause = limits ? failures >= limits.pauseAfterFailures : false;
-    await prisma.automation.update({
-      where: { id: a.id },
-      data: { consecutiveFailures: failures, ...(pause ? { pausedReason: 'consecutive_failures' } : {}) },
-    });
-    if (pause) console.warn(`[AUTOMATION] ${a.project.name}: paused after ${failures} failed runs`);
+    await noteFailedRun(a.id, a.consecutiveFailures, limits?.pauseAfterFailures ?? Infinity, { id: run.id, reason: fields.reason });
   } else if (a.consecutiveFailures !== 0) {
     await prisma.automation.update({ where: { id: a.id }, data: { consecutiveFailures: 0 } });
   }

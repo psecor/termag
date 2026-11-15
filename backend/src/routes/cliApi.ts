@@ -53,6 +53,7 @@ import { mountCliWorktimeRoutes, type CliWorktime } from './cliWorktime';
 import { mountCliSessionSearchRoutes, type CliSessionSearch } from './cliSessionSearch';
 import { mountCliAutomationRoutes, type CliAutomations } from './cliAutomations';
 import { mountCliBugReportRoutes, type CliBugReports } from './cliBugReports';
+import { mountCliFeedbackRoutes, type CliFeedback } from './cliFeedback';
 import { mountCliMcpConnectorRoutes, type CliMcpConnectors } from './cliMcpConnectors';
 import { mountCliBriefingRoutes, type CliBriefings } from './cliBriefings';
 import { mountCliEnvironmentRoutes } from './cliEnvironments';
@@ -66,6 +67,7 @@ const NO_FEATURES: CliFeatures = { automations: false, liveChat: false };
 import { mountCliDotfilesRoutes, type CliDotfiles } from './cliDotfiles';
 import { parseCliUsage } from '../services/cliUsage';
 import { recordProductEvent } from '../services/productEvents';
+import { setServerSpanAttributes } from '../services/tracing/requestSpan';
 
 export interface CliApiDeps {
   /** The TUI's routes (routes/cliTui.ts); unset in tests that don't need them. */
@@ -96,6 +98,8 @@ export interface CliApiDeps {
   automations?: CliAutomations;
   /** `termag bug report` (routes/cliBugReports.ts). */
   bugReports?: CliBugReports;
+  /** `termag feedback` (routes/cliFeedback.ts). */
+  feedback?: CliFeedback;
   /** The user's MCP broker connectors, read-only (routes/cliMcpConnectors.ts). */
   mcpConnectors?: CliMcpConnectors;
   /** The desktop app's briefing card (routes/cliBriefings.ts). */
@@ -209,6 +213,9 @@ export function cliBearer(deps: CliBearerDeps): RequestHandler {
     const result = await authenticateCliBearer(deps, raw);
     if ('error' in result) { authRequired(res, result.error); return; }
     res.locals.cliAuth = result.auth satisfies CliAuth;
+    // Who, on the request's server span, as requireAuth and the session's
+    // user put it there for the browser: the CLI, TUI and desktop app alike.
+    setServerSpanAttributes(req, { 'termag.user': result.auth.user.id });
     next();
   });
 }
@@ -378,6 +385,7 @@ export function cliApiRouter(deps: CliApiDeps): Router {
   if (deps.previewLinks) mountCliPreviewLinkRoutes(router, deps.previewLinks, bearer);
   if (deps.automations) mountCliAutomationRoutes(router, deps.automations, bearer);
   if (deps.bugReports) mountCliBugReportRoutes(router, deps.bugReports, bearer, now);
+  if (deps.feedback) mountCliFeedbackRoutes(router, deps.feedback, bearer, now);
   if (deps.mcpConnectors) mountCliMcpConnectorRoutes(router, deps.mcpConnectors, bearer);
   if (deps.sessionSpace) mountCliSessionSpaceRoutes(router, deps.sessionSpace, bearer);
   if (deps.githubRepos) mountCliGithubRepoRoutes(router, deps.githubRepos, bearer);

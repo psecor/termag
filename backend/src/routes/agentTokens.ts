@@ -94,11 +94,7 @@ export async function validateAgentToken(rawToken: string): Promise<ValidatedAge
   if (!token || token.revokedAt) return null;
   if (token.expiresAt && token.expiresAt.getTime() <= Date.now()) return null;
 
-  // Update lastUsedAt (fire and forget)
-  prisma.agentToken.update({
-    where: { id: token.id },
-    data: { lastUsedAt: new Date() },
-  }).catch(() => {});
+  touchLastUsed(token.id, token.lastUsedAt);
 
   return {
     user: token.user,
@@ -106,3 +102,56 @@ export async function validateAgentToken(rawToken: string): Promise<ValidatedAge
     token: { id: token.id, scope: token.scope, name: token.name },
   };
 }
+
+/** How often a token's lastUsedAt is written: the token list shows it to the minute. */
+export const LAST_USED_WRITE_MS = 60_000;
+/**
+ * How soon a failed write is retried. A database refusing writes must not get
+ * one write per request — that is the amplification this throttle exists to
+ * prevent — but the full-minute throttle would hide the token's use long after
+ * a short incident. The list shows last use to the minute, so ten seconds is
+ * invisible there.
+ */
+export const LAST_USED_RETRY_MS = 10_000;
+const lastUsedWritten = new Map<string, number>(); // token id → when this process last wrote it
+const lastUsedRetryAt = new Map<string, number>(); // token id → earliest retry after a failed write
+
+/**
+ * Pure: whether a request at `now` should write lastUsedAt, given the last
+ * write this process made and the value the row holds. The row's value covers
+ * another orchestrator's writes (two during an overlapping deploy); the
+ * process's own covers a burst of requests that all read the row before the
+ * first write landed.
+ */
+export function lastUsedDue(now: number, wroteAt: number | undefined, stored: Date | null): boolean {
+  const prev = Math.max(wroteAt ?? 0, stored?.getTime() ?? 0);
+  return now - prev >= LAST_USED_WRITE_MS;
+}
+
+/**
+ * Records that a token was used, at most once a minute per token (fire and
+ * forget); a failed write backs off LAST_USED_RETRY_MS rather than a minute.
+ * It used to be a write on every CLI and agent request: about 90 a minute
+ * from one busy CLI client on 2026-11-13, each one a pooled connection.
+ */
+function touchLastUsed(tokenId: string, stored: Date | null, now = Date.now()): void {
+  if (now < (lastUsedRetryAt.get(tokenId) ?? 0)) return;
+  if (!lastUsedDue(now, lastUsedWritten.get(tokenId), stored)) return;
+  // live tokens are far fewer; this only bounds a leak
+  if (lastUsedWritten.size > 10_000 || lastUsedRetryAt.size > 10_000) { lastUsedWritten.clear(); lastUsedRetryAt.clear(); }
+  lastUsedWritten.set(tokenId, now);
+  prisma.agentToken.update({ where: { id: tokenId }, data: { lastUsedAt: new Date(now) } })
+    // A failure must neither retry on every request nor wait the full minute:
+    // forget this attempt and back off briefly, unless a newer attempt has
+    // already superseded it.
+    .catch(() => {
+      if (lastUsedWritten.get(tokenId) !== now) return;
+      lastUsedWritten.delete(tokenId);
+      // Back off from the failure, not the request: a write that takes longer
+      // than the backoff to reject would otherwise leave the deadline in the past.
+      lastUsedRetryAt.set(tokenId, Date.now() + LAST_USED_RETRY_MS);
+    });
+}
+
+/** Test-only: forget the writes this process made. */
+export function resetLastUsedForTests(): void { lastUsedWritten.clear(); lastUsedRetryAt.clear(); }

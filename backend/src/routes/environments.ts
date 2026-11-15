@@ -6,10 +6,12 @@
  * environment resolves to now for the caller (its repositories and size, a
  * pointer's file read from GitHub), and `GET /:id/pool` its environment pool. `POST /:id/visibility` makes one personal
  * or shared. A personal environment is its owner's alone: anyone else gets 404
- * for it everywhere, history included. A shared one is everyone's to use and
- * edit, and keeps to the shared rules (services/environments.ts
- * sharedRuleError) on every save; only its owner switches it. The store
- * writes the audit event with every change.
+ * for it everywhere, history included. A shared one is everyone's to use, and
+ * only an admin's to change (services/environments.ts sharedNeedsAdmin):
+ * creating one shared, editing, sharing, unsharing or deleting one answers
+ * anyone else 403 `environment_admin_only`. It keeps to the shared rules
+ * (sharedRuleError) on every save. The store writes the audit event with
+ * every change.
  *
  * An edit or delete may send the `updatedAt` it was made from; when the
  * environment has changed since, it answers 409 `environment_changed` rather
@@ -20,11 +22,13 @@ import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errors';
 import {
-  fieldsOf, legacyVisibility, MAX_EVENTS, parseDefinition, parseEnvironmentInput, prismaEnvironmentStore, resolveStoredEnvironment, sharedRuleError, visibleTo,
+  fieldsOf, legacyVisibility, MAX_EVENTS, parseDefinition, parseEnvironmentInput, prismaEnvironmentStore, resolveStoredEnvironment, SHARED_ADMIN_ONLY,
+  sharedNeedsAdmin, sharedRuleError, visibleTo,
   type DefaultBranchReader, type EnvironmentEventRecord, type EnvironmentRecord, type EnvironmentResolver, type EnvironmentStore,
   type EnvironmentVisibility, type EnvironmentWrite,
 } from '../services/environments';
 import { repoEnvironment } from '../services/repoEnvironment';
+import { isAdminUser } from '../services/admin/adminAccess';
 import type { EnvPoolView } from '../services/envPool';
 import { sendResult, type RouteResult } from './routeResult';
 
@@ -39,8 +43,13 @@ export interface EnvironmentsDeps {
   /** The default branches and files the shared rules read (services/repoEnvironment.ts). */
   github?: DefaultBranchReader;
   /** An environment's pool (services/envPool.ts envPoolView): null when it has none. */
-  pool?: (environmentId: string, name: string) => Promise<EnvPoolView | null>;
+  pool?: (environmentId: string, name: string, updatedAt: Date) => Promise<EnvPoolView | null>;
+  /** Whether a user is an admin (services/admin/adminAccess.ts isAdminUser): only an admin changes a shared environment. */
+  isAdmin?: (userId: string) => Promise<boolean>;
 }
+
+const prismaIsAdmin = async (userId: string): Promise<boolean> =>
+  isAdminUser(await prisma.user.findUnique({ where: { id: userId }, select: { id: true, googleEmail: true, role: true, adminSource: true } }));
 
 const prismaPeople = async (ids: string[]): Promise<EnvironmentPerson[]> => {
   if (!ids.length) return [];
@@ -110,6 +119,7 @@ function visibilityOf(body: unknown): EnvironmentVisibility | undefined | null {
 
 const BAD_VISIBILITY: RouteResult = { status: 400, body: { error: 'visibility is personal or shared', code: 'invalid_request' } };
 const notShareable = (error: string): RouteResult => ({ status: 400, body: { error, code: 'environment_not_shareable' } });
+const ADMIN_ONLY: RouteResult = { status: 403, body: { error: SHARED_ADMIN_ONLY, code: 'environment_admin_only' } };
 
 /**
  * Every environment route as a function of who asks and what they sent,
@@ -121,6 +131,10 @@ export function environmentActions(deps: EnvironmentsDeps = { store: prismaEnvir
   const { store } = deps;
   const resolve = deps.resolve ?? resolveStoredEnvironment;
   const github = deps.github ?? repoEnvironment;
+  const isAdmin = deps.isAdmin ?? prismaIsAdmin;
+  /** 403 when a change from `before` to `after` touches a shared environment and `userId` isn't an admin; else null. */
+  const adminRefusal = async (userId: string, before: EnvironmentVisibility | null, after: EnvironmentVisibility | null): Promise<RouteResult | null> =>
+    (sharedNeedsAdmin(before, after) && !(await isAdmin(userId)) ? ADMIN_ONLY : null);
   return {
     /** The caller's personal environments, then the shared ones, each by name; nobody else's personal ones. */
     async list(userId: string): Promise<RouteResult> {
@@ -180,7 +194,7 @@ export function environmentActions(deps: EnvironmentsDeps = { store: prismaEnvir
       if (env.visibility !== 'shared') return { status: 200, body: { pool: null } };
       // Loaded on use: the pool's module reaches the warm pool, AWS and the agent registry.
       const view = deps.pool ?? (await import('../services/envPool')).envPoolView;
-      return { status: 200, body: { pool: await view(env.id, env.name) } };
+      return { status: 200, body: { pool: await view(env.id, env.name, env.updatedAt) } };
     },
     async resolved(userId: string, ref: string): Promise<RouteResult> {
       const env = await findVisible(store, ref, userId);
@@ -192,41 +206,51 @@ export function environmentActions(deps: EnvironmentsDeps = { store: prismaEnvir
       const r = await resolve(userId, env);
       return { status: 200, body: { repos: r.repos, size: r.sizes?.size ?? null, warnings: r.warnings } };
     },
-    /** Personal unless the body says `visibility: 'shared'`, which the shared rules must allow. */
+    /** Personal unless the body says `visibility: 'shared'`: an admin's, which the shared rules must allow. */
     async create(userId: string, body: unknown): Promise<RouteResult> {
-      const parsed = parseEnvironmentInput(body);
-      if (!parsed.ok) return { status: 400, body: { error: parsed.error, code: 'invalid_environment' } };
       const visibility = visibilityOf(body);
       if (visibility === null) return BAD_VISIBILITY;
+      const refused = await adminRefusal(userId, null, visibility ?? 'personal');
+      if (refused) return refused;
+      const parsed = parseEnvironmentInput(body);
+      if (!parsed.ok) return { status: 400, body: { error: parsed.error, code: 'invalid_environment' } };
       if (visibility === 'shared') {
         const broken = await sharedRuleError(userId, parsed.fields, github);
         if (broken) return notShareable(broken);
       }
       return written(deps, await store.create(userId, parsed.fields, visibility ?? 'personal'), 201, parsed.fields.name);
     },
+    /** Who may edit comes first (404, then 403), so a non-admin's edit of a shared one is refused whatever it says. */
     async update(userId: string, ref: string, body: unknown): Promise<RouteResult> {
+      const env = await findVisible(store, ref, userId);
+      if (!env) return NOT_FOUND;
+      // Only an admin edits a shared one, and its file pointer keeps to the shared rules.
+      const refused = await adminRefusal(userId, env.visibility, env.visibility);
+      if (refused) return refused;
       const parsed = parseEnvironmentInput(body);
       if (!parsed.ok) return { status: 400, body: { error: parsed.error, code: 'invalid_environment' } };
       const since = expected(body);
       if (since === null) return { status: 400, body: { error: 'updatedAt must be a time', code: 'invalid_request' } };
-      const env = await findVisible(store, ref, userId);
-      if (!env) return NOT_FOUND;
-      // Anyone may edit a shared one, but its file pointer keeps to the shared rules.
       if (env.visibility === 'shared') {
         const broken = await sharedRuleError(userId, parsed.fields, github);
         if (broken) return notShareable(broken);
       }
       return written(deps, await store.update(userId, env.id, parsed.fields, since), 200, parsed.fields.name);
     },
-    /** Personal or shared: the owner's switch, checked against the shared rules to share. */
+    /**
+     * Personal or shared: an admin's switch, either way. Sharing is of their own personal one (nobody else's is
+     * visible), checked against the shared rules; making a shared one personal leaves it its owner's.
+     */
     async setVisibility(userId: string, ref: string, visibility: unknown, updatedAt?: unknown): Promise<RouteResult> {
+      const env = await findVisible(store, ref, userId);
+      if (!env) return NOT_FOUND;
       const v = visibilityOf({ visibility });
+      // Refused before the body is checked: a switch of a shared one, or to shared, is an admin's whatever it says.
+      const refused = await adminRefusal(userId, env.visibility, v || null);
+      if (refused) return refused;
       if (!v) return BAD_VISIBILITY;
       const since = expected({ updatedAt });
       if (since === null) return { status: 400, body: { error: 'updatedAt must be a time', code: 'invalid_request' } };
-      const env = await findVisible(store, ref, userId);
-      if (!env) return NOT_FOUND;
-      if (env.ownerUserId !== userId) return { status: 403, body: { error: `Only ${env.name}'s owner makes it personal or shared`, code: 'environment_not_owner' } };
       if (v === 'shared') {
         const broken = await sharedRuleError(userId, env, github);
         if (broken) return notShareable(broken);
@@ -234,10 +258,12 @@ export function environmentActions(deps: EnvironmentsDeps = { store: prismaEnvir
       return written(deps, await store.setVisibility(userId, env.id, v, since), 200);
     },
     async remove(userId: string, ref: string, updatedAt: unknown): Promise<RouteResult> {
-      const since = expected({ updatedAt });
-      if (since === null) return { status: 400, body: { error: 'updatedAt must be a time', code: 'invalid_request' } };
       const env = await findVisible(store, ref, userId);
       if (!env) return NOT_FOUND;
+      const refused = await adminRefusal(userId, env.visibility, null);
+      if (refused) return refused;
+      const since = expected({ updatedAt });
+      if (since === null) return { status: 400, body: { error: 'updatedAt must be a time', code: 'invalid_request' } };
       return written(deps, await store.remove(userId, env.id, since), 200);
     },
   };

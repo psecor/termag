@@ -202,10 +202,11 @@ describe('review routes: several panes (docs/parallel-reviews.md)', () => {
   let server: Server;
   let base: string;
   let parallel = true;
+  let confined = false;
   beforeAll(async () => {
     const app = express();
     app.use(express.json());
-    app.use('/api', reviewRouter({ parallelOn: async () => parallel }));
+    app.use('/api', reviewRouter({ parallelOn: async () => parallel, confinedOn: async () => confined }));
     server = app.listen(0);
     await new Promise(r => server.once('listening', r));
     base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/projects/p1/review`;
@@ -216,6 +217,7 @@ describe('review routes: several panes (docs/parallel-reviews.md)', () => {
   /** Live review panes, by session, each with the PR its record names. */
   function panes(live: Record<string, number>) {
     parallel = true;
+    confined = false;
     agent.calls = [];
     agent.log = [];
     sweep.records = new Map(Object.entries(live).map(([name, pr]) => [name, { pr, url: `${T}${pr}` }]));
@@ -254,6 +256,33 @@ describe('review routes: several panes (docs/parallel-reviews.md)', () => {
     expect(String(sent('tmux-send-keys')[0].keys)).toContain('review-prompts/u-sample-review-2.md');
     expect(sent('write-file')[0].path).toBe('/home/u/.termag/review-prompts/u-sample-review-2.md');
     expect(sweep.registered.map(r => r.slot)).toEqual([2]);
+  });
+  it('with review-pane-confined-enabled, starts Claude on the box user\'s settings only', async () => {
+    panes({});
+    confined = true;
+    expect((await post({ workstream: 'main', pr: 647, url: `${T}647`, reviewer: 'claude' })).status).toBe(201);
+    expect(String(sent('tmux-send-keys')[0].keys)).toContain('claude --setting-sources user --permission-mode plan');
+    agent.log = [];
+    confined = false;
+    expect((await post({ workstream: 'main', pr: 648, url: `${T}648`, reviewer: 'claude' })).status).toBe(201);
+    expect(String(sent('tmux-send-keys')[0].keys)).not.toContain('--setting-sources');
+  });
+  it('with review-pane-confined-enabled, starts Devin and Cursor in the pane\'s own folder, told where the checkout is', async () => {
+    panes({});
+    confined = true;
+    expect((await post({ workstream: 'main', pr: 647, url: `${T}647` })).status).toBe(201);
+    const keys = String(sent('tmux-send-keys')[0].keys);
+    expect(keys).toMatch(/^\(command rm -rf -- "\$HOME\/\.termag\/review-panes\/u-sample-review" && mkdir -p -- .* && cd -- "\$HOME\/\.termag\/review-panes\/u-sample-review" && git init -q && TERMAG_SESSION_KIND=interactive exec devin .*\)$/);
+    expect(keys).not.toContain('termag/projects/sample');
+    expect(String(sent('write-file')[0].content)).toContain('the repository is checked out at ~/termag/projects/sample. Read its files there by path, and run git and gh from there (cd ~/termag/projects/sample first)');
+    agent.log = [];
+    expect((await post({ workstream: 'main', pr: 648, url: `${T}648`, reviewer: 'cursor' })).status).toBe(201);
+    expect(String(sent('tmux-send-keys')[0].keys)).toContain('cursor-agent --add-dir "$HOME/termag/projects/sample" --mode plan');
+    // Claude keeps the checkout as its cwd: no checkout line, no folder.
+    agent.log = [];
+    expect((await post({ workstream: 'main', pr: 649, url: `${T}649`, reviewer: 'claude' })).status).toBe(201);
+    expect(String(sent('write-file')[0].content)).not.toContain('checked out at');
+    expect(String(sent('tmux-send-keys')[0].keys)).not.toContain('review-panes');
   });
   it('restarts only the pane already on that PR', async () => {
     panes({ 'u-sample-review': 646, 'u-sample-review-2': 647 });

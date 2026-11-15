@@ -80,24 +80,43 @@ export function confirmPageBody(v: ConfirmPageView, action: string): string {
     ...(v.name ? [['Name', `<code>${esc(v.name)}</code>`]] : []),
     ['Who can open it', who],
     ['Lifetime', v.ttlHours ? `${esc(v.ttlHours)} hours` : 'the default'],
-    ['Asked from', `a sign-in made on the box <code>${esc(v.fromBoxName ?? 'unknown')}</code>`],
+    ['Asked from', v.agentAsk
+      ? `an agent on the box <code>${esc(v.fromBoxName ?? 'unknown')}</code> (<code>termag preview request</code>)`
+      : `a sign-in made on the box <code>${esc(v.fromBoxName ?? 'unknown')}</code>`],
   ].map(([k, d]) => `<dt>${k}</dt><dd>${d}</dd>`).join('');
   if (v.state === 'pending') {
+    // An agent's note is its own words: quoted, escaped, and never taken as termag's (SR5).
+    const ask = v.agentAsk
+      ? '<p class="warn">An agent on the box asked to share this port. Publish only if you know what listens there.</p>'
+        + (v.agentAsk.note ? `<p>What it says the port is, in its own words (termag hasn't checked it):</p><blockquote>${esc(v.agentAsk.note)}</blockquote>` : '')
+      : '<p class="warn">This was asked from a box. Anything running there, an agent included, can ask in your name, so it waits for you. Publish only if you asked for it.</p>';
     return `<h1>${what}?</h1>`
-      + '<p class="warn">This was asked from a box. Anything running there, an agent included, can ask in your name, so it waits for you. Publish only if you asked for it.</p>'
+      + ask
       + `<dl>${facts}</dl>`
       + (v.audience !== 'owner' ? `<p class="warn">${esc(WIDER_WARNING)}</p>` : '')
       + '<div class="actions">'
       + `<form method="post" action="${esc(action)}"><input type="hidden" name="csrf" value="${esc(v.csrf)}"><input type="hidden" name="decision" value="publish"><button type="submit" class="primary">Publish</button></form>`
       + `<form method="post" action="${esc(action)}"><input type="hidden" name="csrf" value="${esc(v.csrf)}"><input type="hidden" name="decision" value="decline"><button type="submit">Decline</button></form>`
       + '</div>'
-      + `<p class="fine">This request expires at ${esc(v.expiresAt.toISOString().slice(0, 16).replace('T', ' '))} UTC.</p>`;
+      // An agent's ask: this page's link lasts 10 minutes, the request itself 24 hours in Share (Bugbot, #1568).
+      + (v.agentAsk
+        ? `<p class="fine">This link works until ${esc(v.expiresAt.toISOString().slice(0, 16).replace('T', ' '))} UTC. The agent's request waits in the project's Share dialog until ${esc(v.agentAsk.expiresAt.toISOString().slice(0, 16).replace('T', ' '))} UTC.</p>`
+        : `<p class="fine">This request expires at ${esc(v.expiresAt.toISOString().slice(0, 16).replace('T', ' '))} UTC.</p>`);
   }
   const outcome: Record<string, string> = {
-    confirmed: `<h1>Published</h1><p>Done. The terminal that asked shows the link.${v.shareUrl ? ` Share this link (shown once): <code>${esc(v.shareUrl)}</code>` : ''}</p>`,
+    // An agent's request: the agent never sees the link, so the owner gets it here (Bugbot, #1568).
+    // Who can open it, from the audience published, never from the framing (#1568).
+    confirmed: v.agentAsk && v.audience === 'owner'
+      ? `<h1>Published</h1><p>Done: only you and the project's collaborators can open it${v.linkUrl ? `, at <a href="${esc(v.linkUrl)}">${esc(v.linkUrl)}</a>` : ''}. It's in the project's links list too, where you can share it more widely.</p>`
+      : `<h1>Published</h1><p>Done. The terminal that asked shows the link.${v.shareUrl ? ` Share this link (shown once): <code>${esc(v.shareUrl)}</code>` : ''}</p>`,
     applying: '<h1>Publishing…</h1><p>Reload in a moment.</p>',
     declined: '<h1>Declined</h1><p>Nothing was published.</p>',
-    expired: '<h1>Expired</h1><p>This request is more than 10 minutes old, so nothing was published. Ask again from the terminal.</p>',
+    expired: v.agentAsk
+      // Only while the request itself still waits; past its 24 hours it's gone from Share too (Bugbot, #1568).
+      ? (v.agentAsk.waiting
+        ? `<h1>Expired</h1><p>This link is more than 10 minutes old, so nothing was published. The agent's request waits in the project's Share dialog until ${esc(v.agentAsk.expiresAt.toISOString().slice(0, 16).replace('T', ' '))} UTC.</p>`
+        : '<h1>Expired</h1><p>This link is more than 10 minutes old, so nothing was published, and the agent\'s request has expired too (it waits 24 hours), so it isn\'t in the Share dialog either. The agent can ask again.</p>')
+      : '<h1>Expired</h1><p>This request is more than 10 minutes old, so nothing was published. Ask again from the terminal.</p>',
     failed: `<h1>Not published</h1><p>${esc(v.failure ?? 'The publish was refused.')}</p>`,
     interrupted: `<h1>Not published</h1><p>${esc(v.failure ?? 'The publish was interrupted.')}</p>`,
   };

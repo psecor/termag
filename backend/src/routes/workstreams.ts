@@ -1,6 +1,9 @@
+import { CHAT_PROVIDER_ID } from '../providers/registry';
+import { noteSessionCreated } from '../services/sessionStartTiming';
 import { Router, RequestHandler } from 'express';
 import { prisma } from '../db';
 import { fixedOnCreate, resolveChatSpaceChoice } from '../services/chatSpace';
+import { grantSessionFiles, sessionSpaceChoice } from '../services/projectFiles';
 import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { createRequire } from 'module';
@@ -8,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import { requireAuth } from '../middleware/auth';
 import { isProjectAgentConnected, projectAgentCapabilities, sendForProject } from '../services/agentRegistry';
+import { afterConversationsMoved, carriesConversations } from '../services/renameConversations';
 import { projectDirFor } from '../services/tmux';
 import { gitWorktreeRemoveLocal } from '../services/worktreeRemove';
 import { ensureAgentSessionsAndLaunch, stopAgentSessions, stopTerminalSlots, stopAgentPane, resolveAgentProvider } from '../services/agentRuntime';
@@ -115,6 +119,12 @@ export function startWarning(launch: LaunchOutcome, provider: string): string | 
 }
 
 export interface CreateWorkstreamInput {
+  /**
+   * The browser's New session made it (pages/chat/NewChat.tsx): its start is
+   * timed as session.start.timed (services/sessionStartTiming.ts). Telemetry
+   * only; nothing else reads it.
+   */
+  newSession?: boolean;
   /** Workstream name (also the default for branch + worktree dir). */
   name?: string;
   /** Git branch to create; defaults to name. */
@@ -293,6 +303,8 @@ export async function browserFetchAllowed(user: Express.User, body: unknown): Pr
  * in it. Shared by the cookie route and agent spawns (routes/spawns.ts).
  */
 export async function createWorkstreamFor(user: Express.User, projectId: string, input: CreateWorkstreamInput): Promise<RouteResult> {
+  // When the create was asked for: a New session's start timing begins here, its worktree setup inside it.
+  const createStartedAt = Date.now();
   const { name, branch, baseRef, provider, spawnId, pr, system, fetch, attended, readOnly, firstPrompt } = input;
   if (!name) return { status: 400, body: { error: 'name required' } };
   if (!NAME_REGEX.test(name)) {
@@ -470,10 +482,13 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
     }
   }
 
+  // Under project-files-enabled a session of a project belongs to its Project files (services/projectFiles.ts),
+  // in place of New session's space pill.
+  const filesSpace = await sessionSpaceChoice(user, project.userProjectId);
   let workstream;
   try {
     workstream = await prisma.workstream.create({
-      data: { projectId: project.id, name: wsName, branch: branchName, ...fixedOnCreate(input.chatSpace) },
+      data: { projectId: project.id, name: wsName, branch: branchName, ...fixedOnCreate(filesSpace ? { spaceId: filesSpace.id } : input.chatSpace) },
     });
   } catch (err) {
     if (workspaceMade) {
@@ -497,6 +512,22 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
   recordProductEvent('workstream.created', { user: user.id, box: project.instanceId }, {
     provider: provider ?? null, fromPr: !!pr, spawned: !!spawnId,
   });
+  // A New session as a worktree of a checkout on the box: timed from now to its first words (services/sessionStartTiming.ts).
+  // Only a New session's (it says so), from a fresh fetch or off the checkout, of a chat project; a Lab branch-off isn't timed.
+  if (project.instanceId && !system && !spawnId && input.newSession === true) {
+    // A New session's worktree doesn't name its provider: it mirrors the project's main agent (the chat runner).
+    // Telemetry only: a failed lookup never fails the create.
+    let mainProvider: string | null = null;
+    if (!provider) {
+      try {
+        mainProvider = (await prisma.workflow.findFirst({ where: { projectId: project.id, type: 'agent', workstream: { name: 'main' } }, select: { provider: true } }))?.provider ?? null;
+      } catch { /* no provider, then */ }
+    }
+    if ((provider ?? mainProvider) === CHAT_PROVIDER_ID) {
+      // The worktree (and any fetch) is made by now: that's its cloneMs, from when the create was asked for.
+      noteSessionCreated(project.id, wsName, { userId: user.id, boxId: project.instanceId, placement: 'worktree', provider: CHAT_PROVIDER_ID, boxUp: true, setupDone: true }, createStartedAt);
+    }
+  }
 
   // Slack channel for this workstream (#proj-<user>-<project>-<ws>), so /t
   // in that channel routes to this worktree's tmux pair. Fire-and-forget,
@@ -601,6 +632,8 @@ export async function createWorkstreamFor(user: Express.User, projectId: string,
     ...(sessionLaunchWarnings.length > 0 ? { sessionLaunchWarnings } : {}),
     ...(fetch ? { fetched, baseSha } : {}),
   };
+  // Its box gets the project's files (and My files) now if its agent can address them; else on its hello.
+  if (filesSpace) void grantSessionFiles(user, project.id);
   return {
     status: 201,
     body: { ...workstream, ...extras },
@@ -787,6 +820,7 @@ export function workstreamsRouter(): Router {
     const chatSpace = await browserChatSpace(req.user!, req.body);
     sendResult(res, await createWorkstreamFor(req.user!, req.params.projectId, {
       ...createWorkstreamBody(req.body, { allowFetch }), ...(chatSpace ? { chatSpace } : {}),
+      ...((req.body as { newSession?: unknown } | undefined)?.newSession === true ? { newSession: true } : {}),
     }));
   };
 
@@ -897,10 +931,13 @@ export function workstreamsRouter(): Router {
     // 2. The worktree directory. A multi-repo workstream's root holds a
     // worktree of each repository: the box moves the root and repairs each
     // one, or moves nothing (agent/workspace.js moveWorkstreamRoot).
+    // The box carries the worktree's Claude and pi conversations to its new folder (services/renameConversations.ts).
+    const conversations = await carriesConversations(req.user!, projectHost);
+    const carry = conversations ? { conversations: true } : {};
     try {
       if (workspace) {
         const listed = await workstreamGuideRepos(projectHost, projectDirFor(project, from), repos);
-        await sendForProject(projectHost, 'workspace-move', {
+        const answer = await sendForProject(projectHost, 'workspace-move', {
           root: projDir,
           fromDir: projectDirFor(project, from),
           toDir: projectDirFor(project, to),
@@ -908,9 +945,12 @@ export function workstreamsRouter(): Router {
           guides: workspaceGuideWrites({
             project: project.name, repos: listed, workstreams: [{ name: to, branch: workstream.branch }], dirFor: ws => projectDirFor(project, ws),
           }),
+          ...carry,
         }, 60_000);
+        if (conversations) afterConversationsMoved(project.userId, projectHost, answer);
       } else if (connected) {
-        await sendForProject(projectHost, 'git-worktree-move', { projectDir: projDir, from, to });
+        const answer = await sendForProject(projectHost, 'git-worktree-move', { projectDir: projDir, from, to, ...carry });
+        if (conversations) afterConversationsMoved(project.userId, projectHost, answer);
       } else {
         await execAsync(
           `git -C ${shellEscape(projDir)} worktree move ${shellEscape(`${projDir}/.worktrees/${from}`)} ${shellEscape(`${projDir}/.worktrees/${to}`)}`,

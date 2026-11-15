@@ -20,3 +20,21 @@ export function askModelChoiceOn(
 ): Promise<boolean> {
   return boolVariation(ASK_MODEL_FLAG, { ...user, displayName: user.displayName ?? '', defaultAgentProvider: '' }, false, box);
 }
+
+export const ASK_FIREWORKS_FLAG = 'ask-fireworks-enabled' as const;
+
+/**
+ * `termag ask --model fireworks:<id>`, read
+ * for the asker and the target box, on top of ask-model-choice-enabled and the
+ * `fireworks-models` list. Its own off switch: an ask runs unattended, often
+ * on code and PRs, so sending one to another inference provider is released
+ * apart from a person's own Fireworks chat. Off, a Fireworks ask is refused
+ * (fireworks_unavailable), and so is a follow-up on a thread whose chat keeps
+ * a Fireworks model, until one switches it back with a Claude --model.
+ */
+export function askFireworksOn(
+  user: { id: string; googleEmail: string; displayName: string | null; unixUsername: string },
+  box: FlagBox | null,
+): Promise<boolean> {
+  return boolVariation(ASK_FIREWORKS_FLAG, { ...user, displayName: user.displayName ?? '', defaultAgentProvider: '' }, false, box);
+}

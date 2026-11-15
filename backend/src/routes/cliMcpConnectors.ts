@@ -13,7 +13,8 @@ import { getMcpBrokerUrl } from '../services/mcpConnectors';
 import type { CliAuth } from './cliApi';
 import { view } from './mcpConnectors';
 
-export type CliMcpConnectorStatus = 'ready' | 'needs_secrets' | 'secrets_unreadable' | 'needs_link' | 'link_failed';
+// blocked: the owner's mcp-upstream-allowlist refuses it, so the broker refuses every call, whatever its link or secrets.
+export type CliMcpConnectorStatus = 'ready' | 'needs_secrets' | 'secrets_unreadable' | 'needs_link' | 'link_failed' | 'blocked';
 
 export interface CliMcpConnector {
   id: string;
@@ -21,6 +22,8 @@ export interface CliMcpConnector {
   upstream: string;
   authType: 'static' | 'oauth';
   status: CliMcpConnectorStatus;
+  // Why it is blocked, as Settings → MCP servers shows it; null when it isn't.
+  blocked: string | null;
 }
 
 export interface CliMcpConnectors {
@@ -31,6 +34,7 @@ type View = Awaited<ReturnType<typeof view>>;
 
 /** One word for whether a connector works on the user's boxes, as Settings → MCP servers reads its row. */
 export function connectorStatus(v: View): CliMcpConnectorStatus {
+  if (v.blocked) return 'blocked';
   if ('linkStatus' in v) return v.linkStatus === 'linked' ? 'ready' : v.linkError ? 'link_failed' : 'needs_link';
   // null: the credential store couldn't be read, so whether it works is unknown.
   if (v.secretNames === null) return 'secrets_unreadable';
@@ -46,6 +50,7 @@ export const prismaCliMcpConnectors: CliMcpConnectors = {
       available: broker !== null,
       connectors: views.map(v => ({
         id: v.id, name: v.name, upstream: v.upstream, authType: v.authType === 'oauth' ? 'oauth' : 'static', status: connectorStatus(v),
+        blocked: v.blocked,
       })),
     };
   },

@@ -29,6 +29,7 @@ import {
   CompleteMultipartUploadCommand,
   CopyObjectCommand,
   CreateMultipartUploadCommand,
+  DeleteObjectCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -96,8 +97,11 @@ export interface SpaceObjects {
   /** `condition` as presignPut's, which S3 checks when it assembles the object; returns the new version's ETag. */
   completeMultipart(key: string, uploadId: string, parts: Array<{ partNumber: number; etag: string }>, condition?: PutCondition | null): Promise<{ etag: string | null }>;
   abortMultipart(key: string, uploadId: string): Promise<void>;
-  /** `sourceIfMatch`: S3 refuses (412) when the source is no longer that version (CopySourceIfMatch). */
-  copy(fromKey: string, toKey: string, opts?: { sourceIfMatch?: string | null }): Promise<void>;
+  /**
+   * `sourceIfMatch`: S3 refuses (412) when the source is no longer that version (CopySourceIfMatch).
+   * `destNew`: it refuses (412) when the destination exists (If-None-Match: *), checked as it writes.
+   */
+  copy(fromKey: string, toKey: string, opts?: { sourceIfMatch?: string | null; destNew?: boolean }): Promise<void>;
   /** The key's versions, newest first, delete markers included (spaceVersions.ts landedCheck). */
   versionsOf(key: string, max?: number): Promise<ObjectVersionInfo[]>;
   /**
@@ -109,6 +113,11 @@ export interface SpaceObjects {
   restoreVersion(key: string, versionId: string, ifMatch?: string | null): Promise<{ etag: string | null }>;
   /** Deletes current versions (a delete marker each); returns the keys S3 refused. */
   deleteKeys(keys: string[]): Promise<string[]>;
+  /**
+   * Deletes the key (a delete marker) only while its current version is `etag` (If-Match, checked by S3 as it
+   * deletes): `changed` when someone wrote it since, `failed` when S3 refused for another reason.
+   */
+  deleteIfMatch(key: string, etag: string): Promise<'deleted' | 'changed' | 'failed'>;
   /** Bytes in every version under the prefix, current and noncurrent. */
   sumVersions(prefix: string, watch: Set<string>): Promise<{ total: bigint; watched: ObjectVersion[] }>;
   /** Permanently deletes every version and delete marker under the prefix. */
@@ -462,8 +471,29 @@ export function s3SpaceObjects(resources: SpaceResources, opts: { s3?: S3Client 
         Bucket, Key: toKey,
         CopySource: copySource(Bucket, fromKey),
         ...(opts.sourceIfMatch ? { CopySourceIfMatch: opts.sourceIfMatch } : {}),
+        ...(opts.destNew ? { IfNoneMatch: '*' } : {}),
         ...sse,
       }));
+    },
+
+    async deleteIfMatch(key, etag) {
+      try {
+        await s3.send(new DeleteObjectCommand({ Bucket, Key: key, IfMatch: etag }));
+        return 'deleted';
+      } catch (err) {
+        const status = (err as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+        if (status === 412) return 'changed';
+        if (status === 501) {
+          // A store without conditional deletes: compare, then delete, which leaves only the moment between them.
+          const now = await s3.send(new HeadObjectCommand({ Bucket, Key: key })).catch(() => null);
+          if (!now) return 'failed';
+          if (now.ETag !== etag) return 'changed';
+          const out = await s3.send(new DeleteObjectsCommand({ Bucket, Delete: { Objects: [{ Key: key }], Quiet: true } }));
+          return (out.Errors ?? []).length ? 'failed' : 'deleted';
+        }
+        console.warn(`[SPACES] conditional delete of ${key} refused: ${(err as Error).message}`);
+        return 'failed';
+      }
     },
     async versionsOf(key, max = 10) {
       const out = await s3.send(new ListObjectVersionsCommand({ Bucket, Prefix: key, MaxKeys: Math.max(max * 2, 10) }));

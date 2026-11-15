@@ -9,6 +9,17 @@ const P = [
 ];
 const base = (n: string) => `/home/${U}/termag/projects/${n}`;
 
+describe('resolveUsageSource — a renamed workstream', () => {
+  it('goes by its moved log folder when the cwd inside its logs names a worktree the project no longer has', () => {
+    const renamed = [{ id: 't', name: 'termag', workstreams: ['main', 'feature-2'] }];
+    expect(resolveUsageSource({ cwdHint: `${base('termag')}/.worktrees/feature`, dir: encodeClaudeDir(`${base('termag')}/.worktrees/feature-2`) }, U, renamed))
+      .toEqual({ projectId: 't', workstream: 'feature-2' });
+    // A folder naming no current workstream keeps the cwd's worktree name, as before.
+    expect(resolveUsageSource({ cwdHint: `${base('termag')}/.worktrees/hotfix`, dir: encodeClaudeDir(`${base('termag')}/.worktrees/gone`) }, U, renamed))
+      .toEqual({ projectId: 't', workstream: 'hotfix' });
+  });
+});
+
 describe('resolveUsageSource — cwd hints', () => {
   it('main dir and nested drift resolve to main', () => {
     expect(resolveUsageSource({ cwdHint: base('termag') }, U, P)).toEqual({ projectId: 't', workstream: 'main' });

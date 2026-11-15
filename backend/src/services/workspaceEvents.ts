@@ -2,12 +2,14 @@
  * Tells a user's browsers that their project or box list changed, so a project
  * or box made, renamed, archived, powered or terminated outside that tab (the
  * CLI, an agent spawn, a sweep, another tab) shows up without a reload; or that
- * one of their sessions opened or changed a PR (`prs`, services/prLiveUpdates.ts).
+ * one of their sessions opened or changed a PR (`prs`, services/prLiveUpdates.ts),
+ * or an agent asked for a preview link (`preview-links`, services/previewLinkRequests.ts),
+ * or they pinned or unpinned a session in another tab (`pins`, routes/sessionPins.ts).
  * index.ts wires the callback to push `{type: 'workspace', what}` to the
  * owner's status WebSocket clients; the browser refetches the list it names.
  * Only the fact of a change is pushed, never the row.
  */
-export type WorkspaceChange = 'projects' | 'boxes' | 'prs';
+export type WorkspaceChange = 'projects' | 'boxes' | 'prs' | 'preview-links' | 'pins';
 
 type ChangeCallback = (ownerId: string, what: WorkspaceChange) => void;
 let onChange: ChangeCallback | null = null;

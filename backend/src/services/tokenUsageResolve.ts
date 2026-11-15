@@ -100,24 +100,39 @@ function resolveAmong(
       if (best.workstream === 'main') {
         const rest = hint.cwdHint.slice(best.path.length);
         const m = rest.match(/^\/\.worktrees\/([^/]+)/);
-        if (m) return { projectId: best.projectId, workstream: m[1] };
+        if (m) {
+          // A renamed workstream's logs keep the old cwd inside them, but their folder moved with the
+          // rename (agent/conversation-move.js): a folder naming one of the project's workstreams wins.
+          const project = projects.find(p => p.id === best!.projectId);
+          const byDir = project ? resolveDir(hint.dir, username, [project]) : null;
+          if (byDir && project!.workstreams.includes(byDir.workstream)) return byDir;
+          return { projectId: best.projectId, workstream: m[1] };
+        }
       }
       return { projectId: best.projectId, workstream: best.workstream };
     }
   }
-  if (hint.dir) {
-    for (const p of projects) {
-      for (const dir of mainDirs(username, p)) {
-        const main = encodeClaudeDir(dir);
-        if (hint.dir === main) return { projectId: p.id, workstream: 'main' };
-        const prefix = main + '--worktrees-';
-        if (hint.dir.startsWith(prefix)) {
-          const tail = hint.dir.slice(prefix.length);
-          // Encoded names lose '/' vs '.', so prefer a known workstream whose
-          // encoding matches; otherwise keep the raw tail.
-          const ws = p.workstreams.find(w => encodeClaudeDir(w) === tail) ?? tail;
-          return { projectId: p.id, workstream: ws };
-        }
+  return resolveDir(hint.dir, username, projects);
+}
+
+/** A source by its encoded log dir alone: a project's main dir exactly, or one of its worktrees. */
+function resolveDir(
+  dir: string | null | undefined,
+  username: string,
+  projects: readonly ProjectCandidate[],
+): { projectId: string; workstream: string } | null {
+  if (!dir) return null;
+  for (const p of projects) {
+    for (const d of mainDirs(username, p)) {
+      const main = encodeClaudeDir(d);
+      if (dir === main) return { projectId: p.id, workstream: 'main' };
+      const prefix = main + '--worktrees-';
+      if (dir.startsWith(prefix)) {
+        const tail = dir.slice(prefix.length);
+        // Encoded names lose '/' vs '.', so prefer a known workstream whose
+        // encoding matches; otherwise keep the raw tail.
+        const ws = p.workstreams.find(w => encodeClaudeDir(w) === tail) ?? tail;
+        return { projectId: p.id, workstream: ws };
       }
     }
   }

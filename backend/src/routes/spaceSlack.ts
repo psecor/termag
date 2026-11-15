@@ -35,7 +35,7 @@ import type { SpaceChannelRow } from '../services/spaceSlack/linkStore';
 import {
   disable, handOverRunner, pendingRunnerOf, setPaused, type ManageDeps, type ManageRefusal, type RunnerRequest,
 } from '../services/spaceSlack/manage';
-import { newPickerCache, pickChannels, type PickerSlackClient } from '../services/spaceSlack/picker';
+import { newPickerCache, pickChannels, type PickerCache, type PickerSlackClient } from '../services/spaceSlack/picker';
 
 export interface SpaceSlackRouterDeps {
   /** The link and manage services' wiring, read per request (the Slack app may start after the router). */
@@ -44,6 +44,8 @@ export interface SpaceSlackRouterDeps {
   caller: (req: Request, res: Response) => SpaceCaller | null;
   /** The entry point links are recorded with. */
   via: Extract<LinkVia, 'web' | 'cli'>;
+  /** The picker's member cache; one per router by default (tests give each test its own). */
+  pickerCache?: PickerCache;
   /** 'fake' when the staging fake workspace answers (fakeWorkspace.ts), for the status view. */
   slackMode?: () => 'slack' | 'fake' | 'none';
 }
@@ -128,7 +130,7 @@ function channelView(c: SpaceChannelRow, emails: Map<string, string>) {
 
 export function spaceSlackRouter(deps: SpaceSlackRouterDeps): Router {
   const router = Router();
-  const pickerCache = newPickerCache();
+  const pickerCache = deps.pickerCache ?? newPickerCache();
 
   function callerOf(req: Request, res: Response): SpaceCaller {
     const caller = deps.caller(req, res);
@@ -242,7 +244,7 @@ export function spaceSlackRouter(deps: SpaceSlackRouterDeps): Router {
     if (!owned.length) fail(403, 'Only an owner of a space can link Slack channels', 'not_owner');
     if (!d.slack) fail(503, 'Slack isn\'t configured on this termag', 'slack_not_configured');
     const page = await pickChannels({
-      slack: d.slack, store: d.store, admin: d.admin,
+      slack: d.slack, store: d.store, admin: d.admin, ...(d.now ? { now: () => d.now!().getTime() } : {}),
       async visibleSpaceName(spaceId, userId) {
         const space = await d.spaces.findSpace(spaceId);
         return space && (await d.spaces.memberRoles(space.id)).has(userId) ? space.name : null;

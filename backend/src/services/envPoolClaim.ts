@@ -32,11 +32,10 @@
  * settled by the tests on claimEnvPoolBox's injected effects.
  */
 
-import { EC2Client, StartInstancesCommand } from '@aws-sdk/client-ec2';
+import { ec2For, startBox } from './ec2Box';
 import type { Instance } from '@prisma/client';
 import { prisma } from '../db';
-import { awsClientConfig, getBoxConfig, isCapacityRefusal, terminateBox } from './boxProvisioner';
-import { startOnFallbackType } from './boxStartFallback';
+import { isCapacityRefusal, terminateBox } from './boxProvisioner';
 import { getInstanceAgent, instanceAgentTransport } from './agentRegistry';
 import { claimAwaitsOnClaimReport, isNameConflict, MAX_CLAIM_CANDIDATES, prismaClaimEffects, type BoxClaimAck, type ClaimOwner } from './warmPoolClaim';
 import { readGithubAccess } from './credentialStore';
@@ -219,12 +218,6 @@ export function recordEnvPoolClaim(claim: {
 
 // ── The Postgres and EC2 effects ─────────────────────────────────────────────
 
-function ec2For(region: string | null): EC2Client {
-  const cfg = getBoxConfig();
-  if (!cfg) throw new Error('Box provisioning is not configured');
-  return new EC2Client(awsClientConfig(cfg, region ?? cfg.region));
-}
-
 /** The claim statement: environment, current setup hash, outside the refused zones, newest prepared first. */
 async function take(req: EnvClaimRequest, refusedZones: string[]): Promise<Instance | null> {
   const rows = await prisma.$queryRaw<Instance[]>`
@@ -255,17 +248,10 @@ async function hasStale(req: EnvClaimRequest): Promise<boolean> {
 }
 
 async function start(instance: Instance): Promise<StartResult> {
-  const ec2 = ec2For(instance.region);
   try {
-    await ec2.send(new StartInstancesCommand({ InstanceIds: [instance.ec2InstanceId!] }));
-    return { ok: true, fallbackType: null };
+    return { ok: true, ...(await startBox(ec2For(instance), instance)) };
   } catch (err) {
-    if (!isCapacityRefusal(err)) return { ok: false, capacity: false, error: errMsg(err) };
-    try {
-      return { ok: true, fallbackType: await startOnFallbackType(ec2, instance, err) };
-    } catch (again) {
-      return { ok: false, capacity: isCapacityRefusal(again), error: errMsg(again) };
-    }
+    return { ok: false, capacity: isCapacityRefusal(err), error: errMsg(err) };
   }
 }
 
@@ -292,7 +278,8 @@ async function abandon(instance: Instance, reason: string): Promise<void> {
   noteClaimInFlight(instance.id, false);
   const changed = await prisma.instance.updateMany({
     where: { id: instance.id, userId: null, status: 'env-starting' },
-    data: { status: 'terminated', terminatedAt: new Date(), provisioningError: reason.slice(0, 1000) },
+    // No pool log: an abandoned start is the claim's, not a failed prepare (envPool.ts poolFailureWhere).
+    data: { status: 'terminated', terminatedAt: new Date(), provisioningError: reason.slice(0, 1000), poolLog: null },
   }).catch(() => ({ count: 0 }));
   console.warn(`[ENV-POOL] claim: abandon ${instance.id}: ${reason}`);
   if (changed.count) void terminateBox(instance);

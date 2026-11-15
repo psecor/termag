@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 const updates = vi.hoisted(() => [] as unknown[]);
 vi.mock('../db', () => ({ prisma: { workstream: { updateMany: vi.fn(async (args: unknown) => { updates.push(args); return { count: 1 }; }) } } }));
 
-import { chatHolderOf, saveChatHolder } from './chatHolder';
+import { chatHolderOf, runnerSessionOf, saveChatHolder, saveRunnerSession } from './chatHolder';
 
 const SESSION = '5109190e-c0d2-4f72-9c15-3c4c57fb126c';
 
@@ -41,5 +41,45 @@ describe('saveChatHolder', () => {
   it("keeps the desktop's thread when the runner takes the session back", async () => {
     await saveChatHolder('p1', 'ws1', { holder: 'runner', threadId: 't1', sessionId: SESSION }, at);
     expect(data()).toEqual({ chatHolder: 'runner', chatHolderAt: at, chatSessionId: SESSION });
+  });
+});
+
+describe('runnerSessionOf', () => {
+  it("reads the session a runner turn's init names", () => {
+    expect(runnerSessionOf({ type: 'system', subtype: 'init', session_id: SESSION, cwd: '/home/u/p' })).toBe(SESSION);
+  });
+
+  it('is nothing for another event or a bad id', () => {
+    for (const e of [
+      null, 'init', { type: 'system', subtype: 'compact_boundary', session_id: SESSION },
+      { type: 'assistant', session_id: SESSION }, { type: 'system', subtype: 'init', session_id: '../x' },
+      { type: 'system', subtype: 'init' },
+      // A pi turn's init (agent/pi-events.js) names a pi session, not a Claude one.
+      { type: 'system', subtype: 'init', engine: 'pi', session_id: SESSION },
+      // Nor a Cursor turn's (agent/cursor-events.js), a Devin turn's (agent/devin-events.js, its id Devin's name
+      // behind devin-), or one from an engine this backend doesn't know.
+      { type: 'system', subtype: 'init', engine: 'cursor', session_id: SESSION },
+      { type: 'system', subtype: 'init', engine: 'devin', session_id: SESSION },
+      { type: 'system', subtype: 'init', engine: 'devin', session_id: 'devin-vanilla-afternoon' },
+      { type: 'system', subtype: 'init', engine: 'codex', session_id: SESSION },
+    ]) expect(runnerSessionOf(e)).toBeNull();
+    expect(runnerSessionOf({ type: 'system', subtype: 'init', engine: 'claude', session_id: SESSION })).toBe(SESSION);
+  });
+});
+
+describe('saveRunnerSession', () => {
+  it("names the chat's session at once, only when it changed and the runner holds it", async () => {
+    await expect(saveRunnerSession('p1', 'ws1', SESSION)).resolves.toBe(true);
+    expect(updates.at(-1)).toEqual({
+      where: {
+        id: 'ws1', projectId: 'p1',
+        AND: [
+          { OR: [{ chatSessionId: null }, { chatSessionId: { not: SESSION } }] },
+          // While the desktop's thread holds it, its hand-over names the session.
+          { OR: [{ chatHolder: null }, { chatHolder: 'runner' }] },
+        ],
+      },
+      data: { chatSessionId: SESSION },
+    });
   });
 });

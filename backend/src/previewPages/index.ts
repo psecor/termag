@@ -8,7 +8,9 @@
  * and statuses are settled here.
  */
 import type { ServerResponse } from 'http';
-import { pageDocument } from './style';
+import { HANDOFF_FALLBACK_S, pageDocument } from './style';
+
+export { HANDOFF_FALLBACK_S };
 
 export const PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
@@ -30,10 +32,10 @@ interface PageText { status: number; title: string; body: string; retryAfter?: n
 
 /** Every page's status and words. A refusal never says which check failed (A4). */
 export const PREVIEW_PAGES: Readonly<Record<PreviewPageKind, PageText>> = {
-  not_found: { status: 404, title: 'This preview isn\'t available', body: 'The link may have ended, or it isn\'t shared with you. Ask whoever sent it for a new one.' },
+  not_found: { status: 404, title: 'This preview isn\'t available', body: 'The link may have ended, or it isn\'t shared with you. Open the link you were sent again, or ask whoever sent it for a new one.' },
   not_running: { status: 502, title: 'The app isn\'t running right now', body: 'Nothing is answering on this preview\'s port on the box. Try again once its owner has started it.' },
   port_refused: { status: 502, title: 'This port can\'t be shared any more', body: 'The box refused to share this port. Its owner can see why in the link\'s events.' },
-  asleep: { status: 503, title: 'This preview is asleep', body: 'The box it runs on is stopped. Try again once its owner has started it.' },
+  asleep: { status: 503, title: 'This preview is asleep', body: 'The box it runs on is stopped. Open the link you were sent again: where its owner allows it, you can wake the box from there.' },
   try_again: { status: 503, title: 'Try again in a moment', body: 'The box this preview runs on isn\'t ready yet.', retryAfter: 5 },
   busy: { status: 429, title: 'This preview is busy', body: 'Too many connections are open to this box right now. Try again in a moment.', retryAfter: 5 },
   refresh_needed: { status: 401, title: 'Your preview session needs refreshing', body: 'Go back and reload the page, then submit again.' },
@@ -86,8 +88,14 @@ export function sendPage(res: ServerResponse, kind: PreviewPageKind, method?: st
 
 /**
  * The landing page's hand-off (step 4): who runs the app, then a refresh to
- * the preview host's code exchange. No script: a meta refresh, and a link
- * for a browser that doesn't follow one.
+ * the preview host's code exchange. No script: the meta refresh is the one
+ * navigation. The code is single use, so a second navigation to it (a click
+ * on a link while the refresh's exchange is still on its way) cancels the
+ * first after it used the code, and finds it gone: the viewer goes round the
+ * landing page again (previewHost.browser.test.ts shows it in Chromium). So the
+ * link, for a browser that doesn't follow a refresh, stays hidden (and
+ * unclickable) until HANDOFF_FALLBACK_S, by CSS alone (PAGE_CSP allows only
+ * inline style).
  */
 export function renderHandoff(ownerName: string, target: string): string {
   const owner = escapeHtml(ownerName);
@@ -96,7 +104,8 @@ export function renderHandoff(ownerName: string, target: string): string {
     `Opening ${ownerName}'s preview`,
     `<h1>You're opening an app running on ${owner}'s box</h1>`
       + '<p>It runs as they set it up, with their data. termag never asks you to sign in on a preview\'s page.</p>'
-      + `<p><a class="continue" href="${url}">Continue</a></p>`,
+      + '<p>Opening it…</p>'
+      + `<p class="handoff-fallback">Still here? <a class="continue" href="${url}">Continue</a></p>`,
     `<meta http-equiv="refresh" content="1;url=${url}">`,
   );
 }
@@ -106,4 +115,39 @@ export function renderLandingRefusal(kind: 'not_found' | 'asleep' | 'off'): { st
   if (kind === 'off') return { status: 404, html: document('Previews are off', '<h1>Previews are off</h1><p>Preview links aren\'t turned on here.</p>') };
   const p = PREVIEW_PAGES[kind];
   return { status: p.status, html: document(p.title, `<h1>${escapeHtml(p.title)}</h1><p>${escapeHtml(p.body)}</p>`) };
+}
+
+/** The asleep page's CSP when it offers "Wake it": its one form posts back to the landing (form-action 'self'). */
+export const WAKE_PAGE_CSP = PAGE_CSP.replace("form-action 'none'", "form-action 'self'");
+
+/**
+ * The landing page for a link whose box is parked (U4): asleep, with "Wake it"
+ * when this viewer may wake it (previewLinkWake.ts), or why not. The form
+ * posts back to the landing with its CSRF token; no script.
+ */
+export function renderAsleep(view: { ownerName: string; wake: { action: string; csrf: string } | null; message: string | null }): { status: number; headers: Record<string, string | number>; html: string } {
+  const owner = escapeHtml(view.ownerName);
+  const body = view.wake
+    ? `<h1>This preview is asleep</h1><p>${owner}'s box went to sleep after it was idle. You can wake it: it takes a minute or two, and it goes back to sleep when it's idle again.</p>`
+      + `<form method="post" action="${escapeHtml(view.wake.action)}"><input type="hidden" name="csrf" value="${escapeHtml(view.wake.csrf)}"><button type="submit" class="primary">Wake it</button></form>`
+    : `<h1>This preview is asleep</h1><p>${escapeHtml(view.message ?? PREVIEW_PAGES.asleep.body)}</p>`;
+  return { status: 503, headers: pageHeaders(view.wake ? { 'content-security-policy': WAKE_PAGE_CSP } : {}), html: document('This preview is asleep', body) };
+}
+
+/**
+ * While the box starts (`starting`), or is still going down (`stopping`,
+ * `settling`): a meta refresh back to the landing, which continues once the
+ * box is up, or offers "Wake it" once it has stopped.
+ */
+export function renderWaking(ownerName: string, again: string, phase: 'starting' | 'settling' = 'starting'): { status: number; headers: Record<string, string | number>; html: string } {
+  const url = escapeHtml(again);
+  const owner = escapeHtml(ownerName);
+  const [title, words] = phase === 'starting'
+    ? ['Waking the box', `<h1>Waking ${owner}'s box</h1><p>This takes a minute or two. The page carries on by itself once the app is up.</p>`]
+    : ['The box is going to sleep', `<h1>${owner}'s box is going to sleep</h1><p>This page looks again by itself. Once the box has stopped, it says whether you can wake it from here.</p>`];
+  return {
+    status: 503,
+    headers: pageHeaders({ 'retry-after': 5 }),
+    html: document(title, `${words}<p><a class="continue" href="${url}">Check now</a></p>`, `<meta http-equiv="refresh" content="5;url=${url}">`),
+  };
 }

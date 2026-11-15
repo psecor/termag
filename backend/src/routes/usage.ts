@@ -3,7 +3,7 @@ import { prisma } from '../db';
 import { requireAuth } from '../middleware/auth';
 import { getConnectedAgents } from '../services/agentRegistry';
 import {
-  buildUsageResponse, hostStatuses, pollerEstimates, runUserScan, lastSuccessfulRun,
+  buildUsageResponse, hostStatuses, pollerEstimates, runUserScan, lastSuccessfulRun, newestScanAt,
   RESCAN_THROTTLE_MS, UsageRowAgg,
 } from '../services/tokenUsageSampler';
 import { tokenSourceSql } from '../services/admin/tokenSource';
@@ -52,7 +52,7 @@ async function payloadFor(userId: string, unixUsername: string) {
     projects.map(p => ({ id: p.id, name: p.name, color: p.color ?? null, kind: p.kind })),
     pollerEstimates(unixUsername),
     hostStatuses(userId, new Map(instances.map(i => [i.id, i.name]))),
-    newest._max.scannedAt ?? null,
+    newestScanAt(lastSuccessfulRun(userId), newest._max.scannedAt ?? null),
     Date.now(),
   );
 }

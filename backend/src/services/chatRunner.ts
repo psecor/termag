@@ -7,6 +7,7 @@
  * agent session's status (so the sidebar, inbox and working time see chat
  * turns like pane turns) and hands to index.ts for the status WebSocket.
  */
+import { noteFirstText } from './sessionStartTiming';
 import { recordSessionTitle } from './sessionTitleEvent';
 import { prisma } from '../db';
 import { CHAT_EFFORT_CAPABILITY, type ChatEffort } from './chatEffort';
@@ -18,7 +19,7 @@ import { parseStatusKey, statusKey } from './statusKey';
 import { settleTurnPost } from './sessionTurns';
 import { TRUSTED_MODE, UNTRUSTED_MODE } from './chatTrust';
 import { pushOnChatTurn } from './chatTurnPush';
-import { chatHolderOf, saveChatHolder } from './chatHolder';
+import { chatHolderOf, runnerSessionOf, saveChatHolder, saveRunnerSession } from './chatHolder';
 import { FIREWORKS_MENU_CAPABILITY } from './fireworksGateway';
 import * as tmux from './tmux';
 import { traceSweep } from './tracing/spans';
@@ -26,6 +27,57 @@ import { CHAT_IMAGE_SEND_TIMEOUT_MS } from './chatImages';
 import { CHAT_CONFINED_MCP_CAPABILITY, type BrokerMcp } from './chatConfinedMcp';
 
 export const CHAT_RUNNER_CAPABILITY = 'chat-runner-v1';
+/** The runner can run a Cursor turn (agent/chat-runner.js cursorTurnArgs, agent/cursor-events.js). */
+export const CHAT_CURSOR_CAPABILITY = 'chat-cursor-v1';
+/** The runner can run a Devin turn (agent/chat-runner.js devinTurnArgs, agent/devin-acp.js, agent/devin-events.js). */
+export const CHAT_DEVIN_CAPABILITY = 'chat-devin-v1';
+
+/**
+ * The engines a send names to the runner, each with the capability its turns need there. Claude's are the
+ * runner's own, and a send names none for it. pi isn't here: a pi chat's send still names no engine, as before.
+ */
+export const SENT_CHAT_ENGINES: Readonly<Record<string, { capability: string; name: string }>> = {
+  cursor: { capability: CHAT_CURSOR_CAPABILITY, name: 'Cursor' },
+  devin: { capability: CHAT_DEVIN_CAPABILITY, name: 'Devin' },
+};
+
+/**
+ * The engines a send names (SENT_CHAT_ENGINES) that a box's agent can run, from the capabilities it announced:
+ * what the box list tells the browser (`chatEngines`), so Review with Devin is a chat only where it can be.
+ */
+export function chatEnginesOf(capabilities: readonly string[]): string[] {
+  return Object.entries(SENT_CHAT_ENGINES).filter(([, e]) => capabilities.includes(e.capability)).map(([id]) => id);
+}
+
+/**
+ * Why a chat on an engine the runner must be told of can't take a message on this box: its agent predates
+ * the engine, or the message carries images the engine takes none of. Null for Claude, and for an engine
+ * a send doesn't name.
+ */
+/**
+ * Why Open in full UI can't continue a chat in its agent pane: only Claude Code's session can be resumed there (the
+ * runner types nothing for another engine's, agent chat-engines.js paneResume). Null for Claude's.
+ */
+export function chatTerminalRefusal(engine: string | null | undefined): { status: number; body: { error: string; code: string } } | null {
+  // An engine a send names (Cursor's); pi's Open in full UI is left as it was (it types nothing).
+  if (!engine || !SENT_CHAT_ENGINES[engine]) return null;
+  return { status: 409, body: { error: "This agent's chats can't continue in a terminal; only Claude Code's can.", code: 'engine-no-terminal' } };
+}
+
+/** Whether a chat's engine takes images: Claude's does, an engine a send names (Cursor's, Devin's) doesn't yet. */
+export function chatEngineTakesImages(engine: string | null | undefined): boolean {
+  return !(engine && SENT_CHAT_ENGINES[engine]);
+}
+
+export function chatEngineRefusal(engine: string | null | undefined, capabilities: readonly string[], images = 0): { status: number; body: { error: string; code: string } } | null {
+  const sent = engine ? SENT_CHAT_ENGINES[engine] : undefined;
+  if (!sent) return null;
+  if (!capabilities.includes(sent.capability)) {
+    return { status: 409, body: { error: `The box's agent can't run ${sent.name} in a chat yet; it needs an update and a restart`, code: 'engine-missing' } };
+  }
+  if (images > 0 && !chatEngineTakesImages(engine)) return { status: 409, body: { error: `${sent.name}'s chats take no images yet`, code: 'image-refused' } };
+  return null;
+}
 /** The runner understands a trusted turn. chat-runner-v1 alone refuses any mode but dontAsk. */
 export const CHAT_TRUST_CAPABILITY = 'chat-trust-v1';
 /** The runner takes a message into the turn running (agent/chat-turn.js); without it a send queues. */
@@ -99,7 +151,7 @@ export interface ChatBackend {
   models?: string;
 }
 
-function backendFields(t: ChatBackend, capabilities: readonly string[]): Record<string, unknown> {
+export function backendFields(t: ChatBackend, capabilities: readonly string[]): Record<string, unknown> {
   if (!t.backend) return {};
   return {
     backend: t.backend, ...(t.fastModel ? { fastModel: t.fastModel } : {}), ...(t.context ? { context: t.context } : {}),
@@ -417,13 +469,17 @@ export function chatSendId(v: unknown): string | null {
 }
 
 export function chatSendRpcPayload(
-  target: { chatKey: string; cwd: string; projectId: string; project?: string | null; workstream: string; workstreamId: string; requireCheckout: boolean; permissionMode: string; model?: string | null; orchestrator?: boolean } & ChatBackend,
+  target: { chatKey: string; cwd: string; projectId: string; project?: string | null; workstream: string; workstreamId: string; requireCheckout: boolean; permissionMode: string; model?: string | null; orchestrator?: boolean; engine?: string | null } & ChatBackend,
   text: string,
   capabilities: readonly string[] = [],
-  opts: { liveInput?: boolean; images?: ReadonlyArray<{ mediaType: string; data: string }>; titles?: boolean; headings?: boolean; effort?: ChatEffort | null; genUi?: boolean; genUiHint?: boolean; memorySpace?: string | null; boxNotices?: boolean; notice?: string | null; planSpend?: boolean; sendId?: string | null; brokerMcp?: BrokerMcp | null } = {},
+  opts: { liveInput?: boolean; images?: ReadonlyArray<{ mediaType: string; data: string }>; titles?: boolean; headings?: boolean; effort?: ChatEffort | null; genUi?: boolean; genUiHint?: boolean; memorySpace?: string | null; boxNotices?: boolean; notice?: string | null; planSpend?: boolean; sendId?: string | null; brokerMcp?: BrokerMcp | null; files?: { project: string | null; mine: string | null } } = {},
 ): Record<string, unknown> {
+  // A chat on another engine (SENT_CHAT_ENGINES): its turn is told which, and takes none of Claude's model,
+  // backend or effort (the chat's stored choice is a Claude one), which the runner would refuse or misread.
+  const other = target.engine && SENT_CHAT_ENGINES[target.engine] ? target.engine : null;
   return {
     chatKey: target.chatKey, cwd: target.cwd, text, projectId: target.projectId,
+    ...(other ? { engine: other } : {}),
     workstream: target.workstream, workstreamId: target.workstreamId,
     ...(target.project ? { project: target.project } : {}),
     requireCheckout: target.requireCheckout,
@@ -433,9 +489,9 @@ export function chatSendRpcPayload(
     ...(chatSendsLive(capabilities, opts.liveInput) ? { liveInput: true } : {}),
     // Always a concrete tier (or its pinned profile id), already the launch
     // string (services/claudeChatModel.ts); the runner drops anything else.
-    ...(target.model ? { model: target.model } : {}),
+    ...(target.model && !other ? { model: target.model } : {}),
     // Another backend's model is only that backend's; the caller checked chat-backend-v1.
-    ...backendFields(target, capabilities),
+    ...(other ? {} : backendFields(target, capabilities)),
     // New session's "Act as an orchestrator". An older runner would drop it anyway.
     ...(target.orchestrator && capabilities.includes(CHAT_ORCHESTRATOR_CAPABILITY) ? { orchestrator: true } : {}),
     // Already checked against chat-images-v1 (services/chatImages.ts).
@@ -445,7 +501,7 @@ export function chatSendRpcPayload(
     // Haiku's heading for each run of tool calls. An older runner drops it, and the browser keeps Claude's lead-in or the calls' labels.
     ...(opts.headings ? { headings: true } : {}),
     // Already checked against the chat's backend and ask mode (services/chatEffort.ts); an older runner gets none.
-    ...(opts.effort && capabilities.includes(CHAT_EFFORT_CAPABILITY) ? { effort: opts.effort } : {}),
+    ...(opts.effort && !other && capabilities.includes(CHAT_EFFORT_CAPABILITY) ? { effort: opts.effort } : {}),
     // The chat's own space, whose .termag/ the turn loads (services/chatSpace.ts), or null for none: a chat
     // with no space, or one its box isn't granted, loads nothing. Undefined says nothing (the box's default).
     ...(opts.memorySpace !== undefined && capabilities.includes(SPACE_MEMORY_CAPABILITY) ? { spaceMemory: { space: opts.memorySpace } } : {}),
@@ -462,11 +518,17 @@ export function chatSendRpcPayload(
     ...(opts.sendId ? { sendId: opts.sendId } : {}),
     // chat-confined-mcp-enabled: which broker connectors the turn may reach (services/chatConfinedMcp.ts).
     ...brokerMcpField(opts.brokerMcp, capabilities),
+    // project-files-enabled: the turn's Project files and My files, already granted to its box
+    // (services/projectFiles.ts turnFilesFor), for its TERMAG_SPACE and TERMAG_MY_FILES. Only to a box that sets them.
+    ...(opts.files && capabilities.includes(PROJECT_FILES_CAPABILITY) ? { files: opts.files } : {}),
   };
 }
 
 /** The agent loads a space's shared memory into its chat turns (agent/space-memory.js). */
 export const SPACE_MEMORY_CAPABILITY = 'space-memory-v1';
+
+/** The agent sets a turn's TERMAG_SPACE and TERMAG_MY_FILES from its `files` (agent/chat-runner.js); services/projectFiles.ts says the same. */
+export const PROJECT_FILES_CAPABILITY = 'project-files-v1';
 
 /** What a chat's turn loads, from its fixed space (services/chatSpace.ts): the name while its box is granted it, else none. */
 export function chatMemorySpace(place: { space: { name: string } | null; reachable: boolean }): string | null {
@@ -837,6 +899,8 @@ async function handleChatFrame(instance: { id: string }, msg: Record<string, unk
   const sessionName = tmux.sessionName(project.owner, project.name, 'agent', workstream);
   const prev = getStatus(sessionName, instance.id);
   const next = statusForChatEvent(msg.event, prev.message);
+  // Claude's first words in a New session end its start timing (services/sessionStartTiming.ts).
+  if ((msg.event as { type?: unknown } | null)?.type === 'assistant' && next?.message && next.message !== THINKING) noteFirstText(projectId, workstream);
   if (next) {
     writeChatStatus(sessionName, instance.id, next.status, next.message);
     notifyStatusChange(sessionName, instance.id);
@@ -859,6 +923,15 @@ async function handleChatFrame(instance: { id: string }, msg: Record<string, unk
       await saveChatHolder(projectId, msg.workstreamId, holder, new Date());
     } catch (err) {
       console.error('[CHAT] chat holder not saved:', err instanceof Error ? err.message : String(err));
+    }
+  }
+  // The session a runner turn started on, at its init rather than once its transcript is stored (services/chatHolder.ts).
+  const runnerSession = runnerSessionOf(msg.event);
+  if (runnerSession && typeof msg.workstreamId === 'string' && msg.workstreamId) {
+    try {
+      await saveRunnerSession(projectId, msg.workstreamId, runnerSession);
+    } catch (err) {
+      console.error('[CHAT] runner session not saved:', err instanceof Error ? err.message : String(err));
     }
   }
   pusher?.({

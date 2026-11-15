@@ -10,7 +10,7 @@ import type { ProjectHost } from './agentRegistry';
 import { PANE_KIND_ENV } from './launchCommand';
 import { exactPaneTarget } from './tmux';
 import {
-  classifyReviewerPane, DEFAULT_REVIEWER, isReviewerId, reviewerForForeground, reviewerLaunch, type ReviewerId,
+  classifyReviewerPane, DEFAULT_REVIEWER, isReviewerId, reviewerConfinedIn, reviewerForForeground, reviewerLaunch, type ReviewerId,
 } from './reviewers';
 
 export type PrGuessSource = 'gh' | 'milestone' | 'pane';
@@ -161,11 +161,14 @@ export const MAX_REVIEW_BODY = 16_000;
  * With a URL the header names the repository and pins every gh call to it:
  * the review runs in the workstream's directory, which may be another
  * repository or none (services/reviewRepo.ts). Without one (the remote could
- * not be read) it falls back to the directory's repository.
+ * not be read) it falls back to the directory's repository, or to the
+ * checkout's (`checkout`) for a reviewer that runs in a folder of its own.
  */
-export function reviewPromptHeader(pr: number, url: string | null): string {
+export function reviewPromptHeader(pr: number, url: string | null, checkout: string | null = null): string {
   if (!isPrNumber(pr)) throw new Error('invalid PR number');
-  if (!url || !GITHUB_PR_URL.test(url)) return `Review GitHub pull request #${pr} for the repository in the current directory.`;
+  if (!url || !GITHUB_PR_URL.test(url)) {
+    return `Review GitHub pull request #${pr} for the repository ${checkout ? `checked out at ${checkout}` : 'in the current directory'}.`;
+  }
   const [, , , owner, name] = url.split('/');
   const repo = `${owner}/${name}`;
   return `Review GitHub pull request #${pr} (${url}) in the repository ${repo}. Pass --repo ${repo} to every gh command: the current directory may be a different repository, or none.`;
@@ -263,10 +266,22 @@ export function chooseReviewTemplate(candidates: ReviewTemplateCandidate[], cont
   return { template: DEFAULT_REVIEW_TEMPLATE, source: 'builtin', label: null, warnings };
 }
 
-/** Header + rendered body + footer: the whole prompt the reviewer gets; `reviewer` is its display name. */
-export function buildReviewPrompt(pr: number, url: string | null, body: string | null, reviewer = 'Devin'): string {
+/**
+ * For a reviewer that runs in a folder of the pane's own (review-pane-confined-enabled; services/reviewers.ts
+ * `own-folder`), the line after the header saying where the checkout is, as the Devin chat's notice does.
+ */
+export function reviewCheckoutLine(checkout: string): string {
+  return `The current directory is a folder of this review's own, not a checkout: the repository is checked out at ${checkout}. Read its files there by path, and run git and gh from there (cd ${checkout} first), since gh finds the repository from the directory it runs in.`;
+}
+
+/**
+ * Header + rendered body + footer: the whole prompt the reviewer gets; `reviewer` is its display name. `checkout`:
+ * where the checkout is, for a reviewer that runs in a folder of its own (null: it runs in the checkout).
+ */
+export function buildReviewPrompt(pr: number, url: string | null, body: string | null, reviewer = 'Devin', checkout: string | null = null): string {
   const cleanUrl = urlForPr(url, pr);
-  return `${reviewPromptHeader(pr, cleanUrl)}\n${renderReviewTemplate(body ?? DEFAULT_REVIEW_TEMPLATE, pr, cleanUrl)}\n${reviewPromptFooter(reviewer)}\n`;
+  const at = checkout ? `${reviewCheckoutLine(checkout)}\n` : '';
+  return `${reviewPromptHeader(pr, cleanUrl, checkout)}\n${at}${renderReviewTemplate(body ?? DEFAULT_REVIEW_TEMPLATE, pr, cleanUrl)}\n${reviewPromptFooter(reviewer)}\n`;
 }
 
 // ── A review group's review ──
@@ -314,13 +329,14 @@ export function parseGroupReview(raw: unknown): { ok: true; group: GroupReview |
 }
 
 /** The whole prompt of a group review: header on the first member, the ordered list, the instructions, the footer. */
-export function buildGroupReviewPrompt(group: GroupReview, reviewer = 'Devin'): string {
+export function buildGroupReviewPrompt(group: GroupReview, reviewer = 'Devin', checkout: string | null = null): string {
   const [first] = group.members;
   // As reviewRepo.ts prUrlFor, which imports this module.
   const url = (m: GroupReviewMember) => `https://github.com/${m.repo}/pull/${m.number}`;
   const list = group.members.map((m, i) => `${i + 1}. ${m.repo}#${m.number} (${url(m)})${m.note ? ` (note: ${m.note})` : ''}`);
   return [
     `Review GitHub pull request #${first.number} (${url(first)}) first, then the rest of the review group "${group.name}": these pull requests, in this order, as one piece of work.`,
+    ...(checkout ? [reviewCheckoutLine(checkout)] : []),
     '',
     ...list,
     '',
@@ -336,11 +352,48 @@ export function buildGroupReviewPrompt(group: GroupReview, reviewer = 'Devin'): 
 }
 
 const REVIEW_PROMPT_DIR = '.termag/review-prompts';
+/** The review panes' own folders, one per pane (inPaneFolder). */
+const REVIEW_PANE_DIR = '.termag/review-panes';
 const SAFE_SESSION = /^[\w.-]+$/;
 
-function promptFileName(session: string): string {
+function plainSession(session: string): string {
   if (!SAFE_SESSION.test(session) || session.startsWith('.')) throw new Error('unsafe review session name');
-  return `${session}.md`;
+  return session;
+}
+
+function promptFileName(session: string): string {
+  return `${plainSession(session)}.md`;
+}
+
+/**
+ * A path under the box home as the pane can use it: `shell`, a double-quoted word through the pane's $HOME, to type;
+ * `display`, `~/…`, for the prompt. Neither names the backend's home, which a self-managed macOS agent remaps for its
+ * RPCs (/home/<u> to /Users/<u>) but not in typed text. Null when `path` isn't under `home` or a part of it is
+ * anything but plain path characters, so the typed word needs nothing beyond its double quotes.
+ */
+export function homeRelative(home: string, path: string): { shell: string; display: string } | null {
+  const h = home.replace(/\/+$/, '');
+  const p = path.replace(/\/+$/, '');
+  if (!h || !p.startsWith(`${h}/`)) return null;
+  const rest = p.slice(h.length + 1);
+  if (rest.split('/').some(part => !/^[\w.-]+$/.test(part) || part === '.' || part === '..')) return null;
+  return { shell: `"$HOME/${rest}"`, display: `~/${rest}` };
+}
+
+/**
+ * An own-folder reviewer's line (services/reviewers.ts): the pane's folder, ~/.termag/review-panes/<session>, removed
+ * and made again as an empty git repository, then entered, and the reviewer exec'd there. Made afresh because a
+ * reviewer may write in its own folder (Devin's smart mode edits there unasked), and what one left there, a
+ * `.claude/settings.json` say, would run at the next one's start. A repository of its own, not just an empty `.git`
+ * directory, because git walks past an invalid `.git` to a repository above it (a home that is a dotfiles repo): Devin
+ * stopped at the empty directory (checked), but its git commands, and any tool that asks git for the root, wouldn't. In a subshell, so the pane's shell is back in the checkout once the reviewer
+ * exits; `exec`, so the reviewer is the pane's foreground process, which the review ring reads (classifyReviewerPane),
+ * not the subshell. `command` and `--` keep an alias or a function of the user's named rm out of it. Named through
+ * $HOME, like the prompt file.
+ */
+function inPaneFolder(session: string, line: string): string {
+  const dir = `"$HOME/${REVIEW_PANE_DIR}/${plainSession(session)}"`;
+  return `(command rm -rf -- ${dir} && mkdir -p -- ${dir} && cd -- ${dir} && git init -q && ${line})`;
 }
 
 /**
@@ -361,12 +414,19 @@ export function reviewPromptPath(home: string, session: string): string {
  * quotes and newlines arrive as one argument). The file is named through the
  * pane's own $HOME, which is where the remapped write-file put it; the
  * session name is checked to be plain. Per-reviewer flags and why: see
- * services/reviewers.ts.
+ * services/reviewers.ts. `confined` is review-pane-confined-enabled for the
+ * person starting it, with the checkout as a shell word (homeRelative; null
+ * when it can't be typed): the reviewer then loads none of the checkout's own
+ * startup config, in the checkout or in the pane's own folder (gotcha
+ * review-pane-no-checkout-config).
  */
-export function reviewLaunchCommand(session: string, reviewer: ReviewerId = DEFAULT_REVIEWER): string {
+export function reviewLaunchCommand(session: string, reviewer: ReviewerId = DEFAULT_REVIEWER, confined: { checkout: string | null } | null = null): string {
   const file = `"$HOME/${REVIEW_PROMPT_DIR}/${promptFileName(session)}"`;
   // A pane like any other: the kind its resource has, for the tools the reviewer runs.
-  return `${PANE_KIND_ENV}${reviewerLaunch(reviewer, file)}`;
+  if (confined && reviewerConfinedIn(reviewer) === 'own-folder') {
+    return inPaneFolder(session, `${PANE_KIND_ENV}exec ${reviewerLaunch(reviewer, file, confined)}`);
+  }
+  return `${PANE_KIND_ENV}${reviewerLaunch(reviewer, file, confined)}`;
 }
 
 /** Is the review pane's foreground command Devin (still reviewing or at its prompt)? */

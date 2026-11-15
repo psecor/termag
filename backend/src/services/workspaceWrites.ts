@@ -25,6 +25,12 @@ const WATCHED: Record<string, ReadonlySet<string>> = {
     'repoUrl', 'repoDefaultBranch', 'setupStatus', 'setupError', 'workstreams', 'workflows', 'shares',
     // The list's chatTrusted: New session offers a fetched worktree Full access only on a trusted project.
     'chatTrustedAt',
+    // The list's repoKeys (services/projectRepos.ts projectRepoKeys) read the layout and the repositories.
+    'layout', 'repos',
+    // The list's userProjectId: the chat sidebar groups by the person's project.
+    // A Prisma write of it pushes here; attach's and the backfill's raw UPDATE doesn't, so their
+    // callers push (routes/projects.ts withUserProject and listProjectsFor, routes/userProjects.ts).
+    'userProjectId', 'userProject',
   ]),
   // chatHolder, t3ThreadId and chatSessionId: the desktop's sidebar shows who drives a chat (services/chatHolder.ts).
   Workstream: new Set(['name', 'branch', 'archived', 'sessionTitle', 'spaceId', 'space', 'projectId', 'project', 'workflows', 'chatHolder', 't3ThreadId', 'chatSessionId']),
@@ -32,6 +38,11 @@ const WATCHED: Record<string, ReadonlySet<string>> = {
   ProjectShare: new Set(['projectId', 'project', 'userId', 'user']),
   // An ask's chat is named by its thread's title, and only once the thread links it (askChat.ensureAskChat).
   AgentThread: new Set(['title', 'chatWorkstreamId', 'chatWorkstream']),
+  // A workspace's repositories, for the list's repoKeys; a clone's setupStatus isn't in the list.
+  ProjectRepo: new Set(['url', 'position', 'projectId', 'project']),
+  // A person's project: the chat sidebar shows its name, and
+  // one with no session yet, and re-reads GET /api/user-projects on this push. Its owner's alone.
+  UserProject: new Set(['name', 'archivedAt', 'userId', 'user']),
 };
 
 /** Writes Prisma middleware sees; reads and anything else pass straight through. */
@@ -53,6 +64,8 @@ const SELECT: Record<string, Row> = {
   Workflow: { projectId: true },
   ProjectShare: { projectId: true, userId: true },
   AgentThread: { projectId: true },
+  ProjectRepo: { projectId: true },
+  UserProject: { id: true, userId: true },
 };
 
 function delegate(client: PrismaLike, model: string): DelegateLike {
@@ -106,9 +119,9 @@ function idsOf(model: string, rows: Row[]): { projectIds: string[]; userIds: str
   const projectIds: string[] = [];
   const userIds: string[] = [];
   for (const r of rows) {
-    const pid = model === 'Project' ? r.id : r.projectId;
+    const pid = model === 'Project' ? r.id : model === 'UserProject' ? undefined : r.projectId;
     if (typeof pid === 'string') projectIds.push(pid);
-    if ((model === 'Project' || model === 'ProjectShare') && typeof r.userId === 'string') userIds.push(r.userId);
+    if ((model === 'Project' || model === 'ProjectShare' || model === 'UserProject') && typeof r.userId === 'string') userIds.push(r.userId);
   }
   return { projectIds, userIds };
 }
@@ -118,7 +131,7 @@ async function rowsAfter(model: string, result: unknown, args: Row | undefined, 
   if (Array.isArray(result)) return result as Row[]; // createManyAndReturn
   if (result && typeof result === 'object' && !('count' in result)) {
     const row = result as Row;
-    const need = model === 'Project' ? 'userId' : 'projectId';
+    const need = model === 'Project' || model === 'UserProject' ? 'userId' : 'projectId';
     if (typeof row[need] === 'string') return [row];
     if (typeof row.id === 'string') {
       const full = await reader.rowById(model, row.id);

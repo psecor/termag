@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { classifyReviewerPane, isReviewerId, reviewerForForeground, reviewerLaunch, reviewerName, REVIEWER_IDS } from './reviewers';
+import { classifyReviewerPane, isReviewerId, reviewerConfinedIn, reviewerForForeground, reviewerLaunch, reviewerName, REVIEWER_IDS } from './reviewers';
 import { probeReviewPane, reviewLaunchCommand } from './review';
 
 const F = '"$HOME/.termag/review-prompts/a-p-review.md"';
@@ -18,6 +18,32 @@ describe('reviewers', () => {
     expect(reviewerLaunch('cursor', F)).toBe(`cursor-agent --mode plan --auto-review "$(cat ${F})"`);
     expect(reviewLaunchCommand('a-p-review', 'claude')).toBe(`TERMAG_SESSION_KIND=interactive ${reviewerLaunch('claude', F)}`);
     expect(reviewLaunchCommand('a-p-review')).toBe(`TERMAG_SESSION_KIND=interactive ${reviewerLaunch('devin', F)}`);
+  });
+  it('confined (review-pane-confined-enabled), Claude loads only the box user\'s settings, never the checkout\'s', () => {
+    const C = { checkout: '"$HOME/termag/projects/p/.worktrees/pr-1"' };
+    expect(reviewerConfinedIn('claude')).toBe('checkout');
+    expect(reviewerLaunch('claude', F, C)).toBe(`claude --setting-sources user --permission-mode plan "$(cat ${F})"`);
+    // In the checkout still: no folder of its own.
+    expect(reviewLaunchCommand('a-p-review', 'claude', C)).toBe(`TERMAG_SESSION_KIND=interactive ${reviewerLaunch('claude', F, C)}`);
+    // Off, the launch is the one it always was.
+    expect(reviewLaunchCommand('a-p-review', 'claude', null)).toBe(`TERMAG_SESSION_KIND=interactive ${reviewerLaunch('claude', F)}`);
+  });
+  it('confined, Devin and Cursor start in the pane\'s own folder, made afresh as an empty git repository', () => {
+    const C = { checkout: '"$HOME/termag/projects/p/.worktrees/pr-1"' };
+    const D = '"$HOME/.termag/review-panes/a-p-review"';
+    // In a subshell, so the pane's shell stays in the checkout; exec'd, so the reviewer is the pane's foreground.
+    const inFolder = (line: string) => `(command rm -rf -- ${D} && mkdir -p -- ${D} && cd -- ${D} && git init -q && ${line})`;
+    expect(reviewerConfinedIn('devin')).toBe('own-folder');
+    expect(reviewerConfinedIn('cursor')).toBe('own-folder');
+    // Devin: never the checkout as an added directory, whose hooks it would load; the prompt says where it is.
+    expect(reviewLaunchCommand('a-p-review', 'devin', C)).toBe(inFolder(`TERMAG_SESSION_KIND=interactive exec devin --permission-mode smart --prompt-file ${F}`));
+    // Cursor reads hooks from its workspace only: the checkout goes in with --add-dir.
+    expect(reviewLaunchCommand('a-p-review', 'cursor', C))
+      .toBe(inFolder(`TERMAG_SESSION_KIND=interactive exec cursor-agent --add-dir ${C.checkout} --mode plan --auto-review "$(cat ${F})"`));
+    // A checkout that can't be typed is left out, never typed raw.
+    expect(reviewLaunchCommand('a-p-review', 'cursor', { checkout: null }))
+      .toBe(inFolder(`TERMAG_SESSION_KIND=interactive exec cursor-agent --mode plan --auto-review "$(cat ${F})"`));
+    expect(() => reviewLaunchCommand('a/../b', 'devin', C)).toThrow();
   });
   it('recognises each from the pane foreground command', () => {
     expect(reviewerForForeground('devin')).toBe('devin');

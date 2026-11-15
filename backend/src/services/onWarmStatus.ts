@@ -128,6 +128,29 @@ export function onWarmRunUpdate(
   };
 }
 
+/** The total time of a run's finished scripts, in seconds. */
+export function onWarmSecondsOf(report: OnWarmReport): number {
+  return report.durations.reduce((total, d) => total + d.seconds, 0);
+}
+
+/**
+ * The update an environment pool box's on-warm report implies (it runs the hook during its prepare,
+ * agent/environment-prepare.js). Unlike a warm box's, a failure only records itself: the prepare goes on, and the
+ * pool page shows it. Guarded on the pool's own statuses and no owner, so a late frame (the agent forwards every
+ * 2 s, and a quick setup can finish first) still lands on a box that has started stopping, and never rewrites a
+ * claimed one.
+ */
+export function envPoolOnWarmUpdate(instanceId: string, report: OnWarmReport): {
+  where: { id: string; userId: null; status: { in: ['env-preparing', 'env-stopping', 'env-stopped'] } };
+  data: { onWarmStatus: OnWarmStatus; onWarmLog: string; onWarmSeconds: number };
+} {
+  const log = report.state === 'failed' ? `${failureLine(report)}\n${report.logTail}` : report.logTail;
+  return {
+    where: { id: instanceId, userId: null, status: { in: ['env-preparing', 'env-stopping', 'env-stopped'] } },
+    data: { onWarmStatus: report.state, onWarmLog: log.slice(-MAX_LOG_TAIL_CHARS), onWarmSeconds: onWarmSecondsOf(report) },
+  };
+}
+
 /** One line for `provisioningError`, which the breaker's log quotes back. */
 function failureLine(report: Extract<OnWarmReport, { state: 'failed' }>): string {
   const at = report.script ? ` at ${report.script}` : '';

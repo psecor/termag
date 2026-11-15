@@ -5,6 +5,9 @@ import {
 } from '../services/status';
 import { milestoneOnReading, parseMilestoneBody, prRefOf } from '../services/milestone';
 import { parseEditBody } from '../services/fileEditEvent';
+import { AGENT_MCP_EVENTS_FLAG, mcpUseDetail, parseMcpUseBody } from '../services/mcpUseEvent';
+import { catalogNamesForUser, ldUserForId } from '../services/mcpConnectorStore';
+import { boolVariation } from '../services/featureFlags';
 import { recordProductEvent } from '../services/productEvents';
 import { recordCreatedLink } from '../services/workstreamPrs';
 import { AgentStatus } from '../types/index';
@@ -459,6 +462,32 @@ export function statusRouter(): Router {
     res.json({ ok: true });
   };
 
+  // POST /api/status/mcp { session, server, tool, outcome, claudeSession? } —
+  // from the PostToolUse and PostToolUseFailure hooks (deploy/termag-status
+  // post-tool, post-tool-failure) for each MCP tool call: which server and
+  // tool, and whether it failed, never its arguments or result
+  // (services/mcpUseEvent.ts). A server outside termag's own and the user's
+  // catalog is recorded as `other`, with no tool. Same trust model as the
+  // milestone. Only a product event; nothing is kept. Behind
+  // agent-mcp-events-enabled, read for the event's user: off (or no user to
+  // read it for), 404 like an older orchestrator, which the hook ignores.
+  const postMcp: RequestHandler = async (req, res) => {
+    const parsed = parseMcpUseBody(req.body);
+    if ('error' in parsed) { res.status(400).json({ error: parsed.error }); return; }
+    if (!(await callerMayWrite(req, parsed.session))) {
+      res.status(403).json({ error: 'forbidden: session not owned by caller' });
+      return;
+    }
+    const user = await eventUserId(req, parsed.session);
+    const ldUser = await ldUserForId(user);
+    if (!ldUser || !(await boolVariation(AGENT_MCP_EVENTS_FLAG, ldUser, false))) {
+      res.status(404).json({ error: 'agent.mcp.used is not enabled', code: 'agent_mcp_events_disabled' });
+      return;
+    }
+    recordProductEvent('agent.mcp.used', { user, box: writeInstanceId(req) }, mcpUseDetail(parsed, await catalogNamesForUser(ldUser)));
+    res.json({ ok: true });
+  };
+
   // POST /api/status/milestone/dismiss { session, instanceId? } — the user
   // clicked Keep (or acted on it). Browser-authenticated. Allowed for the
   // session's owner, or a collaborator on its project (ProjectShare is the
@@ -496,6 +525,7 @@ export function statusRouter(): Router {
   router.post('/', authStatusWrite, postStatus);
   router.post('/milestone', authStatusWrite, postMilestone);
   router.post('/edit', authStatusWrite, postEdit);
+  router.post('/mcp', authStatusWrite, postMcp);
   router.post('/milestone/dismiss', requireAuth, dismissMilestone);
   router.post('/heartbeat', requireAuth, heartbeat);
   // Was unauthenticated: anyone who knew a session name could read its status.

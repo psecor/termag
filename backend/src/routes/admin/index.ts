@@ -23,7 +23,9 @@ import { systemHealth } from '../../services/admin/systemQueries';
 import { spawnLimitsReport } from '../../services/admin/spawnLimitsQueries';
 import { adminCloudSessions, capacity, cloudReport, cloudSummary, orchestratorHealth, parseReportGroup, pipelineHealth } from '../../services/admin/claudeRunnerQueries';
 import { prismaBugReports } from '../../services/bugReportsPrisma';
+import { prismaFeedback } from '../../services/feedbackPrisma';
 import { bugsRouter } from './bugs';
+import { feedbackRouter } from './feedback';
 import { diskRouter } from './disk';
 import { resizeRouter } from './resize';
 import { manageRouter } from './manage';
@@ -149,6 +151,7 @@ export function adminRouter(): Router {
 
   router.use(bugsRouter(prismaBugReports));
   router.use(diskRouter());
+  router.use(feedbackRouter(prismaFeedback));
   router.use(resizeRouter());
   router.use(prsRouter());
   router.use(segmentsRouter());

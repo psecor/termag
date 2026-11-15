@@ -11,7 +11,9 @@
  * families the on-demand price grows with vCPUs and then with memory, so the
  * fewest vCPUs, then the least memory, is the cheapest type that fits; at the
  * same shape the newer generation goes first. 4 vCPU and 32 GiB is
- * r8g.xlarge, then r7g.xlarge, then m8g.2xlarge and m7g.2xlarge.
+ * r8g.xlarge, then r7g.xlarge, then m8g.2xlarge and m7g.2xlarge, the same
+ * list as the large preset, so it is large; 8 vCPU and 32 GiB is m8g.2xlarge,
+ * then m7g.2xlarge, which no preset starts with.
  *
  * A requirement out of BOX_REQUIREMENT_LIMITS, or one EC2 has no type for,
  * is left out with a warning and the box takes its default size: never a
@@ -34,7 +36,11 @@ import { BOX_SIZES, boxSizeSpec, type BoxRequirements, type BoxSize } from './bo
 
 export type { BoxRequirements };
 
-/** The largest box a requirement may ask for: large's vCPUs, and large's memory (which r8g.xlarge has at 4 vCPU). */
+/**
+ * The largest box a requirement may ask for: 8 vCPU (m8g.2xlarge, twice
+ * large's) and large's 32 GiB. The same cap as a resize
+ * (boxResizePolicy.RESIZE_MAX_VCPUS and RESIZE_MAX_MEMORY_GIB).
+ */
 export const BOX_REQUIREMENT_LIMITS = { maxVcpu: 8, maxMemoryGiB: 32 } as const;
 
 /**

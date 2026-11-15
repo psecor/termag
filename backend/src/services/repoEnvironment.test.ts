@@ -288,14 +288,14 @@ describe('repoSizesFor: a multi-repo project takes the largest of its repositori
     }));
   };
 
-  it('takes the most vCPUs and the most memory across them: 4/32 and 8/16 make 8/32, large\'s shape', async () => {
+  it('takes the most vCPUs and the most memory across them: 4/32 and 8/16 make 8/32, which no preset is', async () => {
     serve({ 'acme/web': '{"resources":{"vcpu":4,"memoryGiB":32}}', 'acme/api': '{"resources":{"vcpu":8,"memoryGiB":16}}' });
-    expect(await repoSizesFor('u1', ['https://github.com/acme/web', 'https://github.com/acme/api'])).toEqual({ sizes: { size: 'large' }, warnings: [] });
+    expect(await repoSizesFor('u1', ['https://github.com/acme/web', 'https://github.com/acme/api'])).toEqual({ sizes: { size: { vcpu: 8, memoryGiB: 32 } }, warnings: [] });
   });
 
-  it('mixes presets and requirements: medium (4/16) and 4/32 make 4/32; small and medium make medium', async () => {
+  it('mixes presets and requirements: medium (4/16) and 4/32 make 4/32, large\'s shape; small and medium make medium', async () => {
     serve({ 'acme/a': '{"resources":"medium"}', 'acme/b': '{"resources":{"vcpu":4,"memoryGiB":32}}', 'acme/c': '{"resources":"small"}' });
-    expect((await repoSizesFor('u1', ['acme/a', 'acme/b'])).sizes).toEqual({ size: { vcpu: 4, memoryGiB: 32 } });
+    expect((await repoSizesFor('u1', ['acme/a', 'acme/b'])).sizes).toEqual({ size: 'large' });
     expect((await repoSizesFor('u1', ['acme/c', 'acme/a'])).sizes).toEqual({ size: 'medium' });
   });
 

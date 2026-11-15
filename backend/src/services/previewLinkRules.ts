@@ -41,8 +41,12 @@ export const HOST_MODES = ['localhost', 'public'] as const;
 export type PreviewHostMode = (typeof HOST_MODES)[number];
 
 const WORKSTREAM_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
-// A loose shape check; whether each is a termag user is the caller's lookup.
-const EMAIL = /^[^\s@]+@[^\s@]+$/;
+/**
+ * A loose shape check; whether each is a termag user is the caller's lookup.
+ * The publish form checks a typed email with a copy (frontend/src/previewLinks/rules.ts).
+ */
+export const PREVIEW_EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
+const EMAIL = PREVIEW_EMAIL_RE;
 const REQUEST_ID = /^[a-z0-9]{8,40}$/;
 
 export type NameRefusal = 'invalid' | 'reserved';

@@ -28,12 +28,12 @@ export const INSTANCE_STATUSES = [
   'provisioning', 'awaiting-agent', 'warming', 'warm', 'ready', 'stopping', 'stopped', 'starting',
   'hibernating', 'hibernated', 'failed', 'quarantined', 'terminated',
   // An environment pool's ownerless boxes.
-  'env-preparing', 'env-stopping', 'env-stopped', 'env-starting', 'env-failed',
+  'env-preparing', 'env-stopping', 'env-stopped', 'env-starting',
 ] as const;
 export type InstanceStatus = typeof INSTANCE_STATUSES[number];
 
 /** An environment pool's statuses: an ownerless box prepared for one environment (Instance.poolEnvironmentId). */
-export const ENV_POOL_STATUSES = ['env-preparing', 'env-stopping', 'env-stopped', 'env-starting', 'env-failed'] as const satisfies readonly InstanceStatus[];
+export const ENV_POOL_STATUSES = ['env-preparing', 'env-stopping', 'env-stopped', 'env-starting'] as const satisfies readonly InstanceStatus[];
 export function isEnvPoolStatus(status: string): boolean {
   return (ENV_POOL_STATUSES as readonly string[]).includes(status);
 }
@@ -123,7 +123,6 @@ const CONNECT_TRANSITIONS: Readonly<Record<InstanceStatus, InstanceStatus>> = {
   'env-stopping': 'env-stopping',
   'env-stopped': 'env-stopped',
   'env-starting': 'env-starting',
-  'env-failed': 'env-failed',
 };
 
 /** The status to write when an instance-bound agent connects. */

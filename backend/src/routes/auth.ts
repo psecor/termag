@@ -22,6 +22,11 @@ import { isAdminUser } from '../services/admin/adminAccess';
 import { findUserByEmail, sameEmail } from '../services/userByEmail';
 import { ownerPlacementKey, serializeByKey } from '../services/claudeRunnerSpawn';
 import { boolVariation } from '../services/featureFlags';
+import { BOX_PLACEMENT_FLAG, isPlacementPolicy } from '../services/boxPlacement';
+import { orgPlacementPolicy } from '../services/boxPlacementPolicy';
+import {
+  ensureMyFiles, grantMyFilesEverywhere, myFilesSpaceName, projectFilesEnabled, removeMyFilesGrants, useExistingSpace,
+} from '../services/projectFiles';
 
 
 export type AuthMode = 'google' | 'okta' | 'oidc' | 'local';
@@ -501,6 +506,27 @@ export function authRouter(): Router {
   // the browser keeps its own as before.
   const uiModeOn = (user: Express.User) => boolVariation('onboarding-refresh-enabled', user, false);
   const withUiMode = (on: boolean, user: { uiMode?: string | null }) => (on ? { uiMode: user.uiMode ?? null } : {});
+  // Whether this person has answered Lab's toast recommending termag's chat,
+  // under chat-ui-nudge-enabled ("The nudge toward the
+  // chat"). Off, /me leaves it out and a write is refused, so no toast shows.
+  const chatNudgeOn = (user: Express.User) => boolVariation('chat-ui-nudge-enabled', user, false);
+  const withChatNudge = (on: boolean, user: { chatNudgeDismissedAt?: Date | null }) => (on ? { chatNudgeDismissed: user.chatNudgeDismissedAt != null } : {});
+  // Where this person's New sessions run when they don't pick a box, and the
+  // org default it beats, under box-placement-enabled.
+  // Off, /me leaves both out and a write is refused.
+  const placementOn = (user: Express.User) => boolVariation(BOX_PLACEMENT_FLAG, user, false);
+  const withPlacement = async (on: boolean, user: Express.User) => (on ? {
+    boxPlacement: isPlacementPolicy(user.boxPlacement) ? user.boxPlacement : null,
+    boxPlacementOrg: await orgPlacementPolicy(user),
+  } : {});
+  // My files, under project-files-enabled: its space's name
+  // (null until it's made or chosen) and Settings' "Put My files on my boxes". Off, /me leaves both out and a
+  // write is refused.
+  const myFilesOn = (user: Express.User) => projectFilesEnabled(user);
+  const withMyFiles = async (on: boolean, user: Express.User) => (on ? {
+    myFilesSpace: await myFilesSpaceName(user.id),
+    myFilesOnBoxes: user.myFilesOnBoxes ?? true,
+  } : {});
 
   const me: RequestHandler = async (req, res) => {
     if (!req.user) {
@@ -519,7 +545,31 @@ export function authRouter(): Router {
         needsOnboarding = projects === 0;
       } catch { needsOnboarding = false; }
     }
-    res.json({ ...userPayload(req.user), needsOnboarding, ...withUiMode(await uiModeOn(req.user), req.user) });
+    res.json({
+      ...userPayload(req.user), needsOnboarding,
+      ...withUiMode(await uiModeOn(req.user), req.user),
+      ...withChatNudge(await chatNudgeOn(req.user), req.user),
+      ...await withPlacement(await placementOn(req.user), req.user),
+      ...await withMyFiles(await myFilesOn(req.user), req.user),
+    });
+  };
+
+  // POST /auth/me/my-files: the person's My files, made now if they have none (the Files tab's My files, as it
+  // opens), and granted to every capable box they own while "Put My files on my boxes" is on: on every call, not
+  // only the one that made it, so a retry after a grant pass that failed still reaches the connected boxes.
+  const ensureMine: RequestHandler = async (req, res) => {
+    if (!req.user) { res.status(401).json({ error: 'Unauthorized' }); return; }
+    if (!await myFilesOn(req.user)) { res.status(404).json({ error: 'My files is not on for you', code: 'project_files_disabled' }); return; }
+    try {
+      const mine = await ensureMyFiles(req.user.id);
+      if (!mine) { res.status(404).json({ error: 'No such user' }); return; }
+      if (req.user.myFilesOnBoxes !== false) await grantMyFilesEverywhere(req.user);
+      req.user.myFilesSpaceId = mine.space.id;
+      res.json({ myFilesSpace: mine.space.name, myFilesOnBoxes: req.user.myFilesOnBoxes ?? true });
+    } catch (err) {
+      console.warn(`[PROJECT-FILES] ${req.user.id}: My files: ${(err as Error).message}`);
+      res.status(500).json({ error: 'Failed to set up My files' });
+    }
   };
 
   // PUT /auth/me/onboarding { done: boolean } — the first-run wizard was
@@ -531,7 +581,13 @@ export function authRouter(): Router {
     if (typeof done !== 'boolean') { res.status(400).json({ error: 'done must be a boolean' }); return; }
     const user = await prisma.user.update({ where: { id: req.user.id }, data: { onboardedAt: done ? new Date() : null } });
     req.user.onboardedAt = user.onboardedAt;
-    res.json({ ...userPayload(req.user), needsOnboarding: false, ...withUiMode(await uiModeOn(req.user), req.user) });
+    res.json({
+      ...userPayload(req.user), needsOnboarding: false,
+      ...withUiMode(await uiModeOn(req.user), req.user),
+      ...withChatNudge(await chatNudgeOn(req.user), req.user),
+      ...await withPlacement(await placementOn(req.user), req.user),
+      ...await withMyFiles(await myFilesOn(req.user), req.user),
+    });
   };
 
   // Partial update: any subset of the preference fields, each validated on its
@@ -545,10 +601,58 @@ export function authRouter(): Router {
       return;
     }
 
-    const body = (req.body ?? {}) as { defaultAgentProvider?: unknown; dotfilesRepoUrl?: unknown; theme?: unknown; pushMutesChat?: unknown; chatTurnNotify?: unknown; telemetryTitles?: unknown; boxIdleNotify?: unknown; uiMode?: unknown };
-    const data: { defaultAgentProvider?: string; dotfilesRepoUrl?: string | null; theme?: Prisma.InputJsonValue; pushMutesChat?: boolean; chatTurnNotify?: boolean; telemetryTitles?: boolean; boxIdleNotify?: boolean; uiMode?: string | null } = {};
+    const body = (req.body ?? {}) as { defaultAgentProvider?: unknown; dotfilesRepoUrl?: unknown; theme?: unknown; pushMutesChat?: unknown; chatTurnNotify?: unknown; telemetryTitles?: unknown; boxIdleNotify?: unknown; uiMode?: unknown; chatNudgeDismissed?: unknown; boxPlacement?: unknown; myFilesOnBoxes?: unknown; myFilesSpace?: unknown };
+    const data: { defaultAgentProvider?: string; dotfilesRepoUrl?: string | null; theme?: Prisma.InputJsonValue; pushMutesChat?: boolean; chatTurnNotify?: boolean; telemetryTitles?: boolean; boxIdleNotify?: boolean; uiMode?: string | null; chatNudgeDismissedAt?: Date | null; boxPlacement?: string | null; myFilesOnBoxes?: boolean } = {};
     const has = (key: string) => Object.prototype.hasOwnProperty.call(body, key);
     const uiModeAllowed = await uiModeOn(req.user);
+    const chatNudgeAllowed = await chatNudgeOn(req.user);
+    const placementAllowed = await placementOn(req.user);
+    const myFilesAllowed = await myFilesOn(req.user);
+
+    // Settings > My files: "Put My files on my boxes", and "Use an existing space as My files…" (a space they own).
+    if (has('myFilesOnBoxes') || has('myFilesSpace')) {
+      if (!myFilesAllowed) {
+        res.status(403).json({ error: 'My files is not available yet', code: 'project_files_disabled' });
+        return;
+      }
+      if (has('myFilesOnBoxes')) {
+        if (typeof body.myFilesOnBoxes !== 'boolean') {
+          res.status(400).json({ error: 'myFilesOnBoxes must be a boolean' });
+          return;
+        }
+        data.myFilesOnBoxes = body.myFilesOnBoxes;
+      }
+      if (has('myFilesSpace') && (typeof body.myFilesSpace !== 'string' || !body.myFilesSpace.trim())) {
+        res.status(400).json({ error: "myFilesSpace must be a space's name" });
+        return;
+      }
+    }
+
+    if (has('boxPlacement')) {
+      if (!placementAllowed) {
+        res.status(403).json({ error: 'Choosing where new sessions run is not available yet', code: 'box_placement_disabled' });
+        return;
+      }
+      // null: back to the org default.
+      if (body.boxPlacement !== null && !isPlacementPolicy(body.boxPlacement)) {
+        res.status(400).json({ error: 'boxPlacement must be reuse-first, fresh-first or null' });
+        return;
+      }
+      data.boxPlacement = body.boxPlacement;
+    }
+
+    if (has('chatNudgeDismissed')) {
+      if (!chatNudgeAllowed) {
+        res.status(403).json({ error: 'The chat recommendation is not available yet', code: 'chat_nudge_disabled' });
+        return;
+      }
+      if (typeof body.chatNudgeDismissed !== 'boolean') {
+        res.status(400).json({ error: 'chatNudgeDismissed must be a boolean' });
+        return;
+      }
+      // true: answered now; false: offer it again (a reset, for support and the e2e stack).
+      data.chatNudgeDismissedAt = body.chatNudgeDismissed ? new Date() : null;
+    }
 
     if (has('uiMode')) {
       if (!uiModeAllowed) {
@@ -620,15 +724,27 @@ export function authRouter(): Router {
       data.boxIdleNotify = body.boxIdleNotify;
     }
 
-    if (Object.keys(data).length === 0) {
+    if (Object.keys(data).length === 0 && !has('myFilesSpace')) {
       res.status(400).json({ error: 'No supported preference supplied' });
       return;
+    }
+
+    // The space first, under its own checks (services/projectFiles.ts): a refusal changes nothing.
+    if (has('myFilesSpace')) {
+      const used = await useExistingSpace(req.user, { kind: 'mine' }, (body.myFilesSpace as string).trim());
+      if (!used.ok) {
+        res.status(used.status).json({ error: used.error, code: used.code });
+        return;
+      }
     }
 
     const user = await prisma.user.update({
       where: { id: req.user.id },
       data,
     });
+    // Off takes My files off every box they own; on puts it on every capable one (the rest on their hello).
+    if (data.myFilesOnBoxes === false) await removeMyFilesGrants(user.id);
+    else if (data.myFilesOnBoxes === true) await grantMyFilesEverywhere(user);
 
     req.user.defaultAgentProvider = user.defaultAgentProvider;
     req.user.dotfilesRepoUrl = user.dotfilesRepoUrl;
@@ -638,8 +754,12 @@ export function authRouter(): Router {
     req.user.telemetryTitles = user.telemetryTitles;
     req.user.boxIdleNotify = user.boxIdleNotify;
     req.user.uiMode = user.uiMode;
+    req.user.chatNudgeDismissedAt = user.chatNudgeDismissedAt;
+    req.user.boxPlacement = user.boxPlacement;
+    req.user.myFilesSpaceId = user.myFilesSpaceId;
+    req.user.myFilesOnBoxes = user.myFilesOnBoxes;
 
-    res.json({ ...userPayload(user), ...withUiMode(uiModeAllowed, user) });
+    res.json({ ...userPayload(user), ...withUiMode(uiModeAllowed, user), ...withChatNudge(chatNudgeAllowed, user), ...await withPlacement(placementAllowed, req.user), ...await withMyFiles(myFilesAllowed, req.user) });
   };
 
   // Local mode: sign in as the first identity in ALLOWED_USERS without an
@@ -697,6 +817,7 @@ export function authRouter(): Router {
 
   router.post('/logout', logout);
   router.get('/me', me);
+  router.post('/me/my-files', ensureMine);
   router.put('/me/preferences', updatePreferences);
   router.put('/me/onboarding', setOnboarding);
   if (authMode() === 'local') router.get('/login', localLogin);

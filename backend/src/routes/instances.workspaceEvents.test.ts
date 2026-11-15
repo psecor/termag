@@ -36,8 +36,12 @@ vi.mock('../services/boxProvisioner', () => ({
   provisionBox: vi.fn(), terminateBox: vi.fn(async () => true), isBoxProvisioningConfigured: () => true,
 }));
 vi.mock('../services/boxPower', () => ({ requestPower, PowerRequestConflict }));
-vi.mock('../services/boxLifecycle', () => ({ recentAutoTerminations: vi.fn(), setBoxLifecycle: vi.fn() }));
-vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
+const runners = { live: 0, guard: true };
+vi.mock('../services/boxLifecycle', () => ({
+  recentAutoTerminations: vi.fn(), setBoxLifecycle: vi.fn(),
+  liveRunnerSessions: vi.fn(async (ids: string[]) => new Map(runners.live ? [[ids[0], runners.live]] : [])),
+}));
+vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async (key: string, _u: unknown, fallback: boolean) => (key === 'box-stop-cloud-session-guard-enabled' ? runners.guard : false)) }));
 vi.mock('../services/warmPool', () => ({ poolSpecHashOrNull: vi.fn(async () => null), reconcileWarmPool: vi.fn() }));
 vi.mock('../services/agentRegistry', () => ({
   isInstanceAgentConnected: vi.fn(() => true), sendToInstanceAgent: vi.fn(), connectedInstanceIds: vi.fn(() => []),
@@ -112,6 +116,34 @@ describe('powerOwnedBox', () => {
     state.box = box({ status: 'stopped' });
     expect((await powerOwnedBox(user, 'b1', 'start')).status).toBe(202);
     expect(requestPower).toHaveBeenLastCalledWith(expect.anything(), 'start', { markInUse: true, byOwner: true });
+  });
+
+  it('refuses to stop a box running cloud sessions until a person forces it, and never for a box credential', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    requestPower.mockClear();
+    runners.live = 2;
+    const refused = await powerOwnedBox(user, 'b1', 'stop');
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({ code: 'box_busy', forceable: true, blockers: [{ check: 'claude-runner', forceable: true }] });
+    expect((refused.body as { error: string }).error).toMatch(/running 2 Claude Code cloud sessions/);
+    const agent = await powerOwnedBox(user, 'b1', 'stop', { force: true, boxCredential: true });
+    expect(agent.status).toBe(409);
+    expect(agent.body).toMatchObject({ code: 'box_busy', forceable: false });
+    expect(requestPower).not.toHaveBeenCalled();
+    expect(changed).not.toHaveBeenCalled();
+    expect((await powerOwnedBox(user, 'b1', 'stop', { force: true })).status).toBe(202);
+    expect(requestPower).toHaveBeenLastCalledWith(expect.anything(), 'stop', { markInUse: false, byOwner: true });
+    state.box = box({ status: 'stopped' });
+    expect((await powerOwnedBox(user, 'b1', 'start')).status).toBe(202);
+    runners.live = 0;
+  });
+
+  it('with box-stop-cloud-session-guard-enabled off, a stop goes ahead as before', async () => {
+    runners.live = 1;
+    runners.guard = false;
+    expect((await powerOwnedBox(user, 'b1', 'stop')).status).toBe(202);
+    runners.live = 0;
+    runners.guard = true;
   });
 
   it('says nothing when the request is refused or EC2 refuses it', async () => {

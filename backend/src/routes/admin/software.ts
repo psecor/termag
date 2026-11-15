@@ -26,10 +26,11 @@ const badComponent = (res: Response) => { res.status(400).json(UNKNOWN_COMPONENT
 
 export function softwareRouter(): Router {
   const router = Router();
-  router.get('/software', asyncHandler(async (_req, res) => { res.json(await softwareMatrix()); }));
+  // The admin asking: what the matrix reads per user (the orchestrator's Claude Code gate) is read for them.
+  router.get('/software', asyncHandler(async (req, res) => { res.json(await softwareMatrix(req.user ?? null)); }));
   router.get('/software/clients', asyncHandler(async (_req, res) => { res.json(await clientVersions()); }));
   router.get('/software/hosts/:hostKey', asyncHandler(async (req, res) => {
-    const out = await softwareHost(req.params.hostKey);
+    const out = await softwareHost(req.params.hostKey, req.user ?? null);
     if (!out) { res.status(404).json({ error: 'No such host' }); return; }
     res.json(out);
   }));

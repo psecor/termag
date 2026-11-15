@@ -8,6 +8,7 @@
  * hellos this module handles (a frame with `repo`, a workspace row).
  */
 
+import { noteSetupDone } from './sessionStartTiming';
 import { prisma } from '../db';
 import {
   type BoxAgentFrame,
@@ -19,7 +20,7 @@ import {
 } from './agentRegistry';
 import { agentView, launchProjectSessions } from './projectClone';
 import { claimUpdateRunning, claimUpdateSettled } from './claimUpdateGate';
-import { parseCloneStatusFrame, toSetupStatus } from './projectSetup';
+import { GOING_DOWN_BOX_STATUSES, parseCloneStatusFrame, toSetupStatus } from './projectSetup';
 import { resolveProjectRoot } from './projectPaths';
 import {
   decideRepoReport,
@@ -227,6 +228,8 @@ async function settleAggregate(projectId: string): Promise<void> {
     data: { setupStatus: next.status, setupError: next.error },
   });
   if (count > 0) console.log(`[WORKSPACE] ${row.id} on ${row.instanceId}: ${from} -> ${next.status}`);
+  // Its repositories are all checked out: a session's start timing marks it (services/sessionStartTiming.ts).
+  if (count > 0 && next.status === 'ready') noteSetupDone(row.id);
 }
 
 /** One repository's report from the box. */
@@ -337,8 +340,12 @@ export async function retryWorkspace(projectId: string): Promise<{ retried: stri
   return { retried: failed.map(r => r.name), dispatch };
 }
 
-async function onHello(ev: BoxAgentHelloEvent): Promise<void> {
+export async function onHello(ev: BoxAgentHelloEvent): Promise<void> {
   await ev.settled;
+  // A box on its way down whose agent reconnected: that agent is about to go, so its waiting repositories wait for
+  // the hello after it's started again, as redispatchClones does.
+  const box = await prisma.instance.findUnique({ where: { id: ev.instance.id }, select: { status: true } });
+  if (box && GOING_DOWN_BOX_STATUSES.includes(box.status)) return;
   const rows = await prisma.project.findMany({
     where: { instanceId: ev.instance.id, userId: ev.user.id, archived: false, layout: 'workspace', repos: { some: { setupStatus: { in: ['pending', 'cloning'] } } } },
     select: { id: true },

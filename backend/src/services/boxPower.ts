@@ -7,20 +7,16 @@
  * writing a stale status back.
  */
 
-import {
-  DescribeInstancesCommand,
-  EC2Client,
-  StartInstancesCommand,
-  StopInstancesCommand,
-} from '@aws-sdk/client-ec2';
+import type { BoxAgentHelloEvent } from './agentRegistry';
+import { DescribeInstancesCommand, StopInstancesCommand } from '@aws-sdk/client-ec2';
 import type { Instance, Prisma } from '@prisma/client';
 import { prisma } from '../db';
-import { awsClientConfig, getBoxConfig } from './boxProvisioner';
+import { getBoxConfig } from './boxProvisioner';
 import { dropInstanceAgent } from './agentRegistry';
 import { boxInUseFields, guestWakeFields } from './boxActivity';
 import { isAutoHibernateNote } from './boxLifecyclePolicy';
 import { resizeFreeWhere } from './boxResizeLock';
-import { startOnFallbackType } from './boxStartFallback';
+import { ec2For, startBox } from './ec2Box';
 import { armBoxStart, recordBoxStartFailed, recordBoxStartStillStarting, type StartedBy } from './boxStartLatency';
 import { traceSweep } from './tracing/spans';
 import { forgetSleepRequest, recordSleepRequested, recordSleepSettled, sleepOutcome, type SleepRequestedBy } from './boxPowerEvents';
@@ -37,6 +33,17 @@ import {
   sleepKeepsDownClock,
 } from './boxPowerPolicy';
 import { QUARANTINED, QUARANTINED_OWNER_ERROR } from './boxQuarantinePolicy';
+
+/** Run a box's held checkouts as its agent's hello would (services/projectClone.ts, services/workspaceSetup.ts). */
+async function redispatchHeldCheckouts(boxId: string, userId: string): Promise<void> {
+  const ev = { instance: { id: boxId }, user: { id: userId }, settled: Promise.resolve() } as unknown as BoxAgentHelloEvent;
+  try {
+    const [{ redispatchClones }, { onHello }] = await Promise.all([import('./projectClone'), import('./workspaceSetup')]);
+    await Promise.all([redispatchClones(ev), onHello(ev)]);
+  } catch (err) {
+    console.warn(`[BOX] ${boxId}: held checkouts not redispatched after its stop timed out:`, err instanceof Error ? err.message : String(err));
+  }
+}
 
 export class PowerRequestConflict extends Error {}
 
@@ -55,25 +62,12 @@ export function powerRequestedAt(instanceId: string): number | null {
 /** Attempts per box to put it back down after a 60-day refresh resume, for the log. */
 const rehibernateAttempts = new Map<string, number>();
 
-function ec2For(instance: Pick<Instance, 'region'>): EC2Client {
-  const cfg = getBoxConfig();
-  if (!cfg) throw new Error('Box provisioning is not configured');
-  return new EC2Client(awsClientConfig(cfg, instance.region ?? cfg.region));
-}
-
 async function sendPower(instance: Instance, action: PowerAction, opts: RequestPowerOptions = {}): Promise<void> {
   const ec2 = ec2For(instance);
   const InstanceIds = [instance.ec2InstanceId!];
-  if (action === 'start') {
-    // A resize walks its own types; any other start of a stopped box EC2 has
-    // no room for may go to another type of the same shape (boxStartFallback.ts).
-    try {
-      await ec2.send(new StartInstancesCommand({ InstanceIds }));
-    } catch (err) {
-      if (opts.forResize) throw err;
-      await startOnFallbackType(ec2, instance, err);
-    }
-  }
+  // A resize walks its own types; any other start of a stopped box EC2 has
+  // no room for may go to another type of the same shape (ec2Box.startBox).
+  if (action === 'start') await startBox(ec2, instance, { fallback: !opts.forResize });
   else if (action === 'hibernate') await ec2.send(new StopInstancesCommand({ InstanceIds, Hibernate: true }));
   else await ec2.send(new StopInstancesCommand({ InstanceIds }));
 }
@@ -369,6 +363,9 @@ export async function sweepPowerStates(now = Date.now()): Promise<void> {
     const applied = await prisma.instance.updateMany({ where: { id: box.id, status: box.status }, data });
     if (applied.count === 0) continue;
     if (slept) recordSleepSettled(box, slept, now);
+    // A stop or hibernate that timed out back to ready keeps its agent, so no hello comes: checkouts held for the
+    // hello after a wake (a session started on the box while it was going down) run now.
+    if (slept === 'failed' && box.userId) void redispatchHeldCheckouts(box.id, box.userId);
     if (box.status === 'starting') {
       if (settlement.status === 'stopped' || settlement.status === 'hibernated') recordBoxStartFailed(box.id, now);
       else if (settlement.provisioningError && !box.provisioningError) recordBoxStartStillStarting(box.id, now);

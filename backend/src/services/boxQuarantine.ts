@@ -17,8 +17,10 @@
 import {
   CreateSnapshotCommand,
   CreateTagsCommand,
+  DescribeIamInstanceProfileAssociationsCommand,
   DescribeInstancesCommand,
   DescribeSnapshotsCommand,
+  DisassociateIamInstanceProfileCommand,
   DescribeSecurityGroupsCommand,
   EC2Client,
   RevokeSecurityGroupEgressCommand,
@@ -39,6 +41,7 @@ import {
   type BoxConfig,
 } from './boxProvisioner';
 import { isHibernateRefusal } from './boxPowerPolicy';
+import { SHARED_QUARANTINE_POLICY, denySharedRoleInstance, usesSharedRole } from './boxSharedRole';
 import {
   EC2_GROUP_NOT_FOUND,
   EC2_PERMISSION_NOT_FOUND,
@@ -248,7 +251,9 @@ async function runAwsSteps(
   }
 
   if (todo.has('iam')) {
-    if (!box.iamRoleName) {
+    if (usesSharedRole(box, cfg.sharedRole)) {
+      await containSharedRole(ec2, iam, box.iamRoleName ?? cfg.sharedRole!.roleName, ec2InstanceId, box.id, record);
+    } else if (!box.iamRoleName) {
       await record('iam', 'skipped', 'no box role recorded');
     } else {
       try {
@@ -291,6 +296,38 @@ async function runAwsSteps(
       await snapshotVolumes(ec2, cfg, box, settled.instance, previous, facts, record);
     }
   }
+}
+
+/**
+ * The `iam` step for a box on the shared role, which every other box uses
+ * too (boxSharedRole.ts): deny every action to this instance's sessions on
+ * the shared role, which also stops credentials the box already holds, then
+ * take the instance profile off the instance so it gets no new ones. Either
+ * failing fails the step, for a Retry; both are idempotent.
+ */
+async function containSharedRole(ec2: EC2Client, iam: IAMClient, roleName: string, ec2InstanceId: string, boxId: string, record: Recorder): Promise<void> {
+  const notes: string[] = [];
+  let ok = true;
+  try {
+    const held = await denySharedRoleInstance(iam, roleName, ec2InstanceId, boxId);
+    notes.push(`${SHARED_QUARANTINE_POLICY} on ${roleName} denies ${ec2InstanceId} (${held} held)`);
+  } catch (err) {
+    ok = false;
+    notes.push(`deny on ${roleName}: ${failure(err)}`);
+  }
+  try {
+    const res = await ec2.send(new DescribeIamInstanceProfileAssociationsCommand({ Filters: [{ Name: 'instance-id', Values: [ec2InstanceId] }] }));
+    const live = (res.IamInstanceProfileAssociations ?? []).filter(a => a.State === 'associated' || a.State === 'associating');
+    if (live.length === 0) notes.push('no instance profile on the instance');
+    for (const a of live) {
+      await ec2.send(new DisassociateIamInstanceProfileCommand({ AssociationId: a.AssociationId }));
+      notes.push(`instance profile removed (${a.AssociationId})`);
+    }
+  } catch (err) {
+    ok = false;
+    notes.push(`instance profile: ${failure(err)}`);
+  }
+  await record('iam', ok ? 'done' : 'failed', notes.join('; '));
 }
 
 /** The instance once EC2 no longer reports it running or stopping, or as it is when the wait runs out. */

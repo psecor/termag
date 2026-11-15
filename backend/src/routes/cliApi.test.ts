@@ -10,6 +10,11 @@ const productEvents: Array<{ name: string; ctx: unknown; detail: unknown }> = []
 vi.mock('../services/productEvents', () => ({
   recordProductEvent: (name: string, ctx: unknown, detail: unknown) => { productEvents.push({ name, ctx, detail }); },
 }));
+const spanAttributes: Array<Record<string, unknown>> = [];
+vi.mock('../services/tracing/requestSpan', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/tracing/requestSpan')>()),
+  setServerSpanAttributes: (_req: unknown, attributes: Record<string, unknown>) => { spanAttributes.push(attributes); },
+}));
 vi.mock('../middleware/auth', () => ({
   requireAuth: (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const id = req.get('x-test-user');
@@ -320,6 +325,16 @@ describe('bearer auth', () => {
     expect(store.touches).toBe(1);
   });
 
+  it('names the user on the server span, for a device sign-in and a box token alike', async () => {
+    const token = await login('bob');
+    store.agentTokens.set('tmag_box', { user: alice, instanceId: 'i-devbox' });
+    spanAttributes.length = 0;
+    expect((await call('/api/cli/v1/whoami', { token })).status).toBe(200);
+    expect((await call('/api/cli/v1/whoami', { token: 'tmag_box' })).status).toBe(200);
+    expect((await call('/api/cli/v1/whoami', { token: 'something-else' })).status).toBe(401);
+    expect(spanAttributes.filter(a => 'termag.user' in a)).toEqual([{ 'termag.user': 'bob' }, { 'termag.user': 'alice' }]);
+  });
+
   it('accepts an owner-bound box token and refuses an ownerless one', async () => {
     store.agentTokens.set('tmag_box', { user: alice, instanceId: 'i-devbox' });
     store.agentTokens.set('tmag_warm', null);
@@ -464,6 +479,23 @@ describe('POST /usage', () => {
     const res = await call('/api/cli/v1/usage', { method: 'POST', token: 'tmag_box', body: JSON.stringify({ command: 'ask', phase: 'finished' }) });
     expect(res.status).toBe(204);
     expect(productEvents[0]).toMatchObject({ ctx: { user: 'alice', box: 'i-devbox' }, detail: { credential: 'box' } });
+  });
+
+  it('records which CLI ran the command: node, go, or absent from an older CLI', async () => {
+    const token = await login();
+    for (const runtime of ['node', 'go', undefined]) {
+      productEvents.length = 0;
+      const res = await call('/api/cli/v1/usage', { method: 'POST', token, body: JSON.stringify({ command: 'box list', phase: 'finished', durationMs: 80, runtime }) });
+      expect(res.status, String(runtime)).toBe(204);
+      expect(productEvents).toEqual([expect.objectContaining({ name: 'cli.command', detail: expect.objectContaining({ command: 'box list', runtime }) })]);
+    }
+  });
+
+  it('refuses a runtime it does not know, and records nothing', async () => {
+    const token = await login();
+    const res = await call('/api/cli/v1/usage', { method: 'POST', token, body: JSON.stringify({ command: 'whoami', phase: 'finished', runtime: 'deno' }) });
+    expect(res.status).toBe(400);
+    expect(productEvents).toEqual([]);
   });
 
   it('refuses a report that is not a command name, and records nothing', async () => {

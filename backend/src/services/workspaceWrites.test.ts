@@ -99,6 +99,28 @@ describe('touchesList', () => {
     expect(touchesList('AgentThread', 'update', { data: { chatWorkstreamId: 'ws1' } })).toBe(true);
     expect(touchesList('AgentThread', 'update', { data: { title: 'Fix the rows' } })).toBe(true);
     expect(touchesList('AgentThread', 'updateMany', { data: { hopCount: { increment: 1 } } })).toBe(false);
+    // The list's repoKeys: a workspace's repositories and its layout, but not a clone's progress.
+    expect(touchesList('ProjectRepo', 'create', { data: { projectId: 'p1', url: 'u' } })).toBe(true);
+    expect(touchesList('ProjectRepo', 'update', { data: { position: 2 } })).toBe(true);
+    expect(touchesList('ProjectRepo', 'updateMany', { data: { setupStatus: 'ready' } })).toBe(false);
+    expect(touchesList('Project', 'update', { data: { layout: 'workspace' } })).toBe(true);
+    // A checkout joining its project, and a project's name and archive.
+    expect(touchesList('Project', 'updateMany', { data: { userProjectId: 'up1' } })).toBe(true);
+    expect(touchesList('UserProject', 'create', { data: { userId: 'owner', name: 'termag' } })).toBe(true);
+    expect(touchesList('UserProject', 'update', { data: { name: 'Termag web', nameKey: 'termag web' } })).toBe(true);
+    expect(touchesList('UserProject', 'update', { data: { archivedAt: new Date() } })).toBe(true);
+    expect(touchesList('UserProject', 'update', { data: { formerRepoSetKeys: [] } })).toBe(false);
+  });
+
+  it("tells only a project's owner when their project is renamed", async () => {
+    await run('UserProject', 'update', { where: { id: 'up1' }, data: { name: 'Termag web' } }, { id: 'up1', userId: 'owner', name: 'Termag web' }).done;
+    await vi.waitFor(() => expect(pushed()).toEqual(['owner']));
+    expect(reader.projectAudience).not.toHaveBeenCalled();
+  });
+
+  it("tells a workspace's owner and collaborators when a repository is added", async () => {
+    await run('ProjectRepo', 'create', { data: { projectId: 'p1', name: 'api', url: 'https://github.com/e2e-org/sample-api' } }, { id: 'r1', projectId: 'p1' }).done;
+    await vi.waitFor(() => expect(pushed()).toEqual(['collab', 'owner']));
   });
 });
 

@@ -45,6 +45,8 @@ describe('shapeBox', () => {
 
   it("says a box made for `termag ask` is one, and any other value isn't", () => {
     expect(shapeBox({ ...box, createdFor: 'ask' }, true).createdFor).toBe('ask');
+    expect(shapeBox({ ...box, shared: true }, true).shared).toBe(true);
+    expect('shared' in shapeBox(box, true)).toBe(false);
     expect(shapeBox({ ...box, createdFor: null }, true).createdFor).toBeNull();
     expect(shapeBox({ ...box, createdFor: 'later' }, true).createdFor).toBeNull();
   });

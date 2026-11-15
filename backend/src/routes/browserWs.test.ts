@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { Instance, User } from '@prisma/client';
 
@@ -6,13 +8,14 @@ vi.mock('../db', () => ({ prisma: {} }));
 vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => false) }));
 vi.mock('../services/boxPower', () => ({ instanceStatus: vi.fn(async () => null) }));
 vi.mock('../services/agentRegistry', () => ({
+  requestBrowserChromium: vi.fn(),
   closeBrowserStream: vi.fn(), isProjectAgentConnected: vi.fn(), projectAgentCapabilities: vi.fn(),
   requestBrowserStream: vi.fn(), sendBrowserMessage: vi.fn(),
 }));
 
 import { TERMINAL_BOX_PARKED_CLOSE_CODE } from '../services/boxPowerPolicy';
-import { BROWSER_PANE_CAPABILITY, BROWSER_PANE_GUEST_CAPABILITY, BROWSER_PANE_PROFILES_CAPABILITY, BROWSER_PANE_DISABLED_CLOSE_CODE, BROWSER_PANE_RETRY_CLOSE_CODE, BROWSER_PANE_UNSUPPORTED_CLOSE_CODE } from '../services/browserPane';
-import { BROWSER_PANE_UNSUPPORTED_MESSAGE, handleBrowserPaneSocket, type BrowserPaneProject, type BrowserWsDeps } from './browserWs';
+import { BROWSER_GUEST_CHECK_CAPABILITY, BROWSER_PANE_CAPABILITY, BROWSER_PANE_CHROMIUM_CAPABILITY, BROWSER_PANE_GUEST_CAPABILITY, BROWSER_PANE_PROFILES_CAPABILITY, BROWSER_PANE_DISABLED_CLOSE_CODE, BROWSER_PANE_RETRY_CLOSE_CODE, BROWSER_PANE_UNSUPPORTED_CLOSE_CODE } from '../services/browserPane';
+import { BROWSER_PANE_INSTALLING_CHROMIUM_MESSAGE, browserPaneInstallFailedMessage, BROWSER_PANE_GUEST_NO_CHROMIUM_MESSAGE, BROWSER_PANE_GUEST_UNSUPPORTED_MESSAGE, BROWSER_PANE_NO_CHROMIUM_MESSAGE, BROWSER_PANE_UNSUPPORTED_MESSAGE, handleBrowserPaneSocket, type BrowserPaneProject, type BrowserWsDeps } from './browserWs';
 
 class FakeSocket extends EventEmitter {
   readyState = 1;
@@ -40,6 +43,8 @@ function deps(over: Partial<BrowserWsDeps> = {}): BrowserWsDeps & { log: ReturnT
     sendToStream: vi.fn(),
     closeStream: vi.fn(),
     suggest: vi.fn(async () => []),
+    chromiumEnabled: vi.fn(async () => false),
+    checkChromium: vi.fn(async () => null),
     log: vi.fn(),
     guestContext: vi.fn(async () => null),
     guestFlags: vi.fn(async () => ({ killed: false, maxGuests: 5 })),
@@ -108,12 +113,115 @@ describe('handleBrowserPaneSocket', () => {
     expect(d.requestStream).not.toHaveBeenCalled();
   });
 
-  it('closes 4501 when the agent does not advertise the capability', async () => {
+  it('closes 4501 saying the agent needs an update when it predates the pane', async () => {
     const d = deps({ agentCapabilities: vi.fn(() => ['tmux-create-command-v1']) });
     const ws = new FakeSocket();
     await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
     expect(ws.sent).toEqual([{ type: 'exit', reason: BROWSER_PANE_UNSUPPORTED_MESSAGE }]);
     expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'browser pane unsupported' });
+    expect(d.log).toHaveBeenCalledWith('[BROWSER-PANE] user u-owner refused for project p1: the agent predates the browser pane');
+  });
+
+  it('closes 4501 saying the box has no Chromium when a current agent found none', async () => {
+    // browser-guest-check-v1 without browser-pane-v1: the agent has the pane, the box has no Chromium.
+    const d = deps({ agentCapabilities: vi.fn(() => ['tmux-create-command-v1', BROWSER_GUEST_CHECK_CAPABILITY]) });
+    const ws = new FakeSocket();
+    await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
+    expect(ws.sent).toEqual([{ type: 'exit', reason: BROWSER_PANE_NO_CHROMIUM_MESSAGE }]);
+    expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'no chromium' });
+    expect(d.log).toHaveBeenCalledWith('[BROWSER-PANE] user u-owner refused for project p1: the box has no Chromium');
+    expect(d.requestStream).not.toHaveBeenCalled();
+  });
+
+  describe('a box with no Chromium, behind browser-pane-chromium-enabled', () => {
+    // A current agent on a box whose image came without Chromium.
+    const noChromium = ['tmux-create-command-v1', BROWSER_GUEST_CHECK_CAPABILITY, BROWSER_PANE_CHROMIUM_CAPABILITY];
+
+    it('flag off: refuses as before and never asks the agent', async () => {
+      const d = deps({ agentCapabilities: vi.fn(() => noChromium) });
+      const ws = new FakeSocket();
+      await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
+      expect(d.chromiumEnabled).toHaveBeenCalledWith(owner, project.instance);
+      expect(d.checkChromium).not.toHaveBeenCalled();
+      expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'no chromium' });
+    });
+
+    it("never asks an agent that can't look again, flag or not", async () => {
+      const d = deps({ agentCapabilities: vi.fn(() => ['tmux-create-command-v1', BROWSER_GUEST_CHECK_CAPABILITY]), chromiumEnabled: vi.fn(async () => true) });
+      const ws = new FakeSocket();
+      await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
+      expect(d.chromiumEnabled).not.toHaveBeenCalled();
+      expect(d.checkChromium).not.toHaveBeenCalled();
+      expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'no chromium' });
+    });
+
+    it('flag on, installing: says so and closes 1013, which the pane redials', async () => {
+      const d = deps({
+        agentCapabilities: vi.fn(() => noChromium), chromiumEnabled: vi.fn(async () => true),
+        checkChromium: vi.fn(async () => ({ answer: { chromium: null, installing: true, error: null, capabilities: [] }, adopt: vi.fn() })),
+      });
+      const ws = new FakeSocket();
+      await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
+      expect(d.checkChromium).toHaveBeenCalledWith({ userId: owner.id, instanceId: box.id }, true);
+      expect(ws.sent).toEqual([{ type: 'exit', reason: BROWSER_PANE_INSTALLING_CHROMIUM_MESSAGE }]);
+      expect(ws.closed).toEqual({ code: BROWSER_PANE_RETRY_CLOSE_CODE, reason: 'installing chromium' });
+      expect(d.requestStream).not.toHaveBeenCalled();
+    });
+
+    it('flag on, found: takes the capabilities the agent gained and opens the pane', async () => {
+      let caps = noChromium;
+      const adopt = vi.fn(() => { caps = [...caps, BROWSER_PANE_CAPABILITY]; });
+      const d = deps({
+        agentCapabilities: vi.fn(() => caps), chromiumEnabled: vi.fn(async () => true),
+        checkChromium: vi.fn(async () => ({ answer: { chromium: '/snap/bin/chromium', installing: false, error: null, capabilities: [BROWSER_PANE_CAPABILITY] }, adopt })),
+      });
+      const ws = new FakeSocket();
+      await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
+      expect(adopt).toHaveBeenCalled();
+      expect(d.requestStream).toHaveBeenCalled();
+      expect(ws.closed).toBeNull();
+      ws.close();
+    });
+
+    it('flag on, found but the answering connection was replaced: refuses rather than attach on the new one', async () => {
+      // adopt() adds nothing when the agent that answered is no longer the box's.
+      const d = deps({
+        agentCapabilities: vi.fn(() => noChromium), chromiumEnabled: vi.fn(async () => true),
+        checkChromium: vi.fn(async () => ({ answer: { chromium: '/snap/bin/chromium', installing: false, error: null, capabilities: [BROWSER_PANE_CAPABILITY] }, adopt: vi.fn() })),
+      });
+      const ws = new FakeSocket();
+      await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
+      expect(d.requestStream).not.toHaveBeenCalled();
+      expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'no chromium' });
+    });
+
+    it('flag on, the install failed: says why and how to add it by hand', async () => {
+      const d = deps({
+        agentCapabilities: vi.fn(() => noChromium), chromiumEnabled: vi.fn(async () => true),
+        checkChromium: vi.fn(async () => ({ answer: { chromium: null, installing: false, error: 'error: unable to contact snap store', capabilities: [] }, adopt: vi.fn() })),
+      });
+      const ws = new FakeSocket();
+      await handleBrowserPaneSocket(ws, url('projectId=p1'), owner.id, d);
+      expect(ws.sent).toEqual([{ type: 'exit', reason: browserPaneInstallFailedMessage('error: unable to contact snap store') }]);
+      expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'no chromium' });
+    });
+
+    it("reads the flag for the box's owner when a collaborator opens the pane, and an unanswered ask refuses as before", async () => {
+      const d = deps({ agentCapabilities: vi.fn(() => noChromium), chromiumEnabled: vi.fn(async () => true) });
+      const ws = new FakeSocket();
+      await handleBrowserPaneSocket(ws, url('projectId=p1'), friend.id, d);
+      expect(d.chromiumEnabled).toHaveBeenCalledWith(owner, project.instance);
+      expect(d.checkChromium).toHaveBeenCalled();
+      expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'no chromium' });
+    });
+  });
+
+  it("keeps the pane's own words for 4501 in step with the backend's", () => {
+    // A pane that missed the exit frame falls back to frontend/src/utils/browserPaneInput.ts.
+    const frontend = readFileSync(join(__dirname, '../../../frontend/src/utils/browserPaneInput.ts'), 'utf8');
+    expect(frontend).toContain(JSON.stringify(BROWSER_PANE_NO_CHROMIUM_MESSAGE));
+    expect(frontend).toContain(JSON.stringify(BROWSER_PANE_UNSUPPORTED_MESSAGE));
+    expect(frontend).toContain("reason === 'no chromium'");
   });
 
   it('asks for a kept profile from an agent that keeps profiles, for every viewer', async () => {
@@ -438,10 +546,23 @@ describe('handleBrowserPaneSocket: a reviewer\'s guest pane', () => {
     expect(ws.closed).toEqual({ code: TERMINAL_BOX_PARKED_CLOSE_CODE, reason: 'box asleep' });
     expect(ws.sent[0].reason).toBe("Olive's box is asleep.");
     expect(asleep.recordShareEvent).toHaveBeenCalledWith('cshare0000000001', 'refused', { actorId: 'u-guest', reason: 'box-asleep' });
-    ws = await open(guestDeps({ agentConnected: vi.fn(() => false) }), 'share=cshare0000000001', guestUser.id);
+    expect(asleep.log).toHaveBeenCalledWith('[BROWSER-PANE] guest u-guest refused for share cshare0000000001: box asleep');
+    const offline = guestDeps({ agentConnected: vi.fn(() => false) });
+    ws = await open(offline, 'share=cshare0000000001', guestUser.id);
     expect(ws.closed).toEqual({ code: BROWSER_PANE_RETRY_CLOSE_CODE, reason: 'agent not connected' });
-    ws = await open(guestDeps({ agentCapabilities: vi.fn(() => [BROWSER_PANE_CAPABILITY]) }), 'share=cshare0000000001', guestUser.id);
+    expect(offline.log).toHaveBeenCalledWith(expect.stringMatching(/^\[BROWSER-PANE\] guest u-guest refused for share cshare0000000001: agent not connected/));
+    expect(offline.recordShareEvent).not.toHaveBeenCalled();
+    const old = guestDeps({ agentCapabilities: vi.fn(() => [BROWSER_PANE_CAPABILITY]) });
+    ws = await open(old, 'share=cshare0000000001', guestUser.id);
     expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'guest pane unsupported' });
+    expect(old.log).toHaveBeenCalledWith('[BROWSER-PANE] guest u-guest refused for share cshare0000000001: guest pane unsupported: the agent does not advertise guests');
+    expect(old.recordShareEvent).toHaveBeenCalledWith('cshare0000000001', 'refused', { actorId: 'u-guest', reason: 'guest-pane-unsupported' });
+    expect(ws.sent[0].reason).toBe(BROWSER_PANE_GUEST_UNSUPPORTED_MESSAGE);
+    const noChromium = guestDeps({ agentCapabilities: vi.fn(() => [BROWSER_GUEST_CHECK_CAPABILITY]) });
+    ws = await open(noChromium, 'share=cshare0000000001', guestUser.id);
+    expect(ws.closed).toEqual({ code: BROWSER_PANE_UNSUPPORTED_CLOSE_CODE, reason: 'guest pane unsupported' });
+    expect(ws.sent[0].reason).toBe(BROWSER_PANE_GUEST_NO_CHROMIUM_MESSAGE);
+    expect(noChromium.log).toHaveBeenCalledWith('[BROWSER-PANE] guest u-guest refused for share cshare0000000001: guest pane unsupported: the box has no Chromium');
   });
 
   it('maps the agent\'s guest refusals: busy redials, a missing dev stack is final', async () => {

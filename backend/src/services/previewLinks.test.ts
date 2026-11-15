@@ -38,7 +38,10 @@ function setup(over: Partial<PreviewLinkDeps> = {}) {
   const workstreams: Record<string, string | null> = { main: null, 'feature-x': 'ws-feature-x', 'feature-y': 'ws-feature-y' };
   const flags = { enabled: true, audiences: true };
   const listeners: Array<Record<string, unknown>> = [
-    { port: 5173, pid: 101, command: 'node /home/alice/termag/projects/webapp/node_modules/.bin/vite --port 5173', verdict: { ok: true }, inCheckout: true },
+    // Started with `termag preview run` for the checkout: wider audiences may have it (SR9).
+    { port: 5173, pid: 101, command: 'node /home/alice/termag/projects/webapp/node_modules/.bin/vite --port 5173', verdict: { ok: true }, inCheckout: true, confined: true },
+    // Started in the owner's shell: "only me" may have it, no wider audience.
+    { port: 4000, pid: 103, command: 'node server.js', verdict: { ok: true }, inCheckout: true },
     { port: 9229, pid: 102, command: 'node --inspect=9229 server.js', verdict: { ok: false, code: 'port_refused', reason: 'debugger or shell' } },
   ];
   const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
@@ -185,6 +188,31 @@ describe('publishing', () => {
     expect(await t.publish(alice, { port: 5173, name: 'my-app' })).toMatchObject({ status: 501, body: { code: 'box_outdated', error: 'Update this box to publish ports' } });
     t.agent.connected = false;
     expect(await t.publish(alice, { port: 5173, name: 'my-app' })).toMatchObject({ status: 503, body: { code: 'box_not_ready' } });
+  });
+
+  // Pinning (SR9): a people or link audience reaches only a listener started with
+  // `termag preview run` for this checkout. The agent's tunnel-open checks it
+  // again on every connection (agent/port-tunnel.js); this is the publish's refusal.
+  it('refuses a wider audience on an unconfined listener (409 not_confined); "only me" may have it', async () => {
+    const t = setup();
+    for (const body of [
+      { port: 4000, name: 'my-app', audience: 'people', emails: ['bob@x.test'] },
+      { port: 4000, name: 'my-app', audience: 'link' },
+    ]) {
+      const r = await t.publish(alice, body);
+      expect(r).toEqual({ status: 409, body: { code: 'not_confined', error: 'Start this app with termag preview run on its box to share it beyond the project: port 4000 runs outside it' } });
+    }
+    expect(t.mem.links).toHaveLength(0);
+    expect(t.mem.names.size).toBe(0);
+    expect((await t.publish(alice, { port: 4000, name: 'my-app' })).status).toBe(201);
+    // Widening that link by a renew is refused the same way, and leaves it as it was.
+    expect(await t.publish(alice, { port: 4000, name: 'my-app', audience: 'link' })).toMatchObject({ status: 409, body: { code: 'not_confined' } });
+    expect(t.mem.links[0]).toMatchObject({ audience: 'owner', linkTokenHash: null });
+    // An agent too old to say (no `confined`) vouches for nothing.
+    delete t.listeners[0].confined;
+    expect(await t.publish(alice, { port: 5173, name: 'other-app', audience: 'link' })).toMatchObject({ status: 409, body: { code: 'not_confined' } });
+    // A port nothing listens on yet may be published: whatever starts there is checked at each tunnel-open.
+    expect((await t.publish(alice, { port: 8080, name: 'later-app', audience: 'link' })).status).toBe(201);
   });
 
   // SR6: a debugger, shell or notebook can't be published, from the dialog or the CLI.
@@ -492,10 +520,12 @@ describe('listing', () => {
     const r = await svc.previewListenersFor(t.deps, caller(alice), 'proj0001', { workstream: 'feature-y' });
     expect(r.status).toBe(200);
     const listeners = (r.body as any).listeners;
-    expect(listeners.map((l: any) => l.port)).toEqual([5173, 9229, 3000]);
-    expect(listeners[1]).toEqual({ port: 9229, pid: 102, command: 'node --inspect=9229 server.js', verdict: { ok: false, code: 'port_refused', reason: 'debugger or shell' }, inCheckout: false });
-    expect(listeners[2].command).toHaveLength(80);
-    expect(listeners[2].verdict).toEqual({ ok: false, code: 'port_refused', reason: 'the box refused this port' });
+    expect(listeners.map((l: any) => l.port)).toEqual([5173, 4000, 9229, 3000]);
+    expect(listeners[2]).toEqual({ port: 9229, pid: 102, command: 'node --inspect=9229 server.js', verdict: { ok: false, code: 'port_refused', reason: 'debugger or shell' }, inCheckout: false, confined: false });
+    // Only an agent's `confined: true` counts: started with termag preview run for the checkout.
+    expect(listeners.map((l: any) => l.confined)).toEqual([true, false, false, false]);
+    expect(listeners[3].command).toHaveLength(80);
+    expect(listeners[3].verdict).toEqual({ ok: false, code: 'port_refused', reason: 'the box refused this port' });
     expect(t.sent[0].payload).toEqual({ cwd: '/home/alice/termag/projects/webapp/.worktrees/feature-y' });
     expect(await svc.previewListenersFor(t.deps, caller(alice), 'proj0001', { workstream: 'nope' })).toMatchObject({ status: 404 });
   });

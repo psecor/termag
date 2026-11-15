@@ -39,7 +39,7 @@ export const PI_TARGET_TAGS: readonly string[] = ['latest'];
  * piUpdatePolicy.test.ts reads the recipe's PINS and fails until this moves
  * with them.
  */
-export const PI_PINNED_LATEST = '1.5.0';
+export const PI_PINNED_LATEST = '1.5.2';
 
 export const DEFAULT_PI_UPDATE_POLICY: ClaudeUpdatePolicy = {
   mode: 'off',

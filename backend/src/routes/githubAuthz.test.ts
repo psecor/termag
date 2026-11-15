@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({
   orgs: {} as Record<string, unknown>,
   rechecks: [] as unknown[],
   callerOk: true,
+  callerThrows: false,
   poolToken: null as string | null,
 }));
 
@@ -29,7 +30,10 @@ vi.mock('../services/poolEnvironmentRepos', () => ({
   poolEnvironmentRepos: async (id: string) => (id === 'env-termag' ? ['example-org/termag', 'example-org/webapp'] : null),
 }));
 vi.mock('../services/callerIdentity', () => ({
-  verifyCallerProof: async (h: Record<string, string>) => (state.callerOk && h['x-termag-caller-authorization'] ? 'arn:gateway' : null),
+  verifyCallerProof: async (h: Record<string, string>) => {
+    if (state.callerThrows) throw new Error('STS 400 Throttling');
+    return state.callerOk && h['x-termag-caller-authorization'] ? 'arn:gateway' : null;
+  },
 }));
 
 const { githubAuthzRouter } = await import('./githubAuthz');
@@ -58,6 +62,7 @@ beforeEach(() => {
   state.ownerToken = OWNER_TOKEN;
   state.orgs = {};
   state.callerOk = true;
+  state.callerThrows = false;
   state.poolToken = POOL_TOKEN;
   logs.length = 0;
 });
@@ -91,6 +96,15 @@ describe('the GitHub broker check (ext_authz)', () => {
     expect(res.status).toBe(403);
     expect(res.headers.get('authorization')).toBeNull();
     expect((await check(REFS, { auth: basic(BOX_TOKEN), proof: false })).status).toBe(403);
+  });
+
+  it('answers a retryable 503, not a refusal, when STS cannot check the proof just now (bug cmw5ja1m)', async () => {
+    state.callerThrows = true;
+    const res = await check(REFS, { auth: basic(BOX_TOKEN) });
+    expect(res.status).toBe(503);
+    expect(res.headers.get('authorization')).toBeNull();
+    expect((await res.json()).message).toBe('The termag GitHub broker could not check this request');
+    expect(logs.join('\n')).toMatch(/\[GH-AUTHZ\] GET .* -> 503 error STS 400 Throttling/);
   });
 
   it('takes no header for proof of the TLS listener: a client-sent one changes nothing', async () => {

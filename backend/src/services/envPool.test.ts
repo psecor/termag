@@ -7,7 +7,7 @@ vi.mock('./agentRegistry', () => ({ onPoolBoxFrame: vi.fn(() => () => undefined)
 vi.mock('./warmPool', () => ({ currentPoolSpecHash: vi.fn(async () => 'spec') }));
 vi.mock('./productEvents', () => ({ recordProductEvent: vi.fn() }));
 
-const { resolveForHello, envPoolDefinitionByName, resetEnvPoolCache, helloAction, prepareSendOutcome, restopIfStillStopping, stopSettlement, envPoolSetupHash, parsePoolStatus, poolStatusOutcome, prepareRequest, resolveEnvPoolDefinition, setupTextOf } = await import('./envPool');
+const { resolveForTick, poolFailureWhere, claimableRows, retireEnvFailedRows, onWarmView, envPoolSetupHash, lastEnvPoolResolution, setLastEnvPoolResolutionForTests, onWarmEventProps, onWarmPoolLog, helloAction, prepareSendOutcome, restopIfStillStopping, stopSettlement, parsePoolStatus, poolStatusOutcome, prepareRequest, resolveEnvPoolDefinition, setupTextOf } = await import('./envPool');
 const { parseEnvPoolSizes, ENV_POOL_TOTAL_CEILING } = await import('./envPoolSizes');
 type Deps = import('./envPool').EnvPoolDeps;
 
@@ -89,10 +89,12 @@ describe('parsePoolStatus', () => {
     expect(parsePoolStatus({ projectId: 'cuid', status: {} })).toBeNull();
     expect(parsePoolStatus({
       projectId: 'pool', status: { state: 'ready', setup: { state: 'succeeded' }, setupCommit: { 'o/a': 'a'.repeat(40), bad: 3 } },
-    })).toEqual({ state: 'ready', setup: 'succeeded', setupCommit: { 'o/a': 'a'.repeat(40) }, log: '', error: null, exitCode: null, prepareId: null });
+    })).toEqual({ state: 'ready', setup: 'succeeded', setupCommit: { 'o/a': 'a'.repeat(40) }, log: '', error: null, exitCode: null, prepareId: null, onWarm: null });
     expect(parsePoolStatus({ projectId: 'pool', status: { state: 'failed', setup: { state: 'failed', error: 'exit 1' }, log: 'npm ERR!' } }))
       .toMatchObject({ state: 'failed', error: 'exit 1', log: 'npm ERR!' });
     expect(parsePoolStatus({ projectId: 'pool', status: { prepareId: 'refresh-1' } })?.prepareId).toBe('refresh-1');
+    expect(parsePoolStatus({ projectId: 'pool', status: { onWarm: { state: 'skipped', seconds: 0 } } })?.onWarm).toEqual({ onWarmStatus: 'skipped', onWarmSeconds: 0 });
+    expect(parsePoolStatus({ projectId: 'pool', status: { onWarm: { state: 'bogus' } } })?.onWarm).toBeNull();
   });
 });
 
@@ -144,6 +146,68 @@ describe('parseEnvPoolSizes', () => {
   });
   it(`clamps the total to ${ENV_POOL_TOTAL_CEILING} in name order`, () => {
     expect(parseEnvPoolSizes({ a: 15, b: 15, c: 15 })).toEqual([{ name: 'a', target: 15 }, { name: 'b', target: 5 }, { name: 'c', target: 0 }]);
+  });
+});
+
+describe('the on-warm run of a pool box, on the prepare event and the pool page', () => {
+  it('says whether it ran and how long it took', () => {
+    expect(onWarmEventProps({ onWarmStatus: 'succeeded', onWarmSeconds: 41 })).toEqual({ onWarm: 'succeeded', onWarmSec: 41 });
+    expect(onWarmEventProps({ onWarmStatus: null, onWarmSeconds: null })).toEqual({ onWarm: 'none', onWarmSec: null });
+  });
+  it('keeps a failure with the box for the page, and nothing for a success', () => {
+    expect(onWarmPoolLog({ onWarmStatus: 'failed', onWarmLog: 'on-warm script-failed at 20-image-pulls.sh exit 1' }))
+      .toMatch(/warm-up \(on-warm\) failed; the box was prepared anyway\n\non-warm script-failed at 20-image-pulls.sh/);
+    expect(onWarmPoolLog({ onWarmStatus: 'succeeded', onWarmLog: 'ok' })).toBeNull();
+  });
+});
+
+describe('the tick\'s last resolution: what a claim and the polled pool view read, never GitHub', () => {
+  it('is nothing before the tick resolved the environment (a claim then misses), and the stored value after', () => {
+    expect(lastEnvPoolResolution({ name: 'envdemo', updatedAt: new Date(0) })).toBeNull();
+    const value = { ok: false as const, reason: 'GitHub said 502' };
+    setLastEnvPoolResolutionForTests('envdemo', value);
+    expect(lastEnvPoolResolution({ name: 'envdemo', updatedAt: new Date(0) })).toBe(value);
+    setLastEnvPoolResolutionForTests('envdemo', null);
+    expect(lastEnvPoolResolution({ name: 'envdemo', updatedAt: new Date(0) })).toBeNull();
+  });
+});
+
+describe('onWarmView: the pool page reads a failed warm-up from the row\'s own on-warm columns (Bugbot on #1461)', () => {
+  it("shows the log of a failure whatever poolLog holds (a stop that raced the frame wrote it null)", () => {
+    expect(onWarmView({ onWarmStatus: 'failed', onWarmSeconds: 5, onWarmLog: 'on-warm script-failed at 20-image-pulls.sh exit 1' }))
+      .toEqual({ state: 'failed', seconds: 5, log: expect.stringContaining('20-image-pulls.sh exit 1') });
+    expect(onWarmView({ onWarmStatus: 'succeeded', onWarmSeconds: 41, onWarmLog: 'ok' })).toEqual({ state: 'succeeded', seconds: 41, log: null });
+    expect(onWarmView({ onWarmStatus: null, onWarmSeconds: null, onWarmLog: null })).toBeNull();
+  });
+});
+
+describe('retireEnvFailedRows: rows a deploy before the one failure rule left env-failed (Bugbot on #1464)', () => {
+  it('moves them to terminated in code (deploys run prisma db push, not the migration), keeping a terminatedAt they had', async () => {
+    const calls: unknown[] = [];
+    const db = { instance: { updateMany: vi.fn(async (q: unknown) => { calls.push(q); return { count: 2 }; }) } };
+    const now = new Date('2026-11-06T12:00:00Z');
+    expect(await retireEnvFailedRows(db as any, now)).toBe(4);
+    expect(calls).toEqual([
+      { where: { status: 'env-failed', terminatedAt: null }, data: { status: 'terminated', terminatedAt: now } },
+      { where: { status: 'env-failed' }, data: { status: 'terminated' } },
+    ]);
+  });
+});
+
+describe("claimableRows: the pool card's ready count is what a claim would take (Bugbot on #1464)", () => {
+  const def = { setupHash: 'h1' } as any;
+  const rows = [
+    { status: 'env-stopped', poolSetupHash: 'h1', preparedAt: new Date(2) },
+    { status: 'env-stopped', poolSetupHash: 'h0', preparedAt: new Date(3) },
+    { status: 'env-preparing', poolSetupHash: 'h1', preparedAt: null },
+    { status: 'env-stopped', poolSetupHash: 'h1', preparedAt: new Date(1) },
+  ];
+  it('counts the stopped boxes at the current hash, newest prepared first', () => {
+    expect(claimableRows(rows, { ok: true, def }).map(r => r.preparedAt?.getTime())).toEqual([2, 1]);
+  });
+  it('counts none with no resolution (a restart, a new replica, before the first tick) or an unresolved one: the claim misses then', () => {
+    expect(claimableRows(rows, null)).toEqual([]);
+    expect(claimableRows(rows, { ok: false, reason: 'GitHub answered 502' })).toEqual([]);
   });
 });
 
@@ -223,28 +287,31 @@ describe('the third review round on #1453 (Bugbot, Cursor security review)', () 
     const res = await resolveEnvPoolDefinition(pointer, d);
     expect(res).toMatchObject({ ok: false, permanent: true, reason: expect.stringContaining('outsider/tool') });
   });
+});
 
-  it("resolves the environment afresh at a hello, past the 60 s cache, and refreshes the cache with it", async () => {
-    resetEnvPoolCache();
-    const personal = { ...pointer, visibility: 'personal' as const };
-    expect(await envPoolDefinitionByName('envdemo', deps({ store: { byName: async () => personal, get: async () => personal } }))).toMatchObject({ ok: false, permanent: true });
-    // The environment is shared again: the cache still says no, a hello's fresh read says yes.
-    const fresh = await resolveForHello(pointer, deps());
-    expect(fresh.ok).toBe(true);
-    expect((await envPoolDefinitionByName('envdemo', deps())).ok).toBe(true);
+describe("poolFailureWhere: only the pool's own failures hold it (Bugbot on #1464)", () => {
+  it("never counts an owned box: a claimed pool box keeps its pool columns, and its later failure is its owner's", () => {
+    expect(poolFailureWhere('env1', new Date(0))).toMatchObject({ userId: null, poolEnvironmentId: 'env1', status: 'terminated' });
   });
 });
 
-describe('resolveForHello keeps a transient failure to itself (Devin on #1453)', () => {
-  it("doesn't replace the cached definition the claims read with a GitHub blip, but does with a success or a permanent refusal", async () => {
-    resetEnvPoolCache();
-    expect((await envPoolDefinitionByName('envdemo', deps())).ok).toBe(true);
-    const blip = await resolveForHello(pointer, deps({ head: async () => ({ error: 'GitHub answered 502' }) }));
-    expect(blip).toEqual({ ok: false, reason: 'GitHub answered 502' });
-    // The claims still see the ready pool.
-    expect((await envPoolDefinitionByName('envdemo', deps({ head: async () => ({ error: 'not called: cached' }) }))).ok).toBe(true);
-    // A permanent refusal is cached: it stays true however often it is read.
-    await resolveForHello({ ...pointer, visibility: 'personal' }, deps());
-    expect(await envPoolDefinitionByName('envdemo', deps())).toMatchObject({ ok: false, permanent: true });
+describe("lastEnvPoolResolution: never a resolution older than the environment's last edit (Devin on #1464)", () => {
+  it('is none once the environment row changed after the tick resolved it: a hello resolves afresh, a claim misses', () => {
+    const value = { ok: true, def: { setupHash: 'h1' } } as any;
+    setLastEnvPoolResolutionForTests('envdemo', value);
+    expect(lastEnvPoolResolution({ name: 'envdemo', updatedAt: new Date(Date.now() - 60_000) })).toBe(value);
+    expect(lastEnvPoolResolution({ name: 'envdemo', updatedAt: new Date(Date.now() + 60_000) })).toBeNull();
+    setLastEnvPoolResolutionForTests('envdemo', null);
+  });
+});
+
+describe("the tick's resolution is of the row it read (Bugbot on #1464)", () => {
+  it("is stale for any edit after the row it was resolved from, even one landing before the resolve began", async () => {
+    const read = { ...pointer, updatedAt: new Date(Date.now() - 60_000) };
+    await resolveForTick(read, deps());
+    expect(lastEnvPoolResolution(read)?.ok).toBe(true);
+    // Edited after the tick read the row, before (or while) it resolved.
+    expect(lastEnvPoolResolution({ name: read.name, updatedAt: new Date(read.updatedAt.getTime() + 1) })).toBeNull();
+    setLastEnvPoolResolutionForTests(read.name, null);
   });
 });

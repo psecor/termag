@@ -218,6 +218,17 @@ describe('waitsForBoxAgent', () => {
       expect(waitsForBoxAgent(status, false)).toBe(false);
     }
   });
+
+  it('with box-placement-enabled, waits too for a box the create wakes', () => {
+    for (const status of ['stopped', 'hibernated', 'starting']) {
+      expect(waitsForBoxAgent(status, false, true)).toBe(true);
+      expect(waitsForBoxAgent(status, true, true)).toBe(false);
+    }
+    // On its way down, even with its agent still connected: that agent is about to go.
+    for (const status of ['stopping', 'hibernating']) expect(waitsForBoxAgent(status, true, true)).toBe(true);
+    for (const status of ['ready', 'failed', 'terminated', 'quarantined']) expect(waitsForBoxAgent(status, false, true)).toBe(false);
+    expect(waitsForBoxAgent('provisioning', false, true)).toBe(true);
+  });
 });
 
 describe('needsBoxRelaunch', () => {

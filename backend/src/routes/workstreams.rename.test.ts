@@ -5,6 +5,7 @@ import { workstreamsRouter } from './workstreams';
 import { prisma } from '../db';
 import { projectAgentCapabilities, sendForProject } from '../services/agentRegistry';
 import { moveStatus } from '../services/status';
+import { afterConversationsMoved, carriesConversations } from '../services/renameConversations';
 
 // A multi-repo project's workstream rename: the
 // box moves the workstream root and repairs each repository's worktree in it
@@ -27,6 +28,7 @@ vi.mock('../services/agentRegistry', () => ({
   sendForProject: vi.fn(),
 }));
 vi.mock('../services/spawnRenames', () => ({ renameSpawnWorkstream: vi.fn(async () => {}) }));
+vi.mock('../services/renameConversations', () => ({ carriesConversations: vi.fn(async () => false), afterConversationsMoved: vi.fn() }));
 vi.mock('../services/status', () => ({
   setStatus: vi.fn(), notifyStatusChange: vi.fn(), moveStatus: vi.fn(), clearMilestoneTimer: vi.fn(), updateStatusMeta: vi.fn(),
 }));
@@ -139,5 +141,36 @@ describe('POST /api/projects/:projectId/workstreams/:id/rename on a multi-repo p
     expect(res.statusCode).toBe(200);
     expect(send).toHaveBeenCalledWith(expect.anything(), 'git-worktree-move', { projectDir: '/home/ada/termag/projects/shop', from: 'fix', to: 'feature' });
     expect(prisma.projectRepo.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/projects/:projectId/workstreams/:id/rename and the worktree\'s conversations', () => {
+  const answer = { ok: true, usageSources: [{ from: '-home-ada-termag-projects-shop--worktrees-fix', to: '-home-ada-termag-projects-shop--worktrees-feature' }] };
+
+  it('asks the box to carry them on git-worktree-move when its agent and the flag allow', async () => {
+    vi.mocked(prisma.workstream.findFirst).mockResolvedValue(workstreamRow('repo') as never);
+    vi.mocked(carriesConversations).mockResolvedValueOnce(true);
+    send.mockImplementation(async (_h, command) => (command === 'git-worktree-move' ? answer : command === 'tmux-rename-session' ? { ok: true, renamed: true } : { ok: true }));
+    expect((await rename('feature')).statusCode).toBe(200);
+    expect(send).toHaveBeenCalledWith(expect.anything(), 'git-worktree-move', { projectDir: '/home/ada/termag/projects/shop', from: 'fix', to: 'feature', conversations: true });
+    expect(afterConversationsMoved).toHaveBeenCalledWith('u1', { userId: 'u1', instanceId: 'box1' }, answer);
+  });
+
+  it('asks on workspace-move too, and hands its answer on', async () => {
+    vi.mocked(carriesConversations).mockResolvedValueOnce(true);
+    send.mockImplementation(async (_h, command) => (command === 'workspace-move' ? answer : command === 'tmux-rename-session' ? { ok: true, renamed: true } : { ok: true }));
+    expect((await rename('feature')).statusCode).toBe(200);
+    expect(send.mock.calls.find(c => c[1] === 'workspace-move')![2]).toMatchObject({ conversations: true });
+    expect(afterConversationsMoved).toHaveBeenCalledWith('u1', { userId: 'u1', instanceId: 'box1' }, answer);
+  });
+
+  it('touches no usage when the move fails', async () => {
+    vi.mocked(carriesConversations).mockResolvedValueOnce(true);
+    send.mockImplementation(async (_h, command) => {
+      if (command === 'workspace-move') throw new Error('git worktree repair failed (shop-api: error: x); nothing was moved');
+      return { ok: true };
+    });
+    expect((await rename('feature')).statusCode).toBe(409);
+    expect(afterConversationsMoved).not.toHaveBeenCalled();
   });
 });

@@ -173,7 +173,9 @@ export interface GithubRecheckDeps {
 }
 
 export class CredentialInputError extends Error {
-  readonly status = 400;
+  constructor(message: string, readonly status: number = 400) {
+    super(message);
+  }
 }
 
 export interface GithubConnected {

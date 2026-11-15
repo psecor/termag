@@ -6,7 +6,8 @@ import { recordProductEvent } from '../services/productEvents';
 import { resolveSessionProject } from '../services/sessionResolver';
 
 // What leaves a box, as product events (docs/agents/observability.md): the
-// edit route's agent.file.edited and the milestone's pr.opened / pr.merged.
+// edit route's agent.file.edited, the mcp route's agent.mcp.used and the
+// milestone's pr.opened / pr.merged.
 vi.mock('../db', () => ({ prisma: { instance: { findUnique: vi.fn() }, project: { updateMany: vi.fn(() => ({ catch: () => {} })) } } }));
 vi.mock('../middleware/auth', () => ({
   requireAuth: vi.fn(),
@@ -33,6 +34,12 @@ vi.mock('../services/contextSampler', () => ({ recordContextSample: vi.fn() }));
 vi.mock('./agentTokens', () => ({ validateAgentToken: vi.fn() }));
 vi.mock('../services/workstreamPrs', () => ({ recordCreatedLink: vi.fn(async () => {}) }));
 vi.mock('../services/productEvents', () => ({ recordProductEvent: vi.fn() }));
+vi.mock('../services/mcpConnectorStore', () => ({
+  ldUserForId: vi.fn(async (id?: string) => (id ? { id } : null)),
+  catalogNamesForUser: vi.fn(async () => ['acme-docs']),
+}));
+const mcpEventsOn = { value: true };
+vi.mock('../services/featureFlags', () => ({ boolVariation: vi.fn(async () => mcpEventsOn.value) }));
 
 interface RouteLayer { route?: { path: string; methods: Record<string, boolean>; stack: { handle: RequestHandler }[] } }
 
@@ -69,6 +76,40 @@ describe('POST /api/status/edit', () => {
   it('refuses a deeper path and another user\'s session, and records nothing', async () => {
     expect((await post('/edit', { session: 'ffox-webapp-agent', dir: 'a/b/c', tool: 'Edit' })).statusCode).toBe(400);
     expect((await post('/edit', { session: 'someoneelse-webapp-agent', dir: 'src', tool: 'Write' })).statusCode).toBe(403);
+    expect(recordProductEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/status/mcp', () => {
+  beforeEach(() => { mcpEventsOn.value = true; vi.spyOn(console, 'log').mockImplementation(() => {}); });
+  afterEach(() => vi.clearAllMocks());
+
+  it('names a known server and its tool, and a catalog server', async () => {
+    const res = await post('/mcp', { session: 'ffox-webapp-agent', server: 'acme-observability', tool: 'search-logs', outcome: 'ok', claudeSession: '818686a7-4ce0-440a-ae11-522472afeecd' });
+    expect(res.statusCode).toBe(200);
+    expect(recordProductEvent).toHaveBeenCalledWith('agent.mcp.used', { user: 'u1', box: 'box-a' },
+      { server: 'acme-observability', tool: 'search-logs', outcome: 'ok', claudeSession: '818686a7-4ce0-440a-ae11-522472afeecd' });
+    await post('/mcp', { session: 'ffox-webapp-agent', server: 'acme-docs', tool: 'lookup', outcome: 'error' });
+    expect(recordProductEvent).toHaveBeenLastCalledWith('agent.mcp.used', { user: 'u1', box: 'box-a' },
+      { server: 'acme-docs', tool: 'lookup', outcome: 'error', claudeSession: null });
+  });
+
+  it('records any other server as other, with no tool', async () => {
+    await post('/mcp', { session: 'ffox-webapp-agent', server: 'my-private-thing', tool: 'read_secret_notes', outcome: 'ok' });
+    expect(recordProductEvent).toHaveBeenCalledWith('agent.mcp.used', { user: 'u1', box: 'box-a' }, { server: 'other', outcome: 'ok', claudeSession: null });
+  });
+
+  it('answers 404 and records nothing while agent-mcp-events-enabled is off', async () => {
+    mcpEventsOn.value = false;
+    const res = await post('/mcp', { session: 'ffox-webapp-agent', server: 'metaterm', tool: 'list_sessions', outcome: 'ok' });
+    expect(res.statusCode).toBe(404);
+    expect(recordProductEvent).not.toHaveBeenCalled();
+  });
+
+  it('refuses a bad body and another user\'s session, and records nothing', async () => {
+    expect((await post('/mcp', { session: 'ffox-webapp-agent', server: 'metaterm', tool: 'list_sessions', outcome: 'maybe' })).statusCode).toBe(400);
+    expect((await post('/mcp', { session: 'ffox-webapp-agent', server: 'meta term', tool: 'x', outcome: 'ok' })).statusCode).toBe(400);
+    expect((await post('/mcp', { session: 'someoneelse-webapp-agent', server: 'metaterm', tool: 'x', outcome: 'ok' })).statusCode).toBe(403);
     expect(recordProductEvent).not.toHaveBeenCalled();
   });
 });

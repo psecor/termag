@@ -23,6 +23,7 @@ import { asyncHandler } from '../middleware/errors';
 import { rateLimit } from '../middleware/rateLimit';
 import { bugHandlers } from './admin/bugs';
 import { cliAdminBox, type CliAdminBox } from './cliAdminBox';
+import { reporterBase } from '../services/cliReporter';
 import {
   RATE_WINDOW_MS, REPORTS_PER_HOUR, parseBugReportInput, underRateLimit, type BugReportStore,
 } from '../services/bugReports';
@@ -45,8 +46,7 @@ export function mountCliBugReportRoutes(router: Router, deps: CliBugReports, bea
     if ('error' in parsed) { res.status(400).json({ error: parsed.error, code: 'invalid_request' }); return; }
     const input = parsed.ok;
 
-    const base = { reporterUserId: user.id, credential: credential.kind, boxId: credential.kind === 'box' ? credential.boxId : null };
-    const reporter = await deps.store.resolveReporter(base, { projectId: input.projectId, workstream: input.workstream });
+    const reporter = await deps.store.resolveReporter(reporterBase(user, credential), { projectId: input.projectId, workstream: input.workstream });
     const at = now();
     const recent = await deps.store.countRecent({ boxId: reporter.boxId, userId: user.id }, new Date(at.getTime() - RATE_WINDOW_MS));
     if (!underRateLimit(recent)) {

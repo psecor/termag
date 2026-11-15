@@ -25,7 +25,15 @@ export function githubConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Githu
 
 /** What became of one reported branch. */
 export type PushOutcome =
-  | { kind: 'recorded'; branch: string; key: string; headSha: string; prNumber: number; prUrl: string; state: string }
+  | {
+    kind: 'recorded'; branch: string; key: string; headSha: string; prNumber: number; prUrl: string; state: string;
+    /**
+     * The PR is closed or merged and the branch moved since the thread last
+     * recorded it: this turn pushed commits no open PR shows. A branch the
+     * clone re-reports at the head already recorded is not flagged.
+     */
+    notOpen?: true;
+  }
   | { kind: 'no-pr'; branch: string; headSha: string }
   /**
    * GitHub no longer has the branch and it never had a PR: deleted after the
@@ -43,8 +51,12 @@ export interface ConfirmInput {
   ownBranch: string;
   /** Where its extra PRs go: `<ownBranch>-<name>` for the thread's own naming. */
   prefix: string;
-  /** The thread's rows so far, so a branch keeps its key from turn to turn. */
-  rows: { key: string; branch: string }[];
+  /**
+   * The thread's rows so far, so a branch keeps its key from turn to turn, and
+   * the head each was last recorded at, so a push onto a closed PR is told
+   * apart from a branch the clone re-reports.
+   */
+  rows: { key: string; branch: string; headSha?: string | null }[];
 }
 
 const encodeBranch = (b: string) => b.split('/').map(encodeURIComponent).join('/');
@@ -107,7 +119,14 @@ export async function confirmPushes(cfg: GithubConfig, input: ConfirmInput): Pro
       if (!hasPr) { out.push({ kind: 'no-pr', branch: p.branch, headSha }); continue; }
       const key = pushKey(p.branch, input, taken);
       taken.set(key, p.branch);
-      out.push({ kind: 'recorded', branch: p.branch, key, headSha, prNumber: pr!.number as number, prUrl: pr!.html_url as string, state: String(pr!.state ?? 'open') });
+      const state = String(pr!.state ?? 'open');
+      const before = input.rows.find(r => r.branch === p.branch)?.headSha;
+      // A deleted branch (tip null) is history at the PR's last head, not a push.
+      const notOpen = state !== 'open' && tip !== null && before !== headSha;
+      out.push({
+        kind: 'recorded', branch: p.branch, key, headSha, prNumber: pr!.number as number, prUrl: pr!.html_url as string, state,
+        ...(notOpen ? { notOpen: true as const } : {}),
+      });
     } catch (e) {
       out.push({ kind: 'failed', branch: p.branch, reason: `GitHub could not be reached for ${p.branch}: ${e instanceof Error ? e.message : String(e)}` });
     }
@@ -139,7 +158,8 @@ export function unpushedParts(unpushed: UnpushedBranch[], ownBranch: string): st
  * branch has a PR, `partial` when some have none yet or could not be
  * confirmed, `failed` when none could. Commits the clone has that no origin
  * branch has (`unpushed`, any turn's, a canceled one's included) are in the
- * detail and keep it from `published`; with nothing pushed they are
+ * detail and keep it from `published`; so does a push onto a PR that is
+ * closed or merged (`notOpen`), since no open PR shows it. With nothing pushed they are
  * `unpushed`, never `none`, so a turn that only committed doesn't read as
  * done. Past MAX_ASK_PRS PRs on the thread the detail says so; nothing is
  * refused.
@@ -151,11 +171,13 @@ export function pushSummary(
   const outcomes = all.filter(o => o.kind !== 'gone');
   const left = unpushedParts(unpushed, ownBranch);
   if (!outcomes.length) return left.length ? { publish: 'unpushed', detail: left.join(' | ') } : { publish: 'none', detail: null };
-  const recorded = outcomes.filter(o => o.kind === 'recorded').length;
+  const recorded = outcomes.filter(o => o.kind === 'recorded' && !o.notOpen).length;
   const failed = outcomes.filter(o => o.kind === 'failed').length;
   const publish = recorded === outcomes.length ? (left.length ? 'partial' : 'published') : !recorded && failed === outcomes.length ? 'failed' : 'partial';
   const parts = outcomes.map(o => o.kind === 'recorded'
-    ? `${o.branch}: PR #${o.prNumber}${o.state === 'open' ? '' : ` (${o.state})`}`
+    ? o.notOpen
+      ? `${o.branch}: pushed at ${o.headSha.slice(0, 12)}, but PR #${o.prNumber} is ${o.state}, so no open PR shows it (reopen it, or open a new draft with termag-pr-create)`
+      : `${o.branch}: PR #${o.prNumber}${o.state === 'open' ? '' : ` (${o.state})`}`
     : o.kind === 'no-pr'
       ? `${o.branch}: pushed at ${o.headSha.slice(0, 12)}, no pull request yet (open a draft with termag-pr-create)`
       : `${o.branch}: ${(o as Extract<PushOutcome, { kind: 'failed' }>).reason}`);

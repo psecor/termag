@@ -59,8 +59,13 @@ const consumeOAuthState = vi.fn(async (nonce: string) => {
   return r;
 });
 const createOAuthState = vi.fn(async () => {});
+const TEST_ALLOWLIST = { loaded: true, entries: ['mcp.example.test', 'mcp.slack.com', 'mcp.linear.app'].map(host => ({ host, port: '443', path: '' }))
+  .concat({ host: 'mcp.example.test', port: '18444', path: '' }) };
 vi.mock('../services/mcpConnectorStore', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/mcpConnectorStore')>()),
+  // The allowlist (mcpConnectors.test.ts covers it) allows the servers here.
+  upstreamAllowlistForUser: async () => TEST_ALLOWLIST,
+  upstreamAllowlistForUserId: async () => TEST_ALLOWLIST,
   findConnector: async (id: string) => rows.find(r => r.id === id) ?? null,
   listConnectors: async (userId: string) => rows.filter(r => r.userId === userId),
   consumeOAuthState,

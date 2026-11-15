@@ -66,6 +66,8 @@ export interface BoxRow {
   diskGiB?: number | null;
   createdFor?: string | null;
   lifecycle?: LifecycleView | null;
+  /** Whether a project on the box (archived ones included) is shared; left out where the caller didn't read it. */
+  shared?: boolean;
 }
 
 export interface CliBox {
@@ -107,6 +109,14 @@ export interface CliBox {
    * couldn't be read.
    */
   lifecycle: LifecycleView | null;
+  /**
+   * Whether a project on the box, archived ones included, is shared with
+   * someone (a ProjectShare). A share is a shell as the owner on this box,
+   * so tools that leave a credential in the
+   * owner's home refuse a shared box. Only the box
+   * list reads it; other answers that shape a box leave it out.
+   */
+  shared?: boolean;
 }
 
 export function shapeBox(row: BoxRow, agentConnected: boolean): CliBox {
@@ -133,6 +143,7 @@ export function shapeBox(row: BoxRow, agentConnected: boolean): CliBox {
     diskGiB: row.diskGiB ?? null,
     createdFor: createdFor(row.createdFor),
     lifecycle: row.lifecycle ?? null,
+    ...(row.shared === undefined ? {} : { shared: row.shared }),
   };
 }
 

@@ -48,6 +48,14 @@ describe('docs/environment.schema.json', () => {
   });
 
   // The repo's demo environment (docs/e2e-stack.md, "A demo environment"), read as a pointer reads it.
+  // `termag ask --new-box` warned 'ports.0 has "path", which it doesn't take' from an orchestrator
+  // built before ports took a path (#998); the file and this schema have agreed since.
+  it('reads .termag/environment.json, ports.0 "path" included, without a warning', () => {
+    const text = readFileSync(join(__dirname, '../../../.termag/environment.json'), 'utf8');
+    expect(JSON.parse(text).ports[0].path).toBe('/termag/');
+    expect(parseRepoEnvironment(text, 'example-org/termag').warnings).toEqual([]);
+  });
+
   it('takes .termag/demo/environment.json, and reads it as a small box with a 50 GB disk and no warning', () => {
     const text = readFileSync(join(__dirname, '../../../.termag/demo/environment.json'), 'utf8');
     expect(environmentSchemaErrors(JSON.parse(text))).toEqual([]);

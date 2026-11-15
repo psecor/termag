@@ -40,7 +40,7 @@ export function setAskNoticeChatSender(fn: ChatNoticeSender | null): void {
 const FINISHED = ['completed', 'failed', 'canceled', 'superseded'];
 
 const rowSelect = {
-  id: true, status: true, error: true, publish: true, replyBytes: true, completedAt: true, supersededById: true,
+  id: true, status: true, error: true, publish: true, replyBytes: true, completedAt: true, supersededById: true, model: true, modelIgnored: true,
   senderUserId: true, notifyProjectId: true, notifyWorkstream: true, notifyVia: true,
   thread: {
     select: {
@@ -83,6 +83,8 @@ function itemOf(row: Row, end: Row | null): NoticeItem {
     status: at.status, title: row.thread.title, thread: row.thread.id, message: row.id, error: at.error,
     publish: at.publish, prUrl: prs[0] ?? null, morePrs: Math.max(0, prs.length - 1), replyBytes: at.replyBytes,
     answeredWith: end ? end.id : null,
+    // What the turn ran on (a tier, or fireworks:<id>); none for the box's default, which an ignored --model ran on too.
+    model: at.modelIgnored ? null : at.model ?? null,
   };
 }
 

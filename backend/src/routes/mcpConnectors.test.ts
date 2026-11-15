@@ -20,6 +20,11 @@ const ACME_ENTRY = { name: 'acme', upstream: 'https://mcp.example.test:18444/acm
 let defaultsFlag: unknown = [ACME_ENTRY];
 // What the mcp-oauth-scope-labels flag serves; null while it doesn't exist.
 let labelsFlag: unknown = null;
+// What the mcp-upstream-allowlist flag serves: this file's MCP hosts unless a
+// test narrows it; NOT_LOADED when the orchestrator never loaded the flag.
+const NOT_LOADED = Symbol('not loaded');
+const TEST_HOSTS = ['https://mcp.example.test', 'https://mcp.example.test:18444'];
+let allowlistFlag: unknown = TEST_HOSTS;
 let storeConfigured = true;
 let storedSecrets: Record<string, string> = {};
 
@@ -72,6 +77,9 @@ vi.mock('../services/featureFlags', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/featureFlags')>()),
   jsonVariation: async (key: string, _user: unknown, fallback: unknown) => (
     key === 'mcp-default-connectors' ? defaultsFlag : key === 'mcp-oauth-scope-labels' ? labelsFlag : fallback),
+  isLdEnabled: () => true,
+  jsonVariationOrUnknown: async (key: string, _user: unknown, fallback: unknown) => (
+    key !== 'mcp-upstream-allowlist' ? { value: fallback } : allowlistFlag === NOT_LOADED ? null : { value: allowlistFlag }),
 }));
 
 const writeConnectorSecrets = vi.fn(async () => {});
@@ -178,6 +186,7 @@ beforeEach(() => {
   apiFlagOn = false;
   defaultsFlag = [ACME_ENTRY];
   labelsFlag = null;
+  allowlistFlag = TEST_HOSTS;
   storeConfigured = true;
   storedSecrets = {};
   lockStored = { client: CLIENT };
@@ -472,6 +481,76 @@ describe('the catalog of MCP servers (the mcp-default-connectors flag)', () => {
   });
 });
 
+describe('the allowlist of MCP server URLs (the mcp-upstream-allowlist flag)', () => {
+  const ACME = 'https://mcp.example.test:18444/acme';
+  const REFUSED = { error: "This MCP server isn't on termag's allowlist", code: 'mcp_upstream_not_allowed' };
+
+  it('allows the servers on the list', async () => {
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([ACME_ENTRY]);
+    expect((await call('POST', '/', 'u1', NEW)).status).toBe(201);
+    expect((await call('GET', '/', 'u1')).body.connectors.every((c: { blocked: string | null }) => c.blocked === null)).toBe(true);
+  });
+
+  it('refuses every server, saying why, when termag never loaded the flag', async () => {
+    allowlistFlag = NOT_LOADED;
+    const refused = { error: "termag couldn't load its MCP server allowlist", code: 'mcp_upstream_not_allowed' };
+    expect(await call('POST', '/', 'u1', NEW)).toEqual({ status: 403, body: refused });
+    expect(await call('POST', '/catalog/acme/connect', 'u1')).toEqual({ status: 403, body: refused });
+    const list = (await call('GET', '/', 'u1')).body;
+    expect(list.catalog).toEqual([]);
+    expect(list.connectors.find((c: { id: string }) => c.id === 'c1').blocked).toBe(refused.error);
+  });
+
+  it('allows nothing when the flag serves something other than a list', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    allowlistFlag = { not: 'a list' };
+    expect(await call('POST', '/', 'u1', NEW)).toEqual({ status: 403, body: REFUSED });
+    warn.mockRestore();
+  });
+
+  it('refuses to add a server off the list, static or OAuth, and creates nothing', async () => {
+    allowlistFlag = ['https://other.example.com'];
+    const before = rows.length;
+    expect(await call('POST', '/', 'u1', NEW)).toEqual({ status: 403, body: REFUSED });
+    expect(await call('POST', '/', 'u1', { ...NEW, auth: { type: 'oauth' } })).toEqual({ status: 403, body: REFUSED });
+    expect(rows.length).toBe(before);
+  });
+
+  it('adds a server whose URL an entry allows, on a path boundary', async () => {
+    allowlistFlag = ['https://mcp.example.test:18444/notion/'];
+    expect((await call('POST', '/', 'u1', NEW)).status).toBe(201);
+    allowlistFlag = ['https://mcp.example.test:18444/not'];
+    expect((await call('POST', '/', 'u1', { ...NEW, name: 'notion two' })).status).toBe(403);
+  });
+
+  it('refuses an edit of a connector off the list unless it moves it onto the list', async () => {
+    allowlistFlag = ['https://mcp.example.test:18444'];
+    expect(await call('PATCH', '/c1', 'u1', { name: 'renamed' })).toEqual({ status: 403, body: REFUSED });
+    expect(rows.find(r => r.id === 'c1')!.name).toBe('figma');
+    const moved = await call('PATCH', '/c1', 'u1', { upstream: 'https://mcp.example.test:18444/figma' });
+    expect(moved.status).toBe(200);
+    expect(moved.body.blocked).toBeNull();
+  });
+
+  it('hides catalog servers off the list, and refuses to connect one', async () => {
+    allowlistFlag = [];
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([]);
+    expect(await call('POST', '/catalog/acme/connect', 'u1')).toEqual({ status: 403, body: REFUSED });
+    expect(rows.some(r => r.upstream === ACME)).toBe(false);
+    allowlistFlag = ['https://mcp.example.test:18444/acme'];
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([ACME_ENTRY]);
+    expect((await call('POST', '/catalog/acme/connect', 'u1')).status).toBe(200);
+  });
+
+  it('marks a connector off the list blocked and refuses to start its sign-in', async () => {
+    allowlistFlag = ['https://other.example.com'];
+    const list = await call('GET', '/', 'u1');
+    expect(list.body.connectors.find((c: { id: string }) => c.id === 'c4')).toMatchObject({ blocked: "This MCP server isn't on termag's allowlist" });
+    expect(await call('POST', '/c4/oauth/start', 'u1')).toEqual({ status: 403, body: REFUSED });
+  });
+
+});
+
 describe('choosing the scopes a sign-in asks for', () => {
   const SCOPES = ['search:read.public', 'channels:history', 'chat:write'];
   const META = {
@@ -544,6 +623,45 @@ describe('choosing the scopes a sign-in asks for', () => {
     ]);
   });
 
+  describe("the scopes termag withholds (Slack's channels:write, groups:write, mpim:write, im:write)", () => {
+    const ADVERTISED = ['search:read.public', 'channels:write', 'channels:history', 'groups:write', 'chat:write', 'mpim:write', 'im:write'];
+    const withWrites = () => { rows.find(r => r.id === 'c4')!.oauthMetadata = { ...META, scopes: ADVERTISED }; };
+    const c4 = async () => (await call('GET', '/', 'u1')).body.connectors.find((c: { id: string }) => c.id === 'c4');
+
+    it('are not on the checklist', async () => {
+      withWrites();
+      expect((await c4()).oauth.scopeChoice.options.map((o: { name: string }) => o.name)).toEqual(['search:read.public', 'channels:history', 'chat:write']);
+    });
+
+    it('are not asked for, even when the client posts them to oauth/start', async () => {
+      withWrites();
+      const res = await call('POST', '/c4/oauth/start', 'u1', { scopes: ['chat:write', 'channels:write', 'groups:write', 'mpim:write', 'im:write'] });
+      expect(res.status).toBe(200);
+      expect(scopeOf(res.body.authorizeUrl)).toBe('chat:write');
+      expect(createOAuthState).toHaveBeenCalledWith(expect.any(String), 'u1', 'c4', expect.any(String), ['chat:write'], null);
+      // Without a choice, the sign-in asks for every advertised scope but those.
+      expect(scopeOf((await call('POST', '/c4/oauth/start', 'u1')).body.authorizeUrl)).toBe('search:read.public channels:history chat:write');
+      // A choice of withheld scopes only is refused before any sign-in starts.
+      createOAuthState.mockClear();
+      expect((await call('POST', '/c4/oauth/start', 'u1', { scopes: ['channels:write', 'im:write'] })).status).toBe(400);
+      expect(createOAuthState).not.toHaveBeenCalled();
+    });
+
+    it('drop out of Change permissions on a grant that holds them', async () => {
+      withWrites();
+      const grant = ['search:read.public', 'channels:write', 'groups:write', 'chat:write', 'mpim:write', 'im:write'];
+      Object.assign(rows.find(r => r.id === 'c4')!, { linkStatus: 'linked', oauthScopes: { requested: grant, granted: grant } });
+      const row = await c4();
+      // The row still shows what the current grant holds...
+      expect(row.oauth.grantedScopes.map((s: { name: string }) => s.name)).toEqual(grant);
+      // ...but the checklist Change permissions opens with offers only what termag asks for, so the
+      // ticks it starts with (the grant, as far as the checklist offers it: mcpForm.ts initialScopes) leave them out,
+      expect(row.oauth.scopeChoice.options.map((o: { name: string }) => o.name).filter((n: string) => grant.includes(n))).toEqual(['search:read.public', 'chat:write']);
+      // and posting the old grant back asks again without them.
+      expect(scopeOf((await call('POST', '/c4/oauth/start', 'u1', { scopes: grant })).body.authorizeUrl)).toBe('search:read.public chat:write');
+    });
+  });
+
   it('records no granted scopes when the token response names none', async () => {
     slack();
     const q = new URLSearchParams({ state: signState(process.env.SESSION_SECRET ?? 'dev-secret', STATE_NONCE, 'u1', 'c4'), code: 'c' });
@@ -593,6 +711,14 @@ describe('API connectors (Google)', () => {
   afterAll(() => {
     delete process.env.MCP_OAUTH_CLIENTS;
     delete process.env.TEST_GOOGLE_SECRET;
+  });
+
+  it('offers Google under an mcp-upstream-allowlist that lists nothing, and connects it: an API is not an MCP server', async () => {
+    allowlistFlag = [];
+    expect((await call('GET', '/', 'u1')).body.catalog).toEqual([{ name: 'google', upstream: 'https://www.googleapis.com', kind: 'api' }]);
+    const res = await call('POST', '/catalog/google/connect', 'u1');
+    expect(res.status).toBe(200);
+    expect(res.body.connector.blocked).toBeNull();
   });
 
   it('offers Google under Available to connect only with api-broker-enabled and a Google client', async () => {
