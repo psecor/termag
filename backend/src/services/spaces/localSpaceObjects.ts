@@ -542,7 +542,7 @@ export class LocalSpaceObjects implements SpaceObjects {
     await fs.rm(dir, { recursive: true, force: true });
   }
 
-  async copy(fromKey: string, toKey: string, opts: { sourceIfMatch?: string | null } = {}): Promise<void> {
+  async copy(fromKey: string, toKey: string, opts: { sourceIfMatch?: string | null; destNew?: boolean } = {}): Promise<void> {
     const src = await this.current(fromKey);
     if (!src) throw new StorageError('NoSuchKey', 404, 'The specified key does not exist');
     if (opts.sourceIfMatch && !sameEtag(src.entry.etag!, opts.sourceIfMatch)) throw preconditionFailed();
@@ -552,7 +552,7 @@ export class LocalSpaceObjects implements SpaceObjects {
       await this.commit(toKey, file, {
         size: src.entry.size, contentType: src.entry.contentType, digest: src.entry.etag!,
         ...(src.entry.meta ? { meta: src.entry.meta } : {}),
-      }, null);
+      }, opts.destNew ? { ifNoneMatch: '*' } : null);
     } finally {
       await fs.rm(file, { force: true });
     }
@@ -601,6 +601,31 @@ export class LocalSpaceObjects implements SpaceObjects {
       }
     }
     return failed;
+  }
+
+  /**
+   * Deletes the key (a delete marker) only while its current version is `etag`, checked under the object's lock,
+   * so no write lands between the check and the marker: `changed` when someone wrote or deleted it since.
+   */
+  async deleteIfMatch(key: string, etag: string): Promise<'deleted' | 'changed' | 'failed'> {
+    try {
+      const dir = this.objectDir(key);
+      if (!live(await this.readIndex(dir))) return 'changed';
+      return await this.withLock(dir, async () => {
+        const versions = await this.readIndex(dir);
+        const cur = live(versions);
+        if (!cur || !sameEtag(cur.etag!, etag)) return 'changed';
+        const marker: VersionEntry = {
+          versionId: newVersionId(), etag: null, size: 0, contentType: null,
+          lastModified: new Date(this.now()).toISOString(), deleteMarker: true,
+        };
+        await this.writeIndex(dir, [...versions, marker]);
+        return 'deleted';
+      });
+    } catch (err) {
+      console.warn(`[SPACES] conditional delete of ${key} failed: ${(err as Error).message}`);
+      return 'failed';
+    }
   }
 
   async sumVersions(prefix: string, watch: Set<string>): Promise<{ total: bigint; watched: ObjectVersion[] }> {

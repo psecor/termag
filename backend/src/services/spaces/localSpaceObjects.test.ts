@@ -181,6 +181,26 @@ describe('LocalSpaceObjects', () => {
     expect(await objects.versionsOf('sp1/never')).toEqual([]);
   });
 
+  it('deletes only while the current version is the one asked for', async () => {
+    const one = await put('sp1/a', 'one');
+    const two = await put('sp1/a', 'two');
+    expect(await objects.deleteIfMatch('sp1/a', one.etag)).toBe('changed');
+    expect(await text('sp1/a')).toBe('two');
+    expect(await objects.deleteIfMatch('sp1/a', two.etag)).toBe('deleted');
+    expect(await objects.head('sp1/a')).toBeNull();
+    expect(await objects.deleteIfMatch('sp1/a', two.etag)).toBe('changed');
+    expect(await objects.deleteIfMatch('sp1/never', two.etag)).toBe('changed');
+  });
+
+  it('copies onto a new key only, with destNew', async () => {
+    await put('sp1/a', 'one');
+    await put('sp1/b', 'two');
+    await expect(objects.copy('sp1/a', 'sp1/b', { destNew: true })).rejects.toMatchObject({ name: 'PreconditionFailed' });
+    expect(await text('sp1/b')).toBe('two');
+    await objects.copy('sp1/a', 'sp1/c', { destNew: true });
+    expect(await text('sp1/c')).toBe('one');
+  });
+
   it('restores an older version as a new one', async () => {
     const one = await put('sp1/a', 'one');
     const two = await put('sp1/a', 'two');
