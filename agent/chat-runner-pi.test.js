@@ -200,7 +200,7 @@ test('pi turn: the session goes on with --session-id, and a Claude turn never re
   const first = await r.sendMessage(job('one'));
   b.finish(first.turnId, NEW_SESSION, 'pi');
   await poll(r);
-  assert.deepEqual(r.readSession('p1--main'), { sessionId: NEW_SESSION, cwd: '/w/p1', engine: 'pi', pane: null, paneAt: null });
+  assert.deepEqual(r.readSession('p1--main'), { sessionId: NEW_SESSION, cwd: '/w/p1', engine: 'pi', pane: null, paneAt: null, t3: null });
   const second = await r.sendMessage(job('two'));
   assert.equal(metaOf(b, second.turnId).resumed, true);
   assert.ok(metaOf(b, second.turnId).args.includes(NEW_SESSION));

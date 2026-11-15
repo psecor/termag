@@ -81,6 +81,10 @@ const VERSION_TIMEOUT_MS = 30_000;
 // How long t3-update waits for the running server to answer with its version
 // (within the orchestrator's 7-minute bound on the RPC, after the install's 5).
 const UPDATE_READY_WAIT_MS = 45_000;
+// Stopping the server: how long its processes get to exit after SIGTERM before
+// SIGKILL, and after SIGKILL before the stop gives up waiting on them.
+const STOP_TERM_WAIT_MS = 10_000;
+const STOP_KILL_WAIT_MS = 2000;
 
 /** The absolute path `cmd` runs as: itself when it has a slash, else its PATH hit; null when none. */
 function resolveOnPath(cmd, envPath, fsImpl = fs) {
@@ -436,6 +440,26 @@ function descendants(psOutput, roots) {
   return tree;
 }
 
+/**
+ * `pid ppid` lines, as `ps -A -o pid=,ppid=` prints them, read from
+ * /proc/<pid>/stat; null where there is no /proc (macOS). The ppid is the
+ * second field after the command's closing parenthesis (a command may hold
+ * spaces and parentheses of its own).
+ */
+function procParents(fsImpl = fs) {
+  let entries;
+  try { entries = fsImpl.readdirSync('/proc'); } catch { return null; }
+  const lines = [];
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue;
+    let stat;
+    try { stat = fsImpl.readFileSync(`/proc/${name}/stat`, 'utf8'); } catch { continue; }
+    const ppid = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[1];
+    if (/^\d+$/.test(ppid || '')) lines.push(`${name} ${ppid}`);
+  }
+  return lines.join('\n');
+}
+
 /** Socket inodes listening on `port` (any address), from /proc/net/tcp{,6} contents. */
 function listeningInodes(procNetTcp, port) {
   const inodes = new Set();
@@ -483,6 +507,9 @@ const wait = (ms) => new Promise(r => setTimeout(r, ms));
  *   credentials  deploy/termag-credentials, which adds a model to pi's Fireworks provider
  *   WebSocket    the ws library's WebSocket
  *   now, log     injectable for tests
+ *   kill         process.kill, injectable for tests
+ *   stopTermWaitMs, stopKillWaitMs  how long a stop waits on the server's
+ *                processes after SIGTERM, then after SIGKILL (STOP_*_WAIT_MS)
  *   updateReadyWaitMs  how long t3-update waits for the running server's
  *                answer (UPDATE_READY_WAIT_MS)
  *   tunnelStallMs, tunnelDrainPollMs  how long a finished tunnel's queued
@@ -495,6 +522,8 @@ function createT3Bridge(deps) {
     command: given = null, pinned = null, release = null, home, execFile, remapPath = (p) => p, termagUrl, token, WebSocket, claudeCommand = null,
     piCommand = null, credentials = CREDENTIALS_SCRIPT,
     netImpl = net, httpImpl = http, fsImpl = fs, now = () => Date.now(), log = () => {},
+    kill = (pid, signal) => process.kill(pid, signal),
+    stopTermWaitMs = STOP_TERM_WAIT_MS, stopKillWaitMs = STOP_KILL_WAIT_MS,
     ensureWaitMs = ENSURE_WAIT_MS, updateReadyWaitMs = UPDATE_READY_WAIT_MS, pollMs = 250,
     tunnelStallMs = TUNNEL_STALL_MS, tunnelDrainPollMs = TUNNEL_DRAIN_POLL_MS,
     tunnelCloseTimeoutMs = TUNNEL_CLOSE_TIMEOUT_MS,
@@ -549,6 +578,52 @@ function createT3Bridge(deps) {
   }
 
   /**
+   * The pane pids and every process under them, from ps, else /proc; just
+   * the panes when neither answers (the pane execs t3, so the server is one).
+   */
+  async function paneTree() {
+    const panes = await panePids();
+    if (!panes.length) return new Set();
+    try { return descendants((await execFile('ps', ['-A', '-o', 'pid=,ppid='], { timeout: 5000, maxBuffer: 8 * 1024 * 1024 })).stdout, panes); } catch { /* no ps: /proc */ }
+    const table = procParents(fsImpl);
+    return table === null ? new Set(panes) : descendants(table, panes);
+  }
+
+  function alive(pid) {
+    try { kill(pid, 0); return true; } catch (err) { return err?.code === 'EPERM'; }
+  }
+
+  async function exited(pids, ms) {
+    const deadline = now() + ms;
+    for (;;) {
+      const left = pids.filter(alive);
+      if (!left.length || now() >= deadline) return left;
+      await wait(Math.min(pollMs, 100));
+    }
+  }
+
+  /**
+   * Stop the server: the session, then every process the pane ran, waited on
+   * until it has exited. Killing the session only hangs up the pane, and t3
+   * outlives a hangup: left running, it keeps the ownership lock on ~/.t3,
+   * and every server started after it exits with ServerAlreadyRunningError, so
+   * the desktop reconnects forever to a port nothing listens on.
+   */
+  async function stopServer() {
+    const tree = [...await paneTree()].filter((pid) => pid !== process.pid);
+    await killSession();
+    let left = tree.filter(alive);
+    if (!left.length) return;
+    for (const pid of left) { try { kill(pid, 'SIGTERM'); } catch { /* gone */ } }
+    left = await exited(left, stopTermWaitMs);
+    if (!left.length) return;
+    log(`[T3] the t3 server's processes ${left.join(', ')} outlived SIGTERM; killing them`);
+    for (const pid of left) { try { kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+    left = await exited(left, stopKillWaitMs);
+    if (left.length) log(`[T3] the t3 server's processes ${left.join(', ')} are still running after SIGKILL`);
+  }
+
+  /**
    * Which of `candidates` listen on `port`, or every listener lsof can see;
    * null when this host can tell neither way (no lsof and no /proc, say).
    */
@@ -583,10 +658,8 @@ function createT3Bridge(deps) {
    * when this host can't tell. Without ps the pane's own pid still counts.
    */
   async function portHeldByPane(port) {
-    const panes = await panePids();
-    if (!panes.length) return false;
-    let tree;
-    try { tree = descendants((await execFile('ps', ['-A', '-o', 'pid=,ppid='], { timeout: 5000, maxBuffer: 8 * 1024 * 1024 })).stdout, panes); } catch { tree = new Set(panes); }
+    const tree = await paneTree();
+    if (!tree.size) return false;
     const listeners = await listenersOn(port, [...tree]);
     if (listeners === null) return null;
     return listeners.some((pid) => tree.has(pid));
@@ -650,7 +723,7 @@ function createT3Bridge(deps) {
       // user), or the pane's own server stopped answering: a fresh one, on a
       // port nothing holds, since a wedged process can outlive its session.
       const silentFor = held ? Math.round((now() - unanswered.since) / 1000) : 0;
-      await killSession();
+      await stopServer();
       const taken = p;
       p = await pickFreePort(netImpl);
       writeState({ port: p });
@@ -664,7 +737,7 @@ function createT3Bridge(deps) {
       }
       // Nothing listens on its port: a session this process didn't start, or
       // one that never answered. Start over.
-      await killSession();
+      await stopServer();
     }
     await startServer(p);
     return readyOrStarting(p, waitMs);
@@ -794,7 +867,7 @@ function createT3Bridge(deps) {
     // turn to lose.
     if (!installed || (state.state === 'ready' && (!state.version || compareVersions(installed, state.version) <= 0))) return state;
     log(`[T3] restarting the t3 server on ${installed} (was ${state.version ?? 'not answering'})`);
-    await killSession();
+    await stopServer();
     // An ensure already in flight may have planned around the server just
     // killed (waiting on it to answer): let it settle, then start afresh.
     while (ensuring) await ensuring.catch(() => {});
@@ -1085,5 +1158,6 @@ module.exports = {
   tunnelDialUrl,
   probeT3,
   descendants,
+  procParents,
   listeningInodes,
 };

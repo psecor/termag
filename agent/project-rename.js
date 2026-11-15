@@ -15,14 +15,23 @@
  * worktree in every workstream root, and the generated guides are rewritten.
  * A failed repair puts the folder and the sessions back, so the rename is all
  * or nothing.
+ *
+ * With `plan.conversations` (the backend sends it to an agent announcing
+ * `rename-conversations-v1`), once the rename has gone through the
+ * Claude Code and pi conversations of each moved checkout move to the new
+ * path's folder too (conversation-move.js), so `claude --resume` in the
+ * renamed project still lists them. That runs even when the directory moved
+ * on an earlier call, so a retry finishes it.
  */
 const fs = require('node:fs');
 const path = require('node:path');
 const workspace = require('./workspace');
+const conversationMove = require('./conversation-move');
 
 /**
  * @param {{ sessions: Array<{ from: string, to: string }>, fromDir: string, toDir: string,
- *   workspace?: { repos: string[], guides?: Array<{ dir: string, content: string }> } }} plan
+ *   workspace?: { repos: string[], guides?: Array<{ dir: string, content: string }> },
+ *   conversations?: { home: string } }} plan
  * @param {{ execFile: (cmd: string, args: string[]) => Promise<unknown>, fs?: typeof fs.promises }} deps
  */
 async function renameProject(plan, deps) {
@@ -49,7 +58,7 @@ async function renameProject(plan, deps) {
 
   if (plan.workspace) {
     const guides = await renameWorkspace(plan, moveDir, renamed, deps);
-    return { ok: true, renamedSessions: renamed.length, movedDir: moveDir, guides };
+    return { ok: true, renamedSessions: renamed.length, movedDir: moveDir, guides, ...carryConversations(plan) };
   }
 
   if (moveDir) {
@@ -60,7 +69,15 @@ async function renameProject(plan, deps) {
         .catch(() => {});
     }
   }
-  return { ok: true, renamedSessions: renamed.length, movedDir: moveDir };
+  return { ok: true, renamedSessions: renamed.length, movedDir: moveDir, ...carryConversations(plan) };
+}
+
+/** `{ conversations }` when the plan asks for them to move, else nothing. */
+function carryConversations(plan) {
+  const home = plan.conversations && plan.conversations.home;
+  if (!home || !plan.fromDir || !plan.toDir || plan.fromDir === plan.toDir) return {};
+  const repos = plan.workspace ? workspace.repoNames(plan.workspace.repos) : [];
+  return { conversations: conversationMove.carryConversations({ home, fromDir: plan.fromDir, toDir: plan.toDir, repos }) };
 }
 
 async function renameWorkspace(plan, moveDir, renamed, deps) {
@@ -87,4 +104,27 @@ async function renameWorkspace(plan, moveDir, renamed, deps) {
   throw new Error(`${why}; nothing was renamed`);
 }
 
-module.exports = { renameProject };
+/**
+ * The box half of a workstream rename (the `git-worktree-move` RPC): move its
+ * worktree from .worktrees/<from> to .worktrees/<to> with `git worktree move`,
+ * which updates git's bookkeeping (.git/worktrees/<id>/gitdir) as well as the
+ * directory, which a plain mv would not. The branch is untouched; the caller
+ * decides whether it follows the name. It never moves onto something
+ * already at <to>, which git would move the worktree *into* (<to>/<from>), as
+ * mv does: a folder there may be another checkout, so it is never taken for
+ * this one. With `conversations`, a move git made carries the worktree's
+ * conversations in the same call; a refused move carries nothing.
+ */
+async function renameWorktree({ projectDir, from, to, conversations }, deps) {
+  if (!projectDir || !from || !to) throw new Error('projectDir, from and to are required');
+  const fromPath = `${projectDir}/.worktrees/${from}`;
+  const toPath = `${projectDir}/.worktrees/${to}`;
+  if ((deps.exists ?? fs.existsSync)(toPath)) throw new Error(`${toPath} already exists`);
+  await deps.execFile('git', ['-C', projectDir, 'worktree', 'move', fromPath, toPath]);
+  const carried = conversations && conversations.home
+    ? { conversations: conversationMove.carryConversations({ home: conversations.home, fromDir: fromPath, toDir: toPath }) }
+    : {};
+  return { ok: true, path: toPath, ...carried };
+}
+
+module.exports = { renameProject, renameWorktree };

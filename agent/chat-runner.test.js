@@ -8,7 +8,7 @@ const {
   CAPABILITIES, capHistory, checkoutOwnTree, ownTreeRefusal, readOnlyFix, readOnlyNotice, STARTUP_CONFIG_PATHS, checkoutReady, completeLines, createChatRunner, entriesBeforeTurn, findTranscript, githubSlug, historyEntries, isChatKey,
   isPullRef, mcpVersionFile, parseEvent, parseTurnRecords, turnCost, permissionArgs, permissionModeFor, prepareChatConfigDir, readCheckoutFacts, rehomeTranscript, resolveClaude, resumeLaunch, slugForCwd, splitLines, turnArgs,
   piTurnArgs,
-  backendOf, backendSettings, chatTelemetryEnv, withTelemetry, withDefaultModel, askTelemetryOf,
+  backendOf, backendSettings, chatTelemetryEnv, inferenceOf, withTelemetry, withDefaultModel, askTelemetryOf, autoCompactWindowOf,
   turnEnv, toolchainDirs, turnModeFor, turnRecord, turnSessionName, userPromptUuid, PANE_START_GRACE_MS, nextPaneClaim,
   appendedSystemPrompt,
   genUiReference,
@@ -2627,6 +2627,12 @@ test('turn records: Claude\'s cost when it printed one, the clock and the exit o
   assert.deepEqual(parsed, [{ turnId: 't1', at: null, prompt: 'hi', sessionId: null, userUuid: null, costUsd: 0.04, sessionCostUsd: 0.04, durationMs: 12, isError: false }]);
   const tagged = parseTurnRecords('{"turnId":"t4","prompt":"go","userUuid":"chat-1","costUsd":0.02,"durationMs":5,"isError":false}\n');
   assert.equal(tagged[0].userUuid, 'chat-1');
+  // The window the turn compacted at, kept for a reopened chat's context ring.
+  assert.equal(turnRecord({ turnId: 't5', prompt: '', result: null, startedAt: 0, endedAt: 0, exitCode: 0, compactWindow: 200000 }).compactWindow, 200000);
+  assert.equal(turnRecord({ turnId: 't6', prompt: '', result: null, startedAt: 0, endedAt: 0, exitCode: 0 }).compactWindow, null, 'none: the model\'s window');
+  assert.equal(parseTurnRecords('{"turnId":"t5","compactWindow":200000}\n')[0].compactWindow, 200000);
+  assert.equal(parseTurnRecords('{"turnId":"t5","compactWindow":"big"}\n')[0].compactWindow, null);
+  assert.equal('compactWindow' in parseTurnRecords('{"turnId":"t5"}\n')[0], false, 'an older agent\'s record says nothing');
 });
 
 // Claude's total_cost_usd is the session's so far, and a turn's own cost is what it grew by.
@@ -3548,6 +3554,23 @@ test('runner: a send on a backend starts its turn with that backend\'s settings 
   await assert.rejects(r.sendMessage(job('hi', { chatKey: 'k2', backend: 'fireworks', model: 'opus' })), /bad backend/);
 });
 
+test("runner: an ask's turn on a backend keeps the ask's system prompt and disallowed tools, on the backend's settings and model", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-backend-ask-'));
+  const b = box(home);
+  const asked = [];
+  const r = runner(home, b, [], { launchSettings: async x => { asked.push(x); return FW_SETTINGS; } });
+  const ask = { threadId: 'thread0001', runId: 'run00001', systemPrompt: 'ASK RULES', gitName: 'Ada', gitEmail: 'ada@example.com' };
+  const { turnId } = await r.sendMessage(job('look', { chatKey: 'p1--wsask', permissionMode: 'bypassPermissions', backend: 'fireworks', model: KIMI, ask }));
+  const { meta } = b.procs.get(turnId);
+  assert.deepEqual(asked, [{ backend: 'fireworks', model: KIMI }]);
+  assert.equal(meta.backend, 'fireworks');
+  assert.equal(meta.args[meta.args.indexOf('--model') + 1], KIMI);
+  assert.deepEqual(settingsArg(meta.args), FW_SETTINGS, 'a trusted ask turn: the backend\'s settings alone');
+  assert.equal(meta.args[meta.args.indexOf('--disallowedTools') + 1], 'ScheduleWakeup CronCreate');
+  assert.equal(meta.args[meta.args.indexOf('--append-system-prompt') + 1], 'ASK RULES');
+  assert.equal(meta.ask.runId, 'run00001');
+});
+
 test('runner: a backend that is not ready on the box ends the turn with its reason, not a turn on the default', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-backend-off-'));
   const b = box(home);
@@ -3680,6 +3703,42 @@ test('a turn says which session it is, for termag ask inside it', () => {
   assert.deepEqual(turnSessionEnv({}), {});
 });
 
+test('a turn names its Project files and My files only from the send\'s files (project-files-v1)', () => {
+  const { turnSessionEnv, filesOf, CAPABILITIES, PROJECT_FILES_CAPABILITY } = require('./chat-runner');
+  assert.ok(CAPABILITIES.includes(PROJECT_FILES_CAPABILITY));
+  assert.equal(PROJECT_FILES_CAPABILITY, 'project-files-v1');
+  assert.deepEqual(
+    turnSessionEnv({ projectId: 'p1', workstream: 'main', files: { project: 'ana-termag', mine: 'ana-my-files' } }),
+    { TERMAG_PROJECT_ID: 'p1', TERMAG_WORKSTREAM: 'main', TERMAG_SPACE: 'ana-termag', TERMAG_MY_FILES: 'ana-my-files' },
+  );
+  // My files off (Settings): the orchestrator sends no `mine`, and the turn has no TERMAG_MY_FILES.
+  assert.deepEqual(turnSessionEnv({ files: { project: 'ana-termag', mine: null } }), { TERMAG_SPACE: 'ana-termag' });
+  assert.deepEqual(turnSessionEnv({ files: { project: null, mine: 'ana-my-files' } }), { TERMAG_MY_FILES: 'ana-my-files' });
+  // No files (an older orchestrator, the flag off), or names that aren't space names: nothing set.
+  for (const files of [undefined, null, 'ana-termag', [], {}, { project: 'Ana Termag', mine: '../x' }, { project: 'a' }, { project: 'x'.repeat(41) }]) {
+    assert.equal(filesOf(files), null, JSON.stringify(files));
+    assert.deepEqual(turnSessionEnv({ files }), {}, JSON.stringify(files));
+  }
+});
+
+test('runner: a send\'s files become the turn\'s TERMAG_SPACE and TERMAG_MY_FILES, and a send without them sets neither', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-turn-files-'));
+  try {
+    const b = box(home);
+    const r = runner(home, b, []);
+    const withFiles = await r.sendMessage(job('save it', { files: { project: 'ana-termag', mine: 'ana-my-files' } }));
+    const env = b.procs.get(withFiles.turnId).meta.env;
+    assert.equal(env.TERMAG_SPACE, 'ana-termag');
+    assert.equal(env.TERMAG_MY_FILES, 'ana-my-files');
+    const without = await r.sendMessage(job('hi', { chatKey: 'p1--other' }));
+    const plain = b.procs.get(without.turnId).meta.env;
+    assert.equal('TERMAG_SPACE' in plain, false);
+    assert.equal('TERMAG_MY_FILES' in plain, false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 function transcript(home, sessionId, entries) {
   const dir = path.join(home, '.claude/projects/-w-p1');
   fs.mkdirSync(dir, { recursive: true });
@@ -3706,7 +3765,7 @@ test('reset: the next turn starts a new session, and history keeps the old one a
   const reset = await r.resetContext('p1--main', { projectId: 'p1', workstream: 'main', workstreamId: 'ws1' });
   assert.deepEqual(reset, { reset: true, at: '2026-10-26T12:00:00.000Z' });
   assert.equal(r.readSession('p1--main').sessionId, null);
-  assert.deepEqual(r.readEarlier('p1--main'), [{ sessionId: 'sess-old-11111111', clearedAt: '2026-10-26T12:00:00.000Z' }]);
+  assert.deepEqual(r.readEarlier('p1--main'), [{ sessionId: 'sess-old-11111111', clearedAt: '2026-10-26T12:00:00.000Z', engine: 'claude' }]);
   const frame = frames.at(-1);
   assert.deepEqual(frame.event, { type: 'context-cleared', at: '2026-10-26T12:00:00.000Z' });
   assert.equal(frame.turnId, null);
@@ -4024,6 +4083,28 @@ test('chatTelemetryEnv: the box script gives the owner\'s resource with the chat
   });
 });
 
+test('chatTelemetryEnv: the run names its inference backend and model; the box script reads the default one', async () => {
+  const home = telemetryHome();
+  const env = { PATH: process.env.PATH, TERMAG_INFERENCE_BACKEND: 'fireworks', TERMAG_INFERENCE_MODEL: 'inherited' };
+  const base = `${RESOURCE.replace('kind=interactive', 'kind=chat')},termag.project=webapp,termag.workstream=main`;
+  const run = inference => chatTelemetryEnv({ project: 'webapp', workstream: 'main', kind: 'chat', inference }, { home, env });
+  // No gateway in the owner's settings: Claude Code's own login.
+  assert.deepEqual(await run(inferenceOf(null, 'opus')), { OTEL_RESOURCE_ATTRIBUTES: `${base},termag.inference.backend=anthropic,termag.inference.model=opus` });
+  const kimi = 'accounts/fireworks/models/kimi-k3';
+  assert.deepEqual(await run(inferenceOf({ backend: 'fireworks', model: kimi })), { OTEL_RESOURCE_ATTRIBUTES: `${base},termag.inference.backend=fireworks,termag.inference.model=${kimi}` });
+  // A launch model the backend accepts (MODEL_ARG, up to 160) is kept; longer is not.
+  const long = 'a'.repeat(160);
+  assert.deepEqual(await run(inferenceOf(null, long)), { OTEL_RESOURCE_ATTRIBUTES: `${base},termag.inference.backend=anthropic,termag.inference.model=${long}` });
+  assert.deepEqual(await run(inferenceOf(null, 'a'.repeat(161))), { OTEL_RESOURCE_ATTRIBUTES: `${base},termag.inference.backend=anthropic` });
+  // None named: nothing, whatever the runner's own environment inherited.
+  assert.deepEqual(await run(null), { OTEL_RESOURCE_ATTRIBUTES: base });
+  assert.deepEqual(await run({ backend: 'fire,works=x', model: 'opus' }), { OTEL_RESOURCE_ATTRIBUTES: base });
+  // termag's Claude gateway in the owner's settings is Bedrock, with its default model.
+  const settings = path.join(home, '.claude/settings.json');
+  fs.writeFileSync(settings, JSON.stringify({ env: { OTEL_RESOURCE_ATTRIBUTES: RESOURCE, CLAUDE_CODE_USE_BEDROCK: '1', ANTHROPIC_MODEL: 'us.anthropic.claude-opus-5-5' } }));
+  assert.deepEqual(await run(inferenceOf(null)), { OTEL_RESOURCE_ATTRIBUTES: `${base},termag.inference.backend=bedrock,termag.inference.model=us.anthropic.claude-opus-5-5` });
+});
+
 test('chatTelemetryEnv: the chat\'s checkout names its repository, branch and commit; a relative or missing one names none', async () => {
   const home = telemetryHome();
   const env = { PATH: process.env.PATH };
@@ -4124,7 +4205,7 @@ test('runner: a turn, trusted or confined, on a backend or not, exports as the c
     readCheckout: async () => ({ repo: true, branch: 'main', originUrl: null }),
   });
   const confined = await r.sendMessage(job('hi', { project: 'webapp' }));
-  assert.deepEqual(asked.at(-1), { project: 'webapp', workstream: 'main', kind: 'chat', cwd: job('hi').cwd });
+  assert.deepEqual(asked.at(-1), { project: 'webapp', workstream: 'main', kind: 'chat', cwd: job('hi').cwd, inference: { backend: 'default', model: null } });
   assert.equal(b.procs.get(confined.turnId).meta.env.TERMAG_SESSION_KIND, 'chat', 'the turn\'s environment names the same kind');
   assert.deepEqual(settingsArg(b.procs.get(confined.turnId).meta.args), { env: resource, disableAllHooks: true });
   assert.equal(b.procs.get(confined.turnId).meta.project, 'webapp');
@@ -4136,6 +4217,7 @@ test('runner: a turn, trusted or confined, on a backend or not, exports as the c
   assert.deepEqual(settingsArg(args), { env: resource }, 'a trusted turn gets the resource alone');
   const onBackend = await r.sendMessage(job('hi', { chatKey: 'p1--fw', project: 'webapp', backend: 'fireworks', model: KIMI }));
   assert.deepEqual(settingsArg(b.procs.get(onBackend.turnId).meta.args), { ...FW_SETTINGS, env: { ...FW_SETTINGS.env, ...resource }, disableAllHooks: true });
+  assert.deepEqual(asked.at(-1).inference, { backend: 'fireworks', model: KIMI }, 'the resource names the backend the turn runs on');
 });
 
 test("withDefaultModel: a saved Fireworks model gives way to the default, a Claude one is kept, the owner's file untouched", () => {
@@ -4171,6 +4253,37 @@ test('runner: a saved Fireworks model is overridden on a turn and a resume off t
   assert.ok(script.includes(`'{"model":"","disableAllHooks":true}'`), script);
 });
 
+test('autoCompactWindowOf: --settings, then the owner\'s settings, then the process env; clamped, suffixes read as Claude Code reads them', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-compact-window-'));
+  const W = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW';
+  assert.equal(autoCompactWindowOf(null, home, {}), null, 'nothing sets it: the model\'s window');
+  assert.equal(autoCompactWindowOf(null, home, { [W]: '300000' }), 300000);
+  fs.mkdirSync(path.join(home, '.claude'));
+  fs.writeFileSync(path.join(home, '.claude/settings.json'), JSON.stringify({ env: { [W]: '200000' } }));
+  assert.equal(autoCompactWindowOf(null, home, { [W]: '300000' }), 200000, 'settings env outranks the process env');
+  assert.equal(autoCompactWindowOf({ env: { [W]: '500k' } }, home, {}), 500000, '--settings outranks the owner\'s');
+  assert.equal(autoCompactWindowOf({ env: { [W]: '1M' } }, home, {}), 1000000);
+  assert.equal(autoCompactWindowOf({ env: { [W]: '200' } }, home, {}), 100000, 'a bare count is tokens, held at the 100K minimum');
+  assert.equal(autoCompactWindowOf({ env: { [W]: '5000000' } }, home, {}), 1000000);
+  assert.equal(autoCompactWindowOf({ env: { [W]: 'lots' } }, home, {}), 200000, 'a value Claude Code ignores falls through');
+});
+
+test('runner: a turn-start says the window the owner\'s settings compact at', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-turn-compact-window-'));
+  fs.mkdirSync(path.join(home, '.claude'));
+  fs.writeFileSync(path.join(home, '.claude/settings.json'), JSON.stringify({ env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: '200000' } }));
+  const b = box(home);
+  const r = runner(home, b, []);
+  const { turnId } = await r.sendMessage(job('hi'));
+  const { meta } = b.procs.get(turnId);
+  assert.equal(meta.compactWindow, 200000);
+  const { turnStartEvent } = require('./chat-turn');
+  assert.equal(turnStartEvent(meta).compactWindow, 200000);
+  fs.writeFileSync(path.join(home, '.claude/settings.json'), JSON.stringify({ env: {} }));
+  const next = await r.sendMessage(job('hi', { chatKey: 'p1--other' }));
+  assert.equal('compactWindow' in b.procs.get(next.turnId).meta, false, 'none set: the turn says nothing');
+});
+
 test('runner: without a resource a turn\'s settings are as before', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-turn-no-telemetry-'));
   const b = box(home);
@@ -4190,7 +4303,7 @@ test('runner: an Open in full UI resume exports as a pane of the chat\'s project
   await r.poll();
   const claim = await r.claimResume('p1--main', { cwd: '/w/p1', permissionMode: 'dontAsk', project: 'webapp', workstream: 'main' });
   assert.equal(claim.claimed, true);
-  assert.deepEqual(asked.at(-1), { project: 'webapp', workstream: 'main', kind: 'interactive', cwd: '/w/p1' }, 'a resume is a pane, named over the settings\' external');
+  assert.deepEqual(asked.at(-1), { project: 'webapp', workstream: 'main', kind: 'interactive', cwd: '/w/p1', inference: { backend: 'default', model: null } }, 'a resume is a pane, named over the settings\' external');
   const script = fs.readFileSync(path.join(home, '.termag/chat-resume/p1--main'), 'utf8');
   assert.ok(script.includes(`'{"env":{"OTEL_RESOURCE_ATTRIBUTES":"r=resume"},"disableAllHooks":true}'`), script);
   assert.ok(script.includes('\nexport TERMAG_SESSION_KIND=interactive\n'), script);

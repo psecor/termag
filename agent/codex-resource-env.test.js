@@ -65,3 +65,19 @@ test('spawnEnv drops each bad value on its own, and everything without a good id
 test('withoutResourceEnv takes an inherited spawn out too', () => {
   assert.deepEqual(withoutResourceEnv({ PATH: '/bin', TERMAG_SPAWN_ID: 'old', TERMAG_SPAWN_PARENT_BOX: 'old' }), { PATH: '/bin' });
 });
+
+test('carries the pane\'s Project files and My files from the RPC\'s files, each name checked (project-files-v1)', () => {
+  assert.deepEqual(
+    codexResourceEnv({ project: 'research', workstream: 'main', files: { project: 'ana-research', mine: 'ana-my-files' } }),
+    { TERMAG_PROJECT: 'research', TERMAG_WORKSTREAM: 'main', TERMAG_SPACE: 'ana-research', TERMAG_MY_FILES: 'ana-my-files' },
+  );
+  assert.deepEqual(codexResourceEnv({ files: { project: 'ana-research', mine: null } }), { TERMAG_SPACE: 'ana-research' });
+  assert.deepEqual(codexResourceEnv({ files: { project: 'Bad Name', mine: '$(id)' } }), {});
+  assert.deepEqual(codexResourceEnv({ files: 'ana-research' }), {});
+  // A session that names none inherits none from the agent's own environment.
+  assert.equal(withoutResourceEnv({ TERMAG_SPACE: 'x', TERMAG_MY_FILES: 'y', HOME: '/h' }).TERMAG_SPACE, undefined);
+  const env = codexBridgeEnv({ TERMAG_SPACE: 'stale', HOME: '/h' }, codexResourceEnv({ files: { project: 'ana-research', mine: 'ana-my-files' } }));
+  assert.equal(env.TERMAG_SPACE, 'ana-research');
+  assert.equal(env.TERMAG_MY_FILES, 'ana-my-files');
+});
+

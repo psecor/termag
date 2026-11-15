@@ -10,7 +10,7 @@
 // dialog shows a refused port greyed out with the guard's reason; the
 // orchestrator refuses to publish it.
 //
-//   { cwd?, port? } -> { listeners: [{ port, pid, command, verdict, inCheckout }] }
+//   { cwd?, port? } -> { listeners: [{ port, pid, command, verdict, inCheckout, confined }] }
 //
 // With `port`, the answer is that port's entry alone (none when nothing
 // listens on it), for a publish.
@@ -18,7 +18,9 @@
 // `command` is the holder's command line, cut to COMMAND_MAX characters;
 // pid and command are null where the socket isn't this user's to look into
 // (a Docker publish, another user's). `inCheckout`: the holder runs from
-// `cwd` (the workstream's checkout) or under it.
+// `cwd` (the workstream's checkout) or under it. `confined`: every holder of
+// the port descends from a `termag preview run` of `cwd`, which a `people` or
+// `link` link needs (agent/preview-runs.js; the tunnel-open checks it again).
 const fs = require('node:fs');
 const { allListenRows, socketOwners, insideDir } = require('./local-listeners');
 const portGuard = require('./port-guard');
@@ -57,6 +59,10 @@ async function previewListeners({ cwd, port: probed } = {}, deps = {}) {
     realpathSync: fs.realpathSync,
     checkPreviewListener: (port, seen) => portGuard.checkPreviewListener(port, seen),
     checkPreviewPort: (port) => portGuard.checkPreviewPort(port),
+    // (ports, checkout) -> Set of confined ports: PreviewRuns#confinedPorts (vouched for a wider audience).
+    confinedPorts: () => new Set(),
+    // (ports, checkout) -> Set of ports a run of the checkout holds: PreviewRuns#runPorts (the checkout's app).
+    runPorts: () => new Set(),
     ...deps,
   };
   const allRows = allListenRows(d.readFileSync, d.procRoot);
@@ -69,6 +75,9 @@ async function previewListeners({ cwd, port: probed } = {}, deps = {}) {
     : [...new Set(rows.map((r) => r.port))].sort((a, b) => a - b).slice(0, MAX_PORTS);
   const owners = socketOwners(rows.map((r) => r.inode), { readdirSync: d.readdirSync, readlinkSync: d.readlinkSync }, d.procRoot);
   const dir = typeof cwd === 'string' && cwd.startsWith('/') ? cwd : null;
+  // One walk of /proc for both: the run ports, then which of them the agent may vouch for (Devin, #1520).
+  const runs = dir ? d.runPorts(ports, dir) : new Set();
+  const confined = dir ? d.confinedPorts(ports, dir, runs) : new Set();
   const listeners = [];
   for (const port of ports) {
     const holder = rows.filter((r) => r.port === port).map((r) => owners.get(r.inode)).find(Boolean) || null;
@@ -82,7 +91,9 @@ async function previewListeners({ cwd, port: probed } = {}, deps = {}) {
       pid: holder ? holder.pid : null,
       command: holder ? commandOf(holder.pid, d) : null,
       verdict: v.ok ? { ok: true } : { ok: false, code: v.code, reason: v.reason },
-      inCheckout: !!(holder && holder.cwd && dir && insideDir(holder.cwd, dir, d.realpathSync)),
+      // A confined run's holder works in its run directory's copy, so it counts as the checkout's.
+      inCheckout: runs.has(port) || confined.has(port) || !!(holder && holder.cwd && dir && insideDir(holder.cwd, dir, d.realpathSync)),
+      confined: confined.has(port),
     });
   }
   return { listeners };

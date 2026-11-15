@@ -42,11 +42,30 @@ const { userMessageKind } = require('./tool-group-headings');
 const { WORKFLOW_SCOPE_HINT, isWorkflowScopeRefusal } = require('./workflow-scope');
 
 // ask-model-v1: an ask-run's `model` (termag ask --model) is the turn's --model.
-const CAPABILITIES = ['ask-chat-v1', 'ask-steer-v1', 'ask-model-v1'];
+// ask-backend-v1: an ask-run's, or a person's message's, `backend` (termag ask --model fireworks:<id>) goes to the
+// chat runner with its model, fast model, window and menu, as a chat-send's does (chat-runner.js backendOf).
+const CAPABILITIES = ['ask-chat-v1', 'ask-steer-v1', 'ask-model-v1', 'ask-backend-v1'];
 /** An ask-run `model` the chat runner may launch with (chat-runner.js claudeModelArg): a tier alias or a US Anthropic profile id. */
 const LAUNCH_MODEL = /^(opus|sonnet|haiku|us\.anthropic\.claude-[A-Za-z0-9._:-]{1,80})$/;
-/** The job's `model`, when the orchestrator named one this runner takes; anything else is left out (the box's default). */
-const modelOf = (msg) => (typeof msg.model === 'string' && LAUNCH_MODEL.test(msg.model) ? { model: msg.model } : {});
+/** A model backend's model (chat-runner.js BACKEND_MODEL), which the chat runner checks again. */
+const BACKEND_MODEL = /^accounts\/[a-z0-9-]+\/(?:models|routers)\/[A-Za-z0-9._-]{1,120}$/;
+/**
+ * The job's launch: on a model backend (`backend` and its `model`, with the
+ * fast model, window and menu when named), or a Claude `model` this runner
+ * takes; anything else is left out (the box's default). A backend the chat
+ * runner can't start is refused there, so a Fireworks turn never runs on Claude.
+ */
+function modelOf(msg) {
+  if (typeof msg.backend === 'string' && msg.backend) {
+    return {
+      backend: msg.backend, model: typeof msg.model === 'string' ? msg.model : null,
+      ...(typeof msg.fastModel === 'string' && BACKEND_MODEL.test(msg.fastModel) ? { fastModel: msg.fastModel } : {}),
+      ...(Number.isInteger(msg.context) && msg.context > 0 ? { context: msg.context } : {}),
+      ...(typeof msg.models === 'string' && msg.models ? { models: msg.models } : {}),
+    };
+  }
+  return typeof msg.model === 'string' && LAUNCH_MODEL.test(msg.model) ? { model: msg.model } : {};
+}
 const RUN_ID_RE = /^[a-z0-9]{8,40}$/;
 const PHASES_MARKER = 'Phases: ask-chat-v1';
 const TRUSTED_MODE = 'bypassPermissions';
@@ -56,6 +75,10 @@ const askMode = (capped) => (askRun.CAPPED_MODES.includes(capped) ? capped : TRU
 const PREPARE_TIMEOUT_MS = 15 * 60 * 1000;
 const STOPPED = 'The ask\'s turn on the target box stopped before Claude answered.';
 const STOPPED_FOLLOW_UP = 'The ask\'s turn on the target box stopped before Claude answered this follow-up.';
+
+// A stopped turn has no result, but Claude may have written to the asker on
+// the way (a question, a request for more boxes): its last such text follows.
+const STOPPED_LAST_TEXT = 'Claude\'s last message in this turn, before it stopped:';
 
 function jobsDir(home) { return path.join(askRun.stateDir(home), 'jobs'); }
 
@@ -87,6 +110,16 @@ function contentText(content) {
 }
 
 /**
+ * Text Claude wrote in the main conversation (not a subagent's): an
+ * assistant message with a non-empty text block.
+ */
+function isAnswerText(ev) {
+  if (!ev || ev.type !== 'assistant' || ev.parent_tool_use_id || !ev.message) return false;
+  const text = contentText(ev.message.content);
+  return typeof text === 'string' && text.trim() !== '';
+}
+
+/**
  * A prompt Claude took in (its replay): a line the chat shows as a person's
  * or an ask's message (tool-group-headings.js userMessageKind, as
  * chat/sdkChat.ts draws it). A task's notification, a reminder, a local
@@ -102,8 +135,9 @@ function isPrompt(ev) {
 /**
  * The reply of a finished turn, as the result event termag-subagent-run
  * reports: Claude's own last `result`, else an error naming why there is
- * none (stopped, or the runner's last error), keeping the session so the
- * thread's next ask resumes it. A background task (a Monitor, a background
+ * none (stopped, or the runner's last error) followed by the last text Claude
+ * wrote in the turn, if any, keeping the session so the thread's next ask
+ * resumes it. A background task (a Monitor, a background
  * command or agent) that ends after Claude answered wakes it into another
  * `result` in the same turn, often a short "that was my watcher" note, so the
  * reply is every result's text since the last prompt Claude took in
@@ -131,8 +165,10 @@ function turnResult(log, after = null) {
   let result = null;
   let texts = [];
   let runnerError = null;
+  let said = null;
   for (let i = 0; i < events.length; i++) {
     const ev = events[i];
+    if (i >= from && isAnswerText(ev)) said = contentText(ev.message.content).trim() || said;
     if (ev && ev.type === 'result') {
       if (i < from) continue;
       // An error result ends its attempt: an error, or an answer after one, starts the reply over.
@@ -140,7 +176,7 @@ function turnResult(log, after = null) {
       result = ev;
       if (typeof ev.result === 'string' && ev.result.trim()) texts.push(ev.result);
     } else if (ev && ev.type === 'runner-error' && typeof ev.message === 'string') runnerError = ev.message;
-    else if (i >= from && isPrompt(ev)) texts = [];
+    else if (i >= from && isPrompt(ev)) { texts = []; said = null; }
   }
   // An older Claude's log without the follow-up's replay can't tell its results apart: the last one.
   if (result && after != null && !replayed) return result;
@@ -149,11 +185,12 @@ function turnResult(log, after = null) {
     return text && text !== result.result ? { ...result, result: text } : result;
   }
   const stopped = replayed ? STOPPED_FOLLOW_UP : STOPPED;
+  const why = runnerError ? `${stopped} ${runnerError}` : stopped;
   return {
     type: 'result',
     subtype: 'error_turn_stopped',
     is_error: true,
-    result: runnerError ? `${stopped} ${runnerError}` : stopped,
+    result: said ? `${why}\n\n${STOPPED_LAST_TEXT}\n\n${said}` : why,
     session_id: sessionIdFrom(log) || undefined,
     num_turns: null,
   };
@@ -375,7 +412,8 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
         chatKey: job.chat.chatKey, cwd: prep.repoDir, text: job.prompt,
         projectId: job.chat.projectId, project: job.chat.project, workstream: job.chat.workstream, workstreamId: job.chat.workstreamId,
         permissionMode: askMode(job.permissionMode), ...(job.spaceMemory ? { spaceMemory: job.spaceMemory } : {}),
-        // The turn's --model (termag ask --model, else the thread chat's stored tier); none is the box's default.
+        // The turn's --model (termag ask --model, else the thread chat's stored choice), and its backend when on one;
+        // none is the box's default.
         ...modelOf(job),
         // live: the turn reads stdin as it runs, so a later ask on the thread can join it (steerRun).
         ...(job.live === true ? { liveInput: true } : {}),
@@ -493,7 +531,8 @@ function createAskChat({ home, chats, spawn, fsImpl = fs, log = () => {} }) {
       let systemPrompt = '';
       try { systemPrompt = fsImpl.readFileSync(systemPromptFile(prep.repoDir), 'utf8'); } catch { /* a thread cloned again: none */ }
       return chats.sendMessage({
-        ...chat, cwd: prep.repoDir, text: msg.text, permissionMode: askMode(a.permissionMode), model: msg.model, images: msg.images,
+        // The chat's choice, as the orchestrator sent it: a Claude model, or a backend and its model (the thread's asks' choice).
+        ...chat, cwd: prep.repoDir, text: msg.text, permissionMode: askMode(a.permissionMode), ...modelOf(msg), images: msg.images,
         // A repeat of this id is answered as the send that first carried it (chat-send-ids.js).
         sendId: msg.sendId,
         ...(msg.spaceMemory && typeof msg.spaceMemory === 'object' ? { spaceMemory: msg.spaceMemory } : {}),

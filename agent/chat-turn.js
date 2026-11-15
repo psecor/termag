@@ -61,7 +61,9 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { randomUUID } = require('crypto');
 const { createPiNormalizer } = require('./pi-events');
+const { engineSpec, engineTag } = require('./chat-engines');
 
 const SESSION_ID_RE = /^[A-Za-z0-9-]{8,80}$/;
 const INBOX_POLL_MS = 250;
@@ -97,9 +99,9 @@ function sawResult(jsonl) {
   })());
 }
 
-/** What a turn's messages call its agent. */
+/** What a turn's messages call its agent (chat-engines.js). */
 function agentLabel(engine) {
-  return engine === 'pi' ? 'pi' : 'Claude';
+  return engineSpec(engine).label;
 }
 
 /**
@@ -110,7 +112,7 @@ function agentLabel(engine) {
  */
 function reportedExit({ code, signal, interrupted, engine }) {
   // pi's own exit 0 (it had finished before the stop) is kept.
-  if (interrupted && engine === 'pi' && code !== 0) return { code: null, signal: 'SIGINT' };
+  if (interrupted && engineSpec(engine).stopReadsAsInterrupt && code !== 0) return { code: null, signal: 'SIGINT' };
   return { code, signal: signal || null };
 }
 
@@ -131,16 +133,22 @@ function closingEvents({ code, signal, result, stderrTail, interrupted, engine }
  * hooks key on the pane), the agent's PATH, the scratch config dir when the
  * runner set one, and the turn's own variables (an ask's git identity and
  * where it writes PR descriptions; which session the turn is, for `termag ask`;
- * its kind, TERMAG_SESSION_KIND, the same as its telemetry resource's).
+ * its kind, TERMAG_SESSION_KIND, the same as its telemetry resource's; its
+ * Project files and My files, TERMAG_SPACE and TERMAG_MY_FILES, for `termag space`).
  */
-function childEnv(env, pathValue, configDir, extra) {
+function childEnv(env, pathValue, configDir, extra, agentEnv) {
   const next = { ...env };
   delete next.TMUX;
   delete next.TMUX_PANE;
   if (pathValue) next.PATH = pathValue;
   if (configDir) next.CLAUDE_CONFIG_DIR = configDir;
   if (extra && typeof extra === 'object') {
-    for (const [k, v] of Object.entries(extra)) if (/^(GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)|TERMAG_ASK_PR_(BODY_FILE|DIR)|TERMAG_ASK_THREAD|TERMAG_PROJECT_ID|TERMAG_SESSION_KIND|TERMAG_WORKSTREAM)$/.test(k) && typeof v === 'string') next[k] = v;
+    for (const [k, v] of Object.entries(extra)) if (/^(GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)|TERMAG_ASK_PR_(BODY_FILE|DIR)|TERMAG_ASK_THREAD|TERMAG_MY_FILES|TERMAG_PROJECT_ID|TERMAG_SESSION_KIND|TERMAG_SPACE|TERMAG_WORKSTREAM)$/.test(k) && typeof v === 'string') next[k] = v;
+  }
+  // An engine's own folders (chat-runner.js headless env, meta.agentEnv): Cursor's config folder, and a confined
+  // Cursor turn's HOME, which holds none of the box user's hooks. Absolute paths only.
+  if (agentEnv && typeof agentEnv === 'object') {
+    for (const [k, v] of Object.entries(agentEnv)) if (/^(HOME|CURSOR_CONFIG_DIR)$/.test(k) && typeof v === 'string' && path.isAbsolute(v)) next[k] = v;
   }
   return next;
 }
@@ -335,7 +343,8 @@ function turnStartEvent(meta) {
   // readOnly: the turn asked for an open mode and runs read-only (dontAsk) instead, and why (chat-runner.js settleTurnMode);
   // readOnlyFix: what the person runs on the box to get the tools back, when there is such a thing (readOnlyFix).
   // headings: the runner asks Haiku for this turn's tool-group headings (tool-group-headings.js), so the browser may wait for them.
-  return { type: 'turn-start', text: meta.text, resumed: Boolean(meta.resumed), live: meta.live === true, ...(images && { images }), ...(meta.compact === true && { compact: true }), ...(meta.newBoxNotice === true && { newBoxNotice: true }), ...(meta.headings === true && !meta.ask && { headings: true }), ...(typeof meta.readOnly === 'string' && { readOnly: meta.readOnly }), ...(typeof meta.readOnly === 'string' && typeof meta.readOnlyFix === 'string' && { readOnlyFix: meta.readOnlyFix }) };
+  // compactWindow: the context size Claude Code auto-compacts this turn at (chat-runner.js autoCompactWindowOf), for the context ring.
+  return { type: 'turn-start', text: meta.text, resumed: Boolean(meta.resumed), live: meta.live === true, ...(images && { images }), ...(Number.isSafeInteger(meta.compactWindow) && meta.compactWindow > 0 && { compactWindow: meta.compactWindow }), ...(meta.compact === true && { compact: true }), ...(meta.newBoxNotice === true && { newBoxNotice: true }), ...(meta.headings === true && !meta.ask && { headings: true }), ...(typeof meta.readOnly === 'string' && { readOnly: meta.readOnly }), ...(typeof meta.readOnly === 'string' && typeof meta.readOnlyFix === 'string' && { readOnlyFix: meta.readOnlyFix }) };
 }
 
 function appendLine(file, ev) {
@@ -360,16 +369,21 @@ function writeAtomic(file, text) {
 }
 
 /**
- * A pi turn's stdout, line by line: each line as pi wrote it to `rawFile`,
- * and what pi-events.js makes of it to `eventsFile`. `close()` takes the
- * last unfinished line and returns the normaliser, for its end().
+ * An engine's stdout that isn't Claude's stream-json (chat-engines.js
+ * createNormalizer), line by line: each line as the agent wrote it to
+ * `rawFile`, and what its normaliser makes of it to `eventsFile`. `close()`
+ * takes the last unfinished line and returns the normaliser, for its end().
+ * pi's (pi-events.js) is the default.
  */
-function createPiPipe(eventsFile, rawFile, normalizer = createPiNormalizer()) {
+function createEnginePipe(eventsFile, rawFile, normalizer = createPiNormalizer(), onEvent = null) {
   let carry = '';
   const take = (line) => {
     if (!line.trim()) return;
     try { fs.appendFileSync(rawFile, `${line}\n`); } catch { /* diagnosis only */ }
-    for (const ev of normalizer.push(line)) appendLine(eventsFile, ev);
+    for (const ev of normalizer.push(line)) {
+      appendLine(eventsFile, ev);
+      if (onEvent) onEvent(ev);
+    }
   };
   return {
     write(chunk) {
@@ -386,18 +400,51 @@ function createPiPipe(eventsFile, rawFile, normalizer = createPiNormalizer()) {
 }
 
 /**
- * How a turn signals its agent. Claude is the child itself. pi leads its own
- * process group (spawned detached) and every stop is SIGTERM to that group:
- * SIGINT would leave pi's tool processes running.
+ * The session's transcript, for an engine whose own store can't be read
+ * (chat-engines.js runnerTranscript: Cursor's is SQLite): Claude-shaped lines
+ * in `<dir>/<session>.jsonl`, which the runner's history reads as it reads a
+ * Claude transcript. Its file is known once the turn's init names the
+ * session; then the turn's message (prompt.txt, as the agent got it) goes in
+ * as the user line, and after it each normalised assistant and user
+ * (tool_result) line, each with a uuid and a time. A line before the init
+ * waits for it. A failed write loses that line, never the turn.
+ */
+function createTranscriptTee(dir, prompt, { now = () => new Date(), uuid = randomUUID } = {}) {
+  let file = null;
+  const pending = [];
+  const write = (line) => {
+    try { fs.appendFileSync(file, `${JSON.stringify(line)}\n`, { mode: 0o600 }); } catch { /* history misses it */ }
+  };
+  return {
+    push(ev) {
+      if (!ev || typeof ev !== 'object') return;
+      if (!file && ev.type === 'system' && ev.subtype === 'init' && typeof ev.session_id === 'string' && SESSION_ID_RE.test(ev.session_id)) {
+        try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { /* the write says so */ }
+        file = path.join(dir, `${ev.session_id}.jsonl`);
+        if (prompt && prompt.trim()) write({ type: 'user', uuid: uuid(), timestamp: now().toISOString(), message: { role: 'user', content: prompt } });
+        for (const line of pending.splice(0)) write(line);
+        return;
+      }
+      if ((ev.type !== 'assistant' && ev.type !== 'user') || !ev.message) return;
+      const line = { type: ev.type, uuid: uuid(), timestamp: typeof ev.timestamp === 'string' ? ev.timestamp : now().toISOString(), message: ev.message };
+      if (file) write(line); else pending.push(line);
+    },
+    file: () => file,
+  };
+}
+
+/**
+ * How a turn signals its agent (chat-engines.js). Claude is the child itself.
+ * pi leads its own process group (spawned detached) and every stop is SIGTERM
+ * to that group: SIGINT would leave pi's tool processes running.
  */
 function agentSignals(engine) {
-  if (engine === 'pi') return { group: true, stop: 'SIGTERM', interrupt: 'SIGTERM' };
-  return { group: false, stop: 'SIGTERM', interrupt: 'SIGINT' };
+  return { ...engineSpec(engine).signals };
 }
 
 /** What the turn writes to the chat's state file once it is over: the session for the next turn, on the engine that made it. */
 function stateRecord(sessionId, meta, at = new Date()) {
-  return { sessionId, cwd: meta.cwd, ...(meta.engine === 'pi' ? { engine: 'pi' } : {}), updatedAt: at.toISOString() };
+  return { sessionId, cwd: meta.cwd, ...engineTag(meta.engine), updatedAt: at.toISOString() };
 }
 
 // How long a pi turn waits, after pi exited, for the rest of its stdout.
@@ -407,7 +454,8 @@ function main(dir) {
   const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
   const events = path.join(dir, 'events.jsonl');
   const stderrFile = path.join(dir, 'stderr.log');
-  const engine = meta.engine === 'pi' ? 'pi' : 'claude';
+  const spec = engineSpec(meta.engine);
+  const engine = spec.id;
   const label = agentLabel(engine);
   const signals = agentSignals(engine);
   fs.writeFileSync(path.join(dir, 'turn.pid'), String(process.pid));
@@ -415,11 +463,23 @@ function main(dir) {
 
   let finished = false;
   let pipe = null;
+  // An engine whose own store can't be read keeps its transcript here (createTranscriptTee).
+  let tee = null;
+  if (spec.runnerTranscript && typeof meta.transcriptDir === 'string' && path.isAbsolute(meta.transcriptDir)) {
+    let prompt = '';
+    try { prompt = fs.readFileSync(path.join(dir, 'prompt.txt'), 'utf8'); } catch { prompt = typeof meta.text === 'string' ? meta.text : ''; }
+    tee = createTranscriptTee(meta.transcriptDir, prompt);
+  }
   const finish = (code, signal) => {
     if (finished) return;
     finished = true;
     const interrupted = fs.existsSync(path.join(dir, 'interrupted'));
-    if (pipe) for (const ev of pipe.close().end({ code, interrupted })) appendLine(events, ev);
+    if (pipe) {
+      for (const ev of pipe.close().end({ code, interrupted })) {
+        appendLine(events, ev);
+        if (tee) tee.push(ev);
+      }
+    }
     let log = '';
     try { log = fs.readFileSync(events, 'utf8'); } catch { /* nothing written */ }
     // A wrapper that never gets here (reboot, OOM) leaves the init line in
@@ -433,15 +493,17 @@ function main(dir) {
     process.exit(0);
   };
 
-  const out = engine === 'pi' ? 'pipe' : fs.openSync(events, 'a');
+  // An engine with a normaliser is piped through it; Claude's stream-json goes straight to the log.
+  const piped = typeof spec.createNormalizer === 'function';
+  const out = piped ? 'pipe' : fs.openSync(events, 'a');
   const err = fs.openSync(stderrFile, 'a');
-  const live = meta.live === true && engine !== 'pi';
-  const input = live ? 'pipe' : fs.openSync(path.join(dir, engine !== 'pi' && fs.existsSync(path.join(dir, 'prompt.jsonl')) ? 'prompt.jsonl' : 'prompt.txt'), 'r');
+  const live = meta.live === true && spec.liveInput;
+  const input = live ? 'pipe' : fs.openSync(path.join(dir, spec.images && fs.existsSync(path.join(dir, 'prompt.jsonl')) ? 'prompt.jsonl' : 'prompt.txt'), 'r');
   const startOffset = fs.statSync(events).size;
   let child;
   try {
     child = spawn(meta.bin, meta.args, {
-      cwd: meta.cwd, env: childEnv(process.env, meta.path, meta.configDir, meta.env), stdio: [input, out, err],
+      cwd: meta.cwd, env: childEnv(process.env, meta.path, meta.configDir, meta.env, meta.agentEnv), stdio: [input, out, err],
       ...(signals.group ? { detached: true } : {}),
     });
     if (live) runLive(dir, child, events, startOffset, { mcpVersionFile: meta.mcpVersionFile || null });
@@ -450,11 +512,11 @@ function main(dir) {
     finish(127, null);
     return;
   }
-  let drained = engine !== 'pi';
+  let drained = !piped;
   let exited = null;
   const done = () => { if (drained && exited) finish(exited.code, exited.signal); };
-  if (engine === 'pi' && child.stdout) {
-    pipe = createPiPipe(events, path.join(dir, 'pi-events.jsonl'));
+  if (piped && child.stdout) {
+    pipe = createEnginePipe(events, path.join(dir, spec.rawLog || `${engine}-events.jsonl`), spec.createNormalizer(), tee ? ev => tee.push(ev) : null);
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => pipe.write(chunk));
     child.stdout.on('end', () => { drained = true; done(); });
@@ -497,6 +559,6 @@ function main(dir) {
 }
 
 module.exports = {
-  reportedExit, agentLabel, agentSignals, childEnv, closingEvents, createPiPipe, stateRecord, createLiveTracker, createMcpReloader, firstLine, interruptLine, isMcpReloadReply, mcpReloadLine, pendingInbox, pendingInterrupts, runLive, sawResult, sessionIdFrom, turnStartEvent, userLine };
+  reportedExit, agentLabel, agentSignals, childEnv, closingEvents, createEnginePipe, createPiPipe: createEnginePipe, createTranscriptTee, stateRecord, createLiveTracker, createMcpReloader, firstLine, interruptLine, isMcpReloadReply, mcpReloadLine, pendingInbox, pendingInterrupts, runLive, sawResult, sessionIdFrom, turnStartEvent, userLine };
 
 if (require.main === module) main(process.argv[2]);

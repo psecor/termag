@@ -10,9 +10,17 @@ const crypto = require('node:crypto');
 const WebSocket = require('ws');
 const { EventEmitter } = require('node:events');
 const {
-  CAPABILITIES, UPDATE_CAPABILITIES, SESSION_NAME, createT3Bridge, createPinnedInstall, createReleaseInstall, compareVersions, commandFromDropin, resolveT3Command, resolveT3ClaudeCommand, pinClaudeBinary, pinGatewayModels, gatewayModelSlug, parseFireworksParam, piFireworksModelIds, pinFireworksInstance, serverCommandLine, parsePairingOutput, parseThreadOutput, tunnelDialUrl, probeT3,
-  descendants, listeningInodes, parseListOutput, staleAuthFor,
+  CAPABILITIES, UPDATE_CAPABILITIES, SESSION_NAME, createT3Bridge: realCreateT3Bridge, createPinnedInstall, createReleaseInstall, compareVersions, commandFromDropin, resolveT3Command, resolveT3ClaudeCommand, pinClaudeBinary, pinGatewayModels, gatewayModelSlug, parseFireworksParam, piFireworksModelIds, pinFireworksInstance, serverCommandLine, parsePairingOutput, parseThreadOutput, tunnelDialUrl, probeT3,
+  descendants, procParents, listeningInodes, parseListOutput, staleAuthFor,
 } = require('./t3-bridge');
+
+/** A kill for which every pid is already gone (ESRCH). */
+function noProcesses() {
+  throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+}
+// The tests' panes are made-up pids (or this process): a stop must never
+// signal a real process on the machine running them.
+const createT3Bridge = (deps) => realCreateT3Bridge({ kill: noProcesses, ...deps });
 
 function tmpHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 't3-bridge-'));
@@ -1265,6 +1273,92 @@ test('update: an older desktop never moves a newer server back', async () => {
     assert.equal((await box.bridge.update({ version: '0.1.14' })).version, '0.1.15');
     assert.deepEqual(box.calls.filter((c) => c[1] === 'kill-session'), []);
   } finally { await box.close(); }
+});
+
+/**
+ * A box whose 0.1.13 server, pane 4000 running t3 as 4001, outlives the
+ * session's hangup, as t3 does: only a signal from `kill` stops it. A server
+ * started while it still runs exits on the ~/.t3 lock, as t3's does.
+ * `ignoresTerm`: it exits only on SIGKILL.
+ */
+async function hangupSurvivingBox({ ignoresTerm = false } = {}) {
+  const home = tmpHome();
+  const { bin, dropin } = installServer(home);
+  let current = '0.1.13';
+  let old = fakeT3(current);
+  const port = await listen(old);
+  keepPort(home, port);
+  let fresh = null;
+  let session = true;
+  const running = new Set([4000, 4001]);
+  const events = [];
+  const stopOld = () => new Promise((r) => { if (!old) { r(); return; } old.closeAllConnections?.(); old.close(() => r()); old = null; });
+  const kill = (pid, signal) => {
+    if (!running.has(pid)) throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+    if (signal === 0) return;
+    events.push(`${signal} ${pid}`);
+    if (signal === 'SIGTERM' && ignoresTerm) return;
+    running.delete(pid);
+    if (pid === 4001) stopOld();
+  };
+  const tmux = fakeExec({
+    session: true,
+    onKillSession: () => { session = false; events.push('kill-session'); },
+    onNewSession: async () => {
+      session = true;
+      events.push('new-session');
+      if (old) { events.push('ServerAlreadyRunningError'); return; }
+      fresh = fakeT3(current);
+      await new Promise((r) => fresh.listen(port, '127.0.0.1', r));
+    },
+    run: async (cmd, args) => {
+      if (cmd === 'bash' && args[1] === '--release') { current = '0.1.14'; return { stdout: '' }; }
+      if (cmd === bin && args[0] === '--version') return { stdout: `t3 v${current}\n` };
+      if (cmd === 'tmux' && args[0] === 'list-panes') { if (!session) throw new Error('no session'); return { stdout: '4000\n' }; }
+      if (cmd === 'ps') return { stdout: ' 4000     1\n 4001  4000\n' };
+      if (cmd === 'lsof') return { stdout: '4001\n' };
+      return undefined;
+    },
+  });
+  const release = createReleaseInstall({ installer: '/i', dropin, execFile: tmux.execFile });
+  const bridge = realCreateT3Bridge({
+    command: bin, release, home, execFile: tmux.execFile, kill, WebSocket, termagUrl: 'ws://x/termag/ws/agent', token: 't',
+    pollMs: 10, stopTermWaitMs: 100, stopKillWaitMs: 100,
+  });
+  const close = async () => { await stopOld(); await new Promise((r) => (fresh ? fresh.close(() => r()) : r())); };
+  return { bridge, events, home, port, close };
+}
+
+test('update: a server that outlives its session\'s hangup is stopped, and exits, before the new one starts', async () => {
+  const box = await hangupSurvivingBox();
+  try {
+    const state = await box.bridge.update({ version: '0.1.14' });
+    assert.deepEqual(state, { state: 'ready', port: box.port, version: '0.1.14', home: box.home });
+    assert.deepEqual(box.events, ['kill-session', 'SIGTERM 4000', 'SIGTERM 4001', 'new-session']);
+  } finally { await box.close(); }
+});
+
+test('update: a server that ignores SIGTERM is killed before the new one starts', async () => {
+  const box = await hangupSurvivingBox({ ignoresTerm: true });
+  try {
+    assert.equal((await box.bridge.update({ version: '0.1.14' })).version, '0.1.14');
+    assert.deepEqual(box.events, ['kill-session', 'SIGTERM 4000', 'SIGTERM 4001', 'SIGKILL 4000', 'SIGKILL 4001', 'new-session']);
+  } finally { await box.close(); }
+});
+
+test('procParents: pid and ppid from /proc/<pid>/stat, a command with spaces and parentheses included; null without /proc', () => {
+  const files = {
+    '/proc/4000/stat': '4000 (bash) S 1 4000 4000 0 -1',
+    '/proc/4001/stat': '4001 (t3 (serve) x) S 4000 4000 4000 0 -1',
+    '/proc/4002/stat': '4002 (gone',
+  };
+  const fsImpl = {
+    readdirSync: (d) => { assert.equal(d, '/proc'); return ['4000', '4001', '4002', 'self', 'net']; },
+    readFileSync: (f) => { if (!(f in files)) throw new Error('ENOENT'); return files[f]; },
+  };
+  assert.equal(procParents(fsImpl), '4000 1\n4001 4000');
+  assert.deepEqual([...descendants(procParents(fsImpl), [4000])].sort(), [4000, 4001]);
+  assert.equal(procParents({ readdirSync: () => { throw new Error('ENOENT'); } }), null);
 });
 
 test('update: concurrent asks share one install and one restart', async () => {

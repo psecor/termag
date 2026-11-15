@@ -1381,3 +1381,96 @@ test('manager: the sweep removes a kept browser\'s dir no live browser has, and 
   manager.closeAll();
   fsp.rmSync(dir, { recursive: true, force: true });
 });
+
+// a Chromium that arrives after the agent started.
+const { CHROMIUM_CAPABILITY, CHROMIUM_INSTALL_RETRY_MS, createChromiumProbe, installChromium } = require('./browser-pane');
+
+test('manager: one started without Chromium takes the one found later, once, and opens panes with it', async () => {
+  let opened = null;
+  const paneFactory = (opts) => {
+    opened = opts.binary;
+    const f = fakePane(opts.onExit, { streamId: opts.streamId, paneKey: opts.paneKey, transport: opts.transport });
+    f.pane.open = async () => ({ ok: true, streamId: f.pane.streamId });
+    return f.pane;
+  };
+  const manager = createManager({ binary: null, home: '/h', log: () => {}, paneFactory });
+  assert.equal(manager.chromium(), null);
+  await assert.rejects(manager.attach({ streamId: 's', paneKey: 'k', url: 'http://x/' }), /no Chromium/);
+  assert.equal(manager.useChromium('/snap/bin/chromium', { ok: false, reason: 'no launcher' }), true);
+  assert.equal(manager.chromium(), '/snap/bin/chromium');
+  assert.deepEqual(manager.guestEnv(), { ok: false, reason: 'no launcher' });
+  assert.equal(manager.useChromium('/other/chromium', { ok: true }), false, 'a manager keeps the Chromium it has');
+  assert.equal(manager.useChromium(null), false);
+  manager.bindSocket({ send: () => {}, bufferedAmount: () => 0 });
+  await manager.attach({ streamId: 's', paneKey: 'k', url: 'http://x/' });
+  assert.equal(opened, '/snap/bin/chromium');
+  manager.closeAll();
+});
+
+test('chromium probe: looks again on every ask, and tells the agent once when it finds one', () => {
+  const manager = createManager({ binary: null, home: '/h', log: () => {} });
+  let onBox = null;
+  const found = [];
+  const probe = createChromiumProbe({ manager, find: () => onBox, guestEnvironment: () => ({ ok: true, profilesRoot: '/g' }), onFound: (b, env) => found.push([b, env.ok]), install: () => assert.fail('not asked to install'), log: () => {} });
+  assert.deepEqual(probe.check(), { chromium: null, installing: false, error: null });
+  onBox = '/snap/bin/chromium';
+  assert.deepEqual(probe.check(), { chromium: '/snap/bin/chromium', installing: false, error: null });
+  assert.deepEqual(probe.check({ install: true }), { chromium: '/snap/bin/chromium', installing: false, error: null }, 'nothing to install');
+  assert.deepEqual(found, [['/snap/bin/chromium', true]]);
+  assert.equal(manager.guestEnv().ok, true);
+  assert.equal(CHROMIUM_CAPABILITY, 'browser-pane-chromium-v1');
+});
+
+test('chromium probe: installs only when asked, one at a time, and the box has it after', async () => {
+  const manager = createManager({ binary: null, home: '/h', log: () => {} });
+  let onBox = null;
+  let installs = 0;
+  let finish;
+  const probe = createChromiumProbe({
+    manager, find: () => onBox, guestEnvironment: () => ({ ok: false, reason: 'x' }), log: () => {},
+    install: () => { installs += 1; return new Promise((r) => { finish = r; }); },
+  });
+  assert.deepEqual(probe.check({ install: false }), { chromium: null, installing: false, error: null });
+  assert.equal(installs, 0);
+  assert.deepEqual(probe.check({ install: true }), { chromium: null, installing: true, error: null });
+  await new Promise(setImmediate);
+  assert.deepEqual(probe.check({ install: true }), { chromium: null, installing: true, error: null });
+  assert.equal(installs, 1, 'a second ask joins the running install');
+  onBox = '/snap/bin/chromium';
+  finish({ ok: true });
+  await probe.pending();
+  assert.equal(manager.chromium(), '/snap/bin/chromium');
+  assert.deepEqual(probe.check({ install: true }), { chromium: '/snap/bin/chromium', installing: false, error: null });
+  assert.equal(installs, 1);
+});
+
+test('chromium probe: a failed install is reported, and not retried until a while has passed', async () => {
+  const manager = createManager({ binary: null, home: '/h', log: () => {} });
+  let t = 1000;
+  let installs = 0;
+  const probe = createChromiumProbe({
+    manager, find: () => null, guestEnvironment: () => ({ ok: false }), log: () => {}, now: () => t,
+    install: async () => { installs += 1; return installs === 1 ? { ok: false, error: 'error: unable to contact snap store' } : { ok: true }; },
+  });
+  probe.check({ install: true });
+  await probe.pending();
+  assert.deepEqual(probe.check({ install: true }), { chromium: null, installing: false, error: 'error: unable to contact snap store' });
+  assert.equal(installs, 1, 'not again inside the retry window');
+  t += CHROMIUM_INSTALL_RETRY_MS;
+  assert.equal(probe.check({ install: true }).installing, true);
+  await probe.pending();
+  assert.equal(installs, 2);
+  // It "succeeded" but left no Chromium where the agent looks.
+  assert.equal(probe.check().error, 'snap install finished, but no Chromium was found');
+});
+
+test('installChromium: runs the snap install under passwordless sudo, and keeps its last word on failure', async () => {
+  const calls = [];
+  const ok = await installChromium((cmd, args, opts, cb) => { calls.push([cmd, args, opts.timeout > 0]); cb(null, 'chromium 157 installed', ''); });
+  assert.deepEqual(ok, { ok: true });
+  assert.deepEqual(calls, [['sudo', ['-n', 'snap', 'install', 'chromium'], true]]);
+  const failed = await installChromium((cmd, args, opts, cb) => cb(new Error('exit 1'), '', 'warning: x\nerror: unable to contact snap store\n'));
+  assert.deepEqual(failed, { ok: false, error: 'error: unable to contact snap store' });
+  const noSudo = await installChromium((cmd, args, opts, cb) => cb(new Error('sudo: a password is required'), '', ''));
+  assert.deepEqual(noSudo, { ok: false, error: 'sudo: a password is required' });
+});

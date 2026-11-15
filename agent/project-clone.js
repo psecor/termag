@@ -303,6 +303,17 @@ async function templateDir(execFile) {
   }
 }
 
+// A clone that failed on the way rather than at the door: the GitHub broker's
+// (or GitHub's) 5xx, a reset connection or a name that briefly didn't resolve.
+// Tried again, with backoff, before the project is marked failed. A 4xx, a
+// missing repository or a bad branch fails at once.
+const CLONE_TRIES = 3;
+const CLONE_RETRY_BASE_MS = 5000;
+function isTransientCloneError(err) {
+  const text = `${err && err.stderr ? err.stderr : ''}\n${err && err.message ? err.message : ''}`;
+  return /returned error: 5\d\d\b|\bHTTP 5\d\d\b|Could not resolve host|Connection reset|Connection timed out|Operation timed out|early EOF|unexpected disconnect|RPC failed/i.test(text);
+}
+
 function lastLine(err) {
   const text = `${err && err.stderr ? err.stderr : ''}\n${err && err.stdout ? err.stdout : ''}`;
   const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
@@ -573,12 +584,20 @@ async function runClone(projectId, opts = {}) {
   if (reference) args.push('--reference', reference);
   if (state.requestedBranch && state.requestedBranch !== 'HEAD') args.push('--branch', state.requestedBranch);
   args.push('--', state.url, temp);
-  try {
-    await git(execFile, args, gitOpts);
-  } catch (err) {
-    fs.rmSync(temp, { recursive: true, force: true });
-    save(home, state, { status: 'failed', error: lastLine(err) });
-    return 1;
+  for (let tryNo = 1; ; tryNo++) {
+    try {
+      await git(execFile, args, gitOpts);
+      break;
+    } catch (err) {
+      fs.rmSync(temp, { recursive: true, force: true });
+      if (tryNo < CLONE_TRIES && isTransientCloneError(err)) {
+        console.error(`[project-clone] ${projectId}: clone try ${tryNo} of ${CLONE_TRIES} failed (${lastLine(err)}); trying again`);
+        await sleep(CLONE_RETRY_BASE_MS * 2 ** (tryNo - 1));
+        continue;
+      }
+      save(home, state, { status: 'failed', error: lastLine(err) });
+      return 1;
+    }
   }
 
   // A repository of a workspace project brings its own guide; the
@@ -714,6 +733,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  isTransientCloneError,
   CAPABILITIES,
   STATIC_CAPABILITY,
   dropStaticLink,

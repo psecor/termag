@@ -67,6 +67,20 @@ test('lists each reachable port once, lowest first, with its holder, the verdict
   assert.equal(listeners[2].command, 'python3 -m http.server 8080');
   assert.equal(listeners[0].command, null);
   assert.deepEqual(listeners[3].verdict, { ok: false, code: 'port_refused', reason: verdicts[9229].reason });
+  assert.ok(listeners.every((l) => l.confined === false), 'nothing is confined without a run');
+  // A port every holder of which descends from a `termag preview run` of the checkout: confined, and the checkout's
+  // (the run works in its run directory's copy, outside the checkout).
+  const confinedAsked = [];
+  const withRun = await previewListeners({ cwd: checkout }, {
+    procRoot,
+    checkPreviewListener: async (p) => verdicts[p],
+    confinedPorts: (ports, dir) => { confinedAsked.push([ports, dir]); return new Set([8080]); },
+  });
+  assert.deepEqual(confinedAsked, [[[22, 5173, 8080, 9229], checkout]]);
+  assert.deepEqual(withRun.listeners.map((l) => [l.port, l.confined, l.inCheckout]), [[22, false, false], [5173, false, true], [8080, true, true], [9229, false, false]]);
+  // A run of the checkout on a launcher that can't be vouched for yet: not confined, but the checkout's app (Bugbot, #1520).
+  const unvouched = await previewListeners({ cwd: checkout }, { procRoot, checkPreviewListener: async (p) => verdicts[p], runPorts: () => new Set([8080]) });
+  assert.deepEqual(unvouched.listeners.filter((l) => l.port === 8080).map((l) => [l.confined, l.inCheckout]), [[false, true]]);
   // Without a checkout, nothing is in it.
   const bare = await previewListeners({}, { procRoot, checkPreviewListener: async (p) => verdicts[p], checkPreviewPort: async () => assert.fail('probed') });
   assert.ok(bare.listeners.every((l) => !l.inCheckout));

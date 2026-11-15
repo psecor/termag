@@ -1341,3 +1341,10 @@ test('down after a failed setup rerun still gives stop its secrets, resolved the
     assert.equal(fs.readFileSync(path.join(c.root, 'stop-saw'), 'utf8'), 'tok-value\n');
   } finally { c.cleanup(); }
 });
+
+test("a step keeps the box's GIT_CONFIG_SYSTEM when the agent has one, and nothing else of the agent's environment", () => {
+  const { allowedEnv } = require('./environment-run');
+  const base = { PATH: '/bin', HOME: '/h', GIT_CONFIG_SYSTEM: '/box/etc/gitconfig', BASH_ENV: '/x', TERMAG_AGENT_TOKEN: 'tmag_secret' };
+  assert.deepEqual(allowedEnv(base, { A: '1' }, '/d', 'k'), { PATH: '/bin', HOME: '/h', GIT_CONFIG_SYSTEM: '/box/etc/gitconfig', A: '1', TERMAG_ENV_DIR: '/d', TERMAG_ENV_KEY: 'k' });
+  assert.equal(allowedEnv({ PATH: '/bin', HOME: '/h' }, {}, '/d', 'k').GIT_CONFIG_SYSTEM, undefined);
+});

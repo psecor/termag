@@ -30,6 +30,21 @@ test('an ask turn denies wakeups and crons and appends the system prompt; a plai
   assert.deepEqual(person.slice(-2), ['--resume', 'sess-1234-abcd']);
 });
 
+test('an auto ask turn may push its own branch; no other turn gets allow rules', () => {
+  const allowed = args => (args.includes('--allowedTools') ? args[args.indexOf('--allowedTools') + 1] : null);
+  const push = { threadId: THREAD, systemPrompt: 'RULES', push: true, branch: 'termag-ada/threadaaaa01' };
+  const auto = turnArgs(null, 'auto', { ask: push });
+  assert.equal(allowed(auto), 'Bash(git push origin HEAD:termag-ada/threadaaaa01)');
+  assert.equal(auto[auto.indexOf('--permission-mode') + 1], 'auto');
+  assert.equal(allowed(turnArgs(null, 'bypassPermissions', { ask: push })), null, 'bypass needs none');
+  assert.equal(allowed(turnArgs(null, 'dontAsk', { ask: push })), null, 'dontAsk has no Bash');
+  assert.equal(allowed(turnArgs(null, 'auto', { ask: { ...push, push: undefined } })), null, 'a bundle clone does not push');
+  assert.equal(allowed(turnArgs(null, 'auto', { ask: { ...push, branch: undefined } })), null, 'no branch, no rule');
+  assert.equal(allowed(turnArgs(null, 'auto', { ask: { ...push, branch: 'x) Bash(rm' } })), null, 'a branch that would break the rule is dropped');
+  assert.equal(allowed(turnArgs(null, 'auto', { ask: { ...push, branch: 'termag-ada/../main' } })), null, 'the same check as isPushBranch');
+  assert.equal(allowed(turnArgs(null, 'auto')), null, 'a plain auto turn gets none');
+});
+
 test('an ask job is checked, and its commits are the asker\'s', () => {
   assert.equal(askOfJob(null), null);
   assert.throws(() => askOfJob({ threadId: '../x' }), /threadId/);
@@ -293,14 +308,14 @@ case $mode in
 esac
 `;
 
-function askBox({ log } = {}) {
+function askBox({ log, launchSettings } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ask-chat-'));
   fs.mkdirSync(path.join(home, '.local/bin'), { recursive: true });
   fs.writeFileSync(path.join(home, '.local/bin/termag-subagent-run'), FAKE_RUNNER, { mode: 0o755 });
   fs.mkdirSync(path.join(home, 'proj'));
   const b = box();
   let a = null;
-  const chats = runner(home, b, { onTurnDone: (m, d) => a.onTurnDone(m, d), onDropped: j => a.onDropped(j) });
+  const chats = runner(home, b, { onTurnDone: (m, d) => a.onTurnDone(m, d), onDropped: j => a.onDropped(j), ...(launchSettings ? { launchSettings } : {}) });
   const env = { ...process.env, HOME: home };
   a = createAskChat({
     home, chats,
@@ -409,6 +424,58 @@ test('ask-chat: a run launches on the model ask-run names (termag ask --model), 
     a.startRun(runMsg(RUN, model === undefined ? {} : { model }), path.join(home, 'proj'));
     assert.equal(modelArg((await until(() => [...b.procs.values()][0])).meta.args), null);
   }
+});
+
+test('ask-chat: a run on Fireworks (termag ask --model fireworks:<id>) goes to the runner on that backend, as an ask', async () => {
+  assert.ok(CAPABILITIES.includes('ask-backend-v1'));
+  const KIMI = 'accounts/fireworks/models/kimi-k3';
+  const FAST = 'accounts/fireworks/models/deepseek-v4p1-flash';
+  const FW = { env: { ANTHROPIC_BASE_URL: 'https://gw/fireworks/inference', ANTHROPIC_MODEL: KIMI }, apiKeyHelper: '/h' };
+  const asked = [];
+  const { home, b, a, chats } = askBox({ launchSettings: async x => { asked.push(x); return FW; } });
+  a.startRun(runMsg(RUN, { backend: 'fireworks', model: KIMI, fastModel: FAST, context: 262144 }), path.join(home, 'proj'));
+  const proc = await until(() => [...b.procs.values()][0]);
+  const args = proc.meta.args;
+  assert.deepEqual(asked, [{ backend: 'fireworks', model: KIMI, fastModel: FAST, context: 262144 }], "the backend's launch settings, for its model, fast model and window");
+  assert.equal(proc.meta.backend, 'fireworks');
+  assert.equal(args[args.indexOf('--model') + 1], KIMI);
+  const settings = JSON.parse(args[args.indexOf('--settings') + 1]);
+  assert.equal(settings.env.ANTHROPIC_BASE_URL, 'https://gw/fireworks/inference', 'one --settings, the backend\'s');
+  // Still an ask's turn: its system prompt, and no wakeup or cron to keep claude -p up.
+  assert.equal(args[args.indexOf('--disallowedTools') + 1], 'ScheduleWakeup CronCreate');
+  assert.ok(args[args.indexOf('--append-system-prompt') + 1].includes('RULES'));
+  assert.equal(proc.meta.ask.runId, RUN);
+  const kept = JSON.parse(fs.readFileSync(path.join(home, '.termag/subagent/jobs', `${RUN}.json`), 'utf8'));
+  assert.deepEqual([kept.backend, kept.model, kept.fastModel, kept.context], ['fireworks', KIMI, FAST, 262144], 'kept on the job, for a run prepared after a restart');
+  b.finish(proc.meta.turnId, [{ type: 'system', subtype: 'init', session_id: 'sess-1234-abcd' }, { type: 'result', result: 'a', session_id: 'sess-1234-abcd' }]);
+  chats.setSession('p1--wsask', { sessionId: 'sess-1234-abcd', cwd: proc.meta.cwd });
+  await chats.poll();
+  // A person's message in the thread's chat, which keeps Fireworks: the same backend.
+  const sent = await a.sendMessage({
+    chatKey: 'p1--wsask', projectId: 'p1', workstream: `ask-${THREAD}`, workstreamId: 'wsask', text: 'and this',
+    backend: 'fireworks', model: KIMI, ask: { threadId: THREAD, baseSha: null, gitName: 'Ada', gitEmail: 'ada@example.com' },
+  }, path.join(home, 'proj'));
+  const second = b.procs.get(sent.turnId);
+  assert.equal(second.meta.backend, 'fireworks');
+  assert.equal(second.meta.args[second.meta.args.indexOf('--model') + 1], KIMI);
+});
+
+test('ask-chat: a Fireworks run on a box where Fireworks is not set up fails with the reason, never on Claude', async () => {
+  const KIMI = 'accounts/fireworks/models/kimi-k3';
+  const { home, b, a, chats } = askBox({ launchSettings: async () => { throw new Error('fireworks is not ready on this box: skipped on this box'); } });
+  a.startRun(runMsg(RUN, { backend: 'fireworks', model: KIMI }), path.join(home, 'proj'));
+  const outcome = () => ['reported.json', 'failed.txt'].map(f => path.join(home, f)).filter(f => fs.existsSync(f)).map(f => fs.readFileSync(f, 'utf8')).join('');
+  const reported = await until(async () => { await chats.poll(); return outcome(); });
+  assert.equal(b.procs.size, 0, 'no Claude was started');
+  assert.match(reported, /fireworks is not ready on this box: skipped on this box/);
+});
+
+test('ask-chat: a backend run with a model the runner cannot start is refused, not run on the default', async () => {
+  const { home, b, a } = askBox({ launchSettings: async () => ({}) });
+  a.startRun(runMsg(RUN, { backend: 'fireworks', model: 'opus' }), path.join(home, 'proj'));
+  const failed = await until(() => fs.existsSync(path.join(home, 'failed.txt')) && fs.readFileSync(path.join(home, 'failed.txt'), 'utf8'));
+  assert.equal(b.procs.size, 0);
+  assert.match(failed, /the chat runner did not take the turn: bad backend/);
 });
 
 test('ask-chat: the capability needs a runner with the phases', () => {
@@ -599,6 +666,22 @@ test('steer: the reply is Claude\'s last result after it took the follow-up in, 
   assert.equal(turnResult(log([result('A'), result('B')]), 'B').result, 'B', 'no replay (an older Claude): the last result');
   const blocks = { type: 'user', isReplay: true, message: { role: 'user', content: [{ type: 'text', text: 'B' }] } };
   assert.equal(turnResult(log([blocks, result('B')]), 'B').result, 'B');
+});
+
+test('a stopped turn\'s reply carries the last text Claude wrote in it, never an earlier turn\'s or a subagent\'s', () => {
+  const log = evs => evs.map(e => JSON.stringify(e)).join('\n');
+  const said = (text, extra = {}) => ({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] }, parent_tool_use_id: null, ...extra });
+  const tool = { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] }, parent_tool_use_id: null };
+  const stop = { type: 'runner-error', message: 'Claude exited 143' };
+  const asked = 'I need two more boxes for the load test: please create them.';
+  const r = turnResult(log([replay('run the perf test'), said('Starting.'), tool, said(asked), tool, said('subagent detail', { parent_tool_use_id: 't1' }), stop]));
+  assert.equal(r.subtype, 'error_turn_stopped');
+  assert.equal(r.result, `The ask's turn on the target box stopped before Claude answered. Claude exited 143\n\nClaude's last message in this turn, before it stopped:\n\n${asked}`);
+  // Only text since the prompt it answers: an earlier turn's, or one before the follow-up, is not this turn's.
+  assert.equal(turnResult(log([replay('A'), said('about A'), replay('B'), tool, stop]), 'B').result, 'The ask\'s turn on the target box stopped before Claude answered this follow-up. Claude exited 143');
+  assert.equal(turnResult(log([said('earlier'), replay('next'), tool, stop])).result, 'The ask\'s turn on the target box stopped before Claude answered. Claude exited 143');
+  // A turn with a result keeps it as the reply.
+  assert.equal(turnResult(log([replay('A'), said('working'), result('done')])).result, 'done');
 });
 
 test('a wake-up after the answer adds to the reply, never replaces it', () => {
@@ -854,7 +937,7 @@ test('ask-chat: an ask\'s run and a person\'s message in its chat both export as
   a2.startRun(runMsg(RUN, { telemetry: ask }), path.join(home, 'proj'));
   const first = await until(() => [...b.procs.values()][0]);
   // The run's checkout goes with it, for the repository on the resource (termag.repo).
-  assert.deepEqual(asked.at(-1), { project: undefined, workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask });
+  assert.deepEqual(asked.at(-1), { project: undefined, workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask, inference: { backend: 'default', model: null } });
   assert.equal(first.meta.env.TERMAG_SESSION_KIND, 'ask', 'the run\'s environment names its kind too');
   b.finish(first.meta.turnId, [{ type: 'system', subtype: 'init', session_id: 'sess-1234-abcd' }, { type: 'result', result: 'a', session_id: 'sess-1234-abcd' }]);
   r.setSession('p1--wsask', { sessionId: 'sess-1234-abcd', cwd: first.meta.cwd });
@@ -864,7 +947,7 @@ test('ask-chat: an ask\'s run and a person\'s message in its chat both export as
     chatKey: 'p1--wsask', projectId: 'p1', project: 'webapp', workstream: `ask-${THREAD}`, workstreamId: 'wsask', text: 'and also this',
     ask: { threadId: THREAD, baseSha: null, gitName: 'Ada', gitEmail: 'ada@example.com', telemetry: person },
   }, path.join(home, 'proj'));
-  assert.deepEqual(asked.at(-1), { project: 'webapp', workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask: person });
+  assert.deepEqual(asked.at(-1), { project: 'webapp', workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask: person, inference: { backend: 'default', model: null } });
   assert.equal([...b.procs.values()].at(-1).meta.env.TERMAG_SESSION_KIND, 'ask', 'a person\'s turn in the thread\'s chat is the same session');
   // An older orchestrator's message names no one: the thread alone, still kind ask.
   b.finish([...b.procs.values()].at(-1).meta.turnId, [{ type: 'result', result: 'b', session_id: 'sess-1234-abcd' }]);
@@ -873,7 +956,7 @@ test('ask-chat: an ask\'s run and a person\'s message in its chat both export as
     chatKey: 'p1--wsask', projectId: 'p1', workstream: `ask-${THREAD}`, workstreamId: 'wsask', text: 'one more',
     ask: { threadId: THREAD, baseSha: null, gitName: 'Ada', gitEmail: 'ada@example.com' },
   }, path.join(home, 'proj'));
-  assert.deepEqual(asked.at(-1), { project: undefined, workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask: { thread: THREAD } });
+  assert.deepEqual(asked.at(-1), { project: undefined, workstream: `ask-${THREAD}`, kind: 'ask', cwd: first.meta.cwd, ask: { thread: THREAD }, inference: { backend: 'default', model: null } });
 });
 
 test('ask-chat: the chat keeps the project\'s name for its telemetry, and an older orchestrator\'s chat has none', () => {

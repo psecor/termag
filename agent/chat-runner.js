@@ -20,6 +20,7 @@ const claudePlanUsage = require('./claude-plan-usage');
 const { RAW_MAX_BYTES, historyBefore, historyTail, linesForward, uuidAt, wholeLinesFrom } = require('./transcript-lines');
 const { generateTitle, sessionTitle, titlePrompt } = require('./session-title');
 const { findPiSession, piHistoryEntries, piUserEntryId, rehomePiSession } = require('./pi-session');
+const { ENGINE_IDS, engineSpec, engineTag, isEngineId } = require('./chat-engines');
 const boxNotice = require('./box-notice');
 const environmentRun = require('./environment-run');
 const sendIds = require('./chat-send-ids');
@@ -27,6 +28,7 @@ const spaceMemory = require('./space-memory');
 const toolGroupHeadings = require('./tool-group-headings');
 const { codexResourceEnv } = require('./codex-resource-env');
 const brokerMcp = require('./broker-mcp');
+const { isPushBranch } = require('./ask-run');
 
 const execFileAsync = promisify(execFileCb);
 
@@ -48,6 +50,14 @@ const execFileAsync = promisify(execFileCb);
 // chat-pi-v1: a send may carry `engine: 'pi'` (engineOf): its turn runs pi
 // through `termag-pi-headless --headless` (piTurnArgs), and
 // chat-engine-check runs that launcher's pre-flight (checkEngine).
+// chat-cursor-v1: a send may carry `engine: 'cursor'`: its turn runs
+// `cursor-agent -p --output-format stream-json` (cursorTurnArgs), its stream
+// through cursor-events.js, and the turn wrapper keeps its transcript
+// (<root>/sessions/cursor/<session>.jsonl), which history reads.
+// chat-devin-v1: a send may carry `engine: 'devin'`: its turn runs devin-acp.js,
+// the Devin CLI's ACP client (devinTurnArgs: in the chat's own folder, ask mode
+// under its own HOME, or bypass on an owner-trusted own tree), its stream through devin-events.js,
+// and the turn wrapper keeps its transcript (<root>/sessions/devin/<session>.jsonl).
 // chat-genui-v1: a send may carry `genUiPrompt`, generative UI's system prompt,
 // which its turn appends (not a pi turn's).
 // chat-genui-v2: it may carry `genUiHint` too, a few hundred tokens: the turn
@@ -75,7 +85,12 @@ const execFileAsync = promisify(execFileCb);
 // chat-confined-mcp-v1: a send or resume claim may carry `brokerMcp`
 // (broker-mcp.js): a confined turn loads the owner's broker connectors, under
 // its tool rules, and a sharee's bypassPermissions turn denies them.
-const CAPABILITIES = ['chat-runner-v1', 'chat-durable-v1', 'chat-trust-v1', 'chat-auto-v1', 'chat-live-v1', 'chat-interrupt-v1', 'chat-orchestrator-v1', 'chat-backend-v1', 'chat-effort-v1', 'chat-pi-v1', 'chat-context-v1', 'chat-genui-v1', 'chat-genui-v2', 'chat-transcript-v1', 'chat-subagents-v1', 'chat-t3-hold-v1', 'chat-history-pages-v1', brokerMcp.CAPABILITY, ...chatImages.CAPABILITIES, ...boxNotice.CAPABILITIES];
+// Unify UX 8: this runner sets each turn's TERMAG_SPACE and
+// TERMAG_MY_FILES from the send's `files`, a Codex pane's bridge does from codex-session-start's
+// (codex-resource-env.js), and the box's termag CLI (same checkout) reads them for a bare path. The
+// orchestrator grants a box Project files and My files only once its agent says so.
+const PROJECT_FILES_CAPABILITY = 'project-files-v1';
+const CAPABILITIES = ['chat-runner-v1', 'chat-durable-v1', 'chat-trust-v1', 'chat-auto-v1', 'chat-live-v1', 'chat-interrupt-v1', 'chat-orchestrator-v1', 'chat-backend-v1', 'chat-effort-v1', 'chat-pi-v1', 'chat-cursor-v1', 'chat-devin-v1', 'chat-context-v1', 'chat-genui-v1', 'chat-genui-v2', 'chat-transcript-v1', 'chat-subagents-v1', 'chat-t3-hold-v1', 'chat-history-pages-v1', PROJECT_FILES_CAPABILITY, brokerMcp.CAPABILITY, ...chatImages.CAPABILITIES, ...boxNotice.CAPABILITIES];
 
 /** A chat key the backend sends: letters, digits, `-`, `_`, `.`; no path. */
 const CHAT_KEY_RE = /^[A-Za-z0-9_.-]{1,160}$/;
@@ -434,11 +449,11 @@ function backendOf({ backend, model, fastModel, context, models }) {
 }
 
 /**
- * The agent a turn runs: Claude Code (the default, and what a send without
- * `engine` gets) or pi. A send naming anything else is refused rather than
- * run on Claude.
+ * The agent a turn runs (chat-engines.js): Claude Code (the default, and what
+ * a send without `engine` gets) or pi. A send naming anything else is refused
+ * rather than run on Claude.
  */
-const ENGINES = ['claude', 'pi'];
+const ENGINES = ENGINE_IDS;
 
 /** The engine a send or queued job names, checked; throws for one this runner cannot start. */
 function engineOf({ engine } = {}) {
@@ -539,6 +554,218 @@ function piLauncherReady(bin, { readFile = fs.readFileSync } = {}) {
 }
 
 const PI_CHECK_MS = 10_000;
+
+/**
+ * A `--model` value for cursor-agent: one of its model names (`gpt-5`,
+ * `sonnet-4-thinking`, `composer-1`). Anything else, a bracketed override
+ * included, is dropped, so cursor-agent runs its own default (Auto).
+ */
+const CURSOR_MODEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/;
+
+function cursorModelArg(model) {
+  return typeof model === 'string' && CURSOR_MODEL.test(model) ? model : null;
+}
+
+/** What a read-only Cursor turn can do, for the read-only notice: plan mode's reads (no edits, no shell). */
+const CURSOR_READ_ONLY_TOOLS = ['Read', 'Grep', 'Glob'];
+
+/**
+ * The argv for one cursor-agent turn. The message goes on stdin (prompt.txt),
+ * never in argv. Cursor runs a trusted workspace's `.cursor/hooks.json`
+ * (`sessionStart` before any tool, even in plan mode), and print mode refuses
+ * a workspace it hasn't been told to trust. So the workspace is never the
+ * checkout: it is `workspace`, an empty folder the runner keeps for the chat
+ * (the same on every turn, since Cursor files a session by its workspace and
+ * resumes it only there), which `--trust` trusts, and the checkout goes in
+ * with `--add-dir`, readable without its hooks (checked on 2026.10.22: no
+ * checkout hook ran, sessionStart and beforeShellExecution included; a shell
+ * command runs in the workspace, so the message says where the checkout is,
+ * cursorNotice). What a turn may do is then the mode's:
+ * - dontAsk (anything not an owner-trusted own tree): `--mode plan`, which
+ *   refuses every edit and every shell command, whatever the checkout's
+ *   `.cursor/cli.json` allows (checked with an allow-all one);
+ * - auto (an automation's full tier): `--auto-review`, Cursor's classifier,
+ *   which runs safe calls and refuses the rest in print mode;
+ * - bypassPermissions (an owner-trusted own tree): `--force`, everything.
+ * MCP servers are never approved here (no `--approve-mcps`). `--resume`
+ * goes on with the session Cursor named on the chat's first turn.
+ */
+function cursorTurnArgs(sessionId, permissionMode, { model = null, workspace = null, checkout = null } = {}) {
+  const mode = permissionModeFor(permissionMode);
+  if (!workspace || !path.isAbsolute(workspace) || !checkout || !path.isAbsolute(checkout)) throw new Error('a Cursor turn needs its own workspace and the checkout');
+  const args = ['-p', '--output-format', 'stream-json', '--trust', '--workspace', workspace, '--add-dir', checkout];
+  if (mode === TRUSTED_MODE) args.push('--force');
+  else if (mode === AUTO_MODE) args.push('--auto-review');
+  else args.push('--mode', 'plan');
+  if (sessionId != null) {
+    if (!isSessionId(sessionId)) throw new Error('a Cursor turn resumes only a session id');
+    args.push('--resume', sessionId);
+  }
+  const chosen = cursorModelArg(model);
+  if (chosen) args.push('--model', chosen);
+  return args;
+}
+
+/**
+ * cursor-agent: the override (TERMAG_CHAT_CURSOR), then where its installer
+ * puts it (~/.local/bin), then PATH. A bare name means none was found.
+ */
+function resolveCursor({ home, env = process.env, exists = fs.existsSync }) {
+  if (env.TERMAG_CHAT_CURSOR) {
+    const o = env.TERMAG_CHAT_CURSOR;
+    return path.isAbsolute(o) ? o : o.includes('/') ? path.resolve(o) : o;
+  }
+  const installed = path.join(home, '.local/bin/cursor-agent');
+  if (exists(installed)) return installed;
+  for (const dir of (env.PATH || '').split(':')) {
+    if (dir && exists(path.join(dir, 'cursor-agent'))) return path.resolve(dir, 'cursor-agent');
+  }
+  return 'cursor-agent';
+}
+
+const CURSOR_MISSING = 'cursor-agent is not installed on this box (its installer puts it in ~/.local/bin)';
+
+/** What a Cursor turn's message tells it of its workspace (cursorTurnArgs): where the checkout is, for its shell. */
+function cursorNotice(checkout) {
+  return `Your workspace folder is an empty one termag keeps for this chat. The repository is checked out at ${checkout}, added as a workspace root: read its files there, and cd there before a shell command.`;
+}
+/** A folder made afresh: a link put in its place goes as a link (never what it points at), and so does anything in it. */
+function freshDir(dir, fsImpl = fs) {
+  fsImpl.rmSync(dir, { recursive: true, force: true });
+  fsImpl.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+/**
+ * A Cursor chat's own config folder (CURSOR_CONFIG_DIR), the same on every turn: cursor-agent keeps its sessions
+ * there (`chats/`), so a full-access turn and a confined one go on with the same session. Everything else in it
+ * goes before each turn, so no turn leaves the next a `cli-config.json` (its permissions, approval mode, sandbox).
+ */
+function cursorConfigDir(root, chatKey, fsImpl = fs) {
+  const dir = path.join(root, 'cursor-config', chatKey);
+  try {
+    if (fsImpl.lstatSync(dir).isSymbolicLink()) fsImpl.unlinkSync(dir);
+  } catch { /* not there yet */ }
+  fsImpl.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const name of fsImpl.readdirSync(dir)) if (name !== 'chats') fsImpl.rmSync(path.join(dir, name), { recursive: true, force: true });
+  return dir;
+}
+
+/**
+ * A confined Cursor turn's HOME (plan mode, auto-review), made again before each turn: empty but for a link to the
+ * box user's Cursor login. cursor-agent reads the user's hooks from `~/.cursor/hooks.json` and Claude's from
+ * `~/.claude/settings.json`, and runs `sessionStart` before plan mode refuses anything; no switch turns them off.
+ * So a confined turn has none of the box user's, as a confined Claude turn has none (its scratch CLAUDE_CONFIG_DIR and
+ * disableAllHooks), its MCP servers and skills included. The login: macOS keeps it in the keychain, Linux in
+ * `$XDG_CONFIG_HOME/cursor/auth.json` (else `~/.config/cursor/auth.json`); cursor-agent writes that file in place,
+ * so a token it refreshes reaches the real one.
+ */
+function cursorConfinedHome({ root, chatKey, home, env = {}, platform = process.platform, fsImpl = fs }) {
+  const dir = freshDir(path.join(root, 'cursor-homes', chatKey), fsImpl);
+  const link = (target, at) => {
+    if (!fsImpl.existsSync(target)) return;
+    fsImpl.mkdirSync(path.dirname(at), { recursive: true, mode: 0o700 });
+    fsImpl.symlinkSync(target, at);
+  };
+  if (platform === 'darwin') {
+    link(path.join(home, 'Library', 'Keychains'), path.join(dir, 'Library', 'Keychains'));
+    link(path.join(home, '.cursor', 'auth.json'), path.join(dir, '.cursor', 'auth.json'));
+  } else if (!(typeof env.XDG_CONFIG_HOME === 'string' && env.XDG_CONFIG_HOME.trim())) {
+    link(path.join(home, '.config', 'cursor', 'auth.json'), path.join(dir, '.config', 'cursor', 'auth.json'));
+  }
+  return dir;
+}
+
+/**
+ * The Devin CLI: the override (TERMAG_CHAT_DEVIN), then where its installer links it (~/.local/bin/devin), then
+ * PATH. A bare name means none was found.
+ */
+function resolveDevin({ home, env = process.env, exists = fs.existsSync }) {
+  if (env.TERMAG_CHAT_DEVIN) {
+    const o = env.TERMAG_CHAT_DEVIN;
+    return path.isAbsolute(o) ? o : o.includes('/') ? path.resolve(o) : o;
+  }
+  const installed = path.join(home, '.local/bin/devin');
+  if (exists(installed)) return installed;
+  for (const dir of (env.PATH || '').split(':')) {
+    if (dir && exists(path.join(dir, 'devin'))) return path.resolve(dir, 'devin');
+  }
+  return 'devin';
+}
+
+const DEVIN_MISSING = 'the Devin CLI is not installed on this box (its installer links it at ~/.local/bin/devin)';
+
+/** The turn's process for a Devin turn: devin-acp.js, Devin's ACP client, run by this agent's node. */
+const DEVIN_DRIVER = path.join(__dirname, 'devin-acp.js');
+
+/** What a read-only Devin turn can do, for the read-only notice: Devin's ask mode reads and searches; no edits, no commands. */
+const DEVIN_READ_ONLY_TOOLS = ['Read', 'Grep'];
+
+/**
+ * A Devin chat's folders under the runner's root, `devin/<chat>/`: `sessions`, Devin's session store
+ * (DEVIN_SESSIONS_DIR) for every turn of the chat, kept; `workspace`, every turn's cwd, made again before each one,
+ * empty but for an empty `.git` (so no git repository above it is Devin's workspace root, whose hooks Devin would
+ * load), so nothing a turn left there (a planted `.claude/settings.json`) runs at the next one's start; and for a
+ * read-only turn, `home`, its HOME, made again too, empty but for a link to the box user's Devin login
+ * (`credentials.toml`, read in place). Devin reads hooks from its cwd's root, from every added directory and from
+ * HOME (`~/.claude/settings.json`, `~/.config/devin/config.json`), and a project's SessionStart and UserPromptSubmit
+ * hooks run before any model call (devin-acp.js): so no turn has the checkout there, and a read-only one doesn't
+ * have the box user's HOME. A link put in place of a folder goes as a link, never what it points at.
+ */
+function devinChatDirs({ root, chatKey, home, env = {}, readOnly, fsImpl = fs }) {
+  const dir = path.join(root, 'devin', chatKey);
+  const keep = (d) => {
+    try {
+      if (fsImpl.lstatSync(d).isSymbolicLink()) fsImpl.unlinkSync(d);
+    } catch { /* not there yet */ }
+    fsImpl.mkdirSync(d, { recursive: true, mode: 0o700 });
+    return d;
+  };
+  keep(dir);
+  const sessions = keep(path.join(dir, 'sessions'));
+  const workspace = freshDir(path.join(dir, 'workspace'), fsImpl);
+  fsImpl.mkdirSync(path.join(workspace, '.git'), { mode: 0o700 });
+  if (!readOnly) return { sessions, workspace };
+  const confined = freshDir(path.join(dir, 'home'), fsImpl);
+  const data = typeof env.XDG_DATA_HOME === 'string' && path.isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : path.join(home, '.local', 'share');
+  const login = path.join(data, 'devin', 'credentials.toml');
+  if (fsImpl.existsSync(login)) {
+    const at = path.join(confined, '.local', 'share', 'devin');
+    fsImpl.mkdirSync(at, { recursive: true, mode: 0o700 });
+    fsImpl.symlinkSync(login, path.join(at, 'credentials.toml'));
+  }
+  return { sessions, workspace, home: confined };
+}
+
+/**
+ * The argv (after node) for one Devin turn: devin-acp.js and what it needs. The message goes on stdin
+ * (prompt.txt). Every turn runs in the chat's own workspace, never the checkout, which it works on by its path
+ * (devinNotice): Devin loads its cwd's hooks, rules and MCP servers, its own and seven other tools', and the
+ * own-tree check vouches only for Claude's and pi's (STARTUP_CONFIG_PATHS). bypassPermissions (an owner-trusted own
+ * tree) is the full tier: Devin's bypass mode, as the box user. Anything else is the read tier: Devin's ask mode
+ * under its own HOME, permission requests answered only for a look, and no command run (devin-acp.js). auto has no
+ * Devin tier of its own here, so it runs read-only. `--session` goes on with the session of an earlier turn.
+ */
+function devinTurnArgs(sessionId, permissionMode, { devin, dirs, checkout } = {}) {
+  const full = permissionModeFor(permissionMode) === TRUSTED_MODE;
+  if (!devin || !path.isAbsolute(devin) || !checkout || !path.isAbsolute(checkout) || !dirs || !dirs.sessions || !dirs.workspace) throw new Error('a Devin turn needs the Devin CLI, its folders and the checkout');
+  if (!full && !dirs.home) throw new Error('a read-only Devin turn needs its own HOME');
+  const args = [DEVIN_DRIVER, '--devin', devin, '--tier', full ? 'full' : 'read', '--cwd', dirs.workspace, '--sessions', dirs.sessions];
+  if (!full) args.push('--home', dirs.home);
+  if (sessionId != null) {
+    if (!isSessionId(sessionId) || !sessionId.startsWith('devin-')) throw new Error('a Devin turn resumes only a Devin session id');
+    args.push('--session', sessionId);
+  }
+  return args;
+}
+
+/** What a Devin turn's message tells it of its workspace (devinTurnArgs): where the checkout is. */
+function devinNotice(checkout, permissionMode) {
+  const at = `Your working folder is an empty one termag keeps for this chat. The repository is checked out at ${checkout}`;
+  if (permissionModeFor(permissionMode) === TRUSTED_MODE) return `${at}: work on its files there, by that path, and cd there before a shell command.`;
+  return `${at}: read its files there, by that path.`;
+}
+
 const PI_LAUNCHER_MISSING = 'termag-pi-headless is not installed on this box (run termag-reconcile)';
 const PI_LAUNCHER_OUTDATED = 'termag-pi-headless on this box has no --headless or --check (update the box)';
 
@@ -551,6 +778,18 @@ const PI_LAUNCHER_OUTDATED = 'termag-pi-headless on this box has no --headless o
  */
 async function checkEngine({ engine } = {}, { home, env = process.env, execFile = execFileAsync, exists = fs.existsSync, readFile = fs.readFileSync, timeoutMs = PI_CHECK_MS } = {}) {
   const which = engineOf({ engine });
+  if (which === 'cursor') {
+    const cursor = resolveCursor({ home, env, exists });
+    return path.isAbsolute(cursor) && exists(cursor) ? { ok: true, engine: which } : { ok: false, engine: which, code: 'launcher-missing', remedy: CURSOR_MISSING };
+  }
+  if (which === 'devin') {
+    const devin = resolveDevin({ home, env, exists });
+    if (!path.isAbsolute(devin) || !exists(devin)) return { ok: false, engine: which, code: 'launcher-missing', remedy: DEVIN_MISSING };
+    // Its login, where a read-only turn's HOME links it from (devinChatDirs): no file, no signed-in Devin.
+    const data = typeof env.XDG_DATA_HOME === 'string' && path.isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : path.join(home, '.local', 'share');
+    if (!exists(path.join(data, 'devin', 'credentials.toml'))) return { ok: false, engine: which, code: 'auth-missing', remedy: 'Devin is not signed in on this box: run devin auth login in a terminal there' };
+    return { ok: true, engine: which };
+  }
   if (which !== 'pi') return { ok: true, engine: which };
   const bin = resolvePi({ home, env, exists });
   const missing = { ok: false, engine: which, code: 'launcher-missing', remedy: PI_LAUNCHER_MISSING };
@@ -601,12 +840,16 @@ async function backendSettings(b, { env = process.env, execFile = execFileAsync,
  * branch and commit of its checkout (`cwd`), and its kind in place of the
  * settings' `external`: `chat` for a turn, `oneshot` (with `oneshot` its
  * task, title or heading) for a Haiku call off one, `interactive` for an Open
- * in full UI resume, which is a pane. The box script decides, as it does for a
+ * in full UI resume, which is a pane. `inference` names the run's backend
+ * (`default`, the box's own, which the script reads, or a model backend such
+ * as `fireworks`) and the model it starts on, as termag.inference.backend and
+ * termag.inference.model (inferenceOf; docs/agent-telemetry.md, "The
+ * inference backend"). The box script decides, as it does for a
  * pane's launch (telemetry-launch), so a box without termag's telemetry gets
  * nothing. null on any failure or a bad value: the run goes ahead with the
  * settings' resource, never fails for this.
  */
-async function chatTelemetryEnv({ project, workstream, kind = null, oneshot = null, ask = null, cwd = null }, { home, env = process.env, execFile = execFileAsync, script = CREDENTIALS_SCRIPT } = {}) {
+async function chatTelemetryEnv({ project, workstream, kind = null, oneshot = null, ask = null, cwd = null, inference = null }, { home, env = process.env, execFile = execFileAsync, script = CREDENTIALS_SCRIPT } = {}) {
   const pair = codexResourceEnv({ project, workstream });
   const extra = {
     TERMAG_PROJECT: pair.TERMAG_PROJECT || '', TERMAG_WORKSTREAM: pair.TERMAG_WORKSTREAM || '',
@@ -615,12 +858,33 @@ async function chatTelemetryEnv({ project, workstream, kind = null, oneshot = nu
     // (termag-credentials work-resource); `-` for none, since the runner's own directory is not the chat's.
     TERMAG_WORK_DIR: typeof cwd === 'string' && path.isAbsolute(cwd) ? cwd : '-',
     ...askTelemetryEnv(ask),
+    ...inferenceEnv(inference),
   };
   try {
     const { stdout } = await execFile(script, ['telemetry-launch', '-'], { env: { ...env, ...(home ? { HOME: home } : {}), ...extra }, timeout: 10_000 });
     const resource = JSON.parse(stdout)?.env?.OTEL_RESOURCE_ATTRIBUTES;
     return typeof resource === 'string' && resource ? { OTEL_RESOURCE_ATTRIBUTES: resource } : null;
   } catch { return null; }
+}
+
+const INFERENCE_BACKEND_RE = /^[a-z]{1,32}$/;
+const INFERENCE_MODEL_RE = /^[A-Za-z0-9._:/@-]{1,160}$/;
+
+/**
+ * The run's inference backend and model for telemetry-launch
+ * (TERMAG_INFERENCE_BACKEND, TERMAG_INFERENCE_MODEL), empty when not known, so
+ * a value the runner's own environment inherited never names a run's backend.
+ * The box script checks both again.
+ */
+function inferenceEnv(inference) {
+  const backend = inference && typeof inference.backend === 'string' && INFERENCE_BACKEND_RE.test(inference.backend) ? inference.backend : '';
+  const model = backend && typeof inference.model === 'string' && INFERENCE_MODEL_RE.test(inference.model) ? inference.model : '';
+  return { TERMAG_INFERENCE_BACKEND: backend, TERMAG_INFERENCE_MODEL: model };
+}
+
+/** A Claude run's inference for chatTelemetryEnv: its model backend's, or the box's default with the model it launches with. */
+function inferenceOf(backend, model = null) {
+  return backend && typeof backend === 'object' ? { backend: backend.backend, model: backend.model } : { backend: 'default', model };
 }
 
 const ASK_TELEMETRY_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -663,6 +927,36 @@ function askTelemetryEnv(ask) {
 function withTelemetry(settings, telemetry) {
   if (!telemetry) return settings;
   return { ...(settings || {}), env: { ...((settings && settings.env) || {}), ...telemetry } };
+}
+
+const AUTO_COMPACT_ENV = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW';
+
+/**
+ * The context size a Claude turn auto-compacts at, from
+ * CLAUDE_CODE_AUTO_COMPACT_WINDOW as Claude Code reads it: the turn's
+ * `--settings` env first, then the owner's settings env (which the scratch
+ * config dir copies, prepareChatConfigDir; the gateway delivers the variable
+ * there from claude-context-tokens), then the turn's process env. A plain
+ * count is tokens, `k` and `M` scale it, and the result is clamped to Claude
+ * Code's 100K..1M; null when no source sets a usable value. Claude Code caps
+ * it at the model's own window, which the browser does too (frontend
+ * chat/contextUsage.ts contextView). The window goes out on turn-start
+ * (chat-turn.js turnStartEvent), because Claude Code's result reports the
+ * model's window, not this one.
+ */
+function autoCompactWindowOf(settings, home, turnEnvironment, fsImpl = fs) {
+  let owner = null;
+  try { owner = JSON.parse(fsImpl.readFileSync(path.join(home, '.claude/settings.json'), 'utf8')).env; } catch { /* no owner settings */ }
+  for (const env of [settings && settings.env, owner, turnEnvironment]) {
+    const raw = env && typeof env === 'object' ? env[AUTO_COMPACT_ENV] : undefined;
+    if (typeof raw !== 'string') continue;
+    const m = /^\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*$/.exec(raw);
+    const n = m ? Number(m[1]) * (/k/i.test(m[2]) ? 1e3 : /m/i.test(m[2]) ? 1e6 : 1) : NaN;
+    // A value Claude Code ignores leaves the window to the next place it reads one.
+    if (!Number.isFinite(n) || n <= 0) continue;
+    return Math.min(1_000_000, Math.max(100_000, Math.round(n)));
+  }
+  return null;
 }
 
 /**
@@ -742,6 +1036,8 @@ function turnArgs(sessionId, permissionMode, { live = false, images = false, mod
     // An ask's turn (agent/ask-chat.js) runs with nobody watching: a wakeup or
     // cron left pending would keep claude -p up, and the reply with it.
     args.push('--disallowedTools', ASK_DISALLOWED_TOOLS);
+    const publish = askPublishRules(permissionMode, ask);
+    if (publish.length) args.push('--allowedTools', publish.join(','));
     if (ask.systemPrompt) args.push('--append-system-prompt', ask.systemPrompt);
   } else if (appendPromptFile) {
     args.push('--append-system-prompt-file', appendPromptFile);
@@ -755,6 +1051,23 @@ function turnArgs(sessionId, permissionMode, { live = false, images = false, mod
 }
 
 const ASK_DISALLOWED_TOOLS = 'ScheduleWakeup CronCreate';
+
+/**
+ * What an auto ask turn may run with no classifier verdict: the push of its own
+ * thread branch, exactly as its system prompt says (backend agentMessages.ts
+ * pushSystemPrompt). An ask capped at auto (a project from a shared environment)
+ * has nobody to answer a permission prompt, so a push left to it is refused. The
+ * clone's pre-push hook still refuses the default branch. termag-pr-create stays
+ * with the classifier: it reads any file it is given and forwards --repo/--head,
+ * so a wildcard rule would let checkout content publish a credential file.
+ * termag-subagent-run passes the same rule to a headless run.
+ */
+function askPublishRules(permissionMode, ask) {
+  if (permissionModeFor(permissionMode) !== AUTO_MODE || !ask || ask.push !== true) return [];
+  const b = typeof ask.branch === 'string' ? ask.branch : '';
+  if (!isPushBranch(b)) return [];
+  return [`Bash(git push origin HEAD:${b})`];
+}
 
 /**
  * Appended to the system prompt of every turn of a chat started with "Act as
@@ -864,16 +1177,13 @@ function askOfJob(ask) {
     ...(askPath(ask.prDir) ? { prDir: ask.prDir } : {}),
     // A push-mode clone (ask-push-v1): its origin is termag's, and its branch is the thread's (askCloneRecovery).
     ...(ask.push === true ? { push: true } : {}),
-    ...(ask.push === true && ASK_BRANCH_RE.test(str(ask.branch)) && !str(ask.branch).startsWith('-') ? { branch: ask.branch } : {}),
+    ...(ask.push === true && isPushBranch(str(ask.branch)) ? { branch: ask.branch } : {}),
     // What termag-subagent-run --prepare told this turn (a clone converted for pushing), ahead of its message.
     ...(boxNotice.sentNotice(ask.notice) ? { notice: boxNotice.sentNotice(ask.notice) } : {}),
     // Who asked, for the turn's telemetry resource (chatTelemetryEnv); the thread alone from an older orchestrator.
     telemetry: askTelemetryOf(ask.telemetry, ask.threadId),
   };
 }
-
-/** A thread's branch as termag-subagent-run names it (its valid_branch, in short). */
-const ASK_BRANCH_RE = /^[A-Za-z0-9._/-]{1,200}$/;
 
 const askPath = p => typeof p === 'string' && path.isAbsolute(p) && p.length <= 4096 && !/[\0\r\n]/.test(p);
 
@@ -890,7 +1200,26 @@ function turnSessionEnv(job) {
   const env = {};
   if (typeof job.projectId === 'string' && job.projectId) env.TERMAG_PROJECT_ID = job.projectId;
   if (typeof job.workstream === 'string' && job.workstream) env.TERMAG_WORKSTREAM = job.workstream;
+  // The session's Project files and the owner's My files (filesOf): `termag space put <file> <path>` with no
+  // space named saves to the first, `--mine` to the second. Neither set leaves the CLI's default as before.
+  const files = filesOf(job.files);
+  if (files && files.project) env.TERMAG_SPACE = files.project;
+  if (files && files.mine) env.TERMAG_MY_FILES = files.mine;
   return env;
+}
+
+const SPACE_NAME_RE = /^[a-z0-9-]{2,40}$/;
+
+/**
+ * A send's `files` (project-files-v1): `{ project, mine }`, each a space name or null. The
+ * orchestrator sends it only to a box it granted both to, and only while project-files-enabled
+ * is on for the owner; anything else (an older orchestrator, a malformed name) is no files.
+ */
+function filesOf(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const name = v => (typeof v === 'string' && SPACE_NAME_RE.test(v) ? v : null);
+  const out = { project: name(raw.project), mine: name(raw.mine) };
+  return out.project || out.mine ? out : null;
 }
 
 function askEnv(ask) {
@@ -1928,7 +2257,7 @@ function pidIsAlive(pid) {
  * keeps that as `sessionCostUsd`, and the turn's own cost, what the total grew
  * by since `previousTotal` (the session's last record), as `costUsd`.
  */
-function turnRecord({ turnId, prompt, sessionId, userUuid, result, startedAt, endedAt, exitCode, previousTotal = null }) {
+function turnRecord({ turnId, prompt, sessionId, userUuid, result, startedAt, endedAt, exitCode, previousTotal = null, compactWindow = null }) {
   const total = result && typeof result.total_cost_usd === 'number' && Number.isFinite(result.total_cost_usd) ? result.total_cost_usd : null;
   const duration = result && typeof result.duration_ms === 'number' && Number.isFinite(result.duration_ms)
     ? result.duration_ms
@@ -1943,8 +2272,13 @@ function turnRecord({ turnId, prompt, sessionId, userUuid, result, startedAt, en
     sessionCostUsd: total,
     durationMs: Math.round(duration),
     isError: result ? result.is_error === true : exitCode !== 0,
+    // Where the turn's Claude Code compacted (autoCompactWindowOf), for the context ring of a reopened chat;
+    // null is the model's full window. An older agent's record has no key at all.
+    compactWindow: compactWindowOk(compactWindow) ? compactWindow : null,
   };
 }
+
+const compactWindowOk = v => Number.isSafeInteger(v) && v > 0;
 
 /**
  * A turn's own cost from its session's total and the total the session's turn
@@ -1989,6 +2323,7 @@ function parseTurnRecords(text, max = TURN_RECORDS_MAX) {
       sessionCostUsd: total,
       durationMs: typeof r.durationMs === 'number' && Number.isFinite(r.durationMs) ? r.durationMs : null,
       isError: r.isError === true,
+      ...('compactWindow' in r ? { compactWindow: compactWindowOk(r.compactWindow) ? r.compactWindow : null } : {}),
     });
   }
   return out.slice(-max);
@@ -1997,7 +2332,7 @@ function parseTurnRecords(text, max = TURN_RECORDS_MAX) {
 function createChatRunner({
   home, send, isOpen = () => true, startProcess, sessionAlive, signalPid, stopSession = async () => {},
   pidAlive = pidIsAlive, interruptGraceMs = INTERRUPT_GRACE_MS, turnInterruptMs = TURN_INTERRUPT_MS,
-  env = process.env, claudeBin, piBin, username = 'user', log = () => {}, now = Date.now,
+  env = process.env, claudeBin, piBin, cursorBin, devinBin, username = 'user', log = () => {}, now = Date.now,
   readCheckout = null,
   // A pi session id for a chat's first pi turn; tests give their own.
   newSessionId = () => crypto.randomUUID(),
@@ -2056,8 +2391,106 @@ function createChatRunner({
   const resumeHolds = new Set();
   const bin = () => claudeBin || resolveClaude({ home, env });
   const piLauncher = () => piBin || resolvePi({ home, env });
-  /** A session's own file: Claude's transcript, or pi's session file. */
-  const transcriptOf = (engine, sessionId) => (engine === 'pi' ? findPiSession(home, sessionId) : findTranscript(home, sessionId));
+  const devinPath = () => devinBin || resolveDevin({ home, env });
+  /** Where the turn wrapper keeps an engine's transcripts when its own store can't be read (chat-engines.js runnerTranscript). */
+  const runnerTranscripts = engine => path.join(root, 'sessions', engine);
+  /**
+   * A chat's own Cursor workspace (cursorTurnArgs): never a checkout, the same path on every turn, and emptied before
+   * each one. A turn's shell runs there, so an open turn could leave a `.cursor/hooks.json` in it that `--trust` would
+   * run at the next turn's session start, a confined one's included. Nothing a turn leaves there outlives it: the
+   * folder's contents go (links as links, never what they point at), and a folder put in its place by a link is
+   * made again.
+   */
+  const cursorWorkspace = chatKey => {
+    const dir = path.join(root, 'cursor-workspaces', chatKey);
+    try {
+      if (fs.lstatSync(dir).isSymbolicLink()) fs.unlinkSync(dir);
+    } catch { /* not there yet */ }
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    for (const name of fs.readdirSync(dir)) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+    return dir;
+  };
+  /**
+   * What the runner needs of an engine that isn't Claude Code (chat-engines.js), by id: its binary and whether
+   * it can run a headless turn (else why not), its argv, its read-only tools (for the read-only notice), the model
+   * and effort a send may name, and its session file: where it is, how it moves with the checkout, the id of a
+   * turn's user entry in it, and its history.
+   */
+  const headless = {
+    pi: {
+      bin: piLauncher,
+      // A launcher from before --headless would start an interactive pi with the status extension.
+      // resolvePi gives a bare name only when no launcher is found, PATH included.
+      notReady: b => (path.isAbsolute(b) && piLauncherReady(b) ? null : path.isAbsolute(b) && fs.existsSync(b) ? PI_LAUNCHER_OUTDATED : PI_LAUNCHER_MISSING),
+      args: (sessionId, mode, job) => ['--headless', ...piTurnArgs(sessionId, mode, { model: job.model, effort: job.effort, noConnectors: Boolean(job.brokerMcp && job.brokerMcp.connectors === 'none') })],
+      readOnlyTools: PI_READ_ONLY_TOOLS,
+      modelArg: piModelArg,
+      effortArg: piThinkingArg,
+      findSession: sessionId => findPiSession(home, sessionId),
+      rehome: (sessionId, cwd) => rehomePiSession(home, sessionId, cwd),
+      userEntryId: piUserEntryId,
+      historyEntries: piHistoryEntries,
+    },
+    // Cursor's own store is SQLite: the turn wrapper keeps the session's transcript, Claude-shaped (chat-turn.js
+    // createTranscriptTee), so its user entries and history read as Claude's do. It isn't kept by checkout, so a
+    // renamed checkout moves nothing here; cursor-agent itself files a chat by workspace, and may not resume one
+    // from the new path.
+    cursor: {
+      bin: () => cursorBin || resolveCursor({ home, env }),
+      notReady: b => (path.isAbsolute(b) && fs.existsSync(b) ? null : CURSOR_MISSING),
+      args: (sessionId, mode, job) => cursorTurnArgs(sessionId, mode, { model: job.model, workspace: cursorWorkspace(job.chatKey), checkout: job.cwd }),
+      notice: job => cursorNotice(job.cwd),
+      // The chat's config folder on every turn (its sessions), and a confined turn's own HOME, with none of the box
+      // user's hooks (cursorConfinedHome). Only bypassPermissions, on a tree the owner trusts, is the box user's Cursor.
+      env: (mode, job) => ({
+        CURSOR_CONFIG_DIR: cursorConfigDir(root, job.chatKey),
+        ...(mode === 'bypassPermissions' ? {} : { HOME: cursorConfinedHome({ root, chatKey: job.chatKey, home, env }) }),
+      }),
+      readOnlyTools: CURSOR_READ_ONLY_TOOLS,
+      modelArg: cursorModelArg,
+      effortArg: () => null,
+      findSession: sessionId => {
+        if (!isSessionId(sessionId)) return null;
+        const file = path.join(runnerTranscripts('cursor'), `${sessionId}.jsonl`);
+        return fs.existsSync(file) ? file : null;
+      },
+      rehome: () => {},
+      userEntryId: userPromptUuid,
+      historyEntries: (jsonl, max, opts) => historyEntries(jsonl, max, opts),
+    },
+    // Devin's ACP server, driven by devin-acp.js under this agent's node (DEVIN_DRIVER). Its store is SQLite, so the
+    // turn wrapper keeps the transcript, as Cursor's. It keeps the session in the chat's own store (devinChatDirs),
+    // in the chat's own workspace, not by checkout, so a renamed checkout moves nothing.
+    devin: {
+      bin: () => process.execPath,
+      notReady: () => {
+        const d = devinPath();
+        return path.isAbsolute(d) && fs.existsSync(d) ? null : DEVIN_MISSING;
+      },
+      args: (sessionId, mode, job) => devinTurnArgs(sessionId, mode, {
+        devin: devinPath(),
+        dirs: devinChatDirs({ root, chatKey: job.chatKey, home, env, readOnly: permissionModeFor(mode) !== TRUSTED_MODE }),
+        checkout: job.cwd,
+      }),
+      notice: (job, mode) => devinNotice(job.cwd, mode),
+      readOnlyTools: DEVIN_READ_ONLY_TOOLS,
+      modelArg: () => null,
+      effortArg: () => null,
+      findSession: sessionId => {
+        if (!isSessionId(sessionId)) return null;
+        const file = path.join(runnerTranscripts('devin'), `${sessionId}.jsonl`);
+        return fs.existsSync(file) ? file : null;
+      },
+      rehome: () => {},
+      userEntryId: userPromptUuid,
+      historyEntries: (jsonl, max, opts) => historyEntries(jsonl, max, opts),
+    },
+  };
+  /** A session's own file: Claude's transcript, or the engine's session file. */
+  const transcriptOf = (engine, sessionId) => {
+    const spec = engineSpec(engine);
+    return spec.claudeCode ? findTranscript(home, sessionId) : headless[spec.id].findSession(sessionId);
+  };
   let lastAliveCheck = 0;
   // poll/send/history/clear wait out an in-flight recover, so a chat-send
   // cannot start a second turn on a session recover has not taken up yet.
@@ -2102,10 +2535,12 @@ function createChatRunner({
     }
     return out;
   }
+  // Each with the engine that made it (an entry from before engines is Claude's).
   function readEarlier(chatKey) {
     const list = readJson(earlierFile(chatKey), []);
     return Array.isArray(list)
-      ? list.filter(e => e && isSessionId(e.sessionId) && typeof e.clearedAt === 'string').slice(-EARLIER_SESSIONS_MAX)
+      ? list.filter(e => e && isSessionId(e.sessionId) && typeof e.clearedAt === 'string')
+        .map(e => ({ ...e, engine: isEngineId(e.engine) ? e.engine : 'claude' })).slice(-EARLIER_SESSIONS_MAX)
       : [];
   }
   // The boot the chat's last turn started in (box-notice.js). Beside the
@@ -2130,7 +2565,7 @@ function createChatRunner({
     // t3: the desktop app's thread that holds the session (claimT3), or null.
     const t3 = s.t3 && typeof s.t3.threadId === 'string' && T3_THREAD_RE.test(s.t3.threadId) ? { threadId: s.t3.threadId } : null;
     // engine: which agent made the session. A state from before engines is Claude's.
-    return { sessionId: isSessionId(s.sessionId) ? s.sessionId : null, cwd: typeof s.cwd === 'string' ? s.cwd : null, engine: s.engine === 'pi' ? 'pi' : 'claude', pane, paneAt, t3 };
+    return { sessionId: isSessionId(s.sessionId) ? s.sessionId : null, cwd: typeof s.cwd === 'string' ? s.cwd : null, engine: isEngineId(s.engine) ? s.engine : 'claude', pane, paneAt, t3 };
   }
   function writeState(chatKey, patch) {
     ensureRoot();
@@ -2264,12 +2699,12 @@ function createChatRunner({
     let endedAt = now();
     try { endedAt = fs.statSync(path.join(t.dir, 'exit')).mtimeMs; } catch { /* not written yet */ }
     const sessionId = (result && result.session_id) || sessionIdFrom(log) || readState(t.meta.chatKey).sessionId;
-    const pi = t.meta.engine === 'pi';
+    const spec = engineSpec(t.meta.engine);
     const file = sessionId ? transcriptOf(t.meta.engine, sessionId) : null;
     // The first prompt Claude wrote after this turn started. An earlier
     // terminal turn is before that offset; a later one is a later uuid.
     const slice = file ? linesForward(file, { start: Number.isInteger(t.meta.transcriptBytes) ? t.meta.transcriptBytes : 0 }) : null;
-    const userUuid = slice ? (pi ? piUserEntryId(slice) : userPromptUuid(slice)) : null;
+    const userUuid = slice ? (spec.claudeCode ? userPromptUuid(slice) : headless[spec.id].userEntryId(slice)) : null;
     return turnRecord({
       turnId: t.meta.turnId,
       prompt: t.meta.text,
@@ -2280,6 +2715,7 @@ function createChatRunner({
       endedAt,
       exitCode: exit && typeof exit.code === 'number' ? exit.code : null,
       previousTotal: sessionTotalBefore(t.meta.chatKey, sessionId, t.meta.turnId),
+      compactWindow: t.meta.compactWindow,
     });
   }
   /** The session's total as its last record before this turn's reported it. */
@@ -2299,7 +2735,7 @@ function createChatRunner({
    */
   function titleOfTurn(t) {
     // pi's session files carry no title.
-    if (t.meta.engine === 'pi') return null;
+    if (!engineSpec(t.meta.engine).titles) return null;
     const sessionId = readState(t.meta.chatKey).sessionId;
     const file = sessionId ? findTranscript(home, sessionId) : null;
     if (!file) return null;
@@ -2385,7 +2821,7 @@ function createChatRunner({
     const configDir = prepareChatConfigDir(home, fs, { dir: TITLE_CONFIG_DIR, linkProjects: false });
     const cwd = path.join(home, TITLE_CWD);
     fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
-    const telemetry = await telemetryFor({ project: t.meta.project, workstream: t.meta.workstream, kind: 'oneshot', oneshot: 'title', cwd: t.meta.cwd });
+    const telemetry = await telemetryFor({ project: t.meta.project, workstream: t.meta.workstream, kind: 'oneshot', oneshot: 'title', cwd: t.meta.cwd, inference: inferenceOf(null, 'haiku') });
     const title = await titleGenerator({ bin: claude, env: { ...turnEnv(env, claude, configDir), TERMAG_SESSION_KIND: 'oneshot' }, cwd, prompt: titlePrompt(message), settingsEnv: telemetry });
     if (!title) {
       log(`[CHAT] ${chatKey}: no session title from Haiku this time`);
@@ -2453,7 +2889,7 @@ function createChatRunner({
       const cwd = path.join(home, HEADING_CWD);
       fs.mkdirSync(cwd, { recursive: true, mode: 0o700 });
       const input = toolGroupHeadings.headingPrompt({ ...group, previous: toolGroupHeadings.lastHeading(file) });
-      const telemetry = await telemetryFor({ project: t.meta.project, workstream: t.meta.workstream, kind: 'oneshot', oneshot: 'heading', cwd: t.meta.cwd });
+      const telemetry = await telemetryFor({ project: t.meta.project, workstream: t.meta.workstream, kind: 'oneshot', oneshot: 'heading', cwd: t.meta.cwd, inference: inferenceOf(null, 'haiku') });
       heading = await headingGenerator({ bin: claude, env: { ...turnEnv(env, claude, configDir), TERMAG_SESSION_KIND: 'oneshot' }, cwd, input, settingsEnv: telemetry });
     } catch (err) {
       log(`[CHAT] ${chatKey}: tool-group heading call failed: ${err.message}`);
@@ -2726,14 +3162,29 @@ function createChatRunner({
    * finishes: a reboot or an OOM leaves the init line in the log and no write
    * from chat-turn.js. An id that is not there does not wipe one we have.
    */
+  /**
+   * A turn on another engine than the chat's session (meta.replaces) has named its own session: the one it took
+   * over from stays above it, as a cleared context's does (resetContext), with its engine so its history reads, and
+   * it is no longer the current one, so history never shows it twice.
+   */
+  function keepReplaced(meta, sessionId) {
+    const was = meta && meta.replaces;
+    if (!was || !isSessionId(was.sessionId) || was.sessionId === sessionId) return;
+    const earlier = readEarlier(meta.chatKey);
+    if (earlier.some(e => e.sessionId === was.sessionId)) return;
+    ensureRoot();
+    writeJson(earlierFile(meta.chatKey), [...earlier, { sessionId: was.sessionId, clearedAt: new Date(now()).toISOString(), engine: engineSpec(was.engine).id }].slice(-EARLIER_SESSIONS_MAX));
+  }
+
   function rememberSession(t) {
     let log = '';
     try { log = fs.readFileSync(path.join(t.dir, 'events.jsonl'), 'utf8'); } catch { return; }
     const sessionId = sessionIdFrom(log);
     if (!sessionId) return;
+    keepReplaced(t.meta, sessionId);
     const prev = readState(t.meta.chatKey);
     const cwd = typeof t.meta.cwd === 'string' ? t.meta.cwd : prev.cwd;
-    const engine = t.meta.engine === 'pi' ? 'pi' : 'claude';
+    const engine = engineSpec(t.meta.engine).id;
     if (prev.sessionId === sessionId && prev.cwd === cwd && prev.engine === engine) return;
     writeState(t.meta.chatKey, { sessionId, cwd, engine });
   }
@@ -2761,15 +3212,25 @@ function createChatRunner({
     ensureRoot();
     const state = readState(job.chatKey);
     if (state.sessionId && state.cwd && state.cwd !== job.cwd) {
-      if (state.engine === 'pi') rehomePiSession(home, state.sessionId, job.cwd);
-      else rehomeTranscript(home, state.sessionId, job.cwd);
+      const was = engineSpec(state.engine);
+      if (was.claudeCode) rehomeTranscript(home, state.sessionId, job.cwd);
+      else headless[was.id].rehome(state.sessionId, job.cwd);
       writeState(job.chatKey, { sessionId: state.sessionId, cwd: job.cwd });
     }
     // A session goes on only on the engine that made it. A pi chat's first
     // turn names its session itself; pi creates it under that id.
-    const pi = job.engine === 'pi';
-    const resumeId = state.engine === (pi ? 'pi' : 'claude') ? state.sessionId : null;
-    const piSession = pi ? (resumeId || newSessionId()) : null;
+    const spec = engineSpec(job.engine);
+    // What the turn runs if it isn't Claude Code: its binary, argv and session file.
+    const other = spec.claudeCode ? null : headless[spec.id];
+    const resumeId = state.engine === spec.id ? state.sessionId : null;
+    // A session another engine made isn't resumed (a Cursor chat's transcript restored on a new box as Claude's, a
+    // chat whose engine changed). It stays the chat's session until this turn's engine names its own (keepReplaced):
+    // a turn that never gets that far (no binary, a crash before its stream) leaves the chat on it, to resume.
+    // A Devin load can fail and start a new session (chat-engines.js resumeKeepsId): the one it was given goes to
+    // earlier then, the same way.
+    const replaces = state.sessionId && !resumeId ? { sessionId: state.sessionId, engine: state.engine }
+      : resumeId && !spec.resumeKeepsId ? { sessionId: resumeId, engine: spec.id } : null;
+    const runnerSession = spec.sessionMadeBy === 'runner' ? (resumeId || newSessionId()) : null;
     // The mode stored on a queued job is the backend's ceiling. Re-read this
     // checkout now, including after an agent restart. bypassPermissions is
     // kept for the project's main worktree and for a branch-off marked own
@@ -2782,24 +3243,24 @@ function createChatRunner({
     // config dir, which strips permission rules.
     const { requested, mode, readOnly, fix, facts } = await settleTurnMode(job);
     // The owner's broker connectors for a confined turn, or a sharee's bypass turn's denials (broker-mcp.js).
-    const mcp = pi ? null : brokerMcp.turnMcp(home, mode, job.brokerMcp || null, { headersHelper: mcpHeadersHelper, agentConfig }, { loadsCheckoutConfig: loadsCheckoutConfig(mode) });
+    const mcp = other ? null : brokerMcp.turnMcp(home, mode, job.brokerMcp || null, { headersHelper: mcpHeadersHelper, agentConfig }, { loadsCheckoutConfig: loadsCheckoutConfig(mode) });
     const mcpServers = mcp && mcp.servers ? Object.keys(mcp.servers) : [];
     if (mcpServers.length) log(`[CHAT] ${job.chatKey}: ${mode} turn with broker connectors ${mcpServers.join(', ')} (${mcp.allow.length} allow rules)`);
-    const readOnlyTools = pi ? PI_READ_ONLY_TOOLS : confinedTools(mcpServers.length > 0);
+    const readOnlyTools = other ? other.readOnlyTools : confinedTools(mcpServers.length > 0);
     if (readOnly) log(`[CHAT] ${job.chatKey}: ${requested} asked, the turn runs read-only (${readOnlyTools.join(', ')}): ${readOnly}${fix ? `; to fix, ${fix}` : ''}`);
-    const live = job.liveInput === true && !pi;
+    const live = job.liveInput === true && spec.liveInput;
     // pi reads no Claude config: its closure is in piTurnArgs.
-    const configDir = pi || loadsCheckoutConfig(mode) ? undefined : prepareChatConfigDir(home);
+    const configDir = other || loadsCheckoutConfig(mode) ? undefined : prepareChatConfigDir(home);
     // A sharee's turn reloads no connectors: one linked meanwhile would come in without its deny rule.
-    const mcpFile = pi || (mcp && !mcp.servers) ? null : mcpVersionFile(home, mode, live);
+    const mcpFile = other || (mcp && !mcp.servers) ? null : mcpVersionFile(home, mode, live);
     const turnId = `${now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const dir = path.join(turnsDir, turnId);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const reference = genUiReference(home, job);
-    const appended = appendedSystemPrompt(job, reference, { branches: !pi && isOpenMode(requested) && Boolean(facts && facts.originUrl) });
+    const appended = appendedSystemPrompt(job, reference, { branches: !other && isOpenMode(requested) && Boolean(facts && facts.originUrl) });
     const appendPromptFile = appended ? path.join(dir, 'system-prompt.md') : null;
     if (appendPromptFile) fs.writeFileSync(appendPromptFile, appended, { mode: 0o600 });
-    const agentBin = pi ? piLauncher() : bin();
+    const agentBin = other ? other.bin() : bin();
     const turnEnvironment = turnEnv(env, agentBin, configDir);
     if (job.ask) {
       // The termag tools an ask's prompt may name (termag-pr-create, ...).
@@ -2813,21 +3274,20 @@ function createChatRunner({
     let backendError = null;
     if (job.backend) {
       try { settings = await settingsFor(job.backend); } catch (err) { backendError = err; }
-    } else if (!pi) settings = withDefaultModel(settings, home);
-    // A launcher from before --headless would start an interactive pi with the status extension.
-    // resolvePi gives a bare name only when no launcher is found, PATH included.
-    if (pi && (!path.isAbsolute(agentBin) || !piLauncherReady(agentBin))) {
-      backendError = new Error(path.isAbsolute(agentBin) && fs.existsSync(agentBin) ? PI_LAUNCHER_OUTDATED : PI_LAUNCHER_MISSING);
-    }
+    } else if (!other) settings = withDefaultModel(settings, home);
+    // An engine whose binary can't run a headless turn here says why (headless notReady), instead of starting.
+    const notReady = other ? other.notReady(agentBin) : null;
+    if (notReady) backendError = new Error(notReady);
     // The turn's resource: the chat's project and workstream, kind `chat` (chatTelemetryEnv); an ask's
     // chat is kind `ask`, with who asked (termag.ask.*), its person's turns too, since they are the same session.
     // A pi turn takes no Claude --settings, so it has nothing to carry it.
     // The same kind goes in the turn's environment (TERMAG_SESSION_KIND), pi's too, for the tools it runs.
     const askTelemetry = job.ask ? askTelemetryOf(job.ask.telemetry, job.ask.threadId) : null;
     const kind = askTelemetry ? 'ask' : 'chat';
-    if (!pi) {
+    if (!other) {
       settings = withTelemetry(settings, await telemetryFor({
         project: job.project, workstream: job.workstream, kind, cwd: job.cwd, ...(askTelemetry ? { ask: askTelemetry } : {}),
+        inference: inferenceOf(job.backend, claudeLaunchArg(job.model, claudeOnGateway(home, turnEnvironment))),
       }));
     }
     // The session's space memory: the same system-prompt bytes on every turn of
@@ -2838,7 +3298,7 @@ function createChatRunner({
     try {
       // A compact turn's prompt must stay a bare `/compact`, or Claude Code doesn't compact: it gets the
       // session's frozen index and no notice, and asks the CLI nothing. A change shows on the next turn.
-      memoryTurn = pi ? null : job.compact === true
+      memoryTurn = other ? null : job.compact === true
         ? { appendPrompt: memoryFor.frozenPromptFor(job.chatKey, resumeId), notice: null }
         : await memoryFor.forTurn({
           chatKey: job.chatKey, sessionId: resumeId, space: job.spaceMemory && job.spaceMemory.space, none: !!job.spaceMemory && job.spaceMemory.space === null,
@@ -2874,21 +3334,25 @@ function createChatRunner({
     } catch (err) { log(`[CHAT] ${job.chatKey}: environment notice: ${err.message}`); }
     // A read-only turn tells the model why, or it reports its missing tools as broken.
     if (readOnly && job.compact !== true) notices.push(readOnlyNotice(readOnly, fix, readOnlyTools, mcpServers));
+    // An engine whose turn needs telling something of its setup (Cursor: where the checkout is).
+    if (other && typeof other.notice === 'function') notices.push(other.notice(job, mode));
     // Where the transcript ended before this turn. History cuts there, not on
     // the prompt text: an earlier turn that said the same thing ("go", "yes")
     // would otherwise take everything after it out of the view.
     let transcriptBytes = null;
     if (resumeId) {
-      const existing = transcriptOf(pi ? 'pi' : 'claude', resumeId);
+      const existing = transcriptOf(spec.id, resumeId);
       transcriptBytes = 0;
       if (existing) { try { transcriptBytes = fs.statSync(existing).size; } catch { transcriptBytes = 0; } }
     }
+    // Where Claude Code compacts this turn's context, for the context ring; pi reads no Claude settings.
+    const compactWindow = other ? null : autoCompactWindowOf(settings, home, turnEnvironment);
     const meta = {
       chatKey: job.chatKey, projectId: job.projectId, ...(job.project ? { project: job.project } : {}), workstream: job.workstream, workstreamId: job.workstreamId, turnId,
       session: turnSessionName(username, turnId), cwd: job.cwd, text: job.text, resumed: Boolean(resumeId),
       bin: agentBin,
-      args: pi
-        ? ['--headless', ...piTurnArgs(piSession, mode, { model: job.model, effort: job.effort, noConnectors: Boolean(job.brokerMcp && job.brokerMcp.connectors === 'none') })]
+      args: other
+        ? other.args(runnerSession || resumeId, mode, job)
         : turnArgs(resumeId, mode, { live, images: blocks.length > 0, model: job.model, backend: job.backend, settings, ask: job.ask, orchestrator: job.orchestrator === true, effort: job.effort, appendPromptFile, readDir: reference && reference.dir, onGateway: claudeOnGateway(home, turnEnvironment), mcp }),
       path: turnEnvironment.PATH, configDir, stateFile: stateFile(job.chatKey),
       startedAt: new Date(now()).toISOString(), transcriptBytes, live, requestedMode: requested, mode,
@@ -2898,7 +3362,11 @@ function createChatRunner({
       model: job.model ?? null,
       effort: job.effort ?? null,
       ...(job.titles === true ? { titles: true } : {}),
-      ...(pi ? { engine: 'pi' } : {}),
+      ...engineTag(spec.id),
+      // The other engine's session this turn takes over from, once it names its own (keepReplaced).
+      ...(replaces ? { replaces } : {}),
+      // The wrapper writes this engine's transcript itself (chat-turn.js createTranscriptTee).
+      ...(spec.runnerTranscript ? { transcriptDir: runnerTranscripts(spec.id) } : {}),
       ...(job.headings === true ? { headings: true } : {}),
       ...(job.genUiPrompt != null ? { genUi: true } : {}),
       ...(job.compact === true ? { compact: true } : {}),
@@ -2906,11 +3374,14 @@ function createChatRunner({
       ...(job.notice ? { newBoxNotice: true } : {}),
       ...(job.planSpend === true ? { planSpend: true } : {}),
       ...(job.backend ? { backend: job.backend.backend } : {}),
+      ...(compactWindow ? { compactWindow } : {}),
       ...(blocks.length && { images: job.images }),
       ...(job.ask ? { ask: job.ask } : {}),
       // What the send let it reach (broker-mcp.js): a later live send must have asked for the same (takesLive).
       ...(job.brokerMcp ? { brokerMcp: job.brokerMcp } : {}),
       env: { ...askEnv(job.ask), ...turnSessionEnv(job), TERMAG_SESSION_KIND: kind },
+      // An engine's own folders for the turn (headless env): Cursor's config, and a confined turn's HOME.
+      ...(other && other.env ? { agentEnv: other.env(mode, job) } : {}),
       ...(mcpFile && { mcpVersionFile: mcpFile }),
     };
     // Memories only, as attributed data: nothing from the space's .termag/skills/ is loaded (space-memory.js).
@@ -2933,7 +3404,7 @@ function createChatRunner({
       if (boot && !boxNotice.sameBoot(lastBoot, boot)) writeJson(bootFile(job.chatKey), { boot });
       if (envTurn && envTurn.text) writeJson(envSeenFile(job.chatKey), envTurn.seen);
       if (!t.cancelled) {
-        log(`[CHAT] ${job.chatKey} turn ${turnId} started in ${meta.session}${pi ? ' on pi' : ''}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ''}`);
+        log(`[CHAT] ${job.chatKey} turn ${turnId} started in ${meta.session}${other ? ` on ${spec.label}` : ''}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ''}`);
       }
       // A cancelled turn returns the id either way. The clear that set the
       // flag is waiting on signalStop and must not see an exit file this
@@ -3024,7 +3495,8 @@ function createChatRunner({
           // A reload's answer lists every command and agent: nothing the chat shows.
           if (event && !isMcpReloadReply(event)) {
             if (event.type === 'system' && event.subtype === 'init' && isSessionId(event.session_id)) {
-              writeState(t.meta.chatKey, { sessionId: event.session_id, cwd: t.meta.cwd, engine: t.meta.engine === 'pi' ? 'pi' : 'claude' });
+              keepReplaced(t.meta, event.session_id);
+              writeState(t.meta.chatKey, { sessionId: event.session_id, cwd: t.meta.cwd, engine: engineSpec(t.meta.engine).id });
               if (t.meta.titles === true) maybeTitle(t, event.session_id);
             }
             // The wrapper's turn-end has no cost. Attach this turn's record
@@ -3224,12 +3696,13 @@ function createChatRunner({
    * (armEscalation), once. True when one was found.
    */
   function reapOrphanedPi(t) {
-    if (t.meta.engine !== 'pi' || t.orphanReaped) return false;
+    const spec = engineSpec(t.meta.engine);
+    if (!spec.signals.group || t.orphanReaped) return false;
     const wrapper = readPid(t.dir, 'turn.pid');
     const agent = readPid(t.dir);
     if (!wrapper || pidAlive(wrapper) || !agent || !pidAlive(agent)) return false;
     t.orphanReaped = true;
-    log(`[CHAT] ${t.meta.chatKey} turn ${t.meta.turnId}: its wrapper is gone and pi is not; stopping pi`);
+    log(`[CHAT] ${t.meta.chatKey} turn ${t.meta.turnId}: its wrapper is gone and ${spec.label} is not; stopping ${spec.label}`);
     armEscalation(t, agent);
     return true;
   }
@@ -3257,7 +3730,7 @@ function createChatRunner({
     if (!pid) return;
     const grace = interruptGraceMs;
     const over = () => fs.existsSync(path.join(t.dir, 'exit'));
-    if (t.meta.engine === 'pi') {
+    if (engineSpec(t.meta.engine).signals.group) {
       signalPid(-pid, 'SIGTERM');
       setTimeout(() => { if (!over()) signalPid(-pid, 'SIGKILL'); }, grace).unref?.();
       return;
@@ -3305,12 +3778,16 @@ function createChatRunner({
     const out = [];
     let left = Math.max(0, budget);
     for (let i = earlier.length - 1; i >= 0; i--) {
-      const { sessionId, clearedAt } = earlier[i];
-      const file = left > 0 ? findTranscript(home, sessionId) : (cut.more = true, null);
+      const { sessionId, clearedAt, engine } = earlier[i];
+      // On the engine that made it, as history() reads the current one: a chat whose engine changed has both.
+      const spec = engineSpec(engine);
+      const file = left > 0 ? transcriptOf(spec.id, sessionId) : (cut.more = true, null);
       const read = {};
-      const jsonl = file ? historyTail(file, { maxBytes: left, shrink: e => images.stripEvent(chatKey, e), keeps: isHistoryLine, report: read }) : '';
+      const jsonl = file ? historyTail(file, { maxBytes: left, shrink: e => images.stripEvent(chatKey, e), keeps: spec.claudeCode ? isHistoryLine : null, report: read }) : '';
       left -= Buffer.byteLength(jsonl);
-      out.unshift(...withUndone(historyEntries(jsonl, HISTORY_MAX_ENTRIES, { report: read }).map(e => images.stripEvent(chatKey, e)), sessionId, undone), { type: 'context-cleared', at: clearedAt });
+      // Every engine's reader says when its cap cut the session (read.cut), so nothing older shows above a gap.
+      const entries = spec.claudeCode ? historyEntries(jsonl, HISTORY_MAX_ENTRIES, { report: read }) : headless[spec.id].historyEntries(jsonl, HISTORY_MAX_ENTRIES, { report: read });
+      out.unshift(...withUndone(entries.map(e => images.stripEvent(chatKey, e)), sessionId, undone), { type: 'context-cleared', at: clearedAt });
       if (read.cut) { cut.more = true; left = 0; }
     }
     return out;
@@ -3538,7 +4015,7 @@ function createChatRunner({
      * move the pane while another send is still settling, and a resume
      * cannot land between them.
      */
-    async sendMessage({ chatKey, cwd, text, projectId, project, workstream, workstreamId, permissionMode, paneProbe, liveInput, model, backend, fastModel, context, models, images: sent, ask, orchestrator, titles, headings, effort, engine, genUiPrompt, genUiHint, spaceMemory: memorySpace , boxNotices, notice, planSpend, sendId, brokerMcp: sentMcp }) {
+    async sendMessage({ chatKey, cwd, text, projectId, project, workstream, workstreamId, permissionMode, paneProbe, liveInput, model, backend, fastModel, context, models, images: sent, ask, orchestrator, titles, headings, effort, engine, genUiPrompt, genUiHint, spaceMemory: memorySpace , boxNotices, notice, planSpend, sendId, brokerMcp: sentMcp, files: sentFiles }) {
       await gate;
       if (!isChatKey(chatKey)) throw new Error('bad chatKey');
       if (clearing.has(chatKey)) throw new Error('chat-clearing: this chat is being stopped');
@@ -3549,13 +4026,15 @@ function createChatRunner({
       if (text.length > MAX_TEXT) throw new Error('text is too long');
       const askJob = askOfJob(ask);
       const onEngine = engineOf({ engine });
-      if (onEngine === 'pi') {
+      const onSpec = engineSpec(onEngine);
+      if (!onSpec.claudeCode) {
         // pi v1 is text turns on its own model list: no Claude ask, backend or images.
         if (askJob) throw new Error('engine-refused: an ask runs on Claude');
-        if (backend != null && backend !== '') throw new Error('engine-refused: a pi turn takes no model backend');
-        if (decoded.length) throw new Error('engine-refused: a pi turn takes no images');
+        if (backend != null && backend !== '') throw new Error(`engine-refused: a ${onSpec.label} turn takes no model backend`);
+        if (decoded.length && !onSpec.images) throw new Error(`engine-refused: a ${onSpec.label} turn takes no images`);
       }
-      const onBackend = askJob || onEngine === 'pi' ? null : backendOf({ backend, model, fastModel, context, models });
+      // An ask's turn may run on a backend too (agent/ask-chat.js, ask-backend-v1); it keeps its system prompt and disallowed tools (turnArgs).
+      const onBackend = onSpec.claudeCode ? backendOf({ backend, model, fastModel, context, models }) : null;
       // PDFs go to Claude's own models only: another backend may not take document blocks.
       if (onBackend && decoded.some(img => img.mediaType === chatImages.PDF)) throw new Error(`image-refused: PDFs go to Claude's own models, not ${onBackend.backend}`);
       ensureRoot();
@@ -3563,16 +4042,20 @@ function createChatRunner({
       const sentNotice = askJob ? null : boxNotice.sentNotice(notice);
       // What the orchestrator lets this turn reach of the broker connectors (broker-mcp.js); never an ask's turn.
       const mcpOfSend = askJob ? null : brokerMcp.brokerMcpOf(sentMcp);
+      // Where `termag space` saves with no space named, on every engine (turnSessionEnv).
+      const files = filesOf(sentFiles);
       // A pi turn: never live, no orchestrator prompt, title, headings, space memory or box notice (all Claude's), pi's model and thinking level.
-      const job = onEngine === 'pi' ? {
+      const engineArgs = onSpec.claudeCode ? null : headless[onEngine];
+      const job = engineArgs ? {
         chatKey, cwd, text: boxNotice.defuseSent(text), projectId: String(projectId || ''), workstream: String(workstream || 'main'),
         workstreamId: workstreamId != null ? String(workstreamId) : null,
         permissionMode: permissionModeFor(permissionMode),
-        engine: 'pi',
+        engine: onEngine,
         // pi takes only "none" (piTurnArgs noConnectors): its confined turns load no MCP at all.
         ...(mcpOfSend && mcpOfSend.connectors === 'none' ? { brokerMcp: mcpOfSend } : {}),
-        model: piModelArg(model),
-        ...(piThinkingArg(effort) ? { effort: piThinkingArg(effort) } : {}),
+        model: engineArgs.modelArg(model),
+        ...(engineArgs.effortArg(effort) ? { effort: engineArgs.effortArg(effort) } : {}),
+        ...(files ? { files } : {}),
       } : {
         // Sender text that opens with <termag-box-notice> is defused, so only a notice this runner inserts is ever stripped (box-notice.js).
         chatKey, cwd, text: boxNotice.defuseSent(text), projectId: String(projectId || ''), workstream: String(workstream || 'main'),
@@ -3607,6 +4090,7 @@ function createChatRunner({
         // nothing named (an older backend), the box's default.
         ...(memorySpace && (typeof memorySpace.space === 'string' || memorySpace.space === null) ? { spaceMemory: { space: memorySpace.space } } : {}),
         ...(mcpOfSend ? { brokerMcp: mcpOfSend } : {}),
+        ...(files ? { files } : {}),
       };
       const stopsAtSend = stopCount(chatKey);
       // A send with an id this chat already took is answered as it was then.
@@ -3744,10 +4228,10 @@ function createChatRunner({
         const state = readState(chatKey);
         if (!state.sessionId) return { reset: false };
         // The earlier sessions' history is read as Claude's; the backend offers no context actions on pi.
-        if (state.engine === 'pi') throw new Error('engine-refused: a pi chat cannot clear its context yet');
+        if (!engineSpec(state.engine).canClear) throw new Error(`engine-refused: a ${engineSpec(state.engine).label} chat cannot clear its context yet`);
         const at = new Date(now()).toISOString();
         ensureRoot();
-        writeJson(earlierFile(chatKey), [...readEarlier(chatKey), { sessionId: state.sessionId, clearedAt: at }].slice(-EARLIER_SESSIONS_MAX));
+        writeJson(earlierFile(chatKey), [...readEarlier(chatKey), { sessionId: state.sessionId, clearedAt: at, engine: state.engine }].slice(-EARLIER_SESSIONS_MAX));
         writeState(chatKey, { sessionId: null });
         log(`[CHAT] ${chatKey} context cleared (left ${state.sessionId.slice(0, 8)})`);
         emit({ chatKey, projectId: String(projectId || ''), workstream: String(workstream || 'main'), workstreamId: workstreamId != null ? String(workstreamId) : null }, null, null, { type: 'context-cleared', at });
@@ -3778,7 +4262,7 @@ function createChatRunner({
         ensureRoot();
         writeJson(undoneFile(chatKey), [...readUndone(chatKey), { sessionId: last.sessionId, clearedAt: last.clearedAt, resumedAt }].slice(-UNDONE_MAX));
         writeJson(earlierFile(chatKey), earlier.slice(0, -1));
-        writeState(chatKey, { sessionId: last.sessionId });
+        writeState(chatKey, { sessionId: last.sessionId, engine: last.engine });
         log(`[CHAT] ${chatKey} context resumed (${last.sessionId.slice(0, 8)})`);
         emit({ chatKey, projectId: String(projectId || ''), workstream: String(workstream || 'main'), workstreamId: workstreamId != null ? String(workstreamId) : null }, null, null,
           { type: 'context-resumed', at: last.clearedAt, resumedAt, sessionId: last.sessionId });
@@ -3809,7 +4293,7 @@ function createChatRunner({
         const { sessionId, engine } = readState(chatKey);
         if (!sessionId) throw new Error('nothing-to-compact: this chat has no context yet');
         // `/compact` is Claude Code's: on a pi session it would start a new Claude session instead.
-        if (engine === 'pi') throw new Error('engine-refused: a pi chat cannot compact');
+        if (!engineSpec(engine).canCompact) throw new Error(`engine-refused: a ${engineSpec(engine).label} chat cannot compact`);
         const job = {
           chatKey, cwd, text: COMPACT_PROMPT, compact: true,
           projectId: String(projectId || ''), workstream: String(workstream || 'main'),
@@ -3867,6 +4351,7 @@ function createChatRunner({
       await gate;
       if (!isChatKey(chatKey)) throw new Error('bad chatKey');
       const { sessionId, engine, t3 } = await fillT3Session(chatKey);
+      const onSpec = engineSpec(engine);
       const earlier = readEarlier(chatKey);
       const runningTurn = activeFor(chatKey);
       const live = stillRunning(runningTurn) ? runningTurn : null;
@@ -3883,13 +4368,21 @@ function createChatRunner({
         end: prefix ? replay.meta.transcriptBytes : Infinity,
         maxBytes: HISTORY_MAX_BYTES,
         shrink: e => images.stripEvent(chatKey, e),
-        keeps: engine === 'pi' ? null : isHistoryLine,
+        keeps: onSpec.claudeCode ? isHistoryLine : null,
         report: read,
       }) : '';
-      let entries = (engine === 'pi' ? piHistoryEntries(jsonl, HISTORY_MAX_ENTRIES) : historyEntries(jsonl, HISTORY_MAX_ENTRIES, { report: read })).map(e => images.stripEvent(chatKey, e));
+      let entries = (onSpec.claudeCode ? historyEntries(jsonl, HISTORY_MAX_ENTRIES, { report: read }) : headless[onSpec.id].historyEntries(jsonl, HISTORY_MAX_ENTRIES, { report: read })).map(e => images.stripEvent(chatKey, e));
       let turn = null;
       if (replay) {
-        if (!prefix && replay.meta.transcriptBytes === null && replay.meta.resumed === false) {
+        // A turn on another engine that hasn't named its own session yet (meta.replaces): the chat's session is still
+        // the one before it, all of it earlier than the turn.
+        const before = Boolean(replay.meta.replaces && replay.meta.replaces.sessionId === sessionId);
+        // One that has named its own (an engine switch's, or a Devin load that failed and started anew): nothing in
+        // that session is from before the turn, whatever offset the turn measured on the session it was given.
+        const renamed = Boolean(replay.meta.replaces && !before);
+        if (before) {
+          // Whole.
+        } else if (renamed || (!prefix && replay.meta.transcriptBytes === null && replay.meta.resumed === false)) {
           // A session's first turn: Claude made the transcript for it, so
           // nothing in it is before the turn. Matching the prompt's words
           // could pick a later message that repeats them.
@@ -3911,16 +4404,16 @@ function createChatRunner({
       const undone = readUndone(chatKey);
       if (sessionId) entries = withUndone(entries, sessionId, undone);
       // more: older entries were left out, which chat-history-before pages in.
-      const cut = { more: engine !== 'pi' && entries.length > 0 && Boolean(read.cut) };
+      const cut = { more: onSpec.pagesHistory && entries.length > 0 && Boolean(read.cut) };
       // A cut tail leaves older lines of this session out: earlier sessions' entries would skip them.
       if (earlier.length) entries = [...earlierEntries(chatKey, earlier, read.cut ? 0 : HISTORY_MAX_BYTES - Buffer.byteLength(jsonl), undone, cut), ...entries];
       if (entries.length > HISTORY_MAX_ENTRIES) cut.more = true;
       entries = capHistory(entries);
-      if (engine === 'pi') cut.more = false;
+      if (!onSpec.pagesHistory) cut.more = false;
       // liveInput: a message sent while the running turn runs goes into it (chat-live-v1).
       // starting: a turn whose checkout inspect has begun is running for a resume.
       return {
-        sessionId, ...(engine === 'pi' ? { engine } : {}), running: Boolean(live) || starting.has(chatKey), liveInput: Boolean(live) && readsInput(live),
+        sessionId, ...engineTag(engine), running: Boolean(live) || starting.has(chatKey), liveInput: Boolean(live) && readsInput(live),
         queued, waiting: waitingMessages([...untaken, ...waitingJobs]), parked: parked.has(chatKey), entries, more: cut.more, turn, turns: readTurns(chatKey),
         headings: toolGroupHeadings.readHeadings(headingsFile(chatKey)),
         // The desktop app's thread holds the session (claimT3): a send here takes it back first.
@@ -3944,9 +4437,14 @@ function createChatRunner({
       if (typeof before !== 'string' || !USER_UUID_RE.test(before)) throw new Error('bad before');
       // A chat just cleared has no session yet, and its earlier sessions still page.
       const { sessionId, engine } = await fillT3Session(chatKey);
-      if (engine === 'pi') return { entries: [], done: true };
+      if (!engineSpec(engine).pagesHistory) return { entries: [], done: true };
       const undone = readUndone(chatKey);
-      const sessions = [{ sessionId, clearedAt: null }, ...readEarlier(chatKey).reverse()];
+      const sessions = [{ sessionId, clearedAt: null, engine: readState(chatKey).engine }, ...readEarlier(chatKey).reverse()];
+      // What it pages is Claude-shaped: Claude's transcript, or the one the turn wrapper keeps (runnerTranscript).
+      const pageable = s => {
+        const spec = engineSpec(s.engine);
+        return spec.claudeCode || spec.runnerTranscript ? transcriptOf(spec.id, s.sessionId) : null;
+      };
       const shrink = e => images.stripEvent(chatKey, e);
       const at = parseHistoryCursor(cursor);
       let from = 0;
@@ -3958,7 +4456,7 @@ function createChatRunner({
       let end = Infinity;
       if (at) {
         const i = sessions.findIndex(s => s.sessionId === at.sessionId);
-        const file = i >= 0 ? findTranscript(home, at.sessionId) : null;
+        const file = i >= 0 ? pageable(sessions[i]) : null;
         if (file && uuidAt(file, at.start) === before) { from = i; end = at.start; }
       }
       const pages = [];
@@ -3980,7 +4478,7 @@ function createChatRunner({
       };
       for (let i = from; i < sessions.length; i++) {
         const s = sessions[i];
-        const file = findTranscript(home, s.sessionId);
+        const file = pageable(s);
         if (found && s.clearedAt) pages.unshift([{ type: 'context-cleared', at: s.clearedAt }]);
         if (!file) continue;
         const pinned = i === from && end !== Infinity;
@@ -4014,10 +4512,13 @@ function createChatRunner({
     async transcriptRead(chatKey, { sessionId: asked = null, from = 0, maxBytes = TRANSCRIPT_READ_MAX } = {}) {
       await gate;
       if (!isChatKey(chatKey)) throw new Error('bad chatKey');
-      const { sessionId } = readState(chatKey);
+      const { sessionId, engine } = readState(chatKey);
       if (!isSessionId(sessionId)) return { sessionId: null };
       const start = asked === sessionId && Number.isSafeInteger(from) && from > 0 ? from : 0;
-      const file = findTranscript(home, sessionId);
+      // What the orchestrator stores is a Claude-shaped transcript: Claude's own, or the one the turn wrapper keeps
+      // for an engine whose store can't be read (runnerTranscript). pi's session file is neither, and reads as missing.
+      const spec = engineSpec(engine);
+      const file = spec.runnerTranscript ? transcriptOf(spec.id, sessionId) : findTranscript(home, sessionId);
       if (!file) return { sessionId, from: start, size: 0, data: '', missing: true };
       const limit = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? Math.min(maxBytes, TRANSCRIPT_READ_MAX) : TRANSCRIPT_READ_MAX;
       const size = fs.statSync(file).size;
@@ -4156,7 +4657,7 @@ function createChatRunner({
         let rehomeTo = null;
         const onBackend = backendOf(opts);
         // A pi session has no resume in the pane yet: no line, so nothing is typed.
-        if (sessionId && readState(chatKey).engine !== 'pi') {
+        if (sessionId && engineSpec(readState(chatKey).engine).paneResume) {
           const cwd = typeof opts.cwd === 'string' && opts.cwd.trim() ? opts.cwd : null;
           let mode = UNTRUSTED_MODE;
           if (cwd) {
@@ -4167,7 +4668,7 @@ function createChatRunner({
           }
           // A backend that is not ready refuses the claim with its reason, before anything is held.
           // The pane's resource: the chat's project and workstream, and its kind, a pane's, over the settings' `external`.
-          const settings = withTelemetry(onBackend ? await settingsFor(onBackend) : withDefaultModel(null, home), await telemetryFor({ project: opts.project, workstream: opts.workstream, kind: 'interactive', cwd }));
+          const settings = withTelemetry(onBackend ? await settingsFor(onBackend) : withDefaultModel(null, home), await telemetryFor({ project: opts.project, workstream: opts.workstream, kind: 'interactive', cwd, inference: inferenceOf(onBackend) }));
           try {
             const mcp = brokerMcp.turnMcp(home, mode, brokerMcp.brokerMcpOf(opts.brokerMcp), { headersHelper: mcpHeadersHelper, agentConfig }, { loadsCheckoutConfig: loadsCheckoutConfig(permissionModeFor(mode)) });
             const launch = resumeLaunch({ home, chatKey, sessionId, mode, bin: bin(), cwd: cwd || undefined, backend: onBackend, settings, appendPrompt: memoryFor.frozenPromptFor(chatKey, sessionId), mcp });
@@ -4263,6 +4764,7 @@ function createChatRunner({
 
 module.exports = {
   CAPABILITIES,
+  autoCompactWindowOf,
   READ_ONLY_TOOLS,
   capHistory,
   CHECKOUT_PENDING,
@@ -4304,11 +4806,23 @@ module.exports = {
   engineOf,
   piLauncherReady,
   piModelArg,
+  cursorModelArg,
+  cursorTurnArgs,
+  cursorConfigDir,
+  cursorConfinedHome,
+  devinTurnArgs,
+  devinChatDirs,
+  devinNotice,
+  resolveDevin,
+  DEVIN_DRIVER,
+  resolveCursor,
+  CURSOR_READ_ONLY_TOOLS,
   piThinkingArg,
   piTurnArgs,
   resolvePi,
   PI_READ_ONLY_TOOLS,
   chatTelemetryEnv,
+  inferenceOf,
   askTelemetryOf,
   withTelemetry,
   withDefaultModel,
@@ -4317,12 +4831,14 @@ module.exports = {
   parseTurnRecords,
   turnCost,
   turnEnv,
+  filesOf,
+  PROJECT_FILES_CAPABILITY,
   toolchainDirs,
   EMPTY_MCP_CONFIG,
   askEnv,
   askOfJob,
   turnRecord,
-  turnSessionName, AUTO_MODE, isOpenMode, loadsCheckoutConfig, turnModeFor,
+  turnSessionName, AUTO_MODE, askPublishRules, isOpenMode, loadsCheckoutConfig, turnModeFor,
   userPromptUuid,
   PANE_START_GRACE_MS, nextPaneClaim,
 };

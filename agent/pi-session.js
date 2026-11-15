@@ -69,7 +69,7 @@ function entryOf(line) {
  * tool_result. pi's system prompt and its model and thinking changes are
  * not conversation.
  */
-function piHistoryEntries(jsonl, max = 600) {
+function piHistoryEntries(jsonl, max = 600, { report = null } = {}) {
   const out = [];
   for (const line of String(jsonl || '').split('\n')) {
     const e = entryOf(line);
@@ -97,6 +97,9 @@ function piHistoryEntries(jsonl, max = 600) {
       });
     }
   }
+  // report.cut: the cap left older entries out (as Claude's historyEntries says it), so history shows no earlier
+  // session's entries above a cut one.
+  if (report && out.length > max) report.cut = true;
   return out.slice(-max);
 }
 

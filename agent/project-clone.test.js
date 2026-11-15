@@ -23,6 +23,7 @@ const {
   createCloneForwarder,
   handleProjectClone,
   runClone,
+  isTransientCloneError,
   writeGuides,
   readState,
   unitTemplateLoaded,
@@ -829,4 +830,60 @@ test("a multi-repo project's repository, under a root linked to ~/code, is the p
   assert.equal(await runClone(key, { home, execFile: execFileAsync, waitSeconds: 300 }), 0);
   assert.equal(fs.readFileSync(path.join(code, 'widget', 'NEW'), 'utf8'), 'x\n');
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+// A git error as execFile rejects with it.
+function gitError(stderr) {
+  return Object.assign(new Error(`Command failed: git clone\n${stderr}`), { stderr, stdout: '' });
+}
+
+test('a 5xx or a dropped connection is transient; a refusal or a missing repository is not', () => {
+  assert.equal(isTransientCloneError(gitError("fatal: unable to access 'https://github-broker.termag.example.com/example-org/termag.git/': The requested URL returned error: 503")), true);
+  assert.equal(isTransientCloneError(gitError('error: RPC failed; curl 56 GnuTLS recv error\nfatal: early EOF')), true);
+  assert.equal(isTransientCloneError(gitError('fatal: unable to access: Could not resolve host: github-broker.termag.example.com')), true);
+  assert.equal(isTransientCloneError(gitError("fatal: unable to access '…': The requested URL returned error: 403")), false);
+  assert.equal(isTransientCloneError(gitError("fatal: repository 'https://x/y.git/' not found")), false);
+  assert.equal(isTransientCloneError(gitError('fatal: Remote branch nope not found in upstream origin')), false);
+});
+
+test('a clone the broker refuses with a 503 is tried again and lands (bug cmw9zsu5)', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-503-'));
+  const src = path.join(home, 'src');
+  const dest = path.join(home, 'projects', 'widget');
+  seedRepo(src);
+  cloneState(home, dest, { url: src });
+  let clones = 0;
+  const flaky = (cmd, args, opts) => {
+    if (cmd === 'git' && args[0] === 'clone' && ++clones === 1) {
+      return Promise.reject(gitError("fatal: unable to access 'https://github-broker.termag.example.com/x.git/': The requested URL returned error: 503"));
+    }
+    return execFileAsync(cmd, args, opts);
+  };
+  const slept = [];
+  assert.equal(await runClone('p1', { home, execFile: flaky, sleep: async (ms) => { slept.push(ms); } }), 0);
+  assert.equal(clones, 2);
+  assert.deepEqual(slept, [5000]);
+  assert.equal(readState(home, 'p1').status, 'ready');
+  assert.ok(fs.existsSync(path.join(dest, '.git')));
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('a clone that keeps failing on a 503 fails after its third try; a 403 fails at once', async () => {
+  for (const [stderr, tries] of [['The requested URL returned error: 503', 3], ['The requested URL returned error: 403', 1]]) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'clone-5xx-'));
+    const dest = path.join(home, 'projects', 'widget');
+    cloneState(home, dest, { url: 'https://example.invalid/x.git' });
+    let clones = 0;
+    const failing = (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'clone') { clones++; return Promise.reject(gitError(`fatal: unable to access '…': ${stderr}`)); }
+      return execFileAsync(cmd, args, opts);
+    };
+    assert.equal(await runClone('p1', { home, execFile: failing, sleep: async () => {} }), 1);
+    assert.equal(clones, tries, stderr);
+    const state = readState(home, 'p1');
+    assert.equal(state.status, 'failed');
+    assert.match(state.error, new RegExp(stderr.slice(-3)));
+    assert.equal(fs.existsSync(dest), false);
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

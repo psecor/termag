@@ -404,6 +404,9 @@ function frameFromEnvState(state) {
       ...(typeof state.file === 'string' ? { file: state.file } : {}),
       // Why it's held, and what started the chain: the card and the setup event say them (#998).
       ...(typeof state.held === 'string' && state.held ? { held: state.held.slice(0, 40) } : {}),
+      // An environment pool prepare's own on-warm outcome (environment-prepare.js), for its environment.setup event.
+      ...(state.poolOnWarm && typeof state.poolOnWarm.state === 'string'
+        ? { onWarm: { state: state.poolOnWarm.state.slice(0, 20), seconds: Number.isFinite(state.poolOnWarm.seconds) ? state.poolOnWarm.seconds : 0 } } : {}),
       ...(state.trigger === 'claim' || state.trigger === 'trust' || state.trigger === 'cli' || state.trigger === 'pool' ? { trigger: state.trigger } : {}),
       // The commit of each repository setup last succeeded at: an environment pool records it as what it prepared.
       ...(state.setupCommit && typeof state.setupCommit === 'object' ? { setupCommit: Object.fromEntries(Object.entries(state.setupCommit).filter(([k, v]) => typeof k === 'string' && typeof v === 'string' && /^[0-9a-f]{40,64}$/.test(v)).slice(0, 10)) } : {}),

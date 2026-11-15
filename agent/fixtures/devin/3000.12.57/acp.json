@@ -1,0 +1,457 @@
+{
+  "devinVersion": "3000.12.57",
+  "recorded": "macOS arm64, signed out, 2026-11-14",
+  "initialize": {
+    "protocolVersion": 1,
+    "agentCapabilities": {
+      "loadSession": true,
+      "promptCapabilities": {
+        "image": true,
+        "audio": false,
+        "embeddedContext": true
+      },
+      "mcpCapabilities": {
+        "http": true,
+        "sse": true
+      },
+      "sessionCapabilities": {
+        "list": {},
+        "delete": {},
+        "additionalDirectories": {},
+        "close": {
+          "_meta": {
+            "cognition.ai/force": true
+          }
+        }
+      },
+      "auth": {},
+      "_meta": {
+        "cognition.ai/sessionDefaultConfigOptions": true,
+        "cognition.ai/multiRootWorkspace": true,
+        "cognition.ai/sessionListContentSearch": true,
+        "cognition.ai/sessionListOrderBy": [
+          "updated_at",
+          "created_at"
+        ],
+        "cognition.ai/sessionListSortDirection": true,
+        "cognition.ai/sessionRename": true,
+        "cognition.ai/persistOnCreate": true,
+        "cognition.ai/sessionShare": true,
+        "cognition.ai/documentLifecycle": true,
+        "cognition.ai/userEdits": true,
+        "cognition.ai/terminalLifecycle": true,
+        "cognition.ai/userConfig": true,
+        "cognition.ai/userShellCommand": true,
+        "cognition.ai/editableCommands": true,
+        "cognition.ai/commandRevision": true,
+        "cognition.ai/chains": true,
+        "cognition.ai/megaplan": true,
+        "cognition.ai/ruleMentions": true,
+        "cognition.ai/mentionTypes": [
+          {
+            "type": "file"
+          },
+          {
+            "type": "directory"
+          },
+          {
+            "type": "git"
+          },
+          {
+            "type": "rule",
+            "icon": "book",
+            "label": "Rules"
+          },
+          {
+            "type": "skill",
+            "icon": "zap",
+            "label": "Skills"
+          },
+          {
+            "type": "plan",
+            "icon": "file-text",
+            "label": "Plans"
+          },
+          {
+            "type": "conversation"
+          },
+          {
+            "type": "terminal"
+          },
+          {
+            "type": "codemap",
+            "icon": "map",
+            "label": "Codemaps"
+          }
+        ],
+        "cognition.ai/midTurnPrompts": true
+      }
+    },
+    "authMethods": [
+      {
+        "id": "devin-browser",
+        "name": "Log in with browser",
+        "description": "Sign in via your browser"
+      }
+    ],
+    "agentInfo": {
+      "name": "affogato",
+      "title": "Devin Agent",
+      "version": "0.0.0-dev"
+    },
+    "_meta": {
+      "mcpConfigPath": "/tmp/devin-fx/home/.config/devin/mcp_config.json"
+    }
+  },
+  "sessionNew": {
+    "sessionId": "somber-minnow",
+    "modes": {
+      "currentModeId": "accept-edits",
+      "availableModes": [
+        {
+          "id": "accept-edits",
+          "name": "Code"
+        },
+        {
+          "id": "smart",
+          "name": "Smart"
+        },
+        {
+          "id": "ask",
+          "name": "Ask"
+        },
+        {
+          "id": "plan",
+          "name": "Plan"
+        },
+        {
+          "id": "bypass",
+          "name": "Bypass Permissions"
+        }
+      ]
+    },
+    "configOptions": [
+      {
+        "id": "mode",
+        "name": "Session Mode",
+        "category": "mode",
+        "type": "select",
+        "currentValue": "accept-edits",
+        "options": [
+          {
+            "value": "accept-edits",
+            "name": "Code",
+            "description": "Write and edit code",
+            "_meta": {
+              "cognition.ai/icon": "code"
+            }
+          },
+          {
+            "value": "smart",
+            "name": "Smart",
+            "description": "Auto-approve actions the model judges safe",
+            "_meta": {
+              "cognition.ai/icon": "sparkles"
+            }
+          },
+          {
+            "value": "ask",
+            "name": "Ask",
+            "description": "Answer questions without code changes",
+            "_meta": {
+              "cognition.ai/icon": "message-circle"
+            }
+          },
+          {
+            "value": "plan",
+            "name": "Plan",
+            "description": "Plan changes before implementing",
+            "_meta": {
+              "cognition.ai/icon": "file-text"
+            }
+          },
+          {
+            "value": "bypass",
+            "name": "Bypass Permissions",
+            "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+            "_meta": {
+              "cognition.ai/icon": "shield-off"
+            }
+          }
+        ]
+      },
+      {
+        "id": "model",
+        "name": "Model",
+        "description": "AI model to use",
+        "category": "model",
+        "type": "select",
+        "currentValue": "swe-1-6-fast",
+        "options": []
+      }
+    ],
+    "_meta": {
+      "cognition.ai/planFilePath": "/tmp/devin-fx/home/.devin/plans/plan-063e7a31afc3be7e.md",
+      "cognition.ai/isLocked": false,
+      "cognition.ai/lockHolderPid": null
+    }
+  },
+  "sessionNewUpdates": [
+    "available_commands_update"
+  ],
+  "setModeAsk": {
+    "result": {},
+    "updates": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "somber-minnow",
+          "update": {
+            "sessionUpdate": "config_option_update",
+            "configOptions": [
+              {
+                "id": "mode",
+                "name": "Session Mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "ask",
+                "options": [
+                  {
+                    "value": "accept-edits",
+                    "name": "Code",
+                    "description": "Write and edit code",
+                    "_meta": {
+                      "cognition.ai/icon": "code"
+                    }
+                  },
+                  {
+                    "value": "smart",
+                    "name": "Smart",
+                    "description": "Auto-approve actions the model judges safe",
+                    "_meta": {
+                      "cognition.ai/icon": "sparkles"
+                    }
+                  },
+                  {
+                    "value": "ask",
+                    "name": "Ask",
+                    "description": "Answer questions without code changes",
+                    "_meta": {
+                      "cognition.ai/icon": "message-circle"
+                    }
+                  },
+                  {
+                    "value": "plan",
+                    "name": "Plan",
+                    "description": "Plan changes before implementing",
+                    "_meta": {
+                      "cognition.ai/icon": "file-text"
+                    }
+                  },
+                  {
+                    "value": "bypass",
+                    "name": "Bypass Permissions",
+                    "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+                    "_meta": {
+                      "cognition.ai/icon": "shield-off"
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "model",
+                "name": "Model",
+                "description": "AI model to use",
+                "category": "model",
+                "type": "select",
+                "currentValue": "swe-1-6-fast",
+                "options": []
+              }
+            ]
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "somber-minnow",
+          "update": {
+            "sessionUpdate": "current_mode_update",
+            "currentModeId": "ask"
+          }
+        }
+      }
+    ]
+  },
+  "promptSignedOut": {
+    "error": {
+      "code": -32000,
+      "message": "Please log in to use Devin. Use `/login` to authenticate again."
+    },
+    "updates": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "somber-minnow",
+          "update": {
+            "sessionUpdate": "session_info_update",
+            "title": "hello"
+          }
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "_cognition.ai/turn_stats",
+        "params": {
+          "sessionId": "somber-minnow",
+          "turnClientMessageId": "f015c674-b37f-4990-b722-060cdd8bd9d2"
+        }
+      },
+      {
+        "jsonrpc": "2.0",
+        "method": "_cognition.ai/agent_stopped",
+        "params": {
+          "cause": "auth_required",
+          "errorMessage": "Please authenticate to continue. Run `/login` to log in.",
+          "stats": {
+            "toolCalls": 0,
+            "filesChanged": 0,
+            "commandsRun": 0
+          },
+          "sessionId": "somber-minnow"
+        }
+      }
+    ]
+  },
+  "slashBypass": {
+    "result": {
+      "stopReason": "end_turn"
+    },
+    "updates": [
+      {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "somber-minnow",
+          "update": {
+            "sessionUpdate": "current_mode_update",
+            "currentModeId": "bypass"
+          }
+        }
+      }
+    ]
+  },
+  "sessionLoad": {
+    "result": {
+      "modes": {
+        "currentModeId": "bypass",
+        "availableModes": [
+          {
+            "id": "accept-edits",
+            "name": "Code"
+          },
+          {
+            "id": "smart",
+            "name": "Smart"
+          },
+          {
+            "id": "ask",
+            "name": "Ask"
+          },
+          {
+            "id": "plan",
+            "name": "Plan"
+          },
+          {
+            "id": "bypass",
+            "name": "Bypass Permissions"
+          }
+        ]
+      },
+      "configOptions": [
+        {
+          "id": "mode",
+          "name": "Session Mode",
+          "category": "mode",
+          "type": "select",
+          "currentValue": "bypass",
+          "options": [
+            {
+              "value": "accept-edits",
+              "name": "Code",
+              "description": "Write and edit code",
+              "_meta": {
+                "cognition.ai/icon": "code"
+              }
+            },
+            {
+              "value": "smart",
+              "name": "Smart",
+              "description": "Auto-approve actions the model judges safe",
+              "_meta": {
+                "cognition.ai/icon": "sparkles"
+              }
+            },
+            {
+              "value": "ask",
+              "name": "Ask",
+              "description": "Answer questions without code changes",
+              "_meta": {
+                "cognition.ai/icon": "message-circle"
+              }
+            },
+            {
+              "value": "plan",
+              "name": "Plan",
+              "description": "Plan changes before implementing",
+              "_meta": {
+                "cognition.ai/icon": "file-text"
+              }
+            },
+            {
+              "value": "bypass",
+              "name": "Bypass Permissions",
+              "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+              "_meta": {
+                "cognition.ai/icon": "shield-off"
+              }
+            }
+          ]
+        },
+        {
+          "id": "model",
+          "name": "Model",
+          "description": "AI model to use",
+          "category": "model",
+          "type": "select",
+          "currentValue": "swe-1-6-fast",
+          "options": []
+        }
+      ],
+      "_meta": {
+        "cognition.ai/createdAt": "2026-11-14T14:50:39.000Z",
+        "cognition.ai/planFilePath": "/tmp/devin-fx/home/.devin/plans/plan-063e7a31afc3be7e.md",
+        "cognition.ai/isLocked": false,
+        "cognition.ai/lockHolderPid": null
+      }
+    },
+    "replayed": [
+      "session_info_update",
+      "session_info_update",
+      "available_commands_update"
+    ]
+  },
+  "loadNotFound": {
+    "error": {
+      "code": -32016,
+      "message": "Session not found",
+      "data": {
+        "cognition.ai/errorKind": "session_not_found",
+        "cognition.ai/retryable": false
+      }
+    }
+  }
+}

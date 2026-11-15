@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   baseUrlFromAgentUrl, resolveBaseUrl, resolveToken, configCandidates, loadAgentConfig,
-  sendKeysSetting, sendKeysOffMessage, findProjectSetting, isSelfTarget, toolsFor, createServer, spawnSetting, fmtBudget, fmtSpawns, handoffSetting,
+  sendKeysSetting, sendKeysOffMessage, findProjectSetting, isSelfTarget, toolsFor, createServer, spawnSetting, fmtBudget, fmtSpawns, handoffSetting, noPaneMessage,
 } from './mcp-server.mjs';
 
 const SERVER = fileURLToPath(new URL('./mcp-server.mjs', import.meta.url));
@@ -591,4 +591,13 @@ test('fmtSpawns links the session\'s own view when it started trees', () => {
   // Renamed since: the stored session name is stale, but the slot matches.
   assert.match(fmtSpawns({ session: 'renamed', caller: { projectId: 'p1', workstream: 'main' }, spawnedBy: null, children: [kid] }, 'https://host/termag'), /spawns\/session\/p1\/main/);
   assert.doesNotMatch(fmtSpawns({ session: 's', caller: { projectId: 'p1', workstream: 'main' }, spawnedBy: null, children: [adopted] }, 'https://host/termag'), /every tree this session started/);
+});
+
+test('a pane-bound tool in a chat or ask turn says why it has no pane and what to use instead', async () => {
+  const chat = createServer({ env: { TERMAG_SESSION_KIND: 'chat' }, ownSession: () => null, spawn: { enabled: true }, fetch: async () => { throw new Error('no call'); } });
+  await assert.rejects(chat.callTool('spawn_budget', {}), /spawn_budget needs to run inside a termag tmux pane.*this is a chat turn, which runs outside tmux.*termag ask/);
+  const ask = createServer({ env: { TERMAG_SESSION_KIND: 'ask', TERMAG_ASK_THREAD: 't1' }, ownSession: () => null, spawn: { enabled: true }, fetch: async () => { throw new Error('no call'); } });
+  await assert.rejects(ask.callTool('spawn_agent', { task: 'x' }), /this is an ask turn/);
+  assert.equal(noPaneMessage('handoff', { TERMAG_SESSION_KIND: 'interactive' }), 'handoff needs to run inside a termag tmux pane (no $TMUX_PANE session found)');
+  assert.match(noPaneMessage('report_back', { TERMAG_SESSION_KIND: 'cloud' }), /this is a cloud session/);
 });

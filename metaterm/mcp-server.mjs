@@ -199,6 +199,25 @@ function ownTmuxSession(env = process.env) {
   } catch { return null; }
 }
 
+/**
+ * Why a pane-bound tool (spawn_agent, spawn_budget, handoff, …) has no session
+ * to act for. A chat or ask turn (agent/chat-runner.js, chat-turn.js) and the
+ * briefing unset TMUX/TMUX_PANE on purpose, so the box's status hooks post
+ * nothing for them; there the tool can never work, and a bare "no $TMUX_PANE"
+ * reads like a broken pane. Name the kind of session and the way out instead.
+ */
+export function noPaneMessage(tool, env = process.env) {
+  const base = `${tool} needs to run inside a termag tmux pane (no $TMUX_PANE session found)`;
+  const k = env.TERMAG_SESSION_KIND;
+  // interactive is a pane's kind: without TMUX_PANE there it is some other launch, so say nothing more.
+  const kind = env.TERMAG_ASK_THREAD || k === 'ask' ? 'an ask turn'
+    : k === 'chat' ? 'a chat turn'
+    : k && k !== 'interactive' ? `a ${k} session` : null;
+  if (!kind) return base;
+  return `${base}: this is ${kind}, which runs outside tmux, so it has no pane of its own to act for. `
+    + 'Run it from the project\'s agent pane, or start parallel work with `termag ask <project> "<task>"` instead.';
+}
+
 const q = (s) => encodeURIComponent(String(s));
 const wsQuery = (ws) => (ws && ws !== 'main' ? `&workstream=${q(ws)}` : '');
 const ROLE = { type: 'string', enum: ['agent', 'ctrl', 'data', 'data-ctrl'] };
@@ -606,7 +625,7 @@ export function createServer(deps = {}) {
   const head = deps.head ?? (() => ownHead(env));
   const needOwnSession = (tool) => {
     const own = ownSession();
-    if (!own) throw new Error(`${tool} needs to run inside a termag tmux pane (no $TMUX_PANE session found)`);
+    if (!own) throw new Error(noPaneMessage(tool, env));
     return own;
   };
 

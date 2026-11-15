@@ -47,6 +47,16 @@ const GUEST_SWEEP_MIN_AGE_MS = 10 * 60 * 1000;
 // profile outlives its browser, so a sign-in survives the 60 s park. The
 // backend asks with `persistProfile` on attach.
 const PROFILES_CAPABILITY = 'browser-pane-profiles-v1';
+// Announced by every agent with this code, Chromium or not: it answers
+// `browser-chromium`, a fresh look for a Chromium (and, when asked, a
+// `snap install`), so a box whose Chromium arrived after the agent started,
+// or never came with its image, needn't wait for an agent restart.
+const CHROMIUM_CAPABILITY = 'browser-pane-chromium-v1';
+// A snap install downloads about 200 MB; the store is slow some days.
+const CHROMIUM_INSTALL_TIMEOUT_MS = 10 * 60_000;
+// After a failed install, asks within this long answer with that failure
+// rather than run another one.
+const CHROMIUM_INSTALL_RETRY_MS = 10 * 60_000;
 // Chromium writes cookies to disk on a timer (about 30 s); a clean exit
 // flushes them, so a guest's kept profile's browser gets longer to quit.
 const PERSISTENT_KILL_GRACE_MS = 5000;
@@ -1484,7 +1494,8 @@ function createManager({ binary, home, log = console.log, parkMs = PARK_MS, pane
   const running = new Set();
   /** Kept profile name → the pane whose browser has it open. */
   const holders = new Map();
-  const ownerProfiles = binary ? path.join(profileRoot(binary, home), 'profiles') : null;
+  // `binary` and `guestEnv` change once at most, from none: useChromium().
+  let ownerProfiles = binary ? path.join(profileRoot(binary, home), 'profiles') : null;
   const makePane = paneFactory || ((opts) => new BrowserPane(opts));
   const resolveRecipe = guestDeps.resolveRecipe || guestMode.resolveRecipe;
   const memAvailable = guestDeps.memAvailableBytes || guestMode.memAvailableBytes;
@@ -1534,11 +1545,12 @@ function createManager({ binary, home, log = console.log, parkMs = PARK_MS, pane
       );
     }
   }
-  if (guestEnv.ok) {
+  function startGuestSweep() {
     sweepGuestProfiles();
     const timer = setInterval(() => { sweepGuestProfiles().catch(() => {}); }, GUEST_SWEEP_EVERY_MS);
     if (timer.unref) timer.unref();
   }
+  if (guestEnv.ok) startGuestSweep();
 
   /**
    * Everything that picks, opens or deletes one kept profile runs in turn:
@@ -2061,11 +2073,104 @@ function createManager({ binary, home, log = console.log, parkMs = PARK_MS, pane
       return suggestions({ cwd: typeof msg.cwd === 'string' ? msg.cwd : null });
     },
 
+    /** The Chromium panes run, or null when the box has none. */
+    chromium() { return binary || null; },
+    /** `guestEnvironment()`'s answer, as of the Chromium this manager runs. */
+    guestEnv() { return guestEnv; },
+
+    /**
+     * A Chromium found after start (createChromiumProbe): the manager runs
+     * it from now on. Only a manager that had none takes one, and that one
+     * has never opened a browser, so nothing running holds the old answer.
+     * Whether it took it.
+     */
+    useChromium(found, foundGuestEnv) {
+      if (binary || !found) return false;
+      binary = found;
+      ownerProfiles = path.join(profileRoot(binary, home), 'profiles');
+      if (foundGuestEnv) guestEnv = foundGuestEnv;
+      if (guestEnv.ok) startGuestSweep();
+      return true;
+    },
+
     sweepGuestProfiles,
   };
 }
 
+/** `sudo -n snap install chromium`: the box's passwordless sudo, as disk-grow.js uses. `{ ok }` or `{ ok: false, error }`. */
+function installChromium(execFileImpl = require('node:child_process').execFile) {
+  return new Promise((resolve) => {
+    execFileImpl('sudo', ['-n', 'snap', 'install', 'chromium'], { timeout: CHROMIUM_INSTALL_TIMEOUT_MS }, (err, _stdout, stderr) => {
+      if (!err) { resolve({ ok: true }); return; }
+      const said = String(stderr || '').trim().split('\n').filter(Boolean).pop();
+      resolve({ ok: false, error: (said || err.message || 'snap install failed').slice(0, 300) });
+    });
+  });
+}
+
+/**
+ * What answers `browser-chromium`. The agent looks for a Chromium
+ * once at start; this looks again whenever it is asked, and when asked to
+ * install, runs one `snap install chromium` at a time in the background.
+ * A Chromium found either way goes to the manager (useChromium), with the
+ * guest check asked again for it, and `onFound` tells the agent, whose next
+ * hello carries the capabilities. The answer is `{ chromium, installing,
+ * error }`: the binary or null, whether an install is running now, and the
+ * last install's failure (kept CHROMIUM_INSTALL_RETRY_MS, during which an
+ * ask to install gets it back rather than starting another).
+ */
+function createChromiumProbe({
+  manager,
+  find = findChromium,
+  guestEnvironment = () => guestMode.guestEnvironment(),
+  install = installChromium,
+  onFound = () => {},
+  log = console.log,
+  now = Date.now,
+  retryMs = CHROMIUM_INSTALL_RETRY_MS,
+}) {
+  let installing = null;
+  let failure = null;
+  function look() {
+    if (manager.chromium()) return manager.chromium();
+    const found = find();
+    if (!found) return null;
+    const env = guestEnvironment();
+    if (manager.useChromium(found, env)) {
+      log(`[AGENT] browser pane: found ${found} after start; guests ${env.ok ? 'available' : `unavailable: ${env.reason}`}`);
+      onFound(found, env);
+    }
+    return manager.chromium();
+  }
+  return {
+    look,
+    check({ install: wanted = false } = {}) {
+      const chromium = look();
+      if (!chromium && wanted && !installing && !(failure && now() - failure.at < retryMs)) {
+        log('[BROWSER-PANE] no Chromium on this box: installing it (sudo -n snap install chromium)');
+        installing = Promise.resolve()
+          .then(() => install())
+          .catch((err) => ({ ok: false, error: err && err.message ? err.message : String(err) }))
+          .then((result) => {
+            installing = null;
+            const found = look();
+            if (found) { failure = null; log(`[BROWSER-PANE] Chromium installed: ${found}`); return; }
+            failure = { at: now(), error: result.ok ? 'snap install finished, but no Chromium was found' : result.error };
+            log(`[BROWSER-PANE] Chromium install failed: ${failure.error}`);
+          });
+      }
+      return { chromium, installing: !!installing, error: chromium ? null : (failure ? failure.error : null) };
+    },
+    /** The running install, for tests and shutdown; null when none is. */
+    pending() { return installing; },
+  };
+}
+
 module.exports = {
+  CHROMIUM_CAPABILITY,
+  CHROMIUM_INSTALL_RETRY_MS,
+  createChromiumProbe,
+  installChromium,
   isProfileName,
   withTimeout,
   CAPABILITIES,

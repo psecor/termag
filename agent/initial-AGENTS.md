@@ -84,7 +84,7 @@ branch that touch the same files, flags or names, so you can tell the user befor
 ## Sharing files
 
 On a termag box, read the `termag-spaces` skill (`~/.claude/skills/termag-spaces/SKILL.md`) before sharing
-a file with a person, saving a plan that should outlive the session, or handing files to another agent or box.
+a file with a person, saving a plan that should outlive the session, handing files to another agent or box, or saving what you make (Project files, or My files).
 
 ## Gotchas
 

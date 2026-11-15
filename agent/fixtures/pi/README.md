@@ -74,3 +74,20 @@ Scrubbing is the same as above.
 | `readonly-bash-refused.jsonl` | `--tools read,grep,find,ls --no-skills --no-approve`, `RUN:touch …` | 0 | the model is offered only those 4; its `bash` call gets an error result, nothing written |
 | `interrupted-sigterm-tool.jsonl` | SIGTERM to pi during `RUN:sleep 61` | **143** | ends after `tool_execution_update`; no `agent_end`/`agent_settled` |
 | `session-file-v3-tool-use.jsonl` | the **session file** of the tool-use run and its 2 resumes | – | still v3: `session`, `model_change`, `thinking_level_change`, `message` |
+
+## `1.5.2/`: pi 1.5.2, the pin from 2026-11-13
+
+Recorded 2026-11-13 on a box with pi 1.5.2 installed by `deploy/termag-pi-update --install-pinned 1.5.2`
+(its package matched the pin's sha512), the same way as the `1.5.0/` set and with the same prompts:
+`PI_CODING_AGENT_DIR=<scratch>/agent`, `TERMAG_PI_EXT=/nonexistent/…`, `deploy/termag-pi-headless -p --mode
+json [args] < /dev/null`, a stand-in OpenAI-compatible server behind a model broker's provider block (`df-test`,
+`openai-completions`, `authHeader: true`), and the same stand-in answers. One difference from the 1.5.0 notes:
+the stand-in `pi-headless` is `exec pi --provider <broker> --model df-test "$@"`, since pi refuses
+`--provider` without `--model` (1.5.0 already did, and the real launcher always passes `--model <alias>`).
+`agent/pi-events.test.js` replays this set and the `1.5.0/` one with the same contracts.
+
+The fixtures are the same eight as `1.5.0/`, and so are their outcomes: the same event sequence, exit 0 for each
+finished run, 143 for SIGTERM mid-tool (the tool's child killed, no `agent_end`/`agent_settled`), the read-only
+run's `bash` call answered `Tool bash not found` with nothing written, and a v3 session file. Nothing in the
+stream changed, so the normaliser didn't either. Scrubbing is the same as above: each system message's
+`sections` are elided, which held the only home paths.

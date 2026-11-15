@@ -161,7 +161,11 @@ const FALLBACK_PATH = '/usr/local/bin:/usr/bin:/bin';
  * it gets none on every box.
  */
 function allowedEnv(base, vars, dir, key) {
-  return { PATH: (base && base.PATH) || FALLBACK_PATH, HOME: (base && base.HOME) || os.homedir(), ...(vars || {}), TERMAG_ENV_DIR: dir, TERMAG_ENV_KEY: key };
+  // GIT_CONFIG_SYSTEM only when the agent itself has one: where this box keeps its system git config (an e2e
+  // stand-in box's, beside the host's), so a step's git uses the box's broker config, as it does on a box image,
+  // where it is unset and /etc/gitconfig is the box's own. It names a file; it carries no credential.
+  const gitSystem = base && typeof base.GIT_CONFIG_SYSTEM === 'string' && base.GIT_CONFIG_SYSTEM ? { GIT_CONFIG_SYSTEM: base.GIT_CONFIG_SYSTEM } : {};
+  return { PATH: (base && base.PATH) || FALLBACK_PATH, HOME: (base && base.HOME) || os.homedir(), ...gitSystem, ...(vars || {}), TERMAG_ENV_DIR: dir, TERMAG_ENV_KEY: key };
 }
 
 /** A run window's environment (execWindow): the same allowlist, from the exec file's variables. */
@@ -706,6 +710,7 @@ async function startChain(dir, opts = {}, deps = {}) {
     projectId: opts.projectId || base.projectId || null, instanceId: opts.instanceId || base.instanceId || null,
     // An environment pool's prepare or refresh: the chain keeps it (state is built on the file), and its frames say it.
     ...(opts.prepareId ? { prepareId: opts.prepareId } : {}),
+    ...(opts.poolOnWarm ? { poolOnWarm: opts.poolOnWarm } : {}),
     ...whereFrom(opts, base), updatedAt: nowIso(),
   });
   const made = live.ok
@@ -997,7 +1002,7 @@ async function adoptPoolState(home, dir, projectId, deps = {}) {
   const key = envKey(dir);
   const pooled = readJson(statePath(home, key));
   if (!pooled || pooled.projectId !== POOL_PROJECT) return false;
-  const { pool: _p, log: _l, pendingId: _id, prepareId: _pr, ...kept } = pooled;
+  const { pool: _p, log: _l, pendingId: _id, prepareId: _pr, poolOnWarm: _w, ...kept } = pooled;
   writeJson(statePath(home, key), { ...kept, key, dir, session: sessionName(key), projectId, preparedByPool: true, updatedAt: nowIso() });
   await (deps.tmux || ((args) => execTmux(args)))(['kill-session', '-t', `=${sessionName(key)}`]);
   return true;
@@ -1099,7 +1104,7 @@ function createEnvForwarder({ readNames, readFile, send, isOpen }) {
 }
 
 module.exports = {
-  CAPABILITIES, handleEnvironmentUp, createEnvForwarder, environmentNotice, reconcileInterrupted, environmentUpLogLine, windowEnv,
+  CAPABILITIES, handleEnvironmentUp, createEnvForwarder, environmentNotice, reconcileInterrupted, environmentUpLogLine, windowEnv, allowedEnv,
   stopEnvironment, HEALTH_TIMEOUT_S, adoptPoolState, checkoutHeads, movedSince, stateDir, statePath, sessionName, locate, loadPlan, whereFrom, chain, startChain, probePort, describeState, parseArgs, runCommand,
 };
 

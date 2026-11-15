@@ -303,13 +303,24 @@ const SHELL_IMAGES = /(^|\/)(jupyter|jupyterhub|code-server|ttyd|openvscode-serv
 
 /** Which shell or debugger a Docker publish of `port` runs, from its containers' command and image; null for none. */
 async function dockerShell(port, d) {
-  const list = await dockerPublishers(port, (p) => d.dockerGet(p, d.dockerSocket));
-  for (const c of list || []) {
-    const what = shellCommand(c.command.split(/\s+/).filter(Boolean));
-    if (what) return what;
-    if (SHELL_IMAGES.test(c.image)) return `a ${c.image} container`;
+  const answer = await dockerShellAnswer(port, d);
+  return answer.ok ? answer.what : null;
+}
+
+/**
+ * dockerShell, telling "Docker answered: no shell publishes it" ({ ok: true, what: null }) from "Docker couldn't
+ * be asked" ({ ok: false }), which a caller that must fail closed can't take for the first (Bugbot, #1521).
+ */
+async function dockerShellAnswer(port, d) {
+  let list;
+  try { list = await dockerPublishers(port, (p) => d.dockerGet(p, d.dockerSocket)); } catch { return { ok: false }; }
+  if (!Array.isArray(list)) return { ok: false };
+  for (const c of list) {
+    const what = shellCommand(String(c.command || '').split(/\s+/).filter(Boolean));
+    if (what) return { ok: true, what };
+    if (SHELL_IMAGES.test(c.image)) return { ok: true, what: `a ${c.image} container` };
   }
-  return null;
+  return { ok: true, what: null };
 }
 
 async function previewVerdict(port, d) {
@@ -392,4 +403,18 @@ function checkPreviewListener(port, deps = {}) {
   return checkPreviewPort(port, { previewCache: defaultListenerCache, ...deps, probe: null });
 }
 
-module.exports = { PORT_CHECK_TTL_MS, SHELL_COMMANDS, canCheckPorts, checkPort, checkPreviewListener, checkPreviewPort, clearPortCache, probeDevtools, shellCommand };
+/**
+ * Which shell or debugger a Docker publish of `port` runs, on any address it
+ * is published on (null for none): for `termag preview run --allow`, whose
+ * port rule opens the port everywhere (agent/preview-runs.js).
+ */
+function dockerShellOn(port, deps = {}) {
+  return dockerShell(port, { dockerSocket: DOCKER_SOCKET, dockerGet, ...deps }).catch(() => null);
+}
+
+/** dockerShellAnswer against this box's Docker. */
+function dockerShellAnswerOn(port, deps = {}) {
+  return dockerShellAnswer(port, { dockerSocket: DOCKER_SOCKET, dockerGet, ...deps }).catch(() => ({ ok: false }));
+}
+
+module.exports = { PORT_CHECK_TTL_MS, SHELL_COMMANDS, canCheckPorts, checkPort, checkPreviewListener, checkPreviewPort, clearPortCache, dockerShellOn, dockerShellAnswerOn, probeDevtools, shellCommand };

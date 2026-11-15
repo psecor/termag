@@ -14,7 +14,25 @@ const RESOURCE_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const SPAWN_ID = /^[a-z0-9]{8,40}$/;
 const SPAWN_KEYS = ['TERMAG_SPAWN_ID', 'TERMAG_SPAWN_ROOT', 'TERMAG_SPAWN_DEPTH',
   'TERMAG_SPAWN_PARENT_PROJECT', 'TERMAG_SPAWN_PARENT_WORKSTREAM', 'TERMAG_SPAWN_PARENT_BOX'];
-const KEYS = ['TERMAG_PROJECT', 'TERMAG_WORKSTREAM', ...SPAWN_KEYS];
+// The pane's Project files and My files (project-files-v1).
+const FILES_KEYS = ['TERMAG_SPACE', 'TERMAG_MY_FILES'];
+const KEYS = ['TERMAG_PROJECT', 'TERMAG_WORKSTREAM', ...SPAWN_KEYS, ...FILES_KEYS];
+const SPACE_NAME = /^[a-z0-9-]{2,40}$/;
+
+/**
+ * The payload's `files` (project-files-v1): `{ project, mine }`, space names
+ * the orchestrator granted this box, as TERMAG_SPACE and TERMAG_MY_FILES for
+ * the app server and the commands it runs, so `termag space put` with no space
+ * saves to Project files, as a chat turn's do (chat-runner.js filesOf). A name
+ * that isn't a space name is left out on its own.
+ */
+function filesEnv(files) {
+  if (!files || typeof files !== 'object') return {};
+  const out = {};
+  if (typeof files.project === 'string' && SPACE_NAME.test(files.project)) out.TERMAG_SPACE = files.project;
+  if (typeof files.mine === 'string' && SPACE_NAME.test(files.mine)) out.TERMAG_MY_FILES = files.mine;
+  return out;
+}
 
 /**
  * A spawned workstream's TERMAG_SPAWN_* from the payload's `spawn` (the
@@ -42,10 +60,11 @@ function spawnEnv(spawn) {
  * The environment pair for a codex-session-start payload: `{TERMAG_PROJECT,
  * TERMAG_WORKSTREAM}` when the payload names both and both are ids, else `{}`
  * (an older orchestrator sends neither; a bad value drops the pair, never
- * the launch), plus a spawned workstream's TERMAG_SPAWN_* (spawnEnv).
+ * the launch), plus a spawned workstream's TERMAG_SPAWN_* (spawnEnv) and the
+ * pane's Project files and My files (filesEnv).
  */
 function codexResourceEnv(payload) {
-  const spawn = spawnEnv(payload && payload.spawn);
+  const spawn = { ...spawnEnv(payload && payload.spawn), ...filesEnv(payload && payload.files) };
   const project = payload && payload.project;
   const workstream = payload && payload.workstream;
   if (typeof project !== 'string' || typeof workstream !== 'string') return spawn;
@@ -71,4 +90,4 @@ function codexBridgeEnv(env, resourceEnv = {}) {
   return { ...withoutResourceEnv(env), ...resourceEnv, TERMAG_SESSION_KIND: 'interactive' };
 }
 
-module.exports = { codexResourceEnv, spawnEnv, withoutResourceEnv, codexBridgeEnv };
+module.exports = { codexResourceEnv, filesEnv, spawnEnv, withoutResourceEnv, codexBridgeEnv };

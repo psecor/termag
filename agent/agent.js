@@ -28,7 +28,8 @@ const unsavedWork = require('./unsaved-work');
 const diskGrow = require('./disk-grow');
 const softwareInventory = require('./software-inventory');
 const runnerSessions = require('./runner-sessions');
-const { renameProject } = require('./project-rename');
+const { renameProject, renameWorktree } = require('./project-rename');
+const conversationMove = require('./conversation-move');
 const { writeFileRpc } = require('./write-file');
 const { gitBranchState, gitCheckoutFacts } = require('./git-branch-state');
 const gitChanges = require('./git-changes');
@@ -64,6 +65,8 @@ const runnerWrapper = require('./claude-runner-wrapper');
 const claudeLogin = require('./claude-login');
 const t3Bridge = require('./t3-bridge');
 const portTunnel = require('./port-tunnel');
+const previewRunsMod = require('./preview-runs');
+const previewSocket = require('./preview-socket');
 const previewListenersRpc = require('./preview-listeners');
 
 const execAsync = promisify(exec);
@@ -174,8 +177,27 @@ async function initWikiFiles(dir, slug, username) {
 // Lives in usage-scanner.js (deduped, incrementally cached; schema 2 with
 // per-directory buckets so the backend can attribute tokens to projects).
 const { readdir, readFile, stat } = require('fs/promises');
-const { createScanner } = require('./usage-scanner');
+const { createScanner, makeUnremap } = require('./usage-scanner');
 const usageScanner = createScanner({ home: process.env.HOME || '/home', pathRemap: path_remap });
+
+// ── Conversations a rename carries (conversation-move.js, rename-conversations-v1) ──
+function conversationHome() {
+  return process.env.HOME || os.homedir();
+}
+
+/**
+ * A rename RPC's answer, plus the token-usage buckets (usage-scanner.js
+ * bucket.dir, in the backend's spelling) its moved Claude folders were
+ * scanned under, so the backend drops those rows rather than count their
+ * days again under the new name.
+ */
+function withUsageSources(result, fromDir, toDir) {
+  const c = result && result.conversations;
+  if (!c) return result;
+  console.log(`[RENAME] ${fromDir} -> ${toDir}: conversation folders moved claude=${c.claude.length} pi=${c.pi.length}, left ${c.left.length}`);
+  const { unremapEncodedDir } = makeUnremap(path_remap);
+  return { ...result, usageSources: c.claude.map(m => ({ from: unremapEncodedDir(m.from), to: unremapEncodedDir(m.to) })) };
+}
 
 // ── Background scan plumbing ──────────────────────────────────────────────
 // Every call a periodic scan makes is bounded, and the next run is armed only
@@ -377,8 +399,9 @@ function stopContextScanner() {
 // ── On-warm status poller ─────────────────────────────────────────────────
 // termag-on-warm.service has no way to talk to the backend itself, so it
 // publishes progress to a file (the contract is in deploy/termag-hook-run) and
-// this forwards every change. Only ever started by the backend's on-warm-start
-// RPC, because an owned box has no warm run to report.
+// this forwards every change. Started by the backend's on-warm-start RPC on a
+// warm box, and by an environment pool box's prepare (environment-prepare.js),
+// never on an owned box, which has no warm run to report.
 
 const ON_WARM_POLL_INTERVAL_MS = 2000;
 const ON_WARM_STATUS_FILE = path.join(process.env.HOME || '/home', '.termag', 'on-warm.status.json');
@@ -410,8 +433,13 @@ function pollOnWarmStatus(ws) {
   }
 }
 
+let onWarmPollWs = null;
+
 function startOnWarmPoller(ws) {
-  if (onWarmPollTimer) return;
+  if (onWarmPollTimer && onWarmPollWs === ws) return;
+  // Another socket's poller (one that outlived its socket): this one forwards from here.
+  stopOnWarmPoller();
+  onWarmPollWs = ws;
   // Cleared rather than kept across runs, because after a reconnect the file
   // is usually byte-identical to what the previous socket forwarded and the
   // new backend connection has not seen any of it.
@@ -423,8 +451,14 @@ function startOnWarmPoller(ws) {
   pollOnWarmStatus(ws);
 }
 
+/** Forwards the status file now, if it changed, over the poller's socket: a prepare's on-warm run just settled. */
+function flushOnWarmPoller() {
+  if (onWarmPollWs) pollOnWarmStatus(onWarmPollWs);
+}
+
 function stopOnWarmPoller() {
   if (onWarmPollTimer) { clearInterval(onWarmPollTimer); onWarmPollTimer = null; }
+  onWarmPollWs = null;
 }
 
 // ── On-claim status poller ────────────────────────────────────────────────
@@ -928,12 +962,31 @@ let t3 = t3Command ? makeT3Bridge(null) : null;
 const spaceSync = spaceSyncRpc.createSpaceSync({ home: os.homedir() || process.env.HOME || '/' });
 // The port forward (agent/port-tunnel.js): tunnels to the user's own box
 // ports, checked by agent/port-guard.js. Needs no t3. Advertised only where
-// the guard has /proc/net/tcp to read (Linux), and used only once the
-// orchestrator's box-port-forward-enabled flag is on. The same tunnels carry
+// the guard has /proc/net/tcp to read (Linux). The same tunnels carry
 // preview links' relays (`preview` targets, preview-link-v1), behind
 // preview-links-enabled, with the guard's SR6 refusals on top.
 const portForwardCapabilities = portTunnel.capabilities();
-const portTunnels = portTunnel.createPortTunnels({ termagUrl: termag_url, token, WebSocket, log: (m) => console.log(m) });
+// `termag preview run` (agent/preview-runs.js, agent/preview-socket.js): the
+// CLI asks this agent, over its local socket, to start an app confined to its
+// checkout by /usr/local/bin/termag-preview; a `people` or `link` link's
+// tunnel-open then admits only a listener descending from such a run.
+// Leftover runs of a previous agent are ended first (the registry is memory).
+const previewRuns = new previewRunsMod.PreviewRuns({ home: os.homedir() || process.env.HOME || '/', log: (m) => console.log(m) });
+if (process.platform === 'linux') {
+  try {
+    const swept = previewRuns.sweep();
+    if (swept) console.log(`[PREVIEW-RUN] ended ${swept} run(s) a previous agent left`);
+  } catch (e) { console.log(`[PREVIEW-RUN] sweep: ${e.message}`); }
+  // Optional: a box where it can't listen still runs everything else (Bugbot, #1520).
+  try {
+    previewSocket.serve({ runs: previewRuns, launcher: previewRunsMod.LAUNCHER, log: (m) => console.log(m) });
+  } catch (e) { console.log(`[PREVIEW-RUN] no local socket: ${e.message}`); }
+}
+const portTunnels = portTunnel.createPortTunnels({
+  termagUrl: termag_url, token, WebSocket, log: (m) => console.log(m),
+  listenerConfined: (port, checkout) => previewRuns.listenerConfined(port, remapPath(checkout)),
+  acceptedConfined: (dial, checkout, opts) => previewRuns.acceptedConfined(dial, remapPath(checkout), opts),
+});
 
 /** The host sample, with the open tunnels the orchestrator's idle sweep counts as busy. */
 function hostSampleNow() {
@@ -948,15 +1001,17 @@ function hostSampleNow() {
 // checkout pulled since the agent started still runs the old code, and that
 // is what this reports, which is the point. Null outside a git checkout.
 const CHECKOUT_DIR = path.resolve(__dirname, '..');
-// The browser pane runs the box's Chromium; found once
-// here, and the capability is advertised only when there is one.
-const browserBinary = browserPane.findChromium();
+// The browser pane runs the box's Chromium; looked for
+// here, and the capability is advertised only when there is one. The
+// `browser-chromium` RPC looks again later (chromiumProbe below), so these two
+// can change once, from none.
+let browserBinary = browserPane.findChromium();
 console.log(`[AGENT] browser pane: ${browserBinary ? browserBinary : 'no Chromium found, capability not advertised'}`);
 // A reviewer's pane runs its Chromium as termag-guest
 // through the box's launcher: asked once whether that works here (the box
 // image or termag-reconcile installs it), and the guest capability is
 // advertised only when it does.
-const guestBrowser = browserBinary ? browserGuest.guestEnvironment() : { ok: false, reason: 'no Chromium' };
+let guestBrowser = browserBinary ? browserGuest.guestEnvironment() : { ok: false, reason: 'no Chromium' };
 console.log(`[AGENT] browser pane guests: ${guestBrowser.ok ? `available (${guestBrowser.profilesRoot})` : `unavailable: ${guestBrowser.reason}`}`);
 // One manager for the process: a pane's browser is parked across a socket
 // drop or a closed pane and reclaimed by the next attach with its key.
@@ -964,6 +1019,22 @@ console.log(`[AGENT] browser pane guests: ${guestBrowser.ok ? `available (${gues
 // in the agent's own state dir; the backend asks for one per attach.
 const browserProfiles = new browserPane.ProfileIndex(path.join(os.homedir() || process.env.HOME || '/', '.local', 'state', 'termag', 'browser-profiles.json'));
 const browsers = browserPane.createManager({ binary: browserBinary, home: os.homedir() || process.env.HOME || '/', guestEnv: guestBrowser, index: browserProfiles });
+// A Chromium that arrives after start (installed by hand, or by this RPC when
+// the orchestrator asks): the manager takes it, and every hello from then on
+// announces the pane.
+const chromiumProbe = browserPane.createChromiumProbe({
+  manager: browsers,
+  guestEnvironment: () => browserGuest.guestEnvironment(),
+  onFound: (found, env) => { browserBinary = found; guestBrowser = env; },
+});
+/** The browser pane's capabilities as of now, in the hello and in the `browser-chromium` answer. */
+function browserPaneCapabilities() {
+  return [
+    ...(browserBinary ? browserPane.CAPABILITIES : []),
+    ...(guestBrowser.ok ? [browserPane.GUEST_CAPABILITY] : []),
+    ...(browserBinary ? [browserPane.PROFILES_CAPABILITY] : []),
+  ];
+}
 let agentCommit = null;
 // When that commit was made (ISO 8601), beside it in the hello: the admin
 // Fleet table sorts boxes by it.
@@ -1031,6 +1102,7 @@ function sendHello(ws) {
         ...unsavedWork.CAPABILITIES,
         ...gitChanges.CAPABILITIES,
         ...paneSubagents.CAPABILITIES,
+        ...conversationMove.CAPABILITIES,
         ...(process.platform === 'linux' ? diskGrow.CAPABILITIES : []),
         ...softwareInventory.CAPABILITIES,
         ...briefing.CAPABILITIES,
@@ -1043,11 +1115,11 @@ function sendHello(ws) {
         ...spaceMemory.CAPABILITIES,
         ...spaceSyncRpc.CAPABILITIES,
         ...claudeTrust.CAPABILITIES,
-        ...(browserBinary ? browserPane.CAPABILITIES : []),
-        ...(guestBrowser.ok ? [browserPane.GUEST_CAPABILITY] : []),
+        ...browserPaneCapabilities(),
+        // Answered whether or not there is a Chromium: it looks for one.
+        browserPane.CHROMIUM_CAPABILITY,
         // Reads Docker and the checkout only, so it needs no guest browser.
         ...browserGuest.CHECK_CAPABILITIES,
-        ...(browserBinary ? [browserPane.PROFILES_CAPABILITY] : []),
         ...wrapperCapabilities,
         ...(t3 ? t3Bridge.CAPABILITIES : []),
         ...(t3 && t3Updatable ? t3Bridge.UPDATE_CAPABILITIES : []),
@@ -1306,10 +1378,12 @@ function connect() {
               fromDir: remapPath(msg.fromDir),
               toDir: remapPath(msg.toDir),
               ...(msg.workspace ? { workspace: { repos: msg.workspace.repos, guides: remapGuides(msg.workspace.guides) } } : {}),
+              // rename-conversations-v1: the backend asks for the Claude and pi conversations to follow.
+              ...(msg.conversations === true ? { conversations: { home: conversationHome() } } : {}),
             },
             { execFile: execFileAsync },
           );
-          respond(ws, requestId, result);
+          respond(ws, requestId, withUsageSources(result, msg.fromDir, msg.toDir));
           break;
         }
 
@@ -1494,20 +1568,14 @@ function connect() {
         }
 
         case 'git-worktree-move': {
-          // Rename a workstream: move its worktree from .worktrees/<from> to
-          // .worktrees/<to>. `git worktree move` updates git's bookkeeping
-          // (.git/worktrees/<id>/gitdir) as well as the directory, which a plain
-          // mv would not. The branch is untouched — the caller decides whether
-          // the git branch follows the workstream name.
+          // Rename a workstream: move its worktree (project-rename.js renameWorktree).
           const projectDir = remapPath(msg.projectDir);
-          const { from, to } = msg;
-          if (!projectDir || !from || !to) throw new Error('projectDir, from and to are required');
-          const fromPath = `${projectDir}/.worktrees/${from}`;
-          const toPath = `${projectDir}/.worktrees/${to}`;
-          await execAsync(
-            `git -C ${shellEscape(projectDir)} worktree move ${shellEscape(fromPath)} ${shellEscape(toPath)}`
-          );
-          respond(ws, requestId, { ok: true, path: toPath });
+          const result = await renameWorktree({
+            projectDir, from: msg.from, to: msg.to,
+            // rename-conversations-v1: the backend asks for the Claude and pi conversations to follow.
+            ...(msg.conversations === true ? { conversations: { home: conversationHome() } } : {}),
+          }, { execFile: execFileAsync });
+          respond(ws, requestId, withUsageSources(result, `${projectDir}/.worktrees/${msg.from}`, result.path));
           break;
         }
 
@@ -1864,6 +1932,17 @@ function connect() {
           break;
         }
 
+        // Is there a Chromium now? Looks again, and with `install`
+        // starts `sudo -n snap install chromium` in the background when there
+        // isn't; the orchestrator asks again until it answers with one. The
+        // capabilities are the pane's as of now, for the orchestrator to use
+        // before this agent's next hello.
+        case 'browser-chromium': {
+          const state = chromiumProbe.check({ install: msg.install === true });
+          respond(ws, requestId, { ...state, capabilities: browserPaneCapabilities() });
+          break;
+        }
+
         // The share dialog's look at a workstream's dev stack, for its owner:
         // what a guest's attach would find, and whose stack is in the way.
         case 'browser-guest-check': {
@@ -1950,6 +2029,13 @@ function connect() {
               respond(ws, requestId, null, 'box-claim: dotfilesRepoUrl must use https://github.com');
               break;
             }
+          }
+          // An environment pool box: its pool git config goes before the ack, so before the owner's credential
+          // delivery writes the broker block under their name (environment-prepare.js dropPoolGitConfig).
+          if (config.warm === true) {
+            await environmentPrepare.dropPoolGitConfig(process.env.HOME || os.homedir(), { credentials })
+              .then(dropped => { if (dropped) console.log('[CLAIM] removed the pool git config'); })
+              .catch(err => console.warn(`[CLAIM] removing the pool git config failed: ${err.message}; the owner's delivery rewrites it`));
           }
           await execAsync(`git config --global user.name ${shellEscape(ownerName)}`);
           await execAsync(`git config --global user.email ${shellEscape(ownerEmail)}`);
@@ -2230,13 +2316,15 @@ function connect() {
 
         case 'workspace-move': {
           // A multi-repo workstream's rename: its root moves, each worktree in it is repaired, all or nothing.
-          respond(ws, requestId, await workspace.moveWorkstreamRoot({
-            root: remapPath(msg.root),
-            fromDir: remapPath(msg.fromDir),
-            toDir: remapPath(msg.toDir),
-            repos: msg.repos,
-            guides: remapGuides(msg.guides),
-          }, { execFile: execFileAsync }));
+          const fromDir = remapPath(msg.fromDir);
+          const toDir = remapPath(msg.toDir);
+          const moved = await workspace.moveWorkstreamRoot({
+            root: remapPath(msg.root), fromDir, toDir, repos: msg.repos, guides: remapGuides(msg.guides),
+          }, { execFile: execFileAsync });
+          const conversations = msg.conversations === true
+            ? conversationMove.carryConversations({ home: conversationHome(), fromDir, toDir, repos: workspace.repoNames(msg.repos) })
+            : null;
+          respond(ws, requestId, withUsageSources({ ...moved, ...(conversations ? { conversations } : {}) }, fromDir, toDir));
           break;
         }
 
@@ -2255,7 +2343,8 @@ function connect() {
         case 'environment-prepare': {
           // An environment pool box, before it has an owner: clone its environment's repositories to the static
           // layout and run setup (environment-prepare.js). Refused on any other box.
-          const result = await environmentPrepare.handleEnvironmentPrepare(msg, { warm: config.warm === true, configPath });
+          // The prepare runs the warm pool's on-warm hook too; its status file is forwarded as a warm box's is.
+          const result = await environmentPrepare.handleEnvironmentPrepare(msg, { warm: config.warm === true, configPath, credentials, systemctl: environmentPrepare.systemctlStart(execFile), onWarmStarted: () => startOnWarmPoller(ws), onWarmSettled: flushOnWarmPoller });
           console.log(`[ENV-POOL] prepare for ${msg.environmentId}: ${result.error || (result.running ? 'already running' : 'started')}`);
           respond(ws, requestId, result);
           break;
@@ -2394,7 +2483,7 @@ function connect() {
           respond(ws, requestId, await previewListenersRpc.previewListeners({
             cwd: typeof msg.cwd === 'string' ? remapPath(msg.cwd) : undefined,
             port: Number.isInteger(msg.port) ? msg.port : undefined,
-          }));
+          }, { confinedPorts: (ports, checkout, runs) => previewRuns.confinedPorts(ports, checkout, runs), runPorts: (ports, checkout) => previewRuns.runPorts(ports, checkout) }));
           break;
         }
 
@@ -2533,6 +2622,8 @@ async function shutdown() {
   for (const sessionName of codexBridges.keys()) {
     stopCodexBridge(sessionName);
   }
+  // Confined runs end with the agent that vouches for them; the next one sweeps anything left.
+  previewRuns.stopAll();
   process.exit(0);
 }
 

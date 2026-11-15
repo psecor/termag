@@ -54,8 +54,18 @@ test('child env: no tmux variables, the agent\'s PATH', () => {
   assert.equal(turn.TERMAG_PROJECT_ID, 'proj1');
   assert.equal(turn.TERMAG_WORKSTREAM, 'main');
   assert.equal(turn.LD_PRELOAD, undefined);
+  // Its Project files and My files (project-files-v1) reach the engine, so `termag space` defaults to them.
+  const files = childEnv({ HOME: '/h' }, '/p', null, { TERMAG_SPACE: 'ana-termag', TERMAG_MY_FILES: 'ana-my-files' });
+  assert.equal(files.TERMAG_SPACE, 'ana-termag');
+  assert.equal(files.TERMAG_MY_FILES, 'ana-my-files');
   // The turn's kind replaces one the agent's own environment carried.
   assert.equal(childEnv({ TERMAG_SESSION_KIND: 'interactive' }, '/p', null, { TERMAG_SESSION_KIND: 'chat' }).TERMAG_SESSION_KIND, 'chat');
+  // An engine's own folders (a confined Cursor turn's HOME, its config folder): absolute paths, those two names only.
+  const cursor = childEnv({ HOME: '/h' }, '/p', null, null, { HOME: '/h/.termag/chats/cursor-homes/k', CURSOR_CONFIG_DIR: '/h/.termag/chats/cursor-config/k', LD_PRELOAD: '/evil.so' });
+  assert.equal(cursor.HOME, '/h/.termag/chats/cursor-homes/k');
+  assert.equal(cursor.CURSOR_CONFIG_DIR, '/h/.termag/chats/cursor-config/k');
+  assert.equal(cursor.LD_PRELOAD, undefined);
+  assert.equal(childEnv({ HOME: '/h' }, '/p', null, null, { HOME: 'relative' }).HOME, '/h');
 });
 
 test('a real turn: prompt on stdin, the log framed, the session id kept, exit written', () => {
@@ -524,6 +534,10 @@ test('turn-start: a compact turn says so, and any other says nothing', () => {
   const { turnStartEvent } = require('./chat-turn');
   assert.equal(turnStartEvent({ text: '/compact', resumed: true, compact: true }).compact, true);
   assert.equal('compact' in turnStartEvent({ text: 'hi' }), false);
+  // Where Claude Code compacts the turn's context (chat-runner.js autoCompactWindowOf), for the context ring.
+  assert.equal(turnStartEvent({ text: 'hi', compactWindow: 200000 }).compactWindow, 200000);
+  assert.equal('compactWindow' in turnStartEvent({ text: 'hi' }), false);
+  assert.equal('compactWindow' in turnStartEvent({ text: 'hi', compactWindow: 'big' }), false);
   // Whether the runner asks Haiku for this turn's tool-group headings: the browser waits for one only then.
   assert.equal(turnStartEvent({ text: 'hi', headings: true }).headings, true);
   assert.equal('headings' in turnStartEvent({ text: 'hi' }), false);
