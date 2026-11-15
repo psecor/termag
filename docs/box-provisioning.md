@@ -35,8 +35,20 @@ box. The frontend has **zero** box UI today (no button, no `instancesApi`).
 1. **Box token delivery:** baked into `user_data` (inline), matching the
    existing `terraform/box/cloudinit.sh.tftpl`. (See Security below — this is no
    weaker than the `agent.config.json` the agent must read anyway.)
-2. **Box IAM identity:** a **per-box role with the permissions boundary**, as
-   the 0.3.0 grant enforces (`iam:CreateRole` is denied without the boundary).
+2. **Box IAM identity:** **one shared role and instance profile for every
+   box**, made by terraform (the box-provisioning module, with the same
+   permissions boundary, `AmazonSSMManagedInstanceCore`, the git-token read
+   and the ECR pull) and named to the orchestrator by `BOX_SHARED_ROLE_NAME`
+   and `BOX_INSTANCE_PROFILE_NAME`. Every box's role was identical, and one
+   role per box ran the account into IAM's 1,000-roles quota. Nothing
+   authorizes by a box's role: the orchestrator, the gateway and the brokers
+   tell boxes apart by their agent tokens. With the two variables unset, each
+   box gets a role of its own with the boundary, as the grant enforces
+   (`iam:CreateRole` is denied without it). A box keeps the kind it launched
+   with: the row's `iamRoleShared` says which, and teardown deletes only a
+   role of the box's own, never the shared one (`services/boxSharedRole.ts`).
+   A quarantine can't deny the shared role everything, so it denies one
+   instance's sessions on it (box-quarantine.md, IAM step).
 3. **AMI selection:** **discover newest by tag** (`App=termag, Component=box`),
    so no redeploy is needed when a new AMI is baked. A user's `box-image` flag
    (services/boxImage.ts) may name another of our images — a pinned AMI or a
@@ -119,7 +131,9 @@ the full image:
 
 - **Actions → "Publish AMI" → target `box-min`** — publish on tags
   `Component=box-min` (what `--minimal` discovers); publish off bakes a
-  `box-min-candidate` discovery ignores, for validating a branch.
+  `box-min-candidate` discovery ignores, for inspecting a bake of main before
+  it is published (a branch can't be baked: the bake role trusts main only;
+  `packer/README.md`, "Validating a packer change before merge").
 - The schedule carries it: **`check-box-min-ami`** compares the newest
   box-min image's `TermagSha` tag against main over the template's inputs (the
   whole of `deploy/` is a staleness signal here, because the lean image's
@@ -174,13 +188,18 @@ Uses `@aws-sdk/client-ec2` + `@aws-sdk/client-iam`.
 3. `AuthorizeSecurityGroupIngress` on `HOST_SECURITY_GROUP_ID`: 3040 from the new
    box SG (grant's `Ec2BoxIngressToHost`). The box reaches the backend directly
    over the private VPC network, not through the ALB.
-4. Per-box IAM: `CreateRole` `<BOX_RESOURCE_PREFIX>-<box>` **with
+4. IAM. With `BOX_SHARED_ROLE_NAME` and `BOX_INSTANCE_PROFILE_NAME` set, no
+   call: the box launches with the shared instance profile, and the row
+   records `iamRoleShared` and the shared names (the Fleet tab shows the role
+   as shared). The warm pool and environment pools launch the same way.
+   Otherwise a role of the box's own: `CreateRole` `<BOX_RESOURCE_PREFIX>-<box>` **with
    `PermissionsBoundary=BOX_PERMISSIONS_BOUNDARY_ARN`** (denied otherwise);
    `AttachRolePolicy` `AmazonSSMManagedInstanceCore`; if
    `BOX_GIT_TOKEN_SECRET_ARN` set, add an inline read policy for just that ARN;
    if `BOX_ECR_PULL_REPOSITORY_ARNS` set, add the pull-only `termag-box-ecr-pull`
-   inline policy (`services/boxEcrPolicy.ts`; existing box roles are backfilled
-   at startup by `backfillBoxEcrPullPolicies`);
+   inline policy (`services/boxEcrPolicy.ts`; existing box roles of their own
+   are backfilled at startup by `backfillBoxEcrPullPolicies`, which skips the
+   shared role: terraform grants it the same pull);
    `CreateInstanceProfile` + `AddRoleToInstanceProfile`.
 5. `RunInstances`: `amiId`, `BOX_INSTANCE_TYPE` (**must be arm64/Graviton** — the
    AMI is arm64-only), a subnet, box SG, instance profile, IMDSv2
@@ -205,7 +224,8 @@ Uses `@aws-sdk/client-ec2` + `@aws-sdk/client-iam`.
    launched as is recorded in `Instance.instanceType`.
 6. Each handle is persisted the moment its resource exists: `region` +
    `securityGroupId` after `CreateSecurityGroup`, `iamRoleName` after
-   `CreateRole`, `iamInstanceProfileName` after `CreateInstanceProfile`,
+   `CreateRole`, `iamInstanceProfileName` after `CreateInstanceProfile` (on
+   the shared role, both with `iamRoleShared`, in one write before `RunInstances`),
    `ec2InstanceId` after `RunInstances`, then `hostname` (best effort: a failed
    write is logged and never fails a box that is already running). A launch
    cut short (restart, SDK error) therefore leaves a row that teardown can
@@ -214,7 +234,12 @@ Uses `@aws-sdk/client-ec2` + `@aws-sdk/client-iam`.
 
 `terminateBox(instance)`: `TerminateInstances` (tag-scoped) → revoke the ALB
 ingress rule → delete SG (after the instance is gone) → detach/delete role +
-instance profile + every inline policy `ListRolePolicies` reports. (No secret
+instance profile + every inline policy `ListRolePolicies` reports, for a box
+with a role of its own. A box on the shared role (`iamRoleShared`, or a role
+or profile under the configured shared names) never has the role or profile
+deleted; a quarantined one keeps its entry on the shared role's deny list for
+24 hours after EC2 reports its instance terminated, and the provisioning
+sweep removes it then (box-quarantine.md). (No secret
 to delete, since the token lives in `user_data`.) A resource that is already
 gone (`InvalidInstanceID.NotFound`, `InvalidGroup.NotFound`, `NoSuchEntity`)
 counts as done, so re-running a teardown costs a few NotFound answers. The
@@ -249,13 +274,21 @@ land at `~termag/src/termag/agent/agent.config.json` — which is what the
 
 ### Box sizes (`backend/src/services/boxSize.ts`)
 
-A box launches at a size, each an arm64 type and its same-shape fallbacks:
+A box launches at a size, each an arm64 type and its fallbacks:
 
 | Size | Type | vCPU / GiB | Fallbacks, in order |
 |---|---|---|---|
 | `small` | `m8g.large` | 2 / 8 | `m7g.large`, `r8g.large`, `r7g.large`, `m8g.xlarge` |
 | `medium` | `m8g.xlarge` | 4 / 16 | `m7g.xlarge`, `r8g.xlarge`, `r7g.xlarge`, `m8g.2xlarge` |
-| `large` | `m8g.2xlarge` | 8 / 32 | `m7g.2xlarge`, `r8g.2xlarge`, `r7g.2xlarge`, `m8g.4xlarge` |
+| `large` | `r8g.xlarge` | 4 / 32 | `r7g.xlarge`, `m8g.2xlarge`, `m7g.2xlarge` |
+
+Large is memory optimized: medium's 4 vCPU with twice the memory. Its
+fallbacks keep at least 4 vCPU and 32 GiB, and stay within the resize cap (8
+vCPU, 32 GiB). A box that needs more vCPUs asks for them as requirements
+(`{ "vcpu": 8, "memoryGiB": 32 }`, below), which match `m8g.2xlarge`. A box
+keeps the instance type it launched with: changing a size's types changes
+only new launches, and the warm pool replaces boxes of the old type (Warm pool
+sizes).
 
 `BOX_SMALL_INSTANCE_TYPES`, `BOX_MEDIUM_INSTANCE_TYPES` and
 `BOX_LARGE_INSTANCE_TYPES` (comma-separated; the first is launched, the rest
@@ -577,6 +610,14 @@ for the same fixed context:
   comes off the largest: 15/15/15 holds small 15, medium 5, large 0. The clamp
   is logged once per value (`[POOL] box-warm-pool-sizes served … clamped to
   small=15 medium=5 large=0 (at most 20 in all, smallest first)`).
+- **A size's first instance type is in its pool spec hash**
+  (`warmPool.currentPoolSpec`), so changing it (the defaults in `boxSize.ts`,
+  or `BOX_<SIZE>_INSTANCE_TYPES`) rolls that size's pool as a new image does:
+  the old type's boxes stop being claimable and stop counting toward the
+  count, replacements launch on the new type (within the in-flight cap), a
+  warming old box is retired on the next tick, and the warm ones are retired
+  once the size is back at its count on the new type. Until then a claim of
+  that size goes cold. The counts don't change.
 - **When the flag serves nothing or a malformed value, the pool is the
   single-size pool it was before per-size counts.** That covers the flag
   unset, the flag source unable to answer, a value that is not an object, and any
@@ -1008,8 +1049,8 @@ and `memory/`), even though the folder name is the same.
   "memoryGiB": <n> }`. The object form may also hold `"diskGiB": <n>`, the
   root disk in GiB (50 to 300, "Disk size" above); `{ "diskGiB": 250 }` alone
   leaves the size to the default, and a preset with a disk is written as its
-  shape (large is `{ "vcpu": 8, "memoryGiB": 32, "diskGiB": 250 }`, which EC2
-  matches to large's type). A bad `diskGiB` is left out with a warning and
+  shape (large is `{ "vcpu": 4, "memoryGiB": 32, "diskGiB": 250 }`, which EC2
+  matches to large's `r8g.xlarge`, so it is large). A bad `diskGiB` is left out with a warning and
   the size beside it still applies, and the other way round. A multi-repo
   project takes the largest `diskGiB`. The
   file's steps (`setup`, `run`, `ports`, `seed`, `stop`, `secrets`) are the
@@ -1027,8 +1068,9 @@ and `memory/`), even though the folder name is the same.
   docs/environment.schema.json.
 - **A multi-repo project** takes the largest of its repositories' sizes
   (`boxSize.largestBoxSize`): the most vCPUs any of them asks for and the
-  most memory, each on its own, so 4/32 and 8/16 make 8/32 (large's shape,
-  so large). A preset counts as its shape. A repository with no file, or a
+  most memory, each on its own, so 4/32 and 8/16 make 8/32 (no preset's
+  shape, so requirements, `m8g.2xlarge`), and 2/32 and 4/8 make 4/32
+  (large's shape, so large). A preset counts as its shape. A repository with no file, or a
   malformed one (with its warning), adds nothing. The result is resolved to
   a type as any requirements are, and an explicit size still wins.
 - **Requirements are minimums**, and EC2 does the matching
@@ -1038,9 +1080,15 @@ and `memory/`), even though the folder name is the same.
   them fewest vCPUs first, then least memory, then the newer generation (in
   these families the price grows with vCPUs, then memory), launches the first
   and walks the rest on a capacity refusal, as a preset's fallbacks. 4 vCPU
-  and 32 GiB is `r8g.xlarge`, then `r7g.xlarge`, `m8g.2xlarge`, `m7g.2xlarge`.
+  and 32 GiB is `r8g.xlarge`, then `r7g.xlarge`, `m8g.2xlarge`, `m7g.2xlarge`:
+  large's list, so a 4/32 match is the large preset (and can come from the
+  warm pool); 8 vCPU and 32 GiB is `m8g.2xlarge`, then `m7g.2xlarge`, which no
+  preset starts with.
   A match is cached for six hours, by requirements. The limit is 8 vCPU and
-  32 GiB (`BOX_REQUIREMENT_LIMITS`, large's shape), whole numbers, at least 1.
+  32 GiB (`BOX_REQUIREMENT_LIMITS`: twice large's vCPUs, large's memory),
+  whole numbers, at least 1. A Retry whose requirements EC2 can't match
+  again launches the smallest preset that covers them; over large's 4 vCPU
+  none does, and it launches large.
   The box-resize role must allow the same families.
 - **Read** from the repository's default branch at the commit a new project
   would clone (`GET /repos/{repo}/commits/HEAD`, then the file at that
@@ -1239,6 +1287,10 @@ Action item: add a one-line comment in the cloud-init generator noting what's in
 
 ## What the box role can actually do
 
+> **Superseded for today's boxes.** This records the old development-account box
+> role. Today's boxes run under a box permissions boundary, and their
+> `ssm:GetParameter` reaches only `/termag/boxes/*`.
+
 Probed from a live box (role
 `example-termag-box-*`) rather than read off the policy, because the
 role cannot introspect itself — `iam:ListRolePolicies` on its own role is denied.
@@ -1259,11 +1311,13 @@ parameter read arrives with the managed policy or the permissions boundary.
 Three things would each remove a human step. All are deliberately **not** being
 done yet; they are recorded here so the reasoning is not re-derived.
 
-1. **Fetch the dev-server token at boot.** Possible today with no IAM change (see
-   above). Not done because it puts a credential on disk at boot on a box whose
-   whole point is running attacker-influenced AI agents — the same reasoning the
-   `user_data` analysis above applies to the agent token. Fetching it on demand,
-   as `make` already does, keeps the exposure window narrow for no real cost.
+1. **Fetch the dev-server token at boot.** *Closed:* a box set up since the
+   gateway route never holds the token. Its flag dev-server sends the box token
+   to the gateway, which holds the key. When this was written it was possible
+   with no IAM change on the old role (above), and was not done because it puts
+   a credential on disk at boot, on a box whose whole point is running
+   attacker-influenced AI agents. The same reasoning the `user_data` analysis
+   above applies to the agent token.
 
 2. **Configure and consume `BOX_GIT_TOKEN_SECRET_ARN`.** This is the one lever
    that would let the repo clones move into cloud-init, because it is the only

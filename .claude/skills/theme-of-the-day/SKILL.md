@@ -194,24 +194,28 @@ keeps you there for what follows):
 Both must pass. The lint names the file and line of any rule broken; fix the
 day, never the lint.
 
-Then the preview, if a local stack is up with the flag on (`make e2e-status`;
+Then the preview, if a local stack is up with production's flags (`make e2e-status`;
 it is `http://localhost:5174/termag/` unless told otherwise, and was started
-with `make e2e-up E2E_FLAGS='{"daily-theme-enabled":true}'`; without the flag
-the preview stops with exit 2 and says so):
+with `make e2e-up E2E_FLAGS="$(node scripts/daily-theme/flags.mjs)"`, which is
+every flag the browser reads at production's value plus the day's; with any
+other flags the preview stops with exit 2 and says which, since its
+screenshots would not show the UI people see):
 
 ```bash
 node scripts/daily-theme/preview.mjs <date>
 ```
 
-It writes before and after screenshots of both UIs in both palettes, and
+It writes before and after screenshots of both UIs and an open session (side panel shut and open), in both palettes, and
 `contrast.json`, to `.termag/theme-of-the-day/out/<date>/screenshots/`.
 
 - Exit 1 means your day added a contrast violation, or made one the app
   already has worse: fix the colours and run it again.
-- Exit 2 means it could not run (no stack, no Playwright). Say so in the PR body.
+- Exit 2 means it could not run (no stack, no Playwright, or a stack without
+  production's flags). Say so in the PR body.
 
-Look at the four "after" screenshots yourself (read the PNGs). Fix anything
-that covers text, makes it hard to read, or looks broken.
+Look at the eight "after" screenshots yourself (read the PNGs). Fix anything
+that covers text, makes it hard to read, sits under a panel or control, or
+looks broken.
 
 Don't start a stack yourself unless you were asked to. `make e2e-up` takes
 minutes and needs PostgreSQL.

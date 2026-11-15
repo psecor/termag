@@ -68,14 +68,19 @@ termag/
 │   └── initial-AGENTS.md           template seeded into new projects on creation
 ├── relay/                          Chrome tab-capture relay (runs on user's laptop)
 ├── packer/                         AMI build for box images (Packer config + setup.sh)
+├── preview-launcher/               Go: termag-preview, the Landlock + seccomp launcher behind `termag preview run`
+│                                    (baked into box images; its tests need a box's kernel; see its README)
 ├── terraform/
 │   └── box/                        V1 Terraform shape of a box, reference only (boxProvisioner is the live path)
 ├── docs/
 │   ├── agents/                     What this file indexes: domain model, data and schema, configuration,
 │   │                               observability, integration surfaces, gotchas (each in full)
+│   ├── box-placement.md            Runs on: Auto: where a New session runs when nobody picks a box (placeSession, GET /api/boxes/placement, the flags)
 │   ├── box-provisioning.md         Design doc for orchestrator-driven box provisioning
 │   ├── environment.schema.json     JSON Schema of an environment definition (.termag/environment.json)
+│   ├── feedback.md                 `termag feedback` and /termag/admin/feedback: agents log what people say about termag; admins read it
 │   ├── hosted-apps.md              How to host extra apps on ALB suburls via the nginx gateway
+│   ├── unify-ux/                   Unify UX build specs: nine milestones in five waves, each with its flag, PRs and acceptance checklist
 └── deploy/                         systemd units, Apache snippet, claude-hooks.md, setup walkthrough (Linux + macOS)
 ```
 
@@ -107,7 +112,7 @@ Per-user agent (systemd --user, runs as the unix user)
   └── Codex bridges (per Codex-backed agent session)
 
 Claude Code hooks (in each user's ~/.claude/settings.json)
-  └── curl POST → :3040/termag/api/status   (UserPromptSubmit, Pre/PostToolUse, Notification, Stop)
+  └── curl POST → :3040/termag/api/status   (UserPromptSubmit, Pre/PostToolUse(Failure), Notification, Stop)
 ```
 
 Apache modules required: `ssl`, `proxy`, `proxy_http`, `proxy_wstunnel`, `rewrite`, `headers`.
@@ -156,7 +161,8 @@ sudo loginctl enable-linger <username>     # so it runs without an active login
 # on demand: GitHub → Actions → "Publish AMI" → Run workflow → target=box
 # (or `both`) + tick `publish`; new boxes then pick up the newest Component=box
 # AMI by tag. Without `publish` the result is a Component=box-candidate that
-# discovery ignores -- bake a branch, inspect it, promote by retagging.
+# discovery ignores -- inspect it, promote by retagging. Main only: the bake
+# role trusts refs/heads/main, so a branch can't be baked (packer/README.md).
 # local fallback (per-template init — `packer init .` errors on dup vars):
 cd packer && packer init box.pkr.hcl && packer build box.pkr.hcl
 
@@ -240,12 +246,13 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [agent-restart-on-change](docs/agents/gotchas.md#agent-restart-on-change): Per-user agent must be restarted on `agent/agent.js` changes
 - [ami-by-tag](docs/agents/gotchas.md#ami-by-tag): The box AMI is discovered by tag, not by id
 - [ami-first-boot-path-index](docs/agents/gotchas.md#ami-first-boot-path-index): First boot rewrites the baked `/home/termag` path from a bake-time index, and the index step must stay the last provisioner
+- [ami-kernel-pin-reviewed-syscalls](docs/agents/gotchas.md#ami-kernel-pin-reviewed-syscalls): The box image's GA kernel pin and the preview launcher's reviewed system-call list change together
 - [ask-owner-only](docs/agents/gotchas.md#ask-owner-only): An ask run has the box owner's full access, which is why asks are owner-only
 - [ask-push-clone-upstream](docs/agents/gotchas.md#ask-push-clone-upstream): A push-mode ask clone's branch tracks an origin branch, or the thread's chat loses its tools
 - [ask-target-pr-history](docs/agents/gotchas.md#ask-target-pr-history): A thread on another PR fetches that PR's history in full, and its publish orders base-branch commits through GitHub
 - [auth-allowed-users](docs/agents/gotchas.md#auth-allowed-users): `ALLOWED_USERS` maps email→unixuser
 - [auth-local-mode](docs/agents/gotchas.md#auth-local-mode): `AUTH_MODE=local` is the only sign-in bypass, and it is loopback-only
-- [auth-okta-login-on-gesture](docs/agents/gotchas.md#auth-okta-login-on-gesture): A tab never starts the Okta login by itself; only a click or key press does
+- [auth-okta-login-on-gesture](docs/agents/gotchas.md#auth-okta-login-on-gesture): A tab never starts the Okta login by itself, and while signed out no tab sends anything
 - [auth-routes-source-of-truth](docs/agents/gotchas.md#auth-routes-source-of-truth): `routes/auth.ts` is the source of truth for sign-in modes
 - [auth-session-cookie-host-prefix](docs/agents/gotchas.md#auth-session-cookie-host-prefix): Every cookie termag sets is `__Host-`, and only termag's paths receive the session cookie
 - [automation-run-is-chat-turn](docs/agents/gotchas.md#automation-run-is-chat-turn): An automation run is a chat-runner turn, and only the relay or the timeout sweep may finish it
@@ -263,6 +270,8 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [box-xclip-shim](docs/agents/gotchas.md#box-xclip-shim): `~/.local/bin/xclip` is a termag shim, not X11 xclip
 - [briefing-on-owner-box](docs/agents/gotchas.md#briefing-on-owner-box): The daily briefing runs on the owner's box, never on the orchestrator, and is opt-in
 - [browser-pane-guest-chromium](docs/agents/gotchas.md#browser-pane-guest-chromium): The browser pane's guest Chromium runs as `termag-guest`, and its sandbox is root's
+- [chat-cursor-turn-trust-and-transcript](docs/agents/gotchas.md#chat-cursor-turn-trust-and-transcript): A Cursor chat turn runs with `--trust` in a workspace of its own, its read tier is plan mode, and its history is a transcript the turn keeps
+- [chat-devin-turn-acp-confined](docs/agents/gotchas.md#chat-devin-turn-acp-confined): A Devin chat turn drives `devin acp` from a turn process of termag's, never in the checkout, its read tier is ask mode under a HOME of its own, and its message never starts with a slash command
 - [chat-live-turn-stdin](docs/agents/gotchas.md#chat-live-turn-stdin): A live chat turn's stdin closes once, late, and the wrapper says so with `stdin-ended`
 - [chat-mermaid-sandboxed-frame](docs/agents/gotchas.md#chat-mermaid-sandboxed-frame): A Mermaid diagram is drawn in a sandboxed frame with svg-pan-zoom and Hammer.js, and Mermaid is only ever imported dynamically
 - [chat-open-mode-own-tree](docs/agents/gotchas.md#chat-open-mode-own-tree): A chat turn gets its full tools only on the project's own tree, and a read-only turn tells the model and the person why
@@ -287,11 +296,13 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [project-initial-commit](docs/agents/gotchas.md#project-initial-commit): New projects get a repo and an initial commit automatically, and the helper that does it lives in two files
 - [project-list-order](docs/agents/gotchas.md#project-list-order): Project-list ordering is `pinned DESC, lastActiveAt DESC`
 - [project-multi-repo-not-git](docs/agents/gotchas.md#project-multi-repo-not-git): A multi-repo project's directory is not a git repository
+- [project-rename-conversations](docs/agents/gotchas.md#project-rename-conversations): Claude Code and pi keep a conversation by its checkout's path, so whatever moves a checkout moves its conversation folders
 - [project-sharing-owner-agent](docs/agents/gotchas.md#project-sharing-owner-agent): Project sharing routes terminal access through the *owner's* per-user agent
 - [provider-registry-two-files](docs/agents/gotchas.md#provider-registry-two-files): Provider registry lives in two files and must stay in sync
 - [provider-string-not-enum](docs/agents/gotchas.md#provider-string-not-enum): `agentProvider` is a string, not an enum
 - [push-endpoint-url](docs/agents/gotchas.md#push-endpoint-url): A push subscription's endpoint is a URL the server POSTs to
 - [push-vapid-subject](docs/agents/gotchas.md#push-vapid-subject): `VAPID_SUBJECT` must be a public contact, or Apple refuses every push
+- [review-pane-no-checkout-config](docs/agents/gotchas.md#review-pane-no-checkout-config): A review pane's reviewer loads none of the checkout's own startup config: Claude starts with `--setting-sources user`, Devin and Cursor in a folder of the pane's own
 - [simple-ui-launchpad-controls](docs/agents/gotchas.md#simple-ui-launchpad-controls): New simple-UI controls are LaunchPad's, and monospace is for code
 - [simple-ui-side-panel-ctrl-shell](docs/agents/gotchas.md#simple-ui-side-panel-ctrl-shell): The simple UI's side panel attaches the ctrl shell, never the agent pane, and shares its tmux window
 - [slack-scopes](docs/agents/gotchas.md#slack-scopes): Slack scopes are large
@@ -314,6 +325,7 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [test-root-only-cases](docs/agents/gotchas.md#test-root-only-cases): A test case that needs a file you don't own runs only as root
 - [tmux-argv-not-shell-string](docs/agents/gotchas.md#tmux-argv-not-shell-string): Never build a shell string to type text into tmux — spawn `tmux` with an argv array
 - [ui-daily-theme-days](docs/agents/gotchas.md#ui-daily-theme-days): A day's theme is CSS and code from an agent: its sprite runs only in the sandboxed frame, and a person reviews each day
+- [ui-landing-gate-redirects](docs/agents/gotchas.md#ui-landing-gate-redirects): A landing gate redirects with `GateRedirect`, never a bare `<Navigate>`, and dev mode hides the race it guards
 - [ui-theme-settings-two-modules](docs/agents/gotchas.md#ui-theme-settings-two-modules): Theme settings are a JSON column validated by a module that exists twice
 - [ui-thermometer-scale](docs/agents/gotchas.md#ui-thermometer-scale): Thermometers use an absolute 8h scale, not p50-relative
 - [ui-whats-new-entries](docs/agents/gotchas.md#ui-whats-new-entries): A change people will notice adds or edits its What's new entry, in the PR that makes it live

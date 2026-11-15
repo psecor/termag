@@ -32,7 +32,7 @@
     "resources": {
       "description": "The box's size: a preset, or minimums EC2 matches to a Graviton m/r type. An explicit --size or picker choice wins over it.",
       "oneOf": [
-        { "type": "string", "enum": ["small", "medium", "large"], "description": "small is 2 vCPU / 8 GiB, medium 4 / 16, large 8 / 32." },
+        { "type": "string", "enum": ["small", "medium", "large"], "description": "small is 2 vCPU / 8 GiB, medium 4 / 16, large 4 / 32. More vCPUs than 4 (up to 8) need the object form." },
         {
           "type": "object",
           "properties": {

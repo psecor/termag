@@ -151,12 +151,13 @@ make e2e-up E2E_FLAGS='{"daily-theme-enabled":true}'
 node scripts/daily-theme/preview.mjs 2026-11-05
 ```
 
-It signs in, and for each UI and palette takes a screenshot with and without
+It signs in, and for each UI, and the stack's first project open in the
+simple UI with its side panel shut and open, and each palette takes a screenshot with and without
 the day (`?dailyTheme=<date>` and `?dailyTheme=off`), and runs axe-core's
 `color-contrast` rule on both. It fails (exit 1) on a contrast violation the
 day adds, or on one the app already has whose ratio the day lowers; the app's
 own violations are not the day's to fix, but it may not make them worse. Output goes to `.termag/theme-of-the-day/out/<date>/screenshots/`
-(gitignored): `<full|simple>-<dark|light>.png`, the `-before` pairs, and
+(gitignored): `<full|simple|session|session-panel>-<dark|light>.png`, the `-before` pairs, and
 `contrast.json`. It uses the Playwright in `/opt/playwright`;
 `PLAYWRIGHT_MODULE` points it at another. It switches the signed-in user's palette through the API
 and puts it back, so run one preview at a time per stack: two at once read each
