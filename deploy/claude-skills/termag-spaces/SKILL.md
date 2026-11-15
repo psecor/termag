@@ -1,6 +1,6 @@
 ---
 name: termag-spaces
-description: Read and write termag spaces, the shared file stores that people and boxes reach from anywhere, with the `termag space` CLI. Use when asked to share a file with a person or another box (a report, screenshots, a build), to share a space with a teammate, to save a plan or notes that should outlive this session or this box, to hand files to another agent or box (including the inputs and outputs of a `termag ask`), to fetch something "from the space", or to look at what is in a space. When you produce a file someone else will want (a report, screenshots, a dataset, build output), put it in the space and give the `space:path`. If a `termag space` command fails, tell the user why and share the file another way.
+description: Read and write termag spaces, the shared file stores that people and boxes reach from anywhere, with the `termag space` CLI. Use when asked to share a file with a person or another box (a report, screenshots, a build), to share a space with a teammate, to save a plan or notes that should outlive this session or this box, to hand files to another agent or box (including the inputs and outputs of a `termag ask`), to fetch something "from the space", or to look at what is in a space. When you produce a file someone else will want (a report, screenshots, a dataset, build output), put it in the space and give the `space:path`. When this session has Project files, save what you make for this project's work there (`termag space put <file> <path>`, no space named), and to My files (`--mine`) only what's personal or reusable across projects, or when the person says so. If a `termag space` command fails, tell the user why and share the file another way.
 ---
 
 # termag spaces
@@ -17,16 +17,17 @@ termag space ls team:reports/           # one folder of a space
 termag space get team:reports/q3.csv    # into the current directory
 termag space get -r team:reports/ out/  # a whole folder
 termag space put build.log team:logs/   # keeps the file name
-termag space put -r dist team:site      # a whole folder
+termag space put -r dist team:site      # dist's files into site/ (not site/dist/)
 termag space mv team:old.md team:new.md
 termag space rm team:logs/build.log     # -r for a folder
 termag space url team:reports/q3.csv    # a browser link to the file
 termag space share team:pr-12/shot.png  # its link opens for everyone on termag
 ```
 
-- A remote path is `space:path`. Leave the `space:` out when this box reaches
-  exactly one space. A path ending in `/` is a folder. `termag space ls`
-  lists the spaces' names when you don't know them.
+- A remote path is `space:path`. Leave the `space:` out when this session has
+  Project files (below), or when this box reaches exactly one space. A path
+  ending in `/` is a folder. `termag space ls` lists the spaces' names when
+  you don't know them.
 - Add `--json` for machine-readable output.
 - Files go straight between this box and storage; the orchestrator only signs
   the URLs. Files up to 5 GiB; big ones go up in parts.
@@ -42,6 +43,24 @@ termag space share team:pr-12/shot.png  # its link opens for everyone on termag
 
 Use spaces directly: run the command you need, and handle a failure when it
 happens (see "When a command fails").
+
+## Project files and My files
+
+When this session has Project files, `termag space ls` lists them first,
+labelled, with My files next: the project's own space, and its owner's.
+
+- Save what you make for this project's work (screenshots, reports, plans,
+  logs, generated assets) to Project files: `termag space put <file> <path>`
+  with no space named. Use My files (`--mine`) only for what's personal or
+  reusable across projects, or when the person says so; when unsure, Project
+  files. You can read both.
+- A named `space:path` always wins. `--mine` works the same way with `get`,
+  `ls`, `url`, `share`, `mv` and `rm`.
+- `My files isn't on this box (Settings → My files)` means its owner keeps My
+  files off their boxes: save to Project files, or tell them.
+- Without Project files (a box whose agent predates them, or a session with no
+  project), a path with no space works only when this box reaches exactly one
+  space, as before.
 
 ## Sharing what you make
 
@@ -113,6 +132,8 @@ termag space slack runner team offer ana@example.com     # the runner hands over
   space to the whole channel.
 - Only the user's own request justifies a link, and only an owner may: like
   managing a space, it needs a person (`termag login` on this box).
+- The owner must be a member of the channel, public or private, as in Slack:
+  otherwise the link is refused (`You need to be a member of this channel`).
 - A private channel needs termag in it first: the user types `/invite
   @termag` in the channel. In Slack itself the same is `/termag link <space>`,
   typed in the channel.
@@ -176,6 +197,7 @@ commit for another agent.
 | Exit | Message | What it means |
 |------|---------|---------------|
 | 3 | `Not found` | the space doesn't exist or isn't reachable (names don't leak) |
+| 3 | `My files isn't on this box …` | its owner keeps My files off their boxes (Settings → My files): save to Project files, or tell them |
 | 3 | `You reach no spaces; …` | nobody added this box to a space: a member adds it with `termag space boxes <space> add <this box>` or the box's **Spaces…** menu |
 | 3 | `No file … in …` / `Nothing at …` | the path is wrong: `termag space ls <space>:<folder>/` and try the right one |
 | 1 | `You are a viewer of …; this needs editor` / `… is read-only …` | the role can't write here: ask an owner for editor |

@@ -86,6 +86,9 @@ same-host server will accept.
     "PostToolUse": [
       { "matcher": ".*", "hooks": [ { "type": "command", "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" post-tool >/dev/null 2>&1 &" } ] }
     ],
+    "PostToolUseFailure": [
+      { "matcher": "mcp__.*", "hooks": [ { "type": "command", "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" post-tool-failure >/dev/null 2>&1 &" } ] }
+    ],
     "Notification": [
       { "hooks": [ { "type": "command", "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" notification >/dev/null 2>&1 &" } ] }
     ],
@@ -149,6 +152,11 @@ box only when its owner ran the updater by hand.
   output is the proof) also posts a **milestone** (`/api/status/milestone`,
   `{kind, url}` only — never the command text), which the UI turns into
   "PR opened — Compact / Clear / Keep" once the agent is back at its prompt
+  ; for an `mcp__<server>__<tool>` call it posts the server and tool names and
+  `outcome: ok` (`/api/status/mcp`, the `agent.mcp.used` product event; never
+  the arguments or result, and the server keeps only a known server's name)
+- `PostToolUseFailure`, for `mcp__` tools only: `working`, and the same MCP
+  post with `outcome: error`
 - `Notification` reads the hook JSON on stdin: `idle_prompt` -> `idle`, anything
   else -> `waiting` (yellow), with `notify: true` so termag posts the captured
   pane to Slack

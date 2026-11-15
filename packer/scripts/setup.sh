@@ -263,13 +263,6 @@ apt_get update -y
 apt_get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Chromium — browser-harness drives this over CDP. Snap is the supported
-# Chromium channel on Ubuntu 24.04 arm64. (Headless CDP / VNC wiring is
-# per-user; we only bake the binary.)
-# ─────────────────────────────────────────────────────────────────────────────
-sudo snap install chromium || true
-
-# ─────────────────────────────────────────────────────────────────────────────
 # termag unix user (placeholder — renamed to the box owner at launch). zsh is
 # the default shell to match the devbox; docker + sudo group membership follow
 # the rename.
@@ -312,7 +305,7 @@ sudo loginctl enable-linger termag
 # ─────────────────────────────────────────────────────────────────────────────
 sudo -u termag -H bash <<'NVM_INSTALL'
 set -euo pipefail
-NODE_VERSION=24.22.1
+NODE_VERSION=24.22.3
 curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 export NVM_DIR="$HOME/.nvm"
 . "$NVM_DIR/nvm.sh"
@@ -750,6 +743,11 @@ install_gh_updater
 install_aws_updater
 install_docker_updater
 install_terminfo
+install_preview_launcher
+# Chromium: the browser pane runs it, and browser-harness drives it over CDP.
+# Snap is the supported Chromium channel on Ubuntu 24.04 arm64. Fails the bake
+# when it can't be installed (box-lib.sh).
+install_chromium
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Claude Code status hooks. termag tracks working/waiting/idle state via hooks

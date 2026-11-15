@@ -420,6 +420,59 @@ for kind in ask chat oneshot; do
   want="{\"env\":{\"OTEL_RESOURCE_ATTRIBUTES\":\"telemetry.project_id=p1,termag.session.kind=$kind,service.name=termag-claude-session,termag.box=$BOX\"}}"
   [ "$got" = "$want" ] || fail "telemetry-launch: an explicit $kind wins over an inherited interactive" "$want" "$got"
 done
+# The inference backend (inference_resource): only for a launch that names
+# it, `default` read from what Claude Code will read (the settings' env over
+# the shell's), the launch's model, else the settings' default; a one-shot
+# gets no default model, and a bad id or an unknown backend is left out.
+INF_BASE="telemetry.project_id=p1,termag.session.kind=interactive,service.name=termag-claude-session,termag.box=$BOX"
+# shellcheck disable=SC2163 # the arguments are NAME=value pairs
+inf() { ( unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX ANTHROPIC_BASE_URL ANTHROPIC_MODEL; export "$@"; run telemetry-launch - ) | jq -r '.env.OTEL_RESOURCE_ATTRIBUTES'; }
+got="$(inf TERMAG_SESSION_KIND=interactive)"
+[ "$got" = "$INF_BASE" ] || fail 'telemetry-launch names no inference backend for a launch that names none' "$INF_BASE" "$got"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default)"
+[ "$got" = "$INF_BASE,termag.inference.backend=anthropic" ] || fail "telemetry-launch: the default backend with no gateway is Claude Code's own login" anthropic "$got"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default TERMAG_INFERENCE_MODEL=opus)"
+[ "$got" = "$INF_BASE,termag.inference.backend=anthropic,termag.inference.model=opus" ] || fail "telemetry-launch names the launch's model" 'model=opus' "$got"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default CLAUDE_CODE_USE_BEDROCK=1)"
+[ "$got" = "$INF_BASE,termag.inference.backend=bedrock" ] || fail "telemetry-launch reads the shell's Bedrock where the settings name none" bedrock "$got"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default ANTHROPIC_BASE_URL=https://proxy.example.test)"
+[ "$got" = "$INF_BASE,termag.inference.backend=custom" ] || fail "telemetry-launch: an owner's own base URL is custom, never the URL" custom "$got"
+long160=$(printf 'a%.0s' $(seq 160))
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default TERMAG_INFERENCE_MODEL="$long160")"
+[ "$got" = "$INF_BASE,termag.inference.backend=anthropic,termag.inference.model=$long160" ] \
+  || fail "telemetry-launch keeps a model id the backend accepts (160, launchCommand.ts MODEL_ARG)" 'model=160 chars' "$got"
+for bad in 'opus,x=y' 'op us' 'a%2Cb' "$(printf 'a%.0s' $(seq 161))"; do
+  got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default TERMAG_INFERENCE_MODEL="$bad")"
+  [ "$got" = "$INF_BASE,termag.inference.backend=anthropic" ] || fail "telemetry-launch drops a model that is not an id ($bad), keeps the backend" anthropic "$got"
+done
+for bad in bedrock 'default,x=y' Default; do
+  got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND="$bad")"
+  [ "$got" = "$INF_BASE" ] || fail "telemetry-launch takes only default or a model backend it knows, not $bad" "$INF_BASE" "$got"
+done
+cp "$CS" "$WORK/cs.inf"
+jq '.env += {CLAUDE_CODE_USE_BEDROCK: "1", ANTHROPIC_MODEL: "us.anthropic.claude-opus-5-5"}' "$WORK/cs.inf" > "$CS"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default)"
+[ "$got" = "$INF_BASE,termag.inference.backend=bedrock,termag.inference.model=us.anthropic.claude-opus-5-5" ] \
+  || fail "telemetry-launch: termag's Claude gateway in the settings is Bedrock, with its default model" bedrock "$got"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default CLAUDE_CODE_USE_BEDROCK=0 ANTHROPIC_MODEL=sonnet)"
+[ "$got" = "$INF_BASE,termag.inference.backend=bedrock,termag.inference.model=us.anthropic.claude-opus-5-5" ] \
+  || fail "telemetry-launch: the settings' env wins over the shell's, as in Claude Code" bedrock "$got"
+got="$(inf TERMAG_SESSION_KIND=oneshot TERMAG_INFERENCE_BACKEND=default)"
+case $got in *',termag.inference.backend=bedrock') : ;; *) fail "telemetry-launch gives a one-shot no default model" 'backend=bedrock, no model' "$got" ;; esac
+# An empty ANTHROPIC_MODEL in the settings is Claude Code's own: it clears the
+# shell's, while the settings' model still names the session's default.
+jq '.env.ANTHROPIC_MODEL = ""' "$CS" > "$WORK/cs.clear" && cat "$WORK/cs.clear" > "$CS"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default ANTHROPIC_MODEL=sonnet)"
+[ "$got" = "$INF_BASE,termag.inference.backend=bedrock" ] \
+  || fail "telemetry-launch: the settings' empty ANTHROPIC_MODEL clears the shell's, as in Claude Code" 'bedrock, no model' "$got"
+jq '.model = "sonnet"' "$CS" > "$WORK/cs.clear" && cat "$WORK/cs.clear" > "$CS"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default ANTHROPIC_MODEL=opus)"
+[ "$got" = "$INF_BASE,termag.inference.backend=bedrock,termag.inference.model=sonnet" ] \
+  || fail "telemetry-launch: the settings' model names it where their ANTHROPIC_MODEL is empty" sonnet "$got"
+jq '.env.CLAUDE_CODE_USE_BEDROCK = "" | .model = "accounts/fireworks/models/kimi-k3" | del(.env.ANTHROPIC_MODEL)' "$WORK/cs.inf" > "$CS"
+got="$(inf TERMAG_SESSION_KIND=interactive TERMAG_INFERENCE_BACKEND=default)"
+[ "$got" = "$INF_BASE,termag.inference.backend=anthropic" ] || fail "telemetry-launch: a saved Fireworks model is not the default's (claude_launch blanks it)" anthropic "$got"
+cp "$WORK/cs.inf" "$CS"
 # The session's work (work_resource): the checkout's repository as owner/name
 # (never the remote URL, which can carry a token), branch and commit, read from
 # TERMAG_WORK_DIR or the working directory, and a spawned agent's spawn, each
@@ -1027,7 +1080,7 @@ cp "$CS" "$WORK/cs.keep"; TSTATE="$H/.config/termag/telemetry.json"; [ -e "$TSTA
 jq '.env.OTEL_RESOURCE_ATTRIBUTES = "telemetry.project_id=abc"' "$WORK/cs.keep" > "$CS"; echo '{"env":{}}' > "$TSTATE"
 got="$(TERMAG_PROJECT=webapp TERMAG_WORKSTREAM=main runfw launch-settings --backend fireworks --model "$KIMI" - 2>/dev/null \
   | jq -r '[.env.OTEL_RESOURCE_ATTRIBUTES, .env.ANTHROPIC_BASE_URL, .apiKeyHelper != null] | @tsv')"
-[ "$got" = "$(printf 'telemetry.project_id=abc,termag.project=webapp,termag.workstream=main\thttps://gw.example/fireworks/inference\ttrue')" ] \
+[ "$got" = "$(printf 'telemetry.project_id=abc,termag.project=webapp,termag.workstream=main,termag.inference.backend=fireworks,termag.inference.model=%s\thttps://gw.example/fireworks/inference\ttrue' "$KIMI")" ] \
   || fail "launch-settings merges the launch's telemetry with the Fireworks settings" 'resource + gateway + helper' "$got"
 cp "$WORK/cs.keep" "$CS"; if [ -e "$WORK/tstate.keep" ]; then cp "$WORK/tstate.keep" "$TSTATE"; else rm -f "$TSTATE"; fi
 got="$(runfw launch-settings - 2>/dev/null)"

@@ -225,6 +225,8 @@ claude-skills/termag-overlap/SKILL.md:$HOME/.claude/skills/termag-overlap/SKILL.
 pi-skills/termag-overlap/SKILL.md:$HOME/.pi/agent/skills/termag-overlap/SKILL.md:644:file:noenable:feature
 claude-skills/termag-bug-report/SKILL.md:$HOME/.claude/skills/termag-bug-report/SKILL.md:644:file:noenable:feature
 pi-skills/termag-bug-report/SKILL.md:$HOME/.pi/agent/skills/termag-bug-report/SKILL.md:644:file:noenable:feature
+claude-skills/termag-feedback/SKILL.md:$HOME/.claude/skills/termag-feedback/SKILL.md:644:file:noenable:feature
+pi-skills/termag-feedback/SKILL.md:$HOME/.pi/agent/skills/termag-feedback/SKILL.md:644:file:noenable:feature
 TABLE
 }
 
@@ -450,6 +452,102 @@ retire_ask_sandbox() {
   fi
 }
 
+# The box marker, /etc/profile.d/termag-box.sh, and its two /etc/zsh/zshenv
+# lines (packer/scripts/box-lib.sh, install_box_marker): the guest browser,
+# the gh, aws and docker updaters and the terminfo steps below run only where
+# the marker exists. Bakes from before 2026-10-08 never wrote it, so a box
+# launched from one skipped all of them and reported clean: no guest mode,
+# and every preview share refused. A box without the marker is told apart by
+# cloud-init's log, which launching one leaves, and only when no other home
+# holds termag state: the marker arms guest mode for every user on the host,
+# so a host with several termag users (a shared one, even one that ran box
+# user-data) never gets one from here. Where it is a box this puts the marker
+# and the zshenv lines (the box user's zsh never reads profile.d) in place,
+# repairs a wrong one, through sudo -n like the steps it gates, and says why
+# when it can't.
+BOX_MARKER="${TERMAG_BOX_MARKER:-/etc/profile.d/termag-box.sh}"
+BOX_ZSHENV="${TERMAG_BOX_ZSHENV:-/etc/zsh/zshenv}"
+BOX_LAUNCH_LOG="${TERMAG_BOX_LAUNCH_LOG:-/var/log/termag-cloudinit.log}"
+BOX_HOMES="${TERMAG_BOX_HOMES:-/home}"
+read -r -a BOX_MARKER_SUDO <<< "${TERMAG_BOX_MARKER_SUDO-sudo -n}"
+BOX_MARKER_LINE='export TERMAG_BOX=1'
+# Kept identical to ZSHENV_LOCAL_BIN in packer/scripts/box-lib.sh (the test checks).
+# shellcheck disable=SC2016
+BOX_ZSHENV_LOCAL_BIN='if [ -d "$HOME/.local/bin" ]; then case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac; fi'
+
+box_marker_wrong() {
+  [ "$(cat "$BOX_MARKER" 2>/dev/null)" != "$BOX_MARKER_LINE" ] || [ "$(stat -c %a "$BOX_MARKER" 2>/dev/null)" != 644 ]
+}
+
+box_other_homes() {
+  local dir home
+  for dir in "$BOX_HOMES"/*/.termag; do
+    [ -d "$dir" ] || continue
+    home=${dir%/.termag}
+    [ "$home" -ef "$HOME" ] || printf ' %s' "$home"
+  done
+}
+
+box_zshenv_missing() {
+  [ -d "${BOX_ZSHENV%/*}" ] || return 1
+  ! grep -qxF "$1" "$BOX_ZSHENV" 2>/dev/null
+}
+
+reconcile_box_marker() {
+  local others had=1 drift=()
+  if [ ! -f "$BOX_MARKER" ]; then
+    had=0
+    [ -e "$BOX_LAUNCH_LOG" ] || return 0
+    others=$(box_other_homes)
+    if [ -n "$others" ]; then
+      printf 'termag-reconcile: no %s, and other homes hold termag state (%s); not writing it on a host with several termag users, so the guest browser, updater and terminfo setups are skipped\n' "$BOX_MARKER" "${others# }" >&2
+      return 0
+    fi
+    drift+=("$BOX_MARKER is missing (a box baked before it); the guest browser, updater and terminfo setups wait on it")
+  elif box_marker_wrong; then
+    drift+=("$BOX_MARKER is not '$BOX_MARKER_LINE', mode 0644")
+  fi
+  box_zshenv_missing "$BOX_MARKER_LINE" && drift+=("$BOX_ZSHENV does not set TERMAG_BOX")
+  box_zshenv_missing "$BOX_ZSHENV_LOCAL_BIN" && drift+=("$BOX_ZSHENV does not put ~/.local/bin on PATH")
+  [ "${#drift[@]}" = 0 ] && return 0
+  if ! "${BOX_MARKER_SUDO[@]}" true >/dev/null 2>&1; then
+    if [ "$had" = 0 ]; then
+      printf 'termag-reconcile: no %s and no passwordless sudo to write it; the guest browser, updater and terminfo setups are skipped\n' "$BOX_MARKER" >&2
+    else
+      printf 'termag-reconcile: no passwordless sudo to repair the box marker: %s\n' "${drift[0]}" >&2
+    fi
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf 'DRIFT: %s\n' "${drift[@]}"
+    return 0
+  fi
+  if [ "$had" = 0 ] || box_marker_wrong; then
+    if printf '%s\n' "$BOX_MARKER_LINE" | "${BOX_MARKER_SUDO[@]}" tee "$BOX_MARKER" >/dev/null \
+      && "${BOX_MARKER_SUDO[@]}" chmod 0644 "$BOX_MARKER"; then
+      printf 'reconciled: %s (the box marker)\n' "$BOX_MARKER"
+    else
+      # A half-written marker would pass the gates' existence test and never be retried.
+      [ "$had" = 0 ] && "${BOX_MARKER_SUDO[@]}" rm -f "$BOX_MARKER"
+      printf 'termag-reconcile: could not write %s; the guest browser, updater and terminfo setups are skipped\n' "$BOX_MARKER" >&2
+      return 0
+    fi
+  fi
+  if box_zshenv_missing "$BOX_MARKER_LINE"; then
+    printf '\n# termag box marker (packer/scripts/box-lib.sh, install_box_marker)\n%s\n' "$BOX_MARKER_LINE" \
+      | "${BOX_MARKER_SUDO[@]}" tee -a "$BOX_ZSHENV" >/dev/null \
+      && printf 'reconciled: %s (TERMAG_BOX)\n' "$BOX_ZSHENV" \
+      || printf 'termag-reconcile: could not add TERMAG_BOX to %s\n' "$BOX_ZSHENV" >&2
+  fi
+  if box_zshenv_missing "$BOX_ZSHENV_LOCAL_BIN"; then
+    printf '\n# ~/.local/bin for non-interactive zsh (packer/scripts/box-lib.sh, install_box_marker)\n%s\n' "$BOX_ZSHENV_LOCAL_BIN" \
+      | "${BOX_MARKER_SUDO[@]}" tee -a "$BOX_ZSHENV" >/dev/null \
+      && printf 'reconciled: %s (~/.local/bin on PATH)\n' "$BOX_ZSHENV" \
+      || printf 'termag-reconcile: could not add ~/.local/bin to %s\n' "$BOX_ZSHENV" >&2
+  fi
+}
+
 # The browser pane's guest user:
 # deploy/termag-guest-browser-setup puts termag-guest, its Chromium wrapper,
 # sudoers entry and egress rule in place for this box user. All of it is
@@ -510,6 +608,71 @@ reconcile_gh_update() {
   else
     printf '%s\n' "$out" >&2
     printf 'termag-reconcile: the gh updater setup failed\n' >&2
+  fi
+}
+
+# The preview launcher's box-wide settings (deploy/termag-preview-sysctl-setup):
+# client TCP Fast Open off, the second layer under its seccomp rule, since a Fast
+# Open send connects past Landlock on some 6.8 kernels; and Yama's ptrace_scope
+# at least 1, which its ptrace and pidfd_getfd refusals rest on. Root's, so through sudo -n like
+# the gh updater, and only on a box (the same marker). Without passwordless
+# sudo it is not reported as drift: nothing here can fix it, and the launcher's
+# own seccomp rule still refuses Fast Open sends.
+PREVIEW_SYSCTL_BOX_MARKER="${TERMAG_PREVIEW_SYSCTL_BOX_MARKER:-/etc/profile.d/termag-box.sh}"
+read -r -a PREVIEW_SYSCTL_SUDO <<< "${TERMAG_PREVIEW_SYSCTL_SUDO-sudo -n}"
+
+reconcile_preview_sysctl() {
+  local setup="$DEPLOY/termag-preview-sysctl-setup" out
+  [ -f "$setup" ] || return 0
+  [ -f "$PREVIEW_SYSCTL_BOX_MARKER" ] || return 0
+  "${PREVIEW_SYSCTL_SUDO[@]}" true >/dev/null 2>&1 || return 0
+  if out=$("${PREVIEW_SYSCTL_SUDO[@]}" bash "$setup" --check 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out" | sed 's/^DRIFT: /DRIFT: preview sysctls: /'
+    return 0
+  fi
+  if out=$("${PREVIEW_SYSCTL_SUDO[@]}" bash "$setup" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/reconciled: preview sysctls: /'
+  else
+    printf '%s\n' "$out" >&2
+    printf 'termag-reconcile: the preview sysctl setup failed\n' >&2
+  fi
+}
+
+# The preview launcher ("Confining the app for
+# wider audiences"): deploy/termag-preview-launcher-setup builds termag-preview
+# from this checkout and installs it root's at /usr/local/bin, then runs the
+# bake's kernel check (packer/scripts/check-preview-launcher.sh), so a box baked
+# before the launcher, or before a change to it, gets it on its next box update
+# or boot. Root's, so through sudo -n like the gh updater, and only on a box
+# (the same marker). Without passwordless sudo it is not reported as drift:
+# nothing here can fix it, and the agent then refuses every confined run
+# (launcher_missing), "only me" links unaffected.
+PREVIEW_LAUNCHER_BOX_MARKER="${TERMAG_PREVIEW_LAUNCHER_BOX_MARKER:-/etc/profile.d/termag-box.sh}"
+read -r -a PREVIEW_LAUNCHER_SUDO <<< "${TERMAG_PREVIEW_LAUNCHER_SUDO-sudo -n}"
+
+reconcile_preview_launcher() {
+  local setup="$DEPLOY/termag-preview-launcher-setup" out me
+  [ -f "$setup" ] || return 0
+  [ -f "$PREVIEW_LAUNCHER_BOX_MARKER" ] || return 0
+  me=$(id -un)
+  "${PREVIEW_LAUNCHER_SUDO[@]}" true >/dev/null 2>&1 || return 0
+  if out=$("${PREVIEW_LAUNCHER_SUDO[@]}" bash "$setup" --agent-user "$me" --check 2>&1); then
+    return 0
+  fi
+  changed=$((changed + 1))
+  if [ "$MODE" = check ]; then
+    printf '%s\n' "$out" | sed 's/^DRIFT: /DRIFT: preview launcher: /'
+    return 0
+  fi
+  if out=$("${PREVIEW_LAUNCHER_SUDO[@]}" bash "$setup" --agent-user "$me" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/reconciled: preview launcher: /'
+  else
+    printf '%s\n' "$out" >&2
+    printf 'termag-reconcile: the preview launcher setup failed\n' >&2
   fi
 }
 
@@ -841,8 +1004,9 @@ enable_unit() {
 
 # The steps after the table, in order : class. The status hooks stay core: the
 # working/waiting lights and the auto-lifecycle's "a working agent keeps the
-# box up" read them. So do the CLI, the ask-sandbox retirement and the guest
-# browser, which is system-level and what a preview share opens.
+# box up" read them. So do the CLI, the ask-sandbox retirement, the box marker
+# and the guest browser, which is system-level and what a preview share opens.
+# The box marker comes before every step it gates.
 steps() {
   cat <<STEPS
 reconcile_claude_config:feature
@@ -850,9 +1014,12 @@ reconcile_claude_path_hook:core
 reconcile_claude_onboarding:feature
 reconcile_cli:core
 reconcile_t3_server:core
+reconcile_box_marker:core
 retire_ask_sandbox:core
 reconcile_guest_browser:core
 reconcile_gh_update:core
+reconcile_preview_sysctl:core
+reconcile_preview_launcher:core
 reconcile_aws_update:core
 reconcile_docker_update:core
 reconcile_terminfo:core

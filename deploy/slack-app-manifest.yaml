@@ -103,10 +103,17 @@ oauth_config:
       - files:write
       # Slack agent sessions (slack/agentSession.ts).
       - assistant:write
-    # Slack's MCP server acts as the user who linked it. termag asks for every
+    # Slack's MCP server acts as the user who linked it. termag offers every
     # scope its protected-resource metadata lists (scopes_supported, the same
-    # list as Slack's per-tool table at docs.slack.dev/ai/mcp-server), so all of
-    # them must be here or the sign-in fails.
+    # list as Slack's per-tool table at docs.slack.dev/ai/mcp-server) except the
+    # ones it withholds: channels:write, groups:write, mpim:write and im:write,
+    # so an agent acting as the person can't create, rename or archive channels,
+    # invite or remove people, or open conversations (WITHHELD_SCOPES in
+    # backend/src/services/mcpOAuthScopes.ts). Posting to an existing DM needs
+    # only chat:write. The bot's im:write above is separate: collaboration DMs
+    # open as the bot (backend/src/slack/collab.ts).
+    # Every other scope in that list must be here, or a sign-in that asks for it
+    # fails. The withheld ones stay out of this block.
     user:
       # Search messages, channels, files and users.
       - search:read.public
@@ -124,12 +131,8 @@ oauth_config:
       - groups:read
       - mpim:read
       - im:read
-      # Post and schedule messages as the user; create conversations.
+      # Post and schedule messages as the user.
       - chat:write
-      - channels:write
-      - groups:write
-      - mpim:write
-      - im:write
       # Users and profiles.
       - users:read
       - users:read.email

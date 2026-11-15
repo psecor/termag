@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# termag-preview-launcher-setup — build termag-preview, the preview launcher
+# (preview-launcher/), from this box's checkout and install it root's at
+# /usr/local/bin/termag-preview. Run as root; idempotent.
+#
+# A bake installs the launcher (packer/scripts/box-lib.sh,
+# install_preview_launcher, then packer/scripts/check-preview-launcher.sh), but
+# a running box only moves forward through termag-box-update and
+# termag-reconcile, so a box baked before the launcher never got one, and one
+# baked before a launcher change kept the old binary. termag-reconcile calls
+# this through `sudo -n` on every boot and box update, as it does the gh and
+# Docker updaters' setups, so such a box converges without a bake.
+#
+# The same steps as the bake, as the bake's users:
+#
+#   1. build, as the agent user, with its own Go toolchain (goenv), into a
+#      directory of its own: the same `go build` as install_preview_launcher;
+#   2. install the result root's (0755): the confined app runs as the agent
+#      user, and must never be able to replace the binary that confines it;
+#   3. check the kernel the box boots against the reviewed system call list
+#      (check-preview-launcher.sh, with this checkout's list). A kernel with an
+#      unreviewed call, or without Landlock ABI 4, removes the binary instead:
+#      with no launcher, every confined run is refused (launcher_missing) and
+#      "only me" links, which need none, are unaffected;
+#   4. record what was built from (/var/lib/termag/preview-launcher/stamp: the
+#      sources, the reviewed list and the boot kernel), so a current box
+#      rebuilds nothing.
+#
+# Usage:
+#   termag-preview-launcher-setup [--agent-user NAME]           apply
+#   termag-preview-launcher-setup [--agent-user NAME] --check   report drift,
+#                                          change nothing (exit 1 if any)
+#
+# --agent-user is the box user the agent runs as (default termag, the name at
+# bake; termag-reconcile passes its own name). Its home holds the checkout.
+#
+# Env (tests): TERMAG_PREVIEW_SETUP_ROOT prefixes every path this writes or
+# reads; TERMAG_PREVIEW_SETUP_HOME is the agent's home (default: its passwd
+# entry); TERMAG_PREVIEW_SETUP_BUILD is a command run with the output
+# directory in place of the go build; TERMAG_PREVIEW_SETUP_CHECK one run in
+# place of check-preview-launcher.sh.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+AGENT_USER=termag
+MODE=apply
+ROOT="${TERMAG_PREVIEW_SETUP_ROOT:-}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) MODE=check ;;
+    --agent-user) AGENT_USER="${2:-}"; shift ;;
+    -h|--help) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+AGENT_UID=$(id -u "$AGENT_USER" 2>/dev/null) || AGENT_UID=
+case "$AGENT_UID" in
+  ''|0) printf 'termag-preview-launcher-setup: no usable agent user %s\n' "$AGENT_USER" >&2; exit 2 ;;
+esac
+if [ -z "$ROOT" ] && [ "$(id -u)" != 0 ]; then
+  echo 'termag-preview-launcher-setup: run as root' >&2
+  exit 1
+fi
+AGENT_HOME="${TERMAG_PREVIEW_SETUP_HOME:-$(getent passwd "$AGENT_USER" | cut -d: -f6)}"
+[ -n "$AGENT_HOME" ] || { echo "termag-preview-launcher-setup: no home for $AGENT_USER" >&2; exit 2; }
+
+CHECKOUT="$ROOT$AGENT_HOME/src/termag"
+SRC="$CHECKOUT/preview-launcher"
+LIST="$SRC/syscalls-arm64.txt"
+DEST="$ROOT/usr/local/bin/termag-preview"
+STATE="$ROOT/var/lib/termag/preview-launcher"
+
+say() { printf '%s\n' "$*"; }
+broke() { printf 'termag-preview-launcher-setup: %s\n' "$*" >&2; }
+install_owned() {
+  if [ "$(id -u)" = 0 ]; then install -o root -g root "$@"; else install "$@"; fi
+}
+
+[ -d "$SRC" ] || { broke "no $SRC to build from"; exit 1; }
+
+# What the binary was built from and checked against: the launcher's sources,
+# the reviewed list, and the kernel the box boots (the newest under /boot, as
+# check-preview-launcher.sh reads it).
+stamp() {
+  local kernel
+  kernel=$(printf '%s\n' "$ROOT"/boot/config-* | sort -V | tail -1)
+  { (cd "$SRC" && find . -maxdepth 1 -type f \( -name '*.go' -o -name go.mod -o -name go.sum -o -name syscalls-arm64.txt \) | LC_ALL=C sort | xargs cat)
+    printf 'kernel %s\n' "${kernel##*/config-}"; } | sha256sum | cut -d' ' -f1
+}
+want=$(stamp)
+have=$(cat "$STATE/stamp" 2>/dev/null || true)
+
+current() {
+  [ "$have" = "$want" ] || return 1
+  [ -f "$DEST" ] && [ "$(stat -c %a "$DEST")" = 755 ] || return 1
+  [ -n "$ROOT" ] || [ "$(stat -c %u "$DEST")" = 0 ] || return 1
+}
+
+if current; then exit 0; fi
+if [ "$MODE" = check ]; then
+  if [ ! -f "$DEST" ]; then say "DRIFT: /usr/local/bin/termag-preview is missing"
+  elif [ "$have" != "$want" ]; then say "DRIFT: /usr/local/bin/termag-preview is older than the checkout's preview-launcher (or the boot kernel changed)"
+  else say "DRIFT: /usr/local/bin/termag-preview is not root's 0755"; fi
+  exit 1
+fi
+
+# 1. Build, as the agent user, into a directory of its own.
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+chown "$AGENT_UID" "$out" 2>/dev/null || true
+if [ -n "${TERMAG_PREVIEW_SETUP_BUILD:-}" ]; then
+  build() { $TERMAG_PREVIEW_SETUP_BUILD "$out"; }
+else
+  build() {
+    runuser -u "$AGENT_USER" -- env HOME="$AGENT_HOME" bash -c 'set -euo pipefail
+      export GOENV_ROOT="$HOME/.goenv" PATH="$HOME/.goenv/bin:$HOME/.goenv/shims:/usr/local/go/bin:/usr/bin:/bin"
+      cd "$1"
+      CGO_ENABLED=0 go build -trimpath -ldflags=-s -o "$2/termag-preview" .' _ "$SRC" "$out"
+  }
+fi
+if ! build || [ ! -s "$out/termag-preview" ]; then
+  broke "could not build termag-preview from $SRC; the installed one, if any, is left as it was"
+  exit 1
+fi
+
+# 2. Install it root's.
+install_owned -d -m 0755 "$(dirname "$DEST")" 2>/dev/null || mkdir -p "$(dirname "$DEST")"
+if install_owned -m 0755 "$out/termag-preview" "$DEST.termag-new" && mv -f "$DEST.termag-new" "$DEST"; then
+  say "installed: /usr/local/bin/termag-preview"
+else
+  rm -f "$DEST.termag-new"
+  broke "could not install /usr/local/bin/termag-preview"
+  exit 1
+fi
+
+# 3. The kernel check the bake runs, against this checkout's list. A failure
+# removes the binary: no launcher refuses every confined run.
+if [ -n "${TERMAG_PREVIEW_SETUP_CHECK:-}" ]; then
+  check() { $TERMAG_PREVIEW_SETUP_CHECK; }
+else
+  check() { PREVIEW_CHECK_LIST="$LIST" bash "$CHECKOUT/packer/scripts/check-preview-launcher.sh"; }
+fi
+if ! check; then
+  rm -f "$DEST"
+  broke "the boot kernel failed termag-preview's check (above); removed /usr/local/bin/termag-preview, so confined runs are refused until this kernel is reviewed (preview-launcher/syscalls-arm64.txt)"
+  exit 1
+fi
+
+# 4. Record it.
+install_owned -d -m 0755 "$STATE" 2>/dev/null || mkdir -p "$STATE"
+printf '%s\n' "$want" > "$STATE/stamp.termag-new" && mv -f "$STATE/stamp.termag-new" "$STATE/stamp"
+exit 0

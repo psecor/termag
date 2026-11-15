@@ -48,6 +48,17 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "INPUT=$(cat); printf '%s' \"$INPUT\" | \"$HOME/.local/bin/termag-status\" post-tool-failure >/dev/null 2>&1 &"
+          }
+        ]
+      }
+    ],
     "Notification": [
       {
         "hooks": [

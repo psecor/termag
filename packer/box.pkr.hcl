@@ -425,6 +425,15 @@ build {
     timeout = "15m"
   }
 
+  // The kernel the image now boots (enable-hibernation.sh has pinned it, or,
+  // with hibernation off, left the rolling one) against what termag-preview
+  // was reviewed for: its system calls and Landlock ABI 4. After the pin, not
+  // in setup.sh: a full bake's builder runs Canonical's rolling kernel, which
+  // the box never boots. Reads /boot and the checkout, writes nothing.
+  provisioner "shell" {
+    script = "${path.root}/scripts/check-preview-launcher.sh"
+  }
+
   // First-boot path rewrite, bake half. cloud-init renames /home/termag to the
   // owner and must then fix every symlink target and text file that embeds the
   // old path. Finding them at boot walked the whole home on a lazily-restored

@@ -22,7 +22,8 @@
 #   codex   the export goes in as `-c otel.*` overrides on this launch only:
 #           traces and metrics over OTLP/HTTP. Codex's log exporter stays off,
 #           because its codex.tool_result log records carry tool arguments and
-#           output; its spans carry only their lengths. An owner whose
+#           output; its spans carry only their lengths. The resource gets a
+#           session.id, a UUID per start, since Codex sends none. An owner whose
 #           ~/.codex/config.toml has an otel table of their own keeps theirs.
 #   devin   Devin reads the standard OTLP variables (metrics and logs, which
 #           carry no prompt or tool content without the OTEL_LOG_* gates).
@@ -110,7 +111,55 @@ work=
 creds=$(credentials_script) && [ -n "$creds" ] \
   && { work=$("$creds" work-resource 2>/dev/null </dev/null) || work=; }
 [[ $work =~ ^(,[A-Za-z0-9._]+=[A-Za-z0-9._/-]+)+$ ]] && resource="$resource$work"
+# Codex's spans carry no session.id (its thread id is on some turn and tool
+# spans only, none of the app server's request spans), so each start gets one
+# on the resource: a UUID. The status bridge starts one app server per pane,
+# and the pane's TUI can start more than one thread on it (/new, a resume,
+# subagents), so it names the app server's run, not one conversation.
+# None when no UUID can be had: never a constant.
+session_uuid() {
+  local u
+  u=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) \
+    || u=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' \
+      | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/') || u=
+  [[ $u =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] && printf '%s' "$u"
+}
+if [ "$agent" = codex ]; then
+  sid=$(session_uuid) && resource="$resource,session.id=$sid"
+fi
 [ -n "$replay" ] && resource="$resource,termag.replay.id=$replay"
+# The inference backend and model ("The inference
+# backend"). Codex: termag never sets its provider, so the owner's
+# $CODEX_HOME/config.toml says: no model_provider (or openai) is `openai`, any
+# other provider (a local or self-hosted one) `custom`, never its URL; the
+# model is the launch's --model / -m, else the config's top-level model.
+# Devin runs on Cognition's own backend, which termag can't see: `devin`, with
+# the launch's --model when there is one. Cursor's hook and pi's extension name
+# their own. Ids only; a bad model is left out, never the launch.
+model_arg() {  # the value of --model / -m / --model=… in the command's arguments
+  local prev=
+  for a in "$@"; do
+    case $prev in --model|-m) printf '%s' "$a"; return 0 ;; esac
+    case $a in --model=*) printf '%s' "${a#--model=}"; return 0 ;; --) return 0 ;; esac
+    prev=$a
+  done
+}
+codex_top() {  # a top-level string key of config.toml, before its first table
+  awk -v k="$1" '/^[[:space:]]*\[/ { exit }
+    $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^["\x27]|["\x27][[:space:]]*(#.*)?$/, ""); print; exit }' \
+    "${CODEX_HOME:-$HOME/.codex}/config.toml" 2>/dev/null
+}
+inference=
+case $agent in
+  codex)
+    case $(codex_top model_provider) in ''|openai) inference=openai ;; *) inference=custom ;; esac
+    inf_model=$(model_arg "$@"); [ -n "$inf_model" ] || inf_model=$(codex_top model) ;;
+  devin) inference=devin; inf_model=$(model_arg "$@") ;;
+esac
+if [ -n "$inference" ]; then
+  resource="$resource,termag.inference.backend=$inference"
+  [[ ${inf_model:-} =~ ^[A-Za-z0-9._:/@-]{1,128}$ ]] && resource="$resource,termag.inference.model=$inf_model"
+fi
 export OTEL_RESOURCE_ATTRIBUTES=$resource
 
 case $agent in

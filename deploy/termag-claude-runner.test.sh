@@ -9,7 +9,8 @@
 #   * without a canonical clone it starts anyway and the runner clones cold
 #   * the webapp runner install's wrapper and hooks are passed only when
 #     they exist
-#   * Bedrock env never reaches the runner, and its host config is a copy
+#   * the gateway's and the owner's other provider env (Bedrock, Vertex, a
+#     base URL) never reaches the runner, and its host config is a copy
 #     with the Claude gateway keys termag-credentials merged into the owner's
 #     settings taken out (and the owner's own kept), never ~/.claude itself
 #   * a bad order id, a bad slot, a missing work order and a claude without
@@ -61,8 +62,9 @@
 #   * with --anthropic-git the runner gets --use-anthropic-git-proxy and no SSH
 #     rewrite; with --github absent the staged CLAUDE.md gets the session note
 #     once, naming the termag settings URL from the agent config; the
-#     Bedrock switch is stripped from the host-config copy whatever is
-#     recorded; under the proxy without a termag credential the keep rule
+#     Bedrock switch, the owner's Vertex switch and base URL are stripped from
+#     the host-config copy whatever is recorded; under the proxy without a
+#     termag credential the keep rule
 #     does not ask origin and keeps an unpushed-looking checkout
 #   * on exit, once the checkout is removed or kept, the end is reported to the
 #     orchestrator's event route with the agent config's token (stdin, not
@@ -605,7 +607,7 @@ for want in 'CLAUDE_CODE_ENABLE_TELEMETRY=1' 'OTEL_METRICS_EXPORTER=otlp' 'OTEL_
   'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf' 'OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.test:4318' 'OTEL_METRICS_INCLUDE_SESSION_ID=true'; do
   grep -qx -- "$want" "$WORK/record.env" || fail 'telemetry: exported to the session' "$want" "$(grep -E '^(CLAUDE_CODE_ENABLE_TELEMETRY|OTEL_)' "$WORK/record.env" | tr '\n' ' ')"
 done
-RESOURCE="telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,service.name=termag-claude-session,termag.agent=claude,termag.session.kind=cloud,termag.project=claude:cloud,termag.workstream=main,termag.box=$(hostname -s),termag.slot=3"
+RESOURCE="telemetry.project_id=5f0c1e2d3a4b5c6d7e8f9a0b,service.name=termag-claude-session,termag.agent=claude,termag.session.kind=cloud,termag.project=claude:cloud,termag.workstream=main,termag.box=$(hostname -s),termag.slot=3,termag.inference.backend=anthropic"
 grep -qx "OTEL_RESOURCE_ATTRIBUTES=$RESOURCE" "$WORK/record.env" \
   || fail 'telemetry: resource attributes name the project, the service, the agent, the session kind, the cloud project and workstream, the box and the slot' "$RESOURCE" "$(grep '^OTEL_RESOURCE' "$WORK/record.env")"
 grep -q '^OTEL_LOG_' "$WORK/record.env" && fail "telemetry: the owner's content gates never reach the session" '(absent)' "$(grep '^OTEL_LOG_' "$WORK/record.env" | tr '\n' ' ')"
@@ -943,18 +945,20 @@ argv_has '--git-ssh-rewrite' || fail 'git3: SSH rewrite without --anthropic-git'
 grep -q 'then termag (Settings, Credentials)' "$WORK/record.hostclaude" 2>/dev/null || fail 'git3: without an agent config the note names termag only' 'termag (Settings, Credentials)' "$(cat "$WORK/record.hostclaude" 2>/dev/null)"
 rm -f "$HOME_DIR/.claude/CLAUDE.md"
 
-# The Bedrock switch leaves the host-config copy whatever claude-gateway.json
-# records (a copy taken mid-delivery would otherwise route the session through
-# the gateway).
+# The inference provider settings leave the host-config copy whatever
+# claude-gateway.json records (a copy taken mid-delivery would otherwise route
+# the session through the gateway), and the runner's environment: a cloud
+# session runs on Anthropic's token, and its resource says `anthropic`.
 mkdir -p "$HOME_DIR/.claude" "$HOME_DIR/.config/termag"
-printf '%s' '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_BEDROCK_BASE_URL":"https://gw.example","BASH_DEFAULT_TIMEOUT_MS":"1"}}' > "$HOME_DIR/.claude/settings.json"
+printf '%s' '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_BEDROCK_BASE_URL":"https://gw.example","CLAUDE_CODE_USE_VERTEX":"1","ANTHROPIC_BASE_URL":"https://proxy.example.test","BASH_DEFAULT_TIMEOUT_MS":"1"}}' > "$HOME_DIR/.claude/settings.json"
 rm -f "$HOME_DIR/.config/termag/claude-gateway.json"
 rm -f "$WORK"/record.*
 seed_order ord-bed
-run ord-bed 2; got=$?
+run ord-bed 2 CLAUDE_CODE_USE_VERTEX=1 ANTHROPIC_BASE_URL=https://proxy.example.test; got=$?
 [ "$got" = 0 ] || fail 'bedrock: runs' 0 "$got"
-jq -e '.env.CLAUDE_CODE_USE_BEDROCK == null and .env.ANTHROPIC_BEDROCK_BASE_URL == null and .env.BASH_DEFAULT_TIMEOUT_MS == "1"' "$WORK/record.hostsettings" >/dev/null 2>&1 \
-  || fail 'bedrock: the switch and the URL are stripped from the copy even with nothing recorded, the rest kept' 'no Bedrock keys, BASH_DEFAULT_TIMEOUT_MS kept' "$(cat "$WORK/record.hostsettings" 2>/dev/null)"
+jq -e '.env.CLAUDE_CODE_USE_BEDROCK == null and .env.ANTHROPIC_BEDROCK_BASE_URL == null and .env.CLAUDE_CODE_USE_VERTEX == null and .env.ANTHROPIC_BASE_URL == null and .env.BASH_DEFAULT_TIMEOUT_MS == "1"' "$WORK/record.hostsettings" >/dev/null 2>&1 \
+  || fail 'bedrock: the provider switches and URLs are stripped from the copy even with nothing recorded, the rest kept' 'no provider keys, BASH_DEFAULT_TIMEOUT_MS kept' "$(cat "$WORK/record.hostsettings" 2>/dev/null)"
+grep -q '^CLAUDE_CODE_USE_VERTEX=\|^ANTHROPIC_BASE_URL=' "$WORK/record.env" && fail "the owner's Vertex switch and base URL are unset for the session" '(absent)' "$(grep -E '^(CLAUDE_CODE_USE_VERTEX|ANTHROPIC_BASE_URL)=' "$WORK/record.env")"
 rm -f "$HOME_DIR/.claude/settings.json"
 
 # The keep rule under the proxy: with the credential connected, origin is asked

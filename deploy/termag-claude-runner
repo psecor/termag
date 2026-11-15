@@ -764,6 +764,7 @@ fi
 # config below. Nor may a stray provider setting or key from this environment
 # take the token's place.
 unset CLAUDE_CODE_USE_BEDROCK ANTHROPIC_BEDROCK_BASE_URL CLAUDE_CODE_SKIP_BEDROCK_AUTH \
+  CLAUDE_CODE_USE_VERTEX ANTHROPIC_BASE_URL \
   ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY AWS_BEARER_TOKEN_BEDROCK
 export DISABLE_AUTOUPDATER=1
 export CLAUDE_CODE_DISABLE_ARTIFACT=1
@@ -826,7 +827,12 @@ if [ -n "$otel_project$otel_endpoint" ]; then
     # termag.project, termag.workstream):
     # a cloud session is Claude's, of kind cloud, under the reserved cloud
     # project the work-time rows use (backend services/worktimeProjects.ts).
-    export OTEL_RESOURCE_ATTRIBUTES="telemetry.project_id=$otel_project,service.name=termag-claude-session,termag.agent=claude,termag.session.kind=cloud,termag.project=claude:cloud,termag.workstream=main,termag.box=${box_name:-unknown},termag.slot=$slot"
+    export OTEL_RESOURCE_ATTRIBUTES="telemetry.project_id=$otel_project,service.name=termag-claude-session,termag.agent=claude,termag.session.kind=cloud,termag.project=claude:cloud,termag.workstream=main,termag.box=${box_name:-unknown},termag.slot=$slot,termag.inference.backend=anthropic"
+    # termag.inference.backend ("The inference
+    # backend"): a cloud session always runs on the token Anthropic issues with
+    # it, never the gateway (the Bedrock keys are unset above) nor a base URL or
+    # Vertex switch (unset too), so `anthropic`. The session picks its own
+    # model, so there is no termag.inference.model.
     # The owner's and the box's ids, both or neither:
     # the browser SDK stamps the same two attributes on its telemetry. Ids
     # only (letters, digits, - and _), so no value needs OTEL escaping.
@@ -909,7 +915,7 @@ stage_host_config() {
     | if (.apiKeyHelper // "" | test("/termag-claude-token(\u0027|$)")) then del(.apiKeyHelper) else . end
     | if .env then .env |= with_entries(select(.key | test(if $pinned == 1 then "^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$|CLAUDE_CODE_ENHANCED_TELEMETRY_BETA$)" else "^OTEL_LOG_" end) | not)) else . end
     | if $pinned == 1 then del(.otelHeadersHelper) else . end
-    | if .env then .env |= del(.CLAUDE_CODE_USE_BEDROCK, .ANTHROPIC_BEDROCK_BASE_URL) else . end
+    | if .env then .env |= del(.CLAUDE_CODE_USE_BEDROCK, .ANTHROPIC_BEDROCK_BASE_URL, .CLAUDE_CODE_USE_VERTEX, .ANTHROPIC_BASE_URL) else . end
     | if ((.env // {}).CLAUDE_CODE_PLUGIN_DIRS | type) == "string"
       then .env.CLAUDE_CODE_PLUGIN_DIRS |= (split(":") | map(select(. != "" and (endswith("/termag-mcp-refresh") | not))) | join(":"))
         | if .env.CLAUDE_CODE_PLUGIN_DIRS == "" then del(.env.CLAUDE_CODE_PLUGIN_DIRS) else . end
@@ -919,7 +925,9 @@ stage_host_config() {
 }
 # The Bedrock switch goes whatever claude-gateway.json records: a copy taken
 # while termag-credentials is mid-write (the settings merge lands before the
-# record does) would otherwise route the session through the gateway.
+# record does) would otherwise route the session through the gateway. The
+# owner's own Vertex switch and base URL go too: a cloud session runs on the
+# token Anthropic issues with it, and its resource says `anthropic`.
 #
 # The session note: with --github absent,
 # the session's CLAUDE.md says what works without a termag GitHub credential

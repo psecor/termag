@@ -101,6 +101,8 @@ curl -s -o /dev/null "http://127.0.0.1:$port/termag/previews/my-app?next=%2Fcall
 curl -s -o /dev/null "http://127.0.0.1:$port/termag/previews/my-app/$LINK_TOKEN/x?next=%2Fcb%3Ftoken%3D$APP_SECRET"
 curl -s -o /dev/null "http://127.0.0.1:$port/termag/previews/my-app/reverify?next=/x&ticket=$TICKET&z=1"
 curl -s -o /dev/null -H 'Host: my-app.previews.test' "http://127.0.0.1:$port/__termag/auth?code=$CODE&next=%2F"
+# A first open's clean step carries the app's URL in next= too (Bugbot, #1745).
+curl -s -o /dev/null -H 'Host: my-app.previews.test' "http://127.0.0.1:$port/__termag/clean?next=%2Fcallback%3Fcode%3D$APP_SECRET"
 # Repeated parameters: the backend reads the first, so neither may survive.
 curl -s -o /dev/null -H 'Host: my-app.previews.test' "http://127.0.0.1:$port/__termag/auth?code=$CODE&code=other"
 curl -s -o /dev/null "http://127.0.0.1:$port/termag/previews/my-app/reverify?ticket=$TICKET&ticket=other"
@@ -142,6 +144,8 @@ got=$(grep -c '"GET /termag/previews/my-app/reverify?<redacted> HTTP/1.1"' "$W/l
 [ "$got" = 3 ] || fail "a reverify's whole query (its ticket, once, among others or repeated) is logged as <redacted>" 3 "$got"
 got=$(grep -c '"GET /__termag/auth?<redacted> HTTP/1.1"' "$W/logs/access.log" || true)
 [ "$got" = 2 ] || fail "a preview host's /__termag/auth query (its code, once or repeated) is logged as <redacted>" 2 "$got"
+got=$(grep -c '"GET /__termag/clean?<redacted> HTTP/1.1"' "$W/logs/access.log" || true)
+[ "$got" = 1 ] || fail "a preview host's /__termag/clean query (the app URL in next=) is logged as <redacted>" 1 "$got"
 for t in "$REF_TOKEN" "$REF_CODE"; do
   if grep -q "$t" "$W/logs/access.log"; then fail "the access log holds no Referer secret $t" absent "$(grep -h "$t" "$W/logs/access.log" | head -1)"; fi
 done

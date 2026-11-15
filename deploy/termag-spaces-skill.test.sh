@@ -57,6 +57,25 @@ has() {
   done
 }
 
+# Where agents save files:
+# Project files by default, My files only for what's personal or reusable, or when asked; when unsure,
+# Project files. Worded to read true on a box without Project files ("When this session has
+# Project files"), since termag-reconcile can't deliver it only to boxes the flag is on for.
+case "$description" in
+  *"When this session has Project files, save what you make for this project's work there (\`termag space put <file> <path>\`, no space named), and to My files (\`--mine\`) only what's personal or reusable across projects, or when the person says so."*) ;;
+  *) fail 'the description carries the Project files rule' 'When this session has Project files, save what you make …' "$description" ;;
+esac
+has 'the body says where to save: Project files by default, My files when personal or reusable' "$body" \
+  '## Project files and My files' 'When this session has Project files' \
+  "Save what you make for this project's work (screenshots, reports, plans, logs, generated assets) to Project files: \`termag space put <file> <path>\` with no space named." \
+  "Use My files (\`--mine\`) only for what's personal or reusable across projects, or when the person says so; when unsure, Project files. You can read both." \
+  'A named `space:path` always wins.' 'Without Project files' 'works only when this box reaches exactly one space' \
+  '## Sharing what you make'
+grep -qF 'a path with no space named saves there' "$here/claude-skills/agent-ask/SKILL.md" \
+  || fail 'agent-ask says a bare path saves to Project files' 'a path with no space named saves there' '(missing from agent-ask)'
+grep -qF 'on a box with' "$here/claude-skills/agent-orchestrator/SKILL.md" \
+  || fail 'agent-orchestrator says to name the space for asked agents' 'on a box with … Project files' '(missing from agent-orchestrator)'
+
 # Agents use spaces optimistically: no "check first" step, anywhere.
 got="$(grep -inE 'once per session|(check|run) `termag space ls` (first|before)|before the first time|fall back without one|First: check' "$CLAUDE" || true)"
 [ -z "$got" ] || fail 'no precheck before using a space' '' "$got"
@@ -65,7 +84,7 @@ has 'a failed command is handled when it happens: tell the user, share another w
   'tell the user the reason' 'share the file another way' \
   '| 3 | `Not found` |' '| 1 | `A box cannot manage spaces; …` |' '| 4 | `Not signed in …`'
 # Every message the table quotes is one the CLI or the orchestrator prints.
-for msg in 'Not found' 'You reach no spaces' 'this needs ' 'is read-only' 'A box cannot manage spaces' \
+for msg in 'Not found' 'You reach no spaces' "My files isn't on this box" 'this needs ' 'is read-only' 'A box cannot manage spaces' \
   'is over its quota' \
   'Files are limited to 5 GiB' 'Not signed in' "refused the CLI's credential" 'Nothing at '; do
   case "$body" in *"$msg"*) ;; *) fail "the failure table quotes: $msg" "$msg" '(missing from the skill)' ;; esac
@@ -112,7 +131,7 @@ skill_path='~/.claude/skills/termag-spaces/SKILL.md'
 pointer="$(sed -n '/^## Sharing files$/,/^## /p' "$AGENTS" | sed '1d;$d' | grep -v '^$' || true)"
 has 'the seeded AGENTS.md points at the termag-spaces skill' "$(printf '%s' "$pointer" | tr '\n' ' ')" \
   '`termag-spaces` skill' "$skill_path" 'sharing a file with a person' \
-  'saving a plan' 'handing files to another agent or box'
+  'saving a plan' 'handing files to another agent or box' 'saving what you make (Project files, or My files)'
 lines="$(printf '%s\n' "$pointer" | grep -c . || true)"
 [ "$lines" -ge 1 ] && [ "$lines" -le 2 ] || fail 'the AGENTS.md pointer is one or two lines' '1-2' "$lines"
 

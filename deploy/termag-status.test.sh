@@ -242,6 +242,30 @@ got="$(printf '%s' "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$ER/
 [ "$(printf '%s\n' "$got" | sed -n 1p)" = '{"session":"psecor-x-agent","status":"working"}' ] || fail 'the edit never rides on the status payload' 'working only' "$got"
 [ "$(printf '%s\n' "$got" | sed -n 2p)" = '{"session":"psecor-x-agent","tool":"Edit","dir":"verifiers"}' ] || fail '--print-payload prints the edit payload after the status' '{"session":"psecor-x-agent","tool":"Edit","dir":"verifiers"}' "$got"
 
+# --- --mcp-of: PostToolUse(Failure) payload → the MCP server and tool ---------
+# Only the two names, the outcome and the session id: never the input or result.
+mcp_of() { printf '%s' "$1" | HOME="$WORK/empty-home" "$SCRIPT" "--mcp-of${2:+-failure}"; }
+got="$(mcp_of "{\"tool_name\":\"mcp__example-mcp__search-logs\",\"tool_input\":{\"query\":\"secret\"},\"tool_response\":{\"content\":[]},\"session_id\":\"$SID\"}")"
+[ "$got" = "example-mcp search-logs ok $SID" ] || fail 'an MCP call names its server, tool and session' "example-mcp search-logs ok $SID" "$got"
+got="$(mcp_of '{"tool_name":"mcp__metaterm__list_sessions","tool_response":{"isError":true,"content":[]}}')"
+[ "$got" = 'metaterm list_sessions error -' ] || fail 'a result MCP marked isError is an error' 'metaterm list_sessions error -' "$got"
+got="$(mcp_of '{"tool_name":"mcp__plugin_x_srv__do.it","error":"boom"}' error)"
+[ "$got" = 'plugin_x_srv do.it error -' ] || fail 'PostToolUseFailure is an error, the server is up to the first __' 'plugin_x_srv do.it error -' "$got"
+for bad in '{"tool_name":"Bash","tool_input":{"command":"ls"}}' '{"tool_name":"mcp__only"}' '{"tool_name":"mcp____x"}' \
+           '{"tool_name":"mcp__a b__c"}' '{"tool_name":"mcp__a__c d"}'; do
+  got="$(mcp_of "$bad")"
+  [ -z "$got" ] || fail "no MCP call for $bad" '' "$got"
+done
+for mode in post-tool post-tool-failure; do
+  got="$(printf '%s' "{\"tool_name\":\"mcp__slack__slack_read_channel\",\"tool_input\":{\"channel\":\"C1\"},\"tool_response\":\"hello\",\"session_id\":\"$SID\"}" | TERMAG_STATUS_SESSION=psecor-x-agent TERMAG_AGENT_CONFIG="$WORK/does-not-exist.json" HOME="$WORK/empty-home" "$SCRIPT" "$mode" --print-payload)"
+  outcome=ok; [ "$mode" = post-tool ] || outcome=error
+  [ "$(printf '%s\n' "$got" | sed -n 1p)" = '{"session":"psecor-x-agent","status":"working"}' ] || fail "$mode: the MCP call never rides on the status payload" 'working only' "$got"
+  want="{\"session\":\"psecor-x-agent\",\"server\":\"slack\",\"tool\":\"slack_read_channel\",\"outcome\":\"$outcome\",\"claudeSession\":\"$SID\"}"
+  [ "$(printf '%s\n' "$got" | sed -n 2p)" = "$want" ] || fail "$mode: --print-payload prints the MCP payload after the status" "$want" "$got"
+done
+jq -e '.hooks.PostToolUseFailure[0].matcher == "mcp__.*" and (.hooks.PostToolUseFailure[0].hooks[0].command | test("termag-status.* post-tool-failure"))' "$(dirname "$SCRIPT")/claude-settings.json" >/dev/null \
+  || fail 'PostToolUseFailure pipes mcp__ calls into post-tool-failure' 'the hook' "$(jq -c '.hooks.PostToolUseFailure' "$(dirname "$SCRIPT")/claude-settings.json")"
+
 # A heredoc BODY that documents the command (and even prints a PR URL) is not a
 # milestone: grep's ^ is line-anchored, so the body is stripped before matching.
 got="$(classify '{"tool_name":"Bash","tool_input":{"command":"cat > NOTES.md <<'"'"'EOF'"'"'\nTo ship:\ngh pr create --fill\nsee https://github.com/o/r/pull/9\nEOF\ncat NOTES.md"},"tool_response":"To ship:\ngh pr create --fill\nsee https://github.com/o/r/pull/9\n"}')"

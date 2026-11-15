@@ -71,6 +71,10 @@ kernel_supports_hibernation() {
     grep -qx 'CONFIG_HIBERNATION=y' "$1"
 }
 
+# preview-launcher/syscalls-arm64.txt was reviewed against this package's kernel
+# (its reviewed-kernel-package line). Change one and Box AMI CI's
+# check-kernel-pin.sh fails until the new kernel's system calls are reviewed
+# and the list updated; its message has the commands.
 GA_KERNEL_PKG=linux-aws-lts-24.04
 ROLLING_KERNEL_PKGS="linux-aws linux-image-aws linux-headers-aws linux-tools-aws"
 FIRST_BROKEN_KERNEL=6.16

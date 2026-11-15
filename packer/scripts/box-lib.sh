@@ -90,6 +90,30 @@ install_terminfo() {
     sudo bash /home/termag/src/termag/deploy/termag-terminfo-setup
 }
 
+# The preview launcher ("Confining the app for
+# wider audiences"): `termag preview run` has the agent start the app under
+# Landlock and seccomp through /usr/local/bin/termag-preview. A static build
+# from the checkout cloned above, with the termag user's Go (goenv, setup.sh),
+# installed root-owned so nothing on the box can swap it for one that doesn't
+# confine (the agent refuses a launcher it could write). The kernel the image
+# boots is checked against what it was reviewed for (the system calls in
+# preview-launcher/syscalls-arm64.txt, Landlock ABI 4) later, by
+# check-preview-launcher.sh: here the builder may run a kernel the box never
+# boots (a full bake's, Canonical's rolling linux-aws).
+install_preview_launcher() {
+    local out
+    out=$(sudo -u termag -H mktemp -d)
+    sudo -u termag -H bash -c 'set -euo pipefail
+        export GOENV_ROOT="$HOME/.goenv" PATH="$HOME/.goenv/bin:$HOME/.goenv/shims:$PATH"
+        cd /home/termag/src/termag/preview-launcher
+        CGO_ENABLED=0 go build -trimpath -ldflags=-s -o "$1/termag-preview" .' _ "$out"
+    sudo install -o root -g root -m 0755 "$out/termag-preview" /usr/local/bin/termag-preview
+    sudo rm -rf "$out"
+    # The launcher's box-wide settings: client TCP Fast Open off (a Fast Open send connects past Landlock on some 6.8
+    # kernels) and Yama's ptrace_scope at least 1. Read as root: the provisioner user can't enter /home/termag.
+    sudo bash /home/termag/src/termag/deploy/termag-preview-sysctl-setup
+}
+
 # Mark the box for login shells, so tooling can tell it runs on a termag box
 # (the hostname is no signal), and a shell from ssh or a bare `tmux` of the
 # owner's does not pass through termag-agent.service, which sets the same variable for
@@ -122,4 +146,37 @@ install_box_marker() {
         printf '\n# ~/.local/bin for non-interactive zsh (packer/scripts/box-lib.sh, install_box_marker)\n%s\n' "$ZSHENV_LOCAL_BIN" \
             | sudo tee -a /etc/zsh/zshenv >/dev/null
     fi
+}
+
+# The browser pane's Chromium: the agent runs the snap,
+# /snap/bin/chromium, and announces the pane only when it finds one, so an
+# image without it ships boxes that refuse every pane. Both bakes call this:
+# the full bake installs it, an incremental one puts it on a source image that
+# lacks it. The full bake used to run `snap install chromium || true`: on
+# 2026-11-11 its install met "error: unable to contact snap store", the image
+# published anyway, and every incremental bake built on it (they skip
+# setup.sh) shipped without one. The store is retried with a growing wait;
+# a store still unreachable fails the bake rather than publish that image.
+# $1 = log prefix. CHROMIUM_INSTALL_TRIES, CHROMIUM_INSTALL_WAIT (seconds, the
+# first wait) and CHROMIUM_BIN are for the test.
+install_chromium() {
+    local prefix=${1:-[packer]} tries=${CHROMIUM_INSTALL_TRIES:-5} wait=${CHROMIUM_INSTALL_WAIT:-20}
+    local bin=${CHROMIUM_BIN:-/snap/bin/chromium} n
+    if snap list chromium >/dev/null 2>&1 && [ -x "$bin" ]; then
+        echo "$prefix chromium is installed ($bin)"
+        return 0
+    fi
+    for ((n = 1; n <= tries; n++)); do
+        if sudo snap install chromium; then
+            [ -x "$bin" ] || { echo "$prefix snap installed chromium but $bin is missing; failing the bake" >&2; exit 1; }
+            echo "$prefix chromium installed ($bin)"
+            return 0
+        fi
+        if [ "$n" -lt "$tries" ]; then
+            echo "$prefix snap install chromium failed (try $n of $tries); retrying in $((wait * n))s"
+            sleep $((wait * n))
+        fi
+    done
+    echo "$prefix snap install chromium failed $tries times; failing the bake rather than publish an image whose boxes can't run a browser pane" >&2
+    exit 1
 }

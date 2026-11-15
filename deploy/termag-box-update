@@ -152,6 +152,7 @@ todo=0
 # it): short tokens, never free text from the box, so the admin Fleet table
 # can sort on them and the journal line stays one line.
 R_PULL=skipped R_RECONCILE=none R_HOOKS=none R_DEPS=unchanged R_AGENT=unchanged
+R_RECONCILE_AGENT=0
 
 # Nothing here may wait on a person. A fetch that needs a credential nobody is
 # there to type fails at once instead of holding the unit open.
@@ -370,6 +371,9 @@ if [ ! -x "$RECONCILE" ]; then
 else
   if out=$("$RECONCILE" --check 2>&1); then
     log 'reconcile: installed artifacts match the checkout'
+    # A clean --check can still explain itself (a shared host's skipped setups, say):
+    # it only shows here, so the run's log carries what reconcile said.
+    [ -z "$out" ] || printf '%s\n' "$out" | indent
     R_RECONCILE=clean
   else
     log 'reconcile: drift:'
@@ -380,6 +384,11 @@ else
       if out=$("$RECONCILE" 2>&1); then
         [ -z "$out" ] || printf '%s\n' "$out" | indent
         R_RECONCILE=reconciled
+        # The agent reads its guest environment only at start (agent.js's
+        # guestEnvironment), and the restart below looks for agent/ changes only:
+        # a reconcile that just put the box marker or the guest browser setup in
+        # place would otherwise wait for an unrelated agent change to be announced.
+        case "$out" in *'the box marker'*|*'guest browser'*) R_RECONCILE_AGENT=1 ;; esac
       else
         warn "reconcile: termag-reconcile exited $?"
         [ -z "$out" ] || printf '%s\n' "$out" | indent >&2
@@ -630,7 +639,9 @@ maybe_restart_agent() {
     return 0
   fi
   if ! changed=$(agent_changed_since "$started"); then
-    if [ "$deps_installed" = 1 ]; then
+    if [ "$R_RECONCILE_AGENT" = 1 ]; then
+      changed='the guest browser setup (reconciled this run; the agent reads its guest environment only at start)'
+    elif [ "$deps_installed" = 1 ]; then
       changed='agent/node_modules'
     else
       log "agent: nothing it runs changed since it started ($(iso "$started")); not restarting"

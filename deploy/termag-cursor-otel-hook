@@ -36,7 +36,9 @@ resource=$(jq -r '.resourceAttributes // empty' "$record" 2>/dev/null)
 replay=${TERMAG_OTEL_REPLAY_ID:-}
 case $replay in *[!A-Za-z0-9]*) replay= ;; esac
 if [ ${#replay} -lt 20 ] || [ ${#replay} -gt 64 ]; then replay=; fi
-resource="$resource,service.name=termag-cursor-session,termag.agent=cursor"
+# Cursor runs on Cursor's own backend, which termag can't see;
+# each event names its model.
+resource="$resource,service.name=termag-cursor-session,termag.agent=cursor,termag.inference.backend=cursor"
 project=${TERMAG_PROJECT:-} workstream=${TERMAG_WORKSTREAM:-}
 [[ $project =~ ^[A-Za-z0-9_-]{1,64}$ ]] && [[ $workstream =~ ^[A-Za-z0-9_-]{1,64}$ ]] \
   && resource="$resource,termag.project=$project,termag.workstream=$workstream"

@@ -415,6 +415,12 @@ printf '{"type":"result","subtype":"error_turn_stopped","is_error":true,"result"
 run --report "$J" "$HOME/result-k2.json"
 eq 'a stopped turn is an error' "$(jq -r .isError "$TSTATE/result.json")" true
 has 'naming why' "$(jq -r .exitReason "$TSTATE/result.json")" 'error_turn_stopped'
+# A model API error: Claude Code says is_error with subtype "success".
+J=$(job runkkkk0004 threadkkkk01)
+printf '{"type":"result","subtype":"success","is_error":true,"result":"API Error: The system encountered an unexpected error during processing. Try your request again."}\n' > "$HOME/result-k4.json"
+run --report "$J" "$HOME/result-k4.json"
+eq 'an API error is an error' "$(jq -r .isError "$TSTATE/result.json")" true
+eq 'naming the API error, not "success"' "$(jq -r .exitReason "$TSTATE/result.json")" 'Claude Code ended with an API error: The system encountered an unexpected error during processing. Try your request again.'
 J=$(job runkkkk0003 threadkkkk01)
 run --fail "$J" 'the chat runner refused the turn'; eq '--fail exits 1' "$?" 1
 eq '--fail is an error reply' "$(jq -r .isError "$TSTATE/result.json")" true
@@ -464,6 +470,7 @@ eq 'the clone has origin, as the checkout names it' "$(git -C "$P" config --get 
 eq 'and is not shallow' "$(git -C "$P" rev-parse --is-shallow-repository)" false
 git -C "$P" cat-file -e "$LIVE_HEAD^{commit}" 2>/dev/null && fail "the live checkout's unpushed commit stays out of the clone" absent present
 eq 'the run is on the thread branch' "$(git -C "$P" branch --show-current)" "$PB"
+lacks 'an ask at its own mode needs no allow rules' "$(cat "$TSTATE/claude-args")" '--allowedTools'
 eq 'which tracks the default branch, so it is its own tree' "$(git -C "$P" rev-parse --abbrev-ref "$PB@{upstream}")" origin/main
 eq 'origin/HEAD names the default branch, as a clone sets it' "$(git -C "$P" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null)" refs/remotes/origin/main
 git -C "$P" rev-parse -q --verify refs/termag/base >/dev/null && fail 'no refs/termag/base in a push clone' absent present
@@ -487,6 +494,13 @@ has 'naming the rebase' "$hook_out" 'rebase onto the current origin/main and pus
 has 'and the refresh' "$hook_out" 'gh auth refresh -h github.com -s workflow'
 hook_out=$(cd "$P" && printf 'refs/heads/x %s refs/heads/x %s\n' "$pc" "$Z" | .git/hooks/pre-push origin https://github.com/org/repo.git 2>&1)
 lacks 'and says nothing of it for a push that does not' "$hook_out" 'workflow'
+lacks 'nor refuses it as another repository' "$hook_out" 'shares no commit'
+# A history of another repository (a PR fetched with `gh pr checkout -R`) is refused.
+fr=$(GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.com GIT_COMMITTER_NAME=Ada GIT_COMMITTER_EMAIL=ada@example.com git -C "$P" commit-tree -m foreign "$(git -C "$P" rev-parse 'HEAD^{tree}')")
+fc=$(GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.com GIT_COMMITTER_NAME=Ada GIT_COMMITTER_EMAIL=ada@example.com git -C "$P" commit-tree -p "$fr" -m fix "$(git -C "$P" rev-parse 'HEAD^{tree}')")
+rc=0; hook_out=$(cd "$P" && printf 'refs/heads/x %s refs/heads/pr-branch %s\n' "$fc" "$Z" | .git/hooks/pre-push origin https://github.com/org/repo.git 2>&1) || rc=$?
+eq 'the pre-push hook refuses a history that shares no commit with origin' "$rc" 1
+has 'saying it belongs to another repository' "$hook_out" 'not pushing pr-branch: its history shares no commit with origin'
 # The hook's warnings count only what the branch adds: not main's commits or files that a
 # merge of origin/main brings in, nor those of a merged branch cut from a newer main.
 HO="$WORK/hook-origin.git" H="$WORK/hook-clone" H2="$WORK/hook-other"
@@ -602,6 +616,16 @@ done
 [ -x "$P/.git/hooks/pre-push" ] || fail "the capped clone keeps termag's own pre-push hook" present absent
 eq 'the hook pre-commit kept is put back' "$(cat "$P/.git/hooks/pre-commit" 2>/dev/null)" "$(printf '#!/bin/sh\nexit 0')"
 rm -f "$P/.pre-commit-config.yaml" "$STUB/pre-commit"
+# An auto run has nobody to answer a prompt: its own branch's push is allowed outright.
+SAVED_MODE=$(cat "$TSTATE/claude-mode"); echo none > "$TSTATE/claude-mode"
+runp "$(job runpush0009 threadpush01 '{"pushBranch":"'"$PB"'","permissionMode":"auto"}')"; eq 'an auto push-mode turn exits 0' "$?" 0
+has 'auto: the push of its own branch is allowed' "$(cat "$TSTATE/claude-args")" \
+  "$(printf -- '--allowedTools\nBash(git push origin HEAD:%s)' "$PB")"
+runp "$(job runpush0010 threadpush01 '{"pushBranch":"'"$PB"'","permissionMode":"dontAsk"}')"
+lacks 'dontAsk: no allow rules, it has no Bash' "$(cat "$TSTATE/claude-args")" '--allowedTools'
+run "$(job runaaaa0011 threadaaaa11 '{"permissionMode":"auto"}')"
+lacks 'auto with no push branch: no allow rules' "$(cat "$TSTATE/claude-args")" '--allowedTools'
+echo "$SAVED_MODE" > "$TSTATE/claude-mode"
 # An older clone of a thread is converted on its first push-mode turn.
 run "$(job runconv0001 threadconv001)"
 C="$ROOT/threads/threadconv001/repo"

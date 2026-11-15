@@ -38,7 +38,7 @@ needs well under half of that, and the orchestrator's
 `backend/src/services/boxProvisioner.ts`) matches.
 
 Bake it from "Publish AMI" with **target `box-min`** (publish ticked to tag
-`Component=box-min`; off for a `box-min-candidate` you can inspect), or by
+`Component=box-min`; off for a `box-min-candidate` of main you can inspect), or by
 hand: `packer build -var vpc_id=… -var subnet_id=… box-min.pkr.hcl`. There is
 no incremental mode — the bake is minutes and always starts from Canonical
 Ubuntu. The schedule's `check-box-min-ami` staleness check covers the same
@@ -54,8 +54,11 @@ scratch-volume pair, hibernation) is a failed check.
 - **System / dev tooling**: `git`, `mosh`, `tmux`, `build-essential`, `curl`,
   `wget`, `jq`, `htop`, `ripgrep`, `zsh`, `zoxide`, `keychain`,
   `postgresql-client`, `rsync`, `neovim` (latest), `gh`, `awscli` v2,
-  `terraform`, Doppler CLI, Docker (ce + buildx + compose), Chromium (snap;
-  Playwright brings its own, below).
+  `terraform`, Doppler CLI, Docker (ce + buildx + compose), Chromium (snap,
+  for the browser pane and browser-harness; `install_chromium` in
+  `scripts/box-lib.sh` retries the snap store and fails the bake rather than
+  ship without it, and an incremental bake adds it to a source image that
+  lacks it; Playwright brings its own, below).
 - **Language toolchains (per-user, under `~termag`)**:
   - Node via **nvm** (LTS) + `corepack` (yarn, pnpm). *nvm-only — there is no
     system node; the agent service sources nvm.*
@@ -221,7 +224,7 @@ that tag). So "ship a change to boxes" means "bake a new box AMI" — editing
 `scripts/setup.sh` alone does nothing until an AMI is rebuilt.
 
 **On `main`, that happens by itself.** `.github/workflows/publish-ami.yml`
-runs hourly (`:17`). Its `check-box-ami` job reads the `TermagSha` tag off the
+runs every three hours (`:17`). Its `check-box-ami` job reads the `TermagSha` tag off the
 newest published box AMI and diffs that commit against `main` over the inputs
 that land in the image: `box.pkr.hcl`, every file and script it ships (read
 from the template, so a new `provisioner "file"` is covered automatically),
@@ -233,6 +236,51 @@ summary shows which commit the live AMI came from, which inputs were
 considered, the decision, and whether the bake was full or incremental (next
 section). Merging is enough — the next box provisioned after the bake finishes
 gets the change.
+
+## Validating a packer change before merge
+
+**A branch can't be baked.** The bake role trusts `refs/heads/main` only, so
+Publish AMI dispatched from a branch fails at "Configure AWS credentials
+(OIDC)", `publish` ticked or not. A packer change is first proven by the
+scheduled bake after it merges. Before that, approximate the bake on a box,
+where the three things the bake differs on are easy to reproduce:
+
+- **Run the changed scripts as a user that isn't `termag`.** Provisioners
+  run as `ubuntu`, and `/home/termag` is 0750, so a read of the checkout
+  that works for you fails in the bake. `sudo -u ubuntu bash <script>` from
+  a copy outside `/home/termag` (or a throwaway user from `useradd`) shows
+  it: `sudo -u ubuntu cat /home/termag/src/termag/<file>` is `Permission
+  denied`. Anything the bake must read there goes through `sudo`.
+- **Check against the GA kernel's files, not the builder's.** A full bake's
+  builder runs Canonical's rolling `linux-aws` kernel, and
+  `enable-hibernation.sh` only pins the image to the GA 6.8 kernel
+  (`linux-aws-lts-24.04`) later on. A box already boots that kernel, so its
+  `/boot` (`config-*`, `System.map-*`) is what the image boots; a step that
+  reads the running kernel (`uname -r`, `/proc/kallsyms`) before that pin
+  sees a different one in the bake. To see another kernel's files without
+  installing it: `apt-get download linux-modules-<release>` and
+  `dpkg-deb --fsys-tarfile` it. Scripts that read `/boot` take a test root
+  for a fixture (`HIBERNATION_ROOT`, `PREVIEW_CHECK_ROOT`).
+- **Make sure a failed read fails loudly.** Make an input unreadable or empty
+  (`chmod 000` a fixture copy) and check the script exits non-zero naming
+  that file, not some later symptom of an empty value. A read inside a
+  process substitution (`<(grep ...)`) or a pipeline without `pipefail`
+  loses its exit status.
+
+**The example.** #1519 checked the builder's kernel against
+`preview-launcher/syscalls-arm64.txt` in `setup.sh`, reading the list as
+`ubuntu` inside a process substitution. The read was denied silently, the
+list came out empty, and every system call read as unreviewed, so every bake
+after the merge failed. With the read fixed, it would still have failed: the
+builder's rolling kernel has 12 calls the box's GA 6.8 lacks. #1598 moved
+the check after the pin, read the box kernel's `System.map`, and read every
+input as root, failing on an empty read. All three of the steps above would
+have caught it on a box.
+
+**After the merge, watch the first scheduled bake.** It runs every three
+hours at `:17` (Actions → Publish AMI, the `build-box` job). If it fails,
+revert the change first and fix it in a new PR: until a bake passes, no
+image change from `main` reaches new boxes.
 
 ## Bake modes and the scratch volume
 
@@ -283,17 +331,20 @@ mode down).
 > fails unless it carries `Component=box` and this run's `TermagSha` — a green
 > run means delivery.
 
-To bake on demand — a branch, another account, or now rather than at `:17` —
-the same workflow runs by hand. It does the same `packer build` below against
-AWS via OIDC, so no local Packer or long-lived creds are needed. **A manual
-box bake is a candidate unless you tick `publish`**: it is tagged
-`Component=box-candidate`, which discovery ignores, so you can bake a branch
-and inspect the image without it becoming what new boxes launch from.
+To bake on demand, from main only (now rather than at `:17`, or into
+another account), the same workflow runs by hand. It does the same `packer
+build` below against AWS via OIDC, so no local Packer or long-lived creds are
+needed. **A manual box bake is a candidate unless you tick `publish`**: it is
+tagged `Component=box-candidate`, which discovery ignores, so you can check an
+image of main before it becomes what new boxes launch from. A branch can't be
+baked: the bake role trusts `refs/heads/main` only, and a run from any other
+branch fails at "Configure AWS credentials (OIDC)". To check a change before
+it merges, see "Validating a packer change before merge" above.
 
 1. **GitHub → Actions → "Publish AMI" → Run workflow.**
-2. Pick the **branch/ref** to bake (usually `main`). Packer ships *that*
-   checkout into the image — `scripts/setup.sh`, the `deploy/` files, and the
-   termag source itself — so the AMI reflects the ref you choose.
+2. Leave **Use workflow from** on `main`. Packer ships that checkout into the
+   image (`scripts/setup.sh`, the `deploy/` files, and the termag source
+   itself), so the AMI is main as of the run.
 3. Set **`target`**:
    - `box` — bake only the per-user box AMI (this image).
    - `box-min` — bake only the lean `Component=box-min` image (see "The lean

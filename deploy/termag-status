@@ -31,7 +31,12 @@
 #                                     # once-marker is claimed before posting)
 #   termag-status post-tool           # PostToolUse hook JSON on stdin: posts
 #                                     # `working`, plus a milestone when the
-#                                     # tool was a Bash `gh pr create|merge`
+#                                     # tool was a Bash `gh pr create|merge`,
+#                                     # the edited directory for a file write,
+#                                     # and the server and tool of an MCP call
+#   termag-status post-tool-failure   # PostToolUseFailure hook JSON on stdin
+#                                     # (mcp__ tools): `working`, plus the MCP
+#                                     # call with outcome error
 #   termag-status permission-request  # PermissionRequest hook JSON on stdin
 #                                     # (Devin's approval prompt): posts
 #                                     # `waiting` (approval, notify) naming the
@@ -54,6 +59,9 @@
 #                                     # the call opened/merged a PR (the URL in
 #                                     # the output is the proof it succeeded),
 #                                     # else nothing; POSTs nothing (tests)
+#   termag-status --mcp-of[-failure]  # hook JSON on stdin → "<server> <tool>
+#                                     # <outcome> <session_id>" for an mcp__
+#                                     # call, else nothing; POSTs nothing (tests)
 #   termag-status session-start       # SessionStart hook: ~/.local/bin onto
 #                                     # $CLAUDE_ENV_FILE, POSTs nothing
 #   termag-status --print-endpoint    # resolve and print, POST nothing
@@ -399,12 +407,40 @@ edit_of() {
   printf '%s %s %s\n' "$tool" "$two" "$sid"
 }
 
+# --- MCP tool calls (docs/agents/observability.md, agent.mcp.used) ----------
+# An mcp__<server>__<tool> call: prints "<server> <tool> <outcome> <session_id>"
+# (session_id may be "-"), or nothing for any other tool or a name with
+# anything but letters, digits and _-. (and . in a tool). <outcome> is error
+# for PostToolUseFailure ($2 = error) or a result MCP marked isError, else ok.
+# Only the two names, the outcome and Claude Code's session id leave the box:
+# never the arguments or the result. The server keeps a name only when it is
+# termag's own or the catalog's (backend services/mcpUseEvent.ts).
+mcp_of() {
+  local input=$1 outcome=${2:-ok} tool rest server name sid
+  tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null) || return 0
+  case $tool in mcp__?*__?*) ;; *) return 0 ;; esac
+  rest=${tool#mcp__}
+  server=${rest%%__*}; name=${rest#*__}
+  printf '%s' "$server" | grep -Eq '^[A-Za-z0-9_-]{1,64}$' || return 0
+  printf '%s' "$name" | grep -Eq '^[A-Za-z0-9_.-]{1,64}$' || return 0
+  if [ "$outcome" = ok ] && [ "$(printf '%s' "$input" | jq -r '(.tool_response | objects | .isError) // false' 2>/dev/null)" = true ]; then
+    outcome=error
+  fi
+  sid=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null) || sid=
+  printf '%s' "$sid" | grep -Eq '^[A-Za-z0-9-]{8,64}$' || sid=-
+  printf '%s %s %s %s\n' "$server" "$name" "$outcome" "$sid"
+}
+
 if [ "$MODE" = "--classify" ]; then
   classify_tool "$(cat)"
   exit 0
 fi
 if [ "$MODE" = "--edit-of" ]; then
   edit_of "$(cat)"
+  exit 0
+fi
+if [ "$MODE" = "--mcp-of" ] || [ "$MODE" = "--mcp-of-failure" ]; then
+  if [ "$MODE" = "--mcp-of" ]; then mcp_of "$(cat)" ok; else mcp_of "$(cat)" error; fi
   exit 0
 fi
 
@@ -596,6 +632,8 @@ ENDPOINT=$(resolve_endpoint)
 # --- build the payload ------------------------------------------------------
 MILESTONE_PAYLOAD=
 EDIT_PAYLOAD=
+MCP_USE=
+MCP_PAYLOAD=
 TITLE_PAYLOAD=
 TITLE_ENDPOINT=
 TITLE_MARKER=
@@ -645,6 +683,15 @@ case $MODE in
       EDIT_PAYLOAD=$(jq -nc --arg s "$SESSION" --arg t "$E_TOOL" --arg d "$E_DIR" --arg c "$E_SID" \
         '{session:$s, tool:$t, dir:$d} + (if $c != "-" then {claudeSession:$c} else {} end)')
     fi
+    MCP_USE=$(mcp_of "$INPUT" ok)
+    ;;
+  post-tool-failure)
+    # PostToolUseFailure, registered for mcp__ tools only: the call is over
+    # but the turn goes on, so `working`, plus agent.mcp.used with outcome
+    # error. Read in the foreground (see `notification`).
+    INPUT=$(cat)
+    PAYLOAD=$(jq -nc --arg s "$SESSION" --argjson x "$(extras)" '{session:$s,status:"working"} + $x')
+    MCP_USE=$(mcp_of "$INPUT" error)
     ;;
   prompt-submit)
     # The UserPromptSubmit payload, read in the foreground (see `notification`).
@@ -731,6 +778,12 @@ esac
 
 [ -n "$PAYLOAD" ] || exit 0
 
+if [ -n "${MCP_USE:-}" ]; then
+  read -r M_SERVER M_TOOL M_OUTCOME M_SID <<< "$MCP_USE"
+  MCP_PAYLOAD=$(jq -nc --arg s "$SESSION" --arg v "$M_SERVER" --arg t "$M_TOOL" --arg o "$M_OUTCOME" --arg c "$M_SID" \
+    '{session:$s, server:$v, tool:$t, outcome:$o} + (if $c != "-" then {claudeSession:$c} else {} end)')
+fi
+
 # A desktop thread's post (inside the t3 server): its source and its Claude
 # session id, so the server tells the threads of one checkout apart and keeps
 # the session working while any of them works (backend services/sessionTurns.ts).
@@ -745,6 +798,7 @@ if [ -n "$PRINT_PAYLOAD" ]; then
   printf '%s\n' "$PAYLOAD"
   [ -n "$TITLE_PAYLOAD" ] && printf '%s\n' "$TITLE_PAYLOAD"
   [ -n "$EDIT_PAYLOAD" ] && printf '%s\n' "$EDIT_PAYLOAD"
+  [ -n "${MCP_PAYLOAD:-}" ] && printf '%s\n' "$MCP_PAYLOAD"
   [ -n "$USAGE_PAYLOAD" ] && printf '%s\n' "$USAGE_PAYLOAD"
   exit 0
 fi
@@ -764,6 +818,9 @@ post_all "$ENDPOINT" "$PRIMARY_TOKEN"
 # The edited directory (POST /api/status/edit): primary only, like the title;
 # an older server answers 404, which post_json ignores.
 [ -n "$EDIT_PAYLOAD" ] && post_json "$ENDPOINT/edit" "$EDIT_PAYLOAD" "$PRIMARY_TOKEN"
+# The MCP call (POST /api/status/mcp): primary only, like the edit; an older
+# server answers 404, which post_json ignores.
+[ -n "${MCP_PAYLOAD:-}" ] && post_json "$ENDPOINT/mcp" "$MCP_PAYLOAD" "$PRIMARY_TOKEN"
 # The usage, when a cloud session's Stop summed it: primary only, like the title.
 [ -n "$USAGE_PAYLOAD" ] && post_json "$(usage_endpoint "$ENDPOINT")" "$USAGE_PAYLOAD" "$PRIMARY_TOKEN"
 

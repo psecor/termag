@@ -36,7 +36,8 @@ Don't file one for:
 - the repository's tests or build failing;
 - a third-party outage (GitHub, the model provider, AWS) that termag only
   passes on;
-- a feature request. Mention it in your reply to the user instead.
+- a feature request, or the person's opinion of termag: log what they said
+  with `termag feedback` (the termag-feedback skill) instead.
 
 ## How
 

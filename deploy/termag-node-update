@@ -4,7 +4,7 @@
 #
 # Why this exists: Node's patch releases are mostly security releases (the
 # floor's sources are in backend/src/services/nodeUpdatePolicy.ts), and the
-# image pins one (`nvm install 24.22.1; nvm alias default 24.22.1`,
+# image pins one (`nvm install 24.22.3; nvm alias default 24.22.3`,
 # packer/scripts/setup.sh) that nothing moves afterwards.
 #
 # It is the most coupled tool. A new Node version has its own npm global root,
@@ -374,8 +374,8 @@ has_cmd() {
   [ -f "$f" ] && [ -x "$f" ]
 }
 # want_shims ROOT: the shims a Node at ROOT should have: ROOT's own, and those
-# of the newest other installed version that has any (the image's 24.22.1
-# stays installed), so a default an earlier run switched to without them, or
+# of the newest other installed version that has any (the version the image
+# pinned stays installed), so a default an earlier run switched to without them, or
 # left with some of them, gets the rest back (the repair, below). None
 # anywhere: none.
 want_shims() {

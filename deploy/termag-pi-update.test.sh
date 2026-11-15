@@ -531,9 +531,10 @@ mkdir -p "$WORK/pp"; got=$(run_plain --pinned-package 1.4.0 "$WORK/pp"); rc=$?
 [ "$rc" = 1 ] || fail 'pinned package: other bytes refused' 1 "$rc"
 # With no TERMAG_PI_PINS the script's own table is read: the image's 1.0.2
 # stays pinned (a put-back needs it) with its registry integrity, beside
-# 1.5.0, and 1.4.0 is not pinned.
+# 1.5.0 (kept for a put-back) and 1.5.2, the newest, and 1.4.0 is not pinned.
 grep -qE "^PINS='1\.0\.2 sha512-[A-Za-z0-9+/=]{88}\$" "$SCRIPT" || fail 'pins: the script pins the image'"'"'s 1.0.2' pinned absent
-grep -qE "^1\.5\.0 sha512-[A-Za-z0-9+/=]{88}'\$" "$SCRIPT" || fail 'pins: the script pins 1.5.0' pinned absent
+grep -qE "^1\.5\.0 sha512-[A-Za-z0-9+/=]{88}\$" "$SCRIPT" || fail 'pins: the script pins 1.5.0' pinned absent
+grep -qE "^1\.5\.2 sha512-[A-Za-z0-9+/=]{88}'\$" "$SCRIPT" || fail 'pins: the script pins 1.5.2, last' pinned absent
 # The image (packer/scripts/setup.sh, box-min-setup.sh) installs the newest
 # pin through --install-pinned, from the checkout it bakes, and names no pi
 # version of its own: PINS is the one list, so the bake and the recipe cannot
@@ -545,7 +546,7 @@ for bake in setup.sh box-min-setup.sh; do
   ! grep -qE 'pi-coding-agent@[0-9]' "$f" || fail "image: $bake installs no pi by name" absent "$(grep -nE 'pi-coding-agent@[0-9]' "$f")"
 done
 got=$(env -i PATH=/usr/bin:/bin HOME="$HOME_DIR" bash "$SCRIPT" --newest-pin)
-[ "$got" = 1.5.0 ] || fail '--newest-pin: the script'"'"'s newest pin' 1.5.0 "$got"
+[ "$got" = 1.5.2 ] || fail '--newest-pin: the script'"'"'s newest pin' 1.5.2 "$got"
 
 # --install-pinned: the image's install, and the launchers' remedy. The
 # package is fetched, checked against its pin, and npm installs that file,
@@ -571,7 +572,7 @@ reset; npm_at 1.0.2; : > "$WORK/err"
 env -i PATH="$STUB:$WORK/npm/bin:/usr/bin:/bin" HOME="$HOME_DIR" LOG="$LOG" STATE="$STATE" NPMROOT="$NPMROOT" PKGJSON="$PKGJSON" \
   bash "$SCRIPT" --install-pinned 2>>"$WORK/err" >/dev/null; rc=$?
 [ "$rc" = 1 ] || fail 'install-pinned, the script'"'"'s pins: other bytes fail' 1 "$rc"
-has 'install-pinned with no version: the newest pin' "$(cat "$LOG")" 'pi-coding-agent@1.5.0'
+has 'install-pinned with no version: the newest pin' "$(cat "$LOG")" 'pi-coding-agent@1.5.2'
 lacks 'install-pinned, the script'"'"'s pins: npm installs nothing' "$(cat "$LOG")" 'npm install'
 # npm installs something else than asked: refused, and the version that was
 # there put back from its own pinned package.
@@ -657,12 +658,12 @@ lacks 'self-update: prints no unchecked argument' "$(cat "$WORK/err")" 'pi.dev n
 reset; npm_at 1.0.2; policy 200 none 1.4.0
 run TERMAG_PI_PINS=
 has 'the script'"'"'s pins: 1.4.0 is not pinned' "$(report .detail)" 'FAILED:unpinned:1.4.0'
-# Its latest is its newest pin, 1.5.0 (the stub's stand-in package is not
+# Its latest is its newest pin, 1.5.2 (the stub's stand-in package is not
 # its bytes, so nothing is installed).
-reset; npm_at 1.0.2; policy 200 none latest; echo 1.5.0 > "$STATE/latest"
+reset; npm_at 1.0.2; policy 200 none latest; echo 1.5.2 > "$STATE/latest"
 run TERMAG_PI_PINS=
-[ "$(report .target)" = 1.5.0 ] || fail 'the script'"'"'s pins: latest is 1.5.0' 1.5.0 "$(report .target)"
-has 'the script'"'"'s pins: the stand-in is refused' "$(cat "$WORK/err")" "pi 1.5.0's package is not the pinned one"
+[ "$(report .target)" = 1.5.2 ] || fail 'the script'"'"'s pins: latest is 1.5.2' 1.5.2 "$(report .target)"
+has 'the script'"'"'s pins: the stand-in is refused' "$(cat "$WORK/err")" "pi 1.5.2's package is not the pinned one"
 
 # ── rejected, restored, quarantined ─────────────────────────────────────────
 # npm installs another version than asked: rejected, then the version that ran is put back.

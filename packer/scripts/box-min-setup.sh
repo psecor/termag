@@ -178,7 +178,7 @@ set -euo pipefail
 # gap: whoever publishes Node's LTS file then chooses the interpreter every
 # --minimal box runs). Bump it for Node security releases, together with
 # setup.sh's NODE_VERSION — box-min.test.sh pins that the two agree.
-NODE_VERSION=24.22.1
+NODE_VERSION=24.22.3
 curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 export NVM_DIR="$HOME/.nvm"
 . "$NVM_DIR/nvm.sh"

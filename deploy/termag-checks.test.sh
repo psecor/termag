@@ -27,6 +27,12 @@ want='location = /healthz {|location /termag/internal/claude-authz/ {|location /
 got="$(code "$CHECKS" | grep -c 'proxy_pass http://127.0.0.1:3100;')"
 [ "$got" = 4 ] || fail 'only the four checks reach the backend' 4 "$got"
 
+got="$(code "$CHECKS" | sed -n '/location = \/healthz {/,/}/p' | sed '1d;$d' | grep -v '^\s*$' | tr -s ' ' | sed 's/^ //' | tr '\n' '|')"
+want='proxy_pass http://127.0.0.1:3100/termag/health/serving;|include /etc/nginx/snippets/termag-proxy.conf;|'
+[ "$got" = "$want" ] || \
+  fail "the ALB's health check is the backend's serving check through the shared proxy snippet, not a fixed 200 (a host whose backend is still starting takes no checks)" \
+  "$want" "$got"
+
 got="$(code "$CHECKS" | sed -n '/location \/ {/,/}/p' | grep -c 'return 404;')"
 [ "$got" = 1 ] || fail 'everything else is a 404' 1 "$got"
 

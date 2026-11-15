@@ -58,7 +58,7 @@ want="arg --permission-mode
 arg auto
 env OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.test
 env OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-env OTEL_RESOURCE_ATTRIBUTES=telemetry.project_id=abc123,termag.session.kind=interactive,termag.box=box1,service.name=termag-devin-session,termag.agent=devin,termag.replay.id=$RID
+env OTEL_RESOURCE_ATTRIBUTES=telemetry.project_id=abc123,termag.session.kind=interactive,termag.box=box1,service.name=termag-devin-session,termag.agent=devin,termag.replay.id=$RID,termag.inference.backend=devin
 env TERMAG_OTEL_REPLAY_ID=$RID"
 [ "$out" = "$want" ] || fail "devin starts with termag's endpoint and resource, and none of the shell's exporter or content gates" "$want" "$out"
 
@@ -115,6 +115,38 @@ case $out in
 esac
 case $out in *shellsecret*|*shell.example.test*|*OTEL_LOG_*) fail "codex gets none of the shell's exporter or content gates" 'absent' "$out" ;; esac
 case $out in *'service.name=termag-codex-session,termag.agent=codex'*) : ;; *) fail 'codex carries the resource with termag.agent' 'termag.agent=codex' "$out" ;; esac
+# A session.id per start, since Codex sends none: a UUID, a new one each
+# launch, before a replay's termag.replay.id.
+sid_of() { printf '%s\n' "$1" | sed -n 's/^env OTEL_RESOURCE_ATTRIBUTES=.*,session\.id=\([^,]*\).*$/\1/p'; }
+sid1=$(sid_of "$out")
+sid2=$(sid_of "$(run codex -- codex app-server)")
+uuid_re='^[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}$'
+printf '%s' "$sid1" | grep -q "$uuid_re" || fail 'codex carries a session.id, a UUID' 'session.id=<uuid>' "$out"
+[ -n "$sid1" ] && [ "$sid1" != "$sid2" ] || fail 'each codex start gets a session.id of its own' "two different ids" "$sid1 $sid2"
+out="$(run codex --replay "$RID" -- codex app-server)"
+case $out in
+  *",session.id=$(sid_of "$out"),termag.replay.id=$RID"*) : ;;
+  *) fail "codex's session.id comes before a replay's termag.replay.id" "session.id=…,termag.replay.id=$RID" "$out" ;;
+esac
+case "$(run devin -- devin)" in *session.id=*) fail 'devin gets no session.id from the wrapper' 'none' 'session.id' ;; esac
+
+# The inference backend: Codex's from the owner's config.toml (termag never
+# sets its provider), its model from the launch or the config; Devin's is Cognition's own.
+case $out in *',termag.inference.backend=openai'*) : ;; *) fail 'codex with no model_provider is on openai' 'termag.inference.backend=openai' "$out" ;; esac
+case $out in *'termag.inference.model='*) fail 'codex names no model when neither the launch nor the config does' 'no model' "$out" ;; esac
+printf 'model = "gpt-5.5-codex" # mine\n[profiles.x]\nmodel_provider = "ollama"\nmodel = "nope"\n' > "$WORK/codex-home/config.toml"
+out="$(run codex -- codex app-server)"
+case $out in *',termag.inference.backend=openai,termag.inference.model=gpt-5.5-codex'*) : ;; *) fail "codex takes the config's top-level model, not a profile's" 'openai, gpt-5.5-codex' "$out" ;; esac
+printf 'model_provider = "ollama"\nmodel = "gpt-oss:20b"\n' > "$WORK/codex-home/config.toml"
+out="$(run codex -- codex --model o4-mini app-server)"
+case $out in *',termag.inference.backend=custom,termag.inference.model=o4-mini'*) : ;; *) fail "codex on the owner's own provider is custom, with the launch's model" 'custom, o4-mini' "$out" ;; esac
+printf "model = 'a,b=c'\n" > "$WORK/codex-home/config.toml"
+out="$(run codex -- codex app-server)"
+case $out in *'termag.inference.model='*) fail 'codex drops a model that is not an id' 'no model' "$out" ;; esac
+case $out in *',termag.inference.backend=openai'*) : ;; *) fail 'codex keeps the backend when the model is dropped' openai "$out" ;; esac
+rm -f "$WORK/codex-home/config.toml"
+out="$(run devin -- devin --model swe-1.6)"
+case $out in *',termag.inference.backend=devin,termag.inference.model=swe-1.6'*) : ;; *) fail "devin names Cognition's backend and the launch's model" 'devin, swe-1.6' "$out" ;; esac
 
 printf '[otel]\nexporter = "none"\n' > "$WORK/codex-home/config.toml"
 out="$(run codex -- codex app-server)"
@@ -171,7 +203,7 @@ got="$(jq -c '.resourceLogs[0].logRecords // .resourceLogs[0].scopeLogs[0].logRe
 want='["cursor.stop",{"event.name":"cursor.stop","session.id":"c1","conversation.id":"c1","generation.id":"g1","model":"gpt-5","user.email":"a@example.test","status":"completed","loop_count":"0","input_tokens":"1200","output_tokens":"30"}]'
 [ "$got" = "$want" ] || fail 'the hook sends the stop metadata and token counts' "$want" "$got"
 got="$(jq -c '[.resourceLogs[0].resource.attributes[] | {(.key): .value.stringValue}] | add' "$WORK/curl.body")"
-want="{\"telemetry.project_id\":\"abc123\",\"termag.session.kind\":\"interactive\",\"termag.box\":\"box1\",\"service.name\":\"termag-cursor-session\",\"termag.agent\":\"cursor\",\"termag.replay.id\":\"$RID\"}"
+want="{\"telemetry.project_id\":\"abc123\",\"termag.session.kind\":\"interactive\",\"termag.box\":\"box1\",\"service.name\":\"termag-cursor-session\",\"termag.agent\":\"cursor\",\"termag.inference.backend\":\"cursor\",\"termag.replay.id\":\"$RID\"}"
 [ "$got" = "$want" ] || fail 'the hook carries the recorded resource, its service and the replay' "$want" "$got"
 grep -q SECRET "$WORK/curl.body" && fail 'the hook sends no response text or tool input' 'no SECRET' "$(cat "$WORK/curl.body")"
 grep -q shellsecret "$WORK/curl.body" "$WORK/curl.url" && fail "the hook sends nothing of the shell's exporter" 'absent' 'present'

@@ -133,6 +133,9 @@ You and the agents you ask keep the work in the space, not in your context:
   something is ready without putting it there.
 - Each file has one writer (there is no locking): you write `status.md` and
   the plans, and each asked agent writes its own handoff and artifacts.
+- Name the space in every `space:path` you give an asked agent: on a box with
+  Project files, a path with no space saves there instead (`termag-spaces`,
+  "Project files and My files").
 - Use the space straight away, with no precheck. If a `termag space` command
   fails, do what `termag-spaces` says ("When a command fails"): tell the user
   the reason, carry the plan and handoffs in the prompts and replies, and
@@ -218,9 +221,17 @@ the result, make sure of that before asking (`termag space boxes <space>`, and
 - **Stop idle ask boxes, and remove finished ones**, each time the user
   messages you. A box with no `working` ask is stopped (`termag box stop
   <name> --yes`), even with its PR still open: its context is in its handoff
-  and on the PR, and the next ask on its thread starts it again. Once every
-  PR on a box is merged or closed and nothing on it is deferred, remove it
-  (`termag box rm <name> --yes`, `agent-ask`'s "A box for the ask"). Leave
+  and on the PR, and the next ask on its thread starts it again. An ask box
+  is still one of the user's boxes: Claude Code cloud sessions the user
+  starts on claude.ai can land on it, and a stop ends them ("Self-hosted
+  runner stopped responding"). When the stop is refused because cloud
+  sessions run on it (`box_busy`), leave the box running, never retry with
+  `--force`, and tell the user which box you left up and why. Don't remove
+  it on that pass either: a removal ends the sessions just the same. Try
+  the stop again next time, and remove it only once a stop goes through.
+  Once every PR on a box is merged or closed and nothing on it is deferred,
+  remove it (`termag box rm <name> --yes`, `agent-ask`'s "A box for the
+  ask"). Leave
   your own box and long-lived workers alone. Only the box that created a box
   can remove it, so do this from your box; boxes another box created are for
   the user to remove. Record each stop and removal in `status.md`.

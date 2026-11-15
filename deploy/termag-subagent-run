@@ -451,6 +451,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     continue
   fi
   [ "$local_sha" = "$zero" ] && continue
+  # A push that carries a root commit the remote has none of brings a whole
+  # other history: most often a pull request of another repository checked out
+  # here (`gh pr checkout <n> -R <owner>/<repo>` fetches it but adds no
+  # remote), which `git push origin` would publish as a new branch of this
+  # clone's repository. Only when the remote's branches are fetched, so a first
+  # push to an empty repository passes.
+  if [ -n "$(git for-each-ref --count=1 --format=x "refs/remotes/$remote/" 2>/dev/null)" ] \
+    && [ -n "$(git rev-list --max-parents=0 --max-count=1 "$local_sha" --not --remotes="$remote" 2>/dev/null)" ]; then
+    url=$(git remote get-url "$remote" 2>/dev/null || printf '%s' "${2:-$remote}")
+    echo "termag: not pushing ${remote_ref#refs/heads/}: its history shares no commit with $remote ($url), so it belongs to another repository (a pull request checked out with \`gh pr checkout -R\`, say). Push it to that repository instead: \`git push https://github.com/<owner>/<repo>.git HEAD:<branch>\` (\`gh pr view <n> -R <owner>/<repo> --json headRepository,headRefName\` names them)." >&2
+    status=1
+    continue
+  fi
   # What the push adds: commits on no branch the remote has, so a merge of
   # <default>, or of a branch cut from a newer <default>, adds none of theirs.
   range=("$local_sha" --not --remotes="$remote")
@@ -864,6 +877,13 @@ run_claude() {
     [ "$mode" = dontAsk ] && args+=(--tools 'Read,Grep,Glob')
     args+=(--strict-mcp-config --mcp-config '{"mcpServers":{}}' --setting-sources user --settings '{"disableAllHooks":true}')
   fi
+  # An auto run has nobody to answer a prompt: the push of its own branch, as
+  # its system prompt says, needs no classifier verdict (agent/chat-runner.js
+  # askPublishRules, which says why termag-pr-create stays with the
+  # classifier). The pre-push hook still guards main.
+  if [ "$mode" = auto ] && [ -n "$push_branch" ]; then
+    args+=(--allowedTools "Bash(git push origin HEAD:$push_branch)")
+  fi
   [ -n "$resume" ] && args+=(--resume "$resume")
 
   git_name=$(field gitName)
@@ -967,7 +987,14 @@ report() {
     jq -j '.result' "$work/claude.json" > "$work/reply"
     session=$(jq -r '.session_id // empty' "$work/claude.json")
     num_turns=$(jq -r '.num_turns // "null" | tostring' "$work/claude.json")
-    [ "$(jq -r '.is_error // false' "$work/claude.json")" = true ] && { is_error=true; reason="Claude Code ended with $(jq -r '.subtype // "an error"' "$work/claude.json")"; }
+    # A model API error comes back as is_error with subtype "success" and the
+    # error as the result: name it from the result, not the subtype.
+    [ "$(jq -r '.is_error // false' "$work/claude.json")" = true ] && { is_error=true; reason=$(jq -r '
+      (.result // "" | tostring | split("\n")[0] | .[0:200]) as $first
+      | if (.subtype // "success") != "success" then "Claude Code ended with \(.subtype)"
+        elif ($first | test("^API Error")) then "Claude Code ended with an API error: \($first | sub("^API Error:? *"; ""))"
+        elif $first != "" then "Claude Code ended with an error: \($first)"
+        else "Claude Code ended with an error" end' "$work/claude.json"); }
   else
     is_error=true
     reason="the run exited $status without a result"

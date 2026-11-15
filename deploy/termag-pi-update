@@ -166,7 +166,8 @@ TU_NPM_FLAGS=(--ignore-scripts)
 # the newest pin up to it, and that version run on a box (a session started
 # and resumed). The image's pin keeps its line, for a put-back.
 PINS='1.0.2 sha512-3ZdIghMSELMGV3sKi5iASOb1Jwb696fLjmNu0aezaqDxTLLWWoRpqBYkGxJ1CgAMCbtfqXWEF0lcRrlVXmiEGQ==
-1.5.0 sha512-xNDZ5kqowO6Z03FS2gwAkPEGk1ssxVcYKQ6qZId84mFEvwACvvyc2l0vAMOS+c5zvxLRMLBE9r4y44IGYkMJaQ=='
+1.5.0 sha512-xNDZ5kqowO6Z03FS2gwAkPEGk1ssxVcYKQ6qZId84mFEvwACvvyc2l0vAMOS+c5zvxLRMLBE9r4y44IGYkMJaQ==
+1.5.2 sha512-mUWI04rqF1Vd/m1q+Ps1XeWsTXEVvRUnsmRa83I3Dzua0Tx5bYS93imeqtIfrXf7PkkaR6ERz+AuQhIJlom5yA=='
 # The pin lines, from TERMAG_PI_PINS when it is set.
 pins_src() {
   if [ -n "${TERMAG_PI_PINS:-}" ]; then cat "$TERMAG_PI_PINS" 2>/dev/null; else printf '%s\n' "$PINS"; fi

@@ -6,6 +6,7 @@
 #   * a repository inited or cloned on the box gets the hook, a worktree uses it
 #   * a commit gets `Generated-by: termag` once, joining an existing trailer block
 #   * an existing Generated-by trailer is kept; an empty message adds nothing
+#   * a merge commit (whose message has no final newline) gets it in its own paragraph
 #   * pre-commit's legacy chaining still runs it
 #   * `termag.trailer false` turns it off
 #
@@ -82,6 +83,23 @@ git worktree add -q "$REPO/.worktrees/ws" -b ws >/dev/null 2>&1
 (cd "$REPO/.worktrees/ws" && echo g > a && git commit -qam 'feat: g' >/dev/null 2>&1)
 got="$(trailers ws)"
 [ "$got" = termag ] || fail 'a worktree commit gets the trailer' termag "$got"
+
+# ── merge commits ───────────────────────────────────────────────────────────
+# git passes a merge's message without a final newline; the trailer must still
+# go in its own paragraph, not onto the subject.
+git switch -q -c side && echo s > s && git add s && git commit -qm 'feat: s' >/dev/null 2>&1
+git switch -q main && echo m > a && git commit -qam 'feat: m' >/dev/null 2>&1
+git merge -q --no-edit side >/dev/null 2>&1
+got="$(git log -1 --format=%B | tr '\n' '|')"
+[ "$got" = "Merge branch 'side'||Generated-by: termag||" ] \
+  || fail 'a merge commit gets the trailer in its own paragraph' "Merge branch 'side'||Generated-by: termag||" "$got"
+got="$(git log -1 --format=%s)"
+[ "$got" = "Merge branch 'side'" ] || fail 'a merge subject is untouched' "Merge branch 'side'" "$got"
+printf 'fix: no newline' > "$WORK/nonl"
+"$TEMPLATE/hooks/commit-msg" "$WORK/nonl"
+got="$(tr '\n' '|' < "$WORK/nonl")"
+[ "$got" = 'fix: no newline||Generated-by: termag|' ] \
+  || fail 'a message without a final newline' 'fix: no newline||Generated-by: termag|' "$got"
 
 # ── pre-commit's legacy chaining ────────────────────────────────────────────
 # pre-commit install --hook-type commit-msg renames an existing hook to

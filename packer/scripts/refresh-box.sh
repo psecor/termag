@@ -83,6 +83,10 @@ install_gh_updater
 install_aws_updater
 install_docker_updater
 install_terminfo
+install_preview_launcher
+# A source image baked without Chromium (the full bake's snap install failed)
+# gets it here, or the bake fails: the incremental bake never runs setup.sh.
+install_chromium "[packer/refresh]"
 
 # Truncate machine-id so each EC2 launched from this AMI gets a fresh one.
 sudo truncate -s 0 /etc/machine-id

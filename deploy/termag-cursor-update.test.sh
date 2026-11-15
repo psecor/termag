@@ -377,9 +377,12 @@ has 'unpinned: says why' "$(report .detail)" "install=$OLD->FAILED:unpinned:$NEW
 reset; installed "$OLD"; policy 200 none "$NEW"
 run TERMAG_CURSOR_PINS=
 has 'the script'"'"'s pins: found, and the stand-in refused by digest' "$(report .detail)" "install=$OLD->FAILED:digest:$NEW"
-# The pin for the stable builds is in the script, for both arches.
-for a in x64 arm64; do
-  grep -qE "(^|')2026\.10\.22-27dcf5f $a [0-9a-f]{64}('|\$)" "$SCRIPT" || fail "pins: the script pins 2026.10.22-27dcf5f for $a" pinned absent
+# The pins for the stable builds are in the script, for both arches; older pins stay.
+for b in 2026.10.22-27dcf5f 2026.11.05-86047df; do
+  re=$(printf %s "$b" | sed 's/\./\\./g')
+  for a in x64 arm64; do
+    grep -qE "(^|')$re $a [0-9a-f]{64}('|\$)" "$SCRIPT" || fail "pins: the script pins $b for $a" pinned absent
+  done
 done
 # A package that is not the pinned one: never unpacked or run, nothing changed.
 reset; installed "$OLD"; policy 200 none "$NEW"

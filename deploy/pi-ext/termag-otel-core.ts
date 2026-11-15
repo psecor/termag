@@ -43,6 +43,9 @@ export function parseDestination(text: string | null, replayId?: string, backend
   resource['termag.agent'] = 'pi';
   // A model backend other than the harness's default (TERMAG_PI_AGENT).
   if (backend === 'fireworks') resource['termag.backend'] = 'fireworks';
+  // The inference backend every agent resource termag launches names:
+  // pi's own is its model broker.
+  resource['termag.inference.backend'] = backend === 'fireworks' ? 'fireworks' : 'broker';
   if (replayId && REPLAY_ID.test(replayId)) resource['termag.replay.id'] = replayId;
   return { endpoint, resource };
 }

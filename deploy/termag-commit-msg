@@ -18,5 +18,10 @@
 [ -n "${1:-}" ] && [ -f "$1" ] || exit 0
 [ "$(git config --bool termag.trailer 2>/dev/null)" != false ] || exit 0
 git stripspace --strip-comments < "$1" | grep -q . || exit 0
+# git hands a merge's message over without a final newline, and
+# interpret-trailers then reads the subject line itself as the trailer block
+# and adds ours right under it (`Merge branch 'f' Generated-by: termag` in
+# `git log --oneline`). End the message with a newline first.
+[ -z "$(tail -c 1 "$1")" ] || printf '\n' >> "$1"
 git interpret-trailers --in-place --if-exists doNothing --trailer 'Generated-by: termag' "$1" || true
 exit 0

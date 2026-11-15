@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# termag-preview-sysctl-setup — the two box-wide kernel settings the preview
+# launcher's confinement rests on (preview-launcher/seccomp.go, yama.go). Run as
+# root; idempotent.
+#
+# 1. Client TCP Fast Open off (net.ipv4.tcp_fastopen = 0), the second layer
+#    under the launcher's seccomp rule (sendRule). A Fast Open send
+#    (sendto/sendmsg/sendmmsg with MSG_FASTOPEN) connects a TCP socket without
+#    connect(), and on 6.8.0-1067-aws, a kernel boxes boot, Landlock's
+#    CONNECT_TCP rule didn't see that connect: a confined app reached instance
+#    metadata and the owner's loopback debuggers (#1521). The launcher's
+#    seccomp refuses MSG_FASTOPEN; with client Fast Open off the kernel refuses it
+#    too (EOPNOTSUPP), for any process, so a seccomp regression alone can't
+#    reopen it. The default, 1, is client on, server off; 0 is both off. Nothing
+#    on a box relies on client Fast Open: a library that tries it falls back to
+#    connect(). The setting is per network namespace, so Docker containers keep
+#    the kernel's default; that's fine for the launcher, which refuses new
+#    namespaces (unshare, setns, clone with CLONE_NEWNET), so a confined app stays
+#    in the box's own (#1637).
+# 2. Yama's kernel.yama.ptrace_scope at least 1. The launcher's refusals of
+#    ptrace, pidfd_getfd and PR_SET_PTRACER keep a confined app from taking
+#    another process's descriptors only while it is: at 0, any process of the
+#    same user may be ptraced (#1520). Ubuntu sets 1
+#    (/etc/sysctl.d/10-ptrace.conf, procps); this makes it the box's own, and
+#    never lowers a stricter value (2, 3), live or at the next boot: the drop-in
+#    says the strictest value in force (Devin, #1637). The launcher refuses to
+#    start below 1.
+#
+# Installs /etc/sysctl.d/60-termag-tcp-fastopen.conf and
+# /etc/sysctl.d/11-termag-yama.conf (0644, each written atomically) and applies
+# both now. Called by packer/scripts/box-lib.sh (install_preview_launcher, every
+# bake) and by termag-reconcile through `sudo -n` on every boot and box update,
+# so a box baked before it converges without a bake.
+#
+# Usage:
+#   termag-preview-sysctl-setup           apply, reporting only what changed
+#   termag-preview-sysctl-setup --check   report drift, change nothing (exit 1 if any)
+#
+# Env (tests): TERMAG_SYSCTL_SETUP_ROOT prefixes the paths this reads and writes
+# (/etc/sysctl.d and /proc/sys); with it set, live values are written to the
+# prefixed /proc/sys files rather than through sysctl.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+MODE=apply
+ROOT="${TERMAG_SYSCTL_SETUP_ROOT:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) MODE=check ;;
+    --agent-user) shift ;;   # accepted, as termag-reconcile passes it to every setup
+    -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'unknown flag: %s (try --help)\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+if [ -z "$ROOT" ] && [ "$(id -u)" != 0 ]; then
+  echo 'termag-preview-sysctl-setup: run as root' >&2
+  exit 1
+fi
+
+drift=0 failed=0
+say() { printf '%s\n' "$*"; }
+broke() { printf 'termag-preview-sysctl-setup: %s\n' "$*" >&2; failed=1; }
+
+# put <file under /etc/sysctl.d> <content>: the drop-in, 0644, written atomically.
+put() {
+  local name=$1 want=$2 path="$ROOT/etc/sysctl.d/$1"
+  if [ "$(cat "$path" 2>/dev/null)" = "$want" ] && [ "$(stat -c %a "$path" 2>/dev/null)" = 644 ]; then return; fi
+  if [ "$MODE" = check ]; then say "DRIFT: /etc/sysctl.d/$name is missing or differs"; drift=1; return; fi
+  mkdir -p "$(dirname "$path")" &&
+    printf '%s\n' "$want" > "$path.termag-new" && chmod 0644 "$path.termag-new" && mv -f "$path.termag-new" "$path" &&
+    say "installed: /etc/sysctl.d/$name" ||
+    { rm -f "$path.termag-new"; broke "could not write /etc/sysctl.d/$name"; }
+}
+
+# live <key> <value>: the running value now.
+live() {
+  local key=$1 value=$2 file="$ROOT/proc/sys/${1//.//}"
+  if [ -n "$ROOT" ]; then
+    mkdir -p "$(dirname "$file")" && echo "$value" > "$file"
+  else
+    sysctl -q -w "$key=$value"
+  fi && say "applied: $key = $value" || broke "could not set $key"
+}
+
+# 1. Client TCP Fast Open off.
+put 60-termag-tcp-fastopen.conf '# Client TCP Fast Open off: a Fast Open send connects past Landlock on some
+# 6.8 kernels (deploy/termag-preview-sysctl-setup, preview-launcher/seccomp.go).
+net.ipv4.tcp_fastopen = 0'
+tfo=$(cat "$ROOT/proc/sys/net/ipv4/tcp_fastopen" 2>/dev/null || echo unreadable)
+if [ "$tfo" != 0 ]; then
+  if [ "$MODE" = check ]; then say "DRIFT: net.ipv4.tcp_fastopen is $tfo, not 0"; drift=1; else live net.ipv4.tcp_fastopen 0; fi
+fi
+
+# 2. Yama's ptrace_scope at least 1, never lowered, now or at the next boot. The drop-in says the strictest value in
+# force: 1, the live value, or any value another sysctl file configures, whichever is greatest. A file that sorts
+# before ours (procps' 10-ptrace.conf, an owner's 2) is then never undone at boot by ours, and 3 (which can't be
+# lowered without a reboot) stays 3 (Devin, #1637). A file that sorts after ours wins over it anyway; a value below 1
+# there is drift --check reports, and the live value is raised again.
+YAMA_FILE=11-termag-yama.conf
+yama_configured() {
+  # The files systemd-sysctl applies: one per basename, the first in directory precedence (/etc, /run,
+  # /usr/local/lib, /usr/lib, /lib), a masked one (a link to /dev/null, or empty) applying nothing; then
+  # /etc/sysctl.conf. A vendor value its admin masked is never applied, so it doesn't count (Devin, #1637).
+  local d f base
+  local -A seen=()
+  for d in "$ROOT"/etc/sysctl.d "$ROOT"/run/sysctl.d "$ROOT"/usr/local/lib/sysctl.d "$ROOT"/usr/lib/sysctl.d "$ROOT"/lib/sysctl.d; do
+    for f in "$d"/*.conf; do
+      [ -e "$f" ] || [ -L "$f" ] || continue
+      base=$(basename "$f")
+      [ -n "${seen[$base]:-}" ] && continue
+      seen[$base]=1
+      [ "$base" = "$YAMA_FILE" ] && continue
+      [ "$(readlink -f "$f" 2>/dev/null)" = /dev/null ] && continue
+      [ -f "$f" ] && [ -s "$f" ] || continue
+      sed -n -E 's/^[[:space:]]*-?kernel[./]yama[./]ptrace_scope[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$f"
+    done
+  done
+  [ -f "$ROOT/etc/sysctl.conf" ] && sed -n -E 's/^[[:space:]]*-?kernel[./]yama[./]ptrace_scope[[:space:]]*=[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' "$ROOT/etc/sysctl.conf"
+}
+scope=$(cat "$ROOT/proc/sys/kernel/yama/ptrace_scope" 2>/dev/null || echo unreadable)
+want=1
+for v in "$scope" $(yama_configured); do
+  case "$v" in ''|*[!0-9]*) continue ;; esac
+  [ "$v" -gt "$want" ] && want=$v
+done
+put "$YAMA_FILE" "# Yama ptrace_scope at least 1, and never below what's in force (deploy/termag-preview-sysctl-setup):
+# the preview launcher refuses to start below 1 (preview-launcher/yama.go).
+kernel.yama.ptrace_scope = $want"
+case "$scope" in
+  1|2|3) ;;
+  *) if [ "$MODE" = check ]; then say "DRIFT: kernel.yama.ptrace_scope is $scope, not 1 or more"; drift=1; else live kernel.yama.ptrace_scope "$want"; fi ;;
+esac
+
+[ "$MODE" = check ] && exit "$drift"
+exit "$failed"

@@ -38,6 +38,11 @@
 #     without passwordless sudo, or a checkout without the script is no drift;
 #     a failed setup is reported and does not fail the run
 #   * so does the terminfo setup (deploy/termag-terminfo-setup), the same way
+#   * a launched box without the box marker (baked before it) gets it and its
+#     /etc/zsh/zshenv lines through sudo -n, so the steps it gates run;
+#     --check reports it; a wrong one is repaired, a half-written one removed;
+#     a host never gets one, nor does one where another home holds termag
+#     state; without sudo it is no drift, and says why
 #   * ~/.local and ~/.local/state lose group and other write (created when
 #     missing); nothing else about their mode changes, and --check only reports
 #   * a uv tool whose entry points, pyvenv.cfg or receipt still name the
@@ -90,6 +95,15 @@ TERMAG_AWS_UPDATE_SUDO=false; TERMAG_AWS_UPDATE_BOX_MARKER="$WORK/no-box-marker"
 export TERMAG_AWS_UPDATE_SUDO TERMAG_AWS_UPDATE_BOX_MARKER
 TERMAG_DOCKER_UPDATE_SUDO=false; TERMAG_DOCKER_UPDATE_BOX_MARKER="$WORK/no-box-marker"
 export TERMAG_DOCKER_UPDATE_SUDO TERMAG_DOCKER_UPDATE_BOX_MARKER
+TERMAG_PREVIEW_SYSCTL_SUDO=false; TERMAG_PREVIEW_SYSCTL_BOX_MARKER="$WORK/no-box-marker"
+export TERMAG_PREVIEW_SYSCTL_SUDO TERMAG_PREVIEW_SYSCTL_BOX_MARKER
+TERMAG_PREVIEW_LAUNCHER_SUDO=false; TERMAG_PREVIEW_LAUNCHER_BOX_MARKER="$WORK/no-box-marker"
+export TERMAG_PREVIEW_LAUNCHER_SUDO TERMAG_PREVIEW_LAUNCHER_BOX_MARKER
+# Nor the box marker: not a launched or baked box, no sudo.
+TERMAG_BOX_MARKER="$WORK/no-box-marker"; TERMAG_BOX_MARKER_SUDO=false
+TERMAG_BOX_LAUNCH_LOG="$WORK/no-launch-log"; TERMAG_BOX_ZSHENV="$WORK/no-zsh/zshenv"
+TERMAG_BOX_HOMES="$WORK/no-homes"
+export TERMAG_BOX_MARKER TERMAG_BOX_MARKER_SUDO TERMAG_BOX_LAUNCH_LOG TERMAG_BOX_ZSHENV TERMAG_BOX_HOMES
 
 # The baked home the uv-tool repair looks for: one that does not exist, so the
 # runner's own /home/termag never matters.
@@ -151,6 +165,9 @@ seed_source pi-skills/termag-overlap/SKILL.md     'v1-pi-overlap-skill'
 mkdir -p "$CHECKOUT/deploy/claude-skills/termag-bug-report" "$CHECKOUT/deploy/pi-skills/termag-bug-report"
 seed_source claude-skills/termag-bug-report/SKILL.md 'v1-bug-report-skill'
 seed_source pi-skills/termag-bug-report/SKILL.md     'v1-pi-bug-report-skill'
+mkdir -p "$CHECKOUT/deploy/claude-skills/termag-feedback" "$CHECKOUT/deploy/pi-skills/termag-feedback"
+seed_source claude-skills/termag-feedback/SKILL.md 'v1-feedback-skill'
+seed_source pi-skills/termag-feedback/SKILL.md     'v1-pi-feedback-skill'
 mkdir -p "$CHECKOUT/deploy/claude-skills/agent-orchestrator"
 seed_source claude-skills/agent-orchestrator/SKILL.md 'v1-orchestrator-skill'
 seed_source termag-pi-fireworks          'v1-pi-fireworks'
@@ -187,7 +204,7 @@ seed_source claude-runner-hooks/post-session 'v1-hook-post-session'
 
 # ── --list ──────────────────────────────────────────────────────────────────
 got="$(run --list | wc -l | tr -d ' ')"
-[ "$got" = 67 ] || fail '--list prints every artifact' 67 "$got"
+[ "$got" = 69 ] || fail '--list prints every artifact' 69 "$got"
 
 # ── no checkout is not an error ─────────────────────────────────────────────
 out="$(HOME="$HOME_DIR" TERMAG_CHECKOUT="$WORK/absent" PATH="$STUB:$PATH" "$SCRIPT" 2>&1)"
@@ -453,6 +470,8 @@ got="$(cat "$HOME_DIR/.claude/skills/termag-overlap/SKILL.md" "$HOME_DIR/.pi/age
 [ "$got" = 'v1-overlap-skill v1-pi-overlap-skill ' ] || fail 'overlap skills installed' 'v1-overlap-skill v1-pi-overlap-skill' "$got"
 got="$(cat "$HOME_DIR/.claude/skills/termag-bug-report/SKILL.md" "$HOME_DIR/.pi/agent/skills/termag-bug-report/SKILL.md" 2>/dev/null | tr '\n' ' ')"
 [ "$got" = 'v1-bug-report-skill v1-pi-bug-report-skill ' ] || fail 'bug-report skills installed' 'v1-bug-report-skill v1-pi-bug-report-skill' "$got"
+got="$(cat "$HOME_DIR/.claude/skills/termag-feedback/SKILL.md" "$HOME_DIR/.pi/agent/skills/termag-feedback/SKILL.md" 2>/dev/null | tr '\n' ' ')"
+[ "$got" = 'v1-feedback-skill v1-pi-feedback-skill ' ] || fail 'feedback skills installed' 'v1-feedback-skill v1-pi-feedback-skill' "$got"
 got="$(cat "$HOME_DIR/.claude/skills/agent-orchestrator/SKILL.md" 2>/dev/null)"
 [ "$got" = 'v1-orchestrator-skill' ] || fail 'orchestrator skill installed for Claude Code' 'v1-orchestrator-skill' "$got"
 got="$(stat -c %a "$HOME_DIR/.claude/skills/agent-orchestrator/SKILL.md" 2>/dev/null)"
@@ -928,6 +947,91 @@ out="$(guest_run 2>&1)"
 got=$?
 [ "$got" = 0 ] || fail 'a failed guest setup does not fail the run' 0 "$got"
 case "$out" in *'termag-reconcile: the guest browser setup failed'*) ;; *) fail 'says the guest setup failed' 'the guest browser setup failed' "$out" ;; esac
+rm -f "$GUEST_FAILS"
+
+# ── the box marker ──────────────────────────────────────────────────────────
+# A box baked before /etc/profile.d/termag-box.sh existed: launched (cloud-init's
+# log), no marker. Every step the marker gates skipped there and reported
+# clean, so it never got guest mode.
+MARK="$WORK/termag-box.sh"; LAUNCH="$WORK/termag-cloudinit.log"; HOMES="$WORK/homes"
+ZSHENV="$WORK/zsh/zshenv"; mkdir -p "$WORK/zsh" "$HOMES"
+LOCAL_BIN_LINE="$(sed -n "s/^ZSHENV_LOCAL_BIN='\(.*\)'\$/\1/p" "$(dirname "$SCRIPT")/../packer/scripts/box-lib.sh")"
+[ -n "$LOCAL_BIN_LINE" ] || fail 'finds ZSHENV_LOCAL_BIN in box-lib.sh' 'a line' ''
+rm -f "$MARK"; touch "$GUEST_DRIFT"; : > "$GUEST_LOG"; : > "$SUDO_LOG"
+old_box_run() {
+  TERMAG_BOX_MARKER="$MARK" TERMAG_BOX_MARKER_SUDO="${BOX_SUDO:-$STUB/fake-sudo}" TERMAG_BOX_LAUNCH_LOG="$LAUNCH" \
+    TERMAG_BOX_ZSHENV="$ZSHENV" TERMAG_BOX_HOMES="$HOMES" TERMAG_GUEST_BROWSER_BOX_MARKER="$MARK" \
+    TERMAG_GUEST_BROWSER_SUDO="$STUB/fake-sudo" run "$@"
+}
+# Not launched (a shared host, or one with only a bake's provenance): nothing, and no drift.
+mkdir -p "$HOME_DIR/.termag"; touch "$HOME_DIR/.termag/baked-repos.json"
+old_box_run --check >/dev/null 2>&1
+got=$?
+[ "$got" = 0 ] || fail 'a host without the marker is no drift' 0 "$got"
+[ -e "$MARK" ] && fail 'a host gets no box marker' absent present
+[ -s "$GUEST_LOG" ] && fail 'a host gets no guest setup' 'empty log' "$(cat "$GUEST_LOG")"
+rm -f "$HOME_DIR/.termag/baked-repos.json"
+# Launched, but another home holds termag state (several termag users): nothing, and it says why.
+touch "$LAUNCH"; mkdir -p "$HOMES/alice/.termag"
+out="$(old_box_run --check 2>&1)"
+got=$?
+[ "$got" = 0 ] || fail 'a launched host with other termag homes is no drift' 0 "$got"
+case "$out" in *"other homes hold termag state ($HOMES/alice)"*) ;; *) fail 'says another home holds termag state' "($HOMES/alice)" "$out" ;; esac
+old_box_run >/dev/null 2>&1
+[ -e "$MARK" ] && fail 'a host with other termag homes gets no box marker' absent present
+[ -s "$ZSHENV" ] && fail 'a host with other termag homes gets no zshenv lines' empty "$(cat "$ZSHENV")"
+rm -rf "$HOMES/alice"
+# Launched, the box user's home only: the marker and zshenv, then guest setup.
+mkdir -p "$HOME_DIR/.termag"; ln -sfn "$HOME_DIR" "$HOMES/box"
+printf '# zsh package\n' > "$ZSHENV"
+out="$(old_box_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail 'a launched box without the marker is drift' 1 "$got"
+case "$out" in *"DRIFT: $MARK is missing"*) ;; *) fail '--check names the missing marker' "DRIFT: $MARK is missing" "$out" ;; esac
+case "$out" in *"DRIFT: $ZSHENV does not set TERMAG_BOX"*) ;; *) fail '--check names the zshenv marker' "DRIFT: $ZSHENV does not set TERMAG_BOX" "$out" ;; esac
+[ -e "$MARK" ] && fail '--check writes no marker' absent present
+out="$(old_box_run 2>&1)"
+case "$out" in *"reconciled: $MARK (the box marker)"*) ;; *) fail 'writes the box marker' "reconciled: $MARK" "$out" ;; esac
+[ "$(cat "$MARK" 2>/dev/null)" = 'export TERMAG_BOX=1' ] || fail 'the marker sets TERMAG_BOX' 'export TERMAG_BOX=1' "$(cat "$MARK" 2>/dev/null)"
+[ "$(stat -c %a "$MARK" 2>/dev/null)" = 644 ] || fail 'the marker is 0644' 644 "$(stat -c %a "$MARK" 2>/dev/null)"
+grep -q "sudo tee $MARK" "$SUDO_LOG" || fail 'the marker goes through sudo' "sudo tee $MARK" "$(cat "$SUDO_LOG")"
+grep -qxF 'export TERMAG_BOX=1' "$ZSHENV" || fail 'zshenv sets TERMAG_BOX' 'export TERMAG_BOX=1' "$(cat "$ZSHENV")"
+grep -qxF "$LOCAL_BIN_LINE" "$ZSHENV" || fail "zshenv gets box-lib.sh's ~/.local/bin line" "$LOCAL_BIN_LINE" "$(cat "$ZSHENV")"
+grep -qx '# zsh package' "$ZSHENV" || fail 'zshenv is appended to' '# zsh package' "$(cat "$ZSHENV")"
+case "$out" in *'reconciled: guest browser: created: user termag-guest'*) ;; *) fail 'the same run then sets up the guest browser' 'reconciled: guest browser: …' "$out" ;; esac
+old_box_run --check >/dev/null 2>&1
+got=$?
+[ "$got" = 0 ] || fail 'a marked, set-up box is no drift' 0 "$got"
+old_box_run >/dev/null 2>&1
+[ "$(grep -cxF 'export TERMAG_BOX=1' "$ZSHENV")" = 1 ] || fail 'zshenv lines are added once' 1 "$(grep -cxF 'export TERMAG_BOX=1' "$ZSHENV")"
+# A wrong marker (empty, wrong mode) is drift and is repaired.
+: > "$MARK"; chmod 600 "$MARK"
+out="$(old_box_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail 'a wrong marker is drift' 1 "$got"
+case "$out" in *"DRIFT: $MARK is not 'export TERMAG_BOX=1', mode 0644"*) ;; *) fail '--check names the wrong marker' "DRIFT: $MARK is not …" "$out" ;; esac
+old_box_run >/dev/null 2>&1
+[ "$(cat "$MARK" 2>/dev/null):$(stat -c %a "$MARK" 2>/dev/null)" = 'export TERMAG_BOX=1:644' ] \
+  || fail 'a wrong marker is repaired' 'export TERMAG_BOX=1:644' "$(cat "$MARK" 2>/dev/null):$(stat -c %a "$MARK" 2>/dev/null)"
+# A write that half-fails (chmod) leaves no marker, so the next run retries.
+cat > "$STUB/chmod-fails-sudo" <<'SUDOEOF'
+#!/bin/sh
+case $1 in chmod) exit 1 ;; esac
+exec "$@"
+SUDOEOF
+chmod 755 "$STUB/chmod-fails-sudo"
+rm -f "$MARK"
+out="$(BOX_SUDO="$STUB/chmod-fails-sudo" old_box_run 2>&1)"
+case "$out" in *"could not write $MARK"*) ;; *) fail 'says the marker write failed' "could not write $MARK" "$out" ;; esac
+[ -e "$MARK" ] && fail 'a half-written marker is removed' absent present
+rm -f "$HOMES/box"
+# Without sudo: not drift, but it says why the gated steps are skipped.
+rm -f "$MARK"; touch "$LAUNCH" "$GUEST_DRIFT"; : > "$GUEST_LOG"
+out="$(TERMAG_BOX_MARKER="$MARK" TERMAG_BOX_LAUNCH_LOG="$LAUNCH" TERMAG_GUEST_BROWSER_BOX_MARKER="$MARK" run --check 2>&1)"
+got=$?
+[ "$got" = 0 ] || fail 'a missing marker without sudo is no drift' 0 "$got"
+case "$out" in *"no $MARK and no passwordless sudo"*) ;; *) fail 'says why the box steps are skipped' "no $MARK and no passwordless sudo" "$out" ;; esac
+rm -f "$MARK" "$LAUNCH"
 rm -f "$CHECKOUT/deploy/termag-guest-browser-setup" "$GUEST_DRIFT" "$GUEST_FAILS"
 
 # ── the gh updater setup ────────────────────────────────────────────────────
@@ -955,6 +1059,57 @@ out="$(ghu_run 2>&1)"
 case "$out" in *'reconciled: gh updater: installed: /etc/sudoers.d/termag-gh-update'*) ;; *) fail 'applies the gh updater setup' 'reconciled: gh updater: …' "$out" ;; esac
 grep -qx "setup --agent-user $(id -un)" "$GHU_LOG" || fail 'applies the gh updater setup for this user' "setup --agent-user $(id -un)" "$(cat "$GHU_LOG")"
 rm -f "$CHECKOUT/deploy/termag-gh-update-setup" "$GHU_DRIFT"
+
+# ── the preview sysctl setup ─────────────────────────────────────────────────
+# A stand-in like the gh updater's: logs, drifts while $TFO_DRIFT exists.
+cat > "$CHECKOUT/deploy/termag-preview-sysctl-setup" <<'SETUPEOF'
+echo "setup $*" >> "$TFO_LOG"
+case " $* " in
+  *" --check "*) [ -f "$TFO_DRIFT" ] && { echo 'DRIFT: net.ipv4.tcp_fastopen is 1, not 0'; exit 1; }; exit 0 ;;
+esac
+echo 'applied: net.ipv4.tcp_fastopen = 0'
+rm -f "$TFO_DRIFT"
+SETUPEOF
+TFO_LOG="$WORK/tfo-log"; TFO_DRIFT="$WORK/tfo-drift"
+export TFO_LOG TFO_DRIFT
+touch "$WORK/box-marker" "$TFO_DRIFT"; : > "$TFO_LOG"
+tfo_run() { TERMAG_PREVIEW_SYSCTL_BOX_MARKER="$WORK/box-marker" TERMAG_PREVIEW_SYSCTL_SUDO="$STUB/fake-sudo" run "$@"; }
+TERMAG_PREVIEW_SYSCTL_SUDO="$STUB/fake-sudo" run --check >/dev/null 2>&1
+[ -s "$TFO_LOG" ] && fail 'the preview sysctl setup never runs off a box' 'empty log' "$(cat "$TFO_LOG")"
+out="$(tfo_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail 'client tcp fast open on is preview sysctl drift' 1 "$got"
+case "$out" in *'DRIFT: preview sysctls: net.ipv4.tcp_fastopen is 1, not 0'*) ;; *) fail '--check names the tcp fast open drift' 'DRIFT: preview sysctls: …' "$out" ;; esac
+grep -q "sudo bash $CHECKOUT/deploy/termag-preview-sysctl-setup" "$SUDO_LOG" || fail 'the preview sysctl setup goes through sudo' 'sudo bash …setup' "$(cat "$SUDO_LOG")"
+out="$(tfo_run 2>&1)"
+case "$out" in *'reconciled: preview sysctls: applied: net.ipv4.tcp_fastopen = 0'*) ;; *) fail 'applies the preview sysctl setup' 'reconciled: preview sysctls: …' "$out" ;; esac
+rm -f "$CHECKOUT/deploy/termag-preview-sysctl-setup" "$TFO_DRIFT"
+
+# ── the preview launcher setup ───────────────────────────────────────────────
+# A stand-in like the gh updater's: logs, drifts while $PLU_DRIFT exists.
+cat > "$CHECKOUT/deploy/termag-preview-launcher-setup" <<'SETUPEOF'
+echo "setup $*" >> "$PLU_LOG"
+case " $* " in
+  *" --check "*) [ -f "$PLU_DRIFT" ] && { echo 'DRIFT: /usr/local/bin/termag-preview is missing'; exit 1; }; exit 0 ;;
+esac
+echo 'installed: /usr/local/bin/termag-preview'
+rm -f "$PLU_DRIFT"
+SETUPEOF
+PLU_LOG="$WORK/plu-log"; PLU_DRIFT="$WORK/plu-drift"
+export PLU_LOG PLU_DRIFT
+touch "$WORK/box-marker" "$PLU_DRIFT"; : > "$PLU_LOG"
+plu_run() { TERMAG_PREVIEW_LAUNCHER_BOX_MARKER="$WORK/box-marker" TERMAG_PREVIEW_LAUNCHER_SUDO="$STUB/fake-sudo" run "$@"; }
+TERMAG_PREVIEW_LAUNCHER_SUDO="$STUB/fake-sudo" run --check >/dev/null 2>&1
+[ -s "$PLU_LOG" ] && fail 'the preview launcher setup never runs off a box' 'empty log' "$(cat "$PLU_LOG")"
+out="$(plu_run --check 2>&1)"
+got=$?
+[ "$got" = 1 ] || fail 'a missing preview launcher is drift' 1 "$got"
+case "$out" in *'DRIFT: preview launcher: /usr/local/bin/termag-preview is missing'*) ;; *) fail '--check names the preview launcher drift' 'DRIFT: preview launcher: …' "$out" ;; esac
+grep -q "sudo bash $CHECKOUT/deploy/termag-preview-launcher-setup" "$SUDO_LOG" || fail 'the preview launcher setup goes through sudo' 'sudo bash …setup' "$(cat "$SUDO_LOG")"
+out="$(plu_run 2>&1)"
+case "$out" in *'reconciled: preview launcher: installed: /usr/local/bin/termag-preview'*) ;; *) fail 'applies the preview launcher setup' 'reconciled: preview launcher: …' "$out" ;; esac
+grep -qx "setup --agent-user $(id -un)" "$PLU_LOG" || fail 'applies the preview launcher setup for this user' "setup --agent-user $(id -un)" "$(cat "$PLU_LOG")"
+rm -f "$CHECKOUT/deploy/termag-preview-launcher-setup" "$PLU_DRIFT"
 
 # ── the aws updater setup ────────────────────────────────────────────────────
 # A stand-in like the guest browser's: logs, drifts while $AWSU_DRIFT exists.

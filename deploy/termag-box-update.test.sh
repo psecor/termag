@@ -127,8 +127,8 @@ cat > "$STUB/reconcile" <<'EOF'
 #!/bin/sh
 echo "reconcile $*" >> "$LOG"
 case "${1:-}" in
-  --check) [ "$(cat "$STATE/drift")" = 0 ] && exit 0; echo 'DRIFT: termag-status differs'; exit 1 ;;
-  '') echo 'reconciled: termag-status'; echo 0 > "$STATE/drift" ;;
+  --check) [ -f "$STATE/check-note" ] && cat "$STATE/check-note" >&2; [ "$(cat "$STATE/drift")" = 0 ] && exit 0; echo 'DRIFT: termag-status differs'; exit 1 ;;
+  '') if [ -f "$STATE/guest-reconciled" ]; then echo 'reconciled: /etc/profile.d/termag-box.sh (the box marker)'; else echo 'reconciled: termag-status'; fi; echo 0 > "$STATE/drift" ;;
 esac
 EOF
 # termag-hooks-update records its call and the env step 2b hands it; its
@@ -360,6 +360,27 @@ reset_state
 echo 404 > "$STATE/report-code"
 out="$(run)"
 has 'an orchestrator without the report route is named, and the run is unchanged' "$out" 'report: not posted: '"$REPORT_URL"' answered 404 (the orchestrator predates the report)'
+
+# ── a reconcile that put the guest setup in place restarts the agent too ────
+# (the agent reads its guest environment only at start, and only agent/ changes
+# would otherwise restart it)
+reset_state
+echo 1 > "$STATE/drift"; touch "$STATE/guest-reconciled"
+# An earlier test's pulls left the checkout newer than the agent's start; this one
+# must find nothing changed, so the reconcile is the only reason left.
+age_all
+out="$(run)"
+has 'a reconcile of the box marker or guest setup restarts the agent' "$(cat "$LOG")" 'systemctl --user restart termag-agent.service'
+has 'names the reconciled guest setup as the reason' "$out" 'restarted termag-agent.service (the guest browser setup (reconciled this run; the agent reads its guest environment only at start)'
+reset_state
+age_all
+
+# ── a clean --check's own output is shown, not dropped ─────────────────────
+reset_state
+echo 'termag-reconcile: no box marker, and other homes hold termag state; not writing it' > "$STATE/check-note"
+out="$(run)"
+has 'a clean --check still says what reconcile printed' "$out" 'not writing it'
+reset_state
 
 # The restarted agent is "newer" than the change now.
 reset_state
