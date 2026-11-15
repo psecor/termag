@@ -43,7 +43,7 @@ Implements `SpaceObjects` on a directory, with S3's semantics where the rest of 
 
 - `localSpaceObjects.test.ts`: versions, delete markers, conditions (racing writers included), copy with `sourceIfMatch`, restore, listing with and without delimiter and paging, long and dot-named segments, multipart, sums, purge, sweep. Running one suite against `MemorySpaceObjects` too would need its test shortcuts (fixed list ETags, sizes it makes up for multipart) reconciled first.
 - Route tests for tokens (expiry, tampering, wrong operation), size and type checks, 412, Range, and the hardening headers.
-- An e2e mode that runs local storage in place of Floci (`docs/e2e-stack.md`).
+- An e2e mode that runs local storage in place of Floci: `E2E_SPACES=local`, and `E2E_TEST_SPACES=local` for `scripts/e2e/spaces.test.sh` (`docs/e2e-stack.md`).
 
 ### 5. Docs
 
@@ -65,5 +65,5 @@ Implements `SpaceObjects` on a directory, with S3's semantics where the rest of 
 | 1. `LocalSpaceObjects` | Done (`services/spaces/localSpaceObjects.ts`, tokens in `spaceStorageTokens.ts`) |
 | 2. Signed storage URLs | Done (`routes/spaceStorage.ts`) |
 | 3. Choosing the backend | Done: `spacesStorageFromEnv` in `spaceConfig.ts`, `localSpaceStorage()` in `spacesRuntime.ts`, mounted and tmp cleaned at startup in `index.ts` |
-| 4. Tests | Unit, route and spaces-API tests (`routes/spaces.localStorage.test.ts`) done; e2e mode not started |
+| 4. Tests | Done: unit, route and spaces-API tests, and the e2e mode (`E2E_SPACES=local`, `make e2e-test-spaces-local`) |
 | 5. Docs | Done: configuration, domain model, the `space-local-same-origin` gotcha |
