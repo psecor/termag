@@ -229,9 +229,10 @@ import { previewLinkRouter, previewSharesRouter, defaultPreviewShareRouteDeps, i
 import { installPreviewShareLinkHooks, startPreviewShareSweep, stopPreviewShareSweep } from './services/previewShareLinks';
 import { FILE_LINK_PREFIX, spaceFileLinkPath, spaceFolderPagePath } from './services/spaces/spaceLinks';
 import {
-  notifySpaceFileChange, spaceObjects, spacesSweeper,
+  localSpaceStorage, notifySpaceFileChange, spaceObjects, spacesSweeper,
   spaceStore, startSpaceFileFeed,
 } from './services/spaces/spacesRuntime';
+import { spaceStorageRouter } from './routes/spaceStorage';
 
 import { ltsRouter } from './slack/lts';
 import { publishHomeView } from './slack/homeView';
@@ -303,6 +304,16 @@ const cliForward = createCliForward({
 app.use(`${BASE_PATH}/api/cli/v1/boxes/:id/forward`, cliForward.router());
 
 app.use(cors({ origin: termagCorsOrigin(), credentials: true }));
+// Spaces on local disk (SPACES_STORAGE=local): the URLs LocalSpaceObjects signs,
+// in place of S3's. Before express.json(), which would consume a JSON upload;
+// no session, because the token is the authority (routes/spaceStorage.ts).
+const localSpaces = localSpaceStorage();
+if (localSpaces) {
+  app.use(`${BASE_PATH}/api/space-storage`, spaceStorageRouter(localSpaces));
+  localSpaces.cleanTmp()
+    .then(n => { if (n) console.log(`[SPACES] removed ${n} abandoned uploads from local storage`); })
+    .catch(err => console.warn(`[SPACES] local storage tmp cleanup failed: ${(err as Error).message}`));
+}
 // Before express.json(): the GitHub broker's check reads GraphQL bodies raw.
 // Registered only with a caller allowlist, so without one the path 404s.
 const callerProof = getCallerProofConfig();

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SpacesUnavailableError, spaceResourceNames, spaceResourcesResolver, type IdentitySource } from './spaceConfig';
+import { DEFAULT_SPACES_LOCAL_DIR, SpacesUnavailableError, spaceResourceNames, spaceResourcesResolver, spacesStorageFromEnv, type IdentitySource } from './spaceConfig';
 
 describe('spaceResourceNames', () => {
   it('matches the names terraform creates in orchestrator/spaces.tf', () => {
@@ -46,5 +46,23 @@ describe('spaceResourcesResolver', () => {
     t = 1001;
     accountId.mockImplementationOnce(async () => '123456789012');
     expect((await resolve()).accountId).toBe('123456789012');
+  });
+});
+
+describe('spacesStorageFromEnv', () => {
+  it('is S3 unless local is asked for', () => {
+    expect(spacesStorageFromEnv({})).toEqual({ kind: 's3' });
+    expect(spacesStorageFromEnv({ SPACES_STORAGE: ' S3 ' })).toEqual({ kind: 's3' });
+    expect(spacesStorageFromEnv({ SPACES_LOCAL_DIR: '/data/spaces' })).toEqual({ kind: 's3' });
+  });
+
+  it('keeps local storage in SPACES_LOCAL_DIR, or the default', () => {
+    expect(spacesStorageFromEnv({ SPACES_STORAGE: 'local' })).toEqual({ kind: 'local', root: DEFAULT_SPACES_LOCAL_DIR });
+    expect(spacesStorageFromEnv({ SPACES_STORAGE: 'Local', SPACES_LOCAL_DIR: ' /data/spaces ' })).toEqual({ kind: 'local', root: '/data/spaces' });
+  });
+
+  it('refuses a value it cannot place rather than pick a backend', () => {
+    expect(spacesStorageFromEnv({ SPACES_STORAGE: 'disk' })).toMatchObject({ kind: 'invalid', reason: expect.stringContaining('disk') });
+    expect(spacesStorageFromEnv({ SPACES_STORAGE: 'local', SPACES_LOCAL_DIR: 'spaces' })).toMatchObject({ kind: 'invalid', reason: expect.stringContaining('absolute') });
   });
 });

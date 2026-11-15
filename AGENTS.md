@@ -2,7 +2,7 @@
 project: termag
 status: production
 status_description: 'Multi-user workspace orchestrator. Runs paired tmux sessions per project, web terminals via xterm.js + WebSocket, multi-provider agent choice (Codex, Claude, Mistral/vibe, Devin), Slack + Discord integration, project sharing with collaborators, two-tube thermometer UI tracking agent working time and human activity, pinned/recent-activity-sorted project list, on-demand EC2 box provisioning via the AWS SDK from a Packer-baked AMI ("Add box" button) with projects routed by `Instance`, per-project git-worktree workstreams (every project starts with `main`), and visit/flow-speed telemetry (ProjectVisit + WarpSample) surfaced in the usage overlay.'
-last_updated: 2026-10-22
+last_updated: 2026-11-15
 last_updated_by:
   - agent:claude-opus-4-6
   - agent:claude-opus-4-7
@@ -296,6 +296,7 @@ One line per gotcha, linking its slug (`<area>-<subject>`, the anchor in gotchas
 - [simple-ui-side-panel-ctrl-shell](docs/agents/gotchas.md#simple-ui-side-panel-ctrl-shell): The simple UI's side panel attaches the ctrl shell, never the agent pane, and shares its tmux window
 - [slack-scopes](docs/agents/gotchas.md#slack-scopes): Slack scopes are large
 - [slack-t-strips-api-key](docs/agents/gotchas.md#slack-t-strips-api-key): Slack `/t` executor strips `ANTHROPIC_API_KEY` from the spawned env
+- [space-local-same-origin](docs/agents/gotchas.md#space-local-same-origin): Spaces on local storage serve members' files from termag's own origin, so every download keeps its sandbox headers
 - [space-memory-frozen-prompt](docs/agents/gotchas.md#space-memory-frozen-prompt): A chat session's space memory is frozen into its system prompt at the session's first turn; changes come as a notice in the message
 - [spawn-brief-claim](docs/agents/gotchas.md#spawn-brief-claim): An agent spawn's brief is claimed by the first launch, by spawn id or child project id, never by name
 - [spawn-handoff-fixed-lines](docs/agents/gotchas.md#spawn-handoff-fixed-lines): A handoff types only fixed lines, and a restart's relaunch is claimed like a spawn's brief

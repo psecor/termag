@@ -37,7 +37,7 @@ Implements `SpaceObjects` on a directory, with S3's semantics where the rest of 
 
 ### 3. Choosing the backend
 
-`SPACES_STORAGE=local` with `SPACES_LOCAL_DIR` (default `/var/lib/termag/spaces`) selects local storage; `spacesRuntime.ts` then builds `LocalSpaceObjects` and never calls STS. Unset keeps S3. It is an explicit choice, not a fallback when AWS is missing, so a deployment meant for S3 never quietly writes to local disk. This departs from `spaceConfig.ts`'s "spaces have no env of their own", and its comment should say so. The orchestrator logs which backend it uses at the first spaces request.
+`SPACES_STORAGE=local` with `SPACES_LOCAL_DIR` (default `/var/lib/termag/spaces`) selects local storage; `spacesRuntime.ts` then builds `LocalSpaceObjects` and never calls STS. Unset keeps S3. It is an explicit choice, not a fallback when AWS is missing, so a deployment meant for S3 never quietly writes to local disk. This departs from `spaceConfig.ts`'s "spaces have no env of their own", and its comment should say so. The orchestrator logs which backend it uses at the first spaces request. Any other `SPACES_STORAGE` value, or a relative `SPACES_LOCAL_DIR`, makes the file routes answer 503 `spaces_unavailable` rather than guess.
 
 ### 4. Tests
 
@@ -62,7 +62,7 @@ Implements `SpaceObjects` on a directory, with S3's semantics where the rest of 
 | Step | State |
 |---|---|
 | 1. `LocalSpaceObjects` | Done (`services/spaces/localSpaceObjects.ts`, tokens in `spaceStorageTokens.ts`) |
-| 2. Signed storage URLs | Done (`routes/spaceStorage.ts`), not yet mounted in `index.ts` |
-| 3. Choosing the backend | Not started: mount the router, select in `spacesRuntime.ts`, call `cleanTmp()` at startup |
-| 4. Tests | Unit and route tests done; e2e mode not started |
-| 5. Docs | Not started |
+| 2. Signed storage URLs | Done (`routes/spaceStorage.ts`) |
+| 3. Choosing the backend | Done: `spacesStorageFromEnv` in `spaceConfig.ts`, `localSpaceStorage()` in `spacesRuntime.ts`, mounted and tmp cleaned at startup in `index.ts` |
+| 4. Tests | Unit, route and spaces-API tests (`routes/spaces.localStorage.test.ts`) done; e2e mode not started |
+| 5. Docs | Done: configuration, domain model, the `space-local-same-origin` gotcha |
