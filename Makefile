@@ -1,6 +1,6 @@
 # Local end-to-end stack (docs/e2e-stack.md). BOXES=N sets the box count; the
 # opt-in fakes are E2E_* variables, e.g. `make e2e-up E2E_FAKE_AWS=1`.
-.PHONY: e2e-up e2e-down e2e-status e2e-ctl e2e-test e2e-test-warm-pool e2e-test-cli e2e-test-cli-connect e2e-test-cli-doctor e2e-test-spaces e2e-test-genui install-cli install-tui e2e-test-box-teardown e2e-test-overlap e2e-test-ask-overlap e2e-test-ask-box e2e-test-isolation e2e-test-multi-repo e2e-test-multi-repo-rename e2e-test-multi-repo-add e2e-test-multi-repo-prs e2e-test-multi-repo-pr-checkout e2e-test-t3 e2e-test-t3-newbox e2e-test-t3-slow-relay e2e-test-forward
+.PHONY: e2e-up e2e-down e2e-status e2e-ctl e2e-test e2e-test-warm-pool e2e-test-cli e2e-test-cli-connect e2e-test-cli-doctor e2e-test-spaces e2e-test-spaces-local e2e-test-genui install-cli install-tui e2e-test-box-teardown e2e-test-overlap e2e-test-ask-overlap e2e-test-ask-box e2e-test-isolation e2e-test-multi-repo e2e-test-multi-repo-rename e2e-test-multi-repo-add e2e-test-multi-repo-prs e2e-test-multi-repo-pr-checkout e2e-test-t3 e2e-test-t3-newbox e2e-test-t3-slow-relay e2e-test-forward
 
 # Build cli/ and put `termag` on PATH (cli/README.md). Re-run after `git pull`
 # to update. BIN_DIR=<dir> overrides where the launcher goes.
@@ -98,6 +98,9 @@ e2e-test-cli-connect:
 
 e2e-test-spaces:
 	@bash scripts/e2e/spaces.test.sh
+
+e2e-test-spaces-local:
+	@E2E_TEST_SPACES=local bash scripts/e2e/spaces.test.sh
 
 e2e-test-genui:
 	@bash scripts/e2e/genui.test.sh
