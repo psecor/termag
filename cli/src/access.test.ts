@@ -41,3 +41,22 @@ describe('freshAccess', () => {
     expect(refreshes).toBe(2);
   });
 });
+
+describe('freshAccess with a signal', () => {
+  it('passes it to the refresh request, which ends on it', async () => {
+    let seen: AbortSignal | undefined;
+    const hanging = ((_url: string, init?: RequestInit) => {
+      seen = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+      });
+    }) as typeof fetch;
+    const ctl = new AbortController();
+    const pending = freshAccess({ host: 'https://orch.example.com/termag', credsPath: join(dir, 'credentials.json'), fetch: hanging }, login(0), { signal: ctl.signal })
+      .then(() => null, (err: Error) => err);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    ctl.abort();
+    expect((await pending)?.message).toBe('Cancelled');
+    expect(seen).toBeDefined();
+  });
+});

@@ -29,8 +29,11 @@ function remembering(ctx: Ctx, fn: () => void): void {
  * with the device login. The orchestrator only hands out presigned S3 URLs,
  * so every byte goes between this process and S3 directly.
  *
- * A remote path is `space:path`. The `space:` may be left out when the caller
- * reaches exactly one space.
+ * A remote path is `space:path`. The `space:` may be left out: it is then the
+ * session's Project files ($TERMAG_SPACE, which the chat runner sets on a box
+ * with project-files-v1), or with --mine the owner's My files
+ * ($TERMAG_MY_FILES), or else the only space the caller reaches.
+ * A named space always wins.
  */
 
 const SPACE_TIMEOUT_MS = 60_000;
@@ -39,50 +42,63 @@ const PART_URL_BATCH = 16;
 export const SPACE_NAME_RE = /^[a-z0-9-]{2,40}$/;
 
 const recursive = { type: 'boolean', short: 'r' } as const;
+/** A path with no `space:` is in My files ($TERMAG_MY_FILES), not Project files. */
+const mine = { type: 'boolean' } as const;
 
 export const SPACE_COMMANDS: Record<string, CommandSpec> = {
   'space ls': {
     summary: 'List the spaces you (or this box) can reach, or the files in one',
-    usage: 'termag space ls [space[:prefix]]',
+    usage: 'termag space ls [space[:prefix]] [--mine]',
+    options: { mine },
     maxArgs: 1,
   },
   'space get': {
     summary: 'Download a file, or a folder with -r',
-    usage: 'termag space get <space:path> [dest] [-r]',
-    options: { recursive },
+    usage: 'termag space get <space:path> [dest] [-r] [--mine]',
+    options: { recursive, mine },
     maxArgs: 2,
   },
   'space url': {
     summary: 'Print a browser link to a file; it opens for anyone who can read the space, or everyone on termag once shared',
-    usage: 'termag space url <space:path>',
+    usage: 'termag space url <space:path> [--mine]',
+    options: { mine },
     maxArgs: 1,
   },
   'space share': {
     summary: 'Share a file read-only with everyone signed in to termag (needs editor or owner)',
-    usage: 'termag space share <space:path>',
+    usage: 'termag space share <space:path> [--mine]',
+    options: { mine },
     maxArgs: 1,
   },
   'space unshare': {
     summary: 'Make a shared file private again: only the space\'s members can open it',
-    usage: 'termag space unshare <space:path>',
+    usage: 'termag space unshare <space:path> [--mine]',
+    options: { mine },
     maxArgs: 1,
   },
   'space put': {
     summary: 'Upload a file, or a folder with -r; refused (exit 6) if it changed since you read it',
-    usage: 'termag space put <local> <space:path> [-r] [--if-match <etag> | --if-new | --force]',
-    options: { recursive, 'if-match': { type: 'string' }, 'if-new': { type: 'boolean' }, force: { type: 'boolean' } },
+    usage: 'termag space put <local> <space:path> [-r] [--mine] [--if-match <etag> | --if-new | --force]',
+    options: { recursive, mine, 'if-match': { type: 'string' }, 'if-new': { type: 'boolean' }, force: { type: 'boolean' } },
     maxArgs: 2,
+    details: 'With -r the folder\'s contents go to <space:path>, not a folder of its name under it:\n'
+      + '  termag space put -r dist team:site        # dist/a.html is team:site/a.html\n'
+      + '  termag space put -r dist team:site/dist/  # dist/a.html is team:site/dist/a.html\n'
+      + 'A single file put to a path ending in / keeps its name there.\n'
+      + 'With no space: named, a session with Project files saves there, and --mine saves to My files:\n'
+      + '  termag space put shot.png screenshots/         # Project files ($TERMAG_SPACE)\n'
+      + '  termag space put --mine notes.md notes/        # My files ($TERMAG_MY_FILES)',
   },
   'space rm': {
     summary: 'Delete a file, or a folder with -r (old versions are kept); a file you read is checked first',
-    usage: 'termag space rm <space:path> [-r] [--force]',
-    options: { recursive, force: { type: 'boolean' } },
+    usage: 'termag space rm <space:path> [-r] [--mine] [--force]',
+    options: { recursive, mine, force: { type: 'boolean' } },
     maxArgs: 1,
   },
   'space mv': {
     summary: 'Move or rename a file or folder (folders end in /); a file you read is checked first',
-    usage: 'termag space mv <space:from> <space:to> [--force]',
-    options: { force: { type: 'boolean' } },
+    usage: 'termag space mv <space:from> <space:to> [--mine] [--force]',
+    options: { mine, force: { type: 'boolean' } },
     maxArgs: 2,
   },
   'space create': {
@@ -113,6 +129,8 @@ export interface SpaceView {
   usedBytes: number;
   quotaBytes: number;
   access?: { kind: 'explicit' } | { kind: 'inherited'; via: string };
+  /** `termag space ls`: this session's Project files ($TERMAG_SPACE) or the owner's My files ($TERMAG_MY_FILES). */
+  files?: 'project' | 'mine';
 }
 
 export interface TreeFile { name: string; path: string; size: number; modifiedAt: string | null; etag?: string | null; shared?: boolean }
@@ -179,13 +197,55 @@ export async function listSpaces(a: Api): Promise<SpaceView[]> {
   return (await a.request<{ spaces: SpaceView[] }>('GET', '/spaces')).spaces;
 }
 
-/** The space a remote ref names, or the only one the caller reaches. */
-async function spaceOf(a: Api, ref: RemoteRef): Promise<string> {
-  if (ref.space) return ref.space;
+/**
+ * Where a path with no `space:` goes:
+ * the session's Project files and the owner's My files, as the chat runner sets
+ * them on a box with project-files-v1, and whether --mine was given.
+ */
+export interface SpaceDefaults { project: string | null; mine: string | null; wantMine: boolean }
+
+const envSpace = (v: string | undefined): string | null => (v && SPACE_NAME_RE.test(v) ? v : null);
+
+export function spaceDefaults(env: NodeJS.ProcessEnv, args: ParsedArgs): SpaceDefaults {
+  return { project: envSpace(env.TERMAG_SPACE), mine: envSpace(env.TERMAG_MY_FILES), wantMine: args.options.mine === true };
+}
+
+/** What `termag space put` tells the orchestrator for `files.saved`: a space named (or --mine) is `explicit`. */
+export type SpaceChoice = 'default' | 'explicit';
+
+export const NO_MY_FILES = "My files isn't on this box (Settings → My files)";
+
+/**
+ * The space a remote ref names; else with --mine My files; else the session's
+ * Project files while this caller reaches it; else the only space it reaches.
+ * A named space always wins, --mine or not.
+ */
+export async function resolveSpace(a: Api, ref: RemoteRef, d: SpaceDefaults): Promise<{ space: string; chosen: SpaceChoice }> {
+  if (ref.space) return { space: ref.space, chosen: 'explicit' };
+  if (d.wantMine) {
+    if (!d.mine) throw new CliError('not_found', NO_MY_FILES);
+    return { space: d.mine, chosen: 'explicit' };
+  }
   const spaces = await listSpaces(a);
-  if (spaces.length === 1) return spaces[0].name;
+  if (d.project && spaces.some(s => s.name === d.project)) return { space: d.project, chosen: 'default' };
+  if (spaces.length === 1) return { space: spaces[0].name, chosen: 'default' };
   if (spaces.length === 0) throw new CliError('not_found', 'You reach no spaces; ask a space owner to add you or this box');
   throw usage(`Name the space as space:path; you reach ${spaces.map(s => s.name).join(', ')}`);
+}
+
+async function spaceOf(a: Api, ref: RemoteRef, d: SpaceDefaults): Promise<string> {
+  return (await resolveSpace(a, ref, d)).space;
+}
+
+/**
+ * `termag space ls` with no argument: this session's Project files first, then
+ * My files, each labelled, then the rest by name as the orchestrator listed them.
+ */
+export function labelledSpaces(spaces: SpaceView[], d: SpaceDefaults): SpaceView[] {
+  const rank = (s: SpaceView) => (s.name === d.project ? 0 : s.name === d.mine ? 1 : 2);
+  return spaces
+    .map(s => (s.name === d.project ? { ...s, files: 'project' as const } : s.name === d.mine ? { ...s, files: 'mine' as const } : s))
+    .sort((x, y) => rank(x) - rank(y));
 }
 
 async function withRetry<T>(what: string, fn: () => Promise<T>): Promise<T> {
@@ -218,21 +278,23 @@ async function s3Fetch(ctx: Ctx, url: string, init: RequestInit, what: string): 
 
 export async function cmdSpaceLs(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const a = await api(ctx, args);
-  if (args.args.length === 0) {
-    const spaces = await listSpaces(a);
+  const defaults = spaceDefaults(ctx.env, args);
+  if (args.args.length === 0 && !defaults.wantMine) {
+    const spaces = labelledSpaces(await listSpaces(a), defaults);
     if (args.json) { ctx.out(json({ spaces })); return EXIT.OK; }
     if (spaces.length === 0) { ctx.out('No spaces. Create one with `termag space create <name>`.'); return EXIT.OK; }
     ctx.out(table(['SPACE', 'ROLE', 'ACCESS', 'USED'], spaces.map(s => [
-      s.name,
+      s.files === 'project' ? `${s.name} (Project files)` : s.files === 'mine' ? `${s.name} (My files)` : s.name,
       s.readOnly ? `${s.role} (read-only)` : s.role,
       !s.access ? '-' : s.access.kind === 'explicit' ? 'this box' : `via ${s.access.via}`,
       `${formatBytes(s.usedBytes)} of ${formatBytes(s.quotaBytes)}`,
     ])));
     return EXIT.OK;
   }
-  const raw = args.args[0];
-  const ref = raw.includes(':') ? parseRemote(raw) : SPACE_NAME_RE.test(raw) ? { space: raw, path: '' } : parseRemote(raw);
-  const space = await spaceOf(a, ref);
+  const raw = args.args[0] ?? '';
+  // With --mine a bare argument is a folder of My files, never a space's name.
+  const ref = raw.includes(':') || defaults.wantMine ? parseRemote(raw) : SPACE_NAME_RE.test(raw) ? { space: raw, path: '' } : parseRemote(raw);
+  const space = await spaceOf(a, ref, defaults);
   const dirs: Tree['dirs'] = [];
   const files: TreeFile[] = [];
   let cursor: string | null = null;
@@ -245,13 +307,48 @@ export async function cmdSpaceLs(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> 
     files.push(...page.files);
     cursor = page.nextCursor;
   } while (cursor);
-  if (args.json) { ctx.out(json({ space, prefix, dirs, files })); return EXIT.OK; }
-  if (dirs.length === 0 && files.length === 0) { ctx.out(`${space}:${prefix} is empty.`); return EXIT.OK; }
+  // Nothing under a path that doesn't end in `/`: the caller may have meant a string prefix
+  // (`inter` for `internal/`), which never matches since a listing goes by whole segments.
+  // Name what in the parent starts with it, so an empty answer isn't mistaken for an empty space.
+  const partial = dirs.length === 0 && files.length === 0 && ref.path !== '' && !ref.path.endsWith('/')
+    ? await segmentMatches(a, space, ref.path)
+    : null;
+  if (args.json) { ctx.out(json({ space, prefix, dirs, files, ...(partial ? { segmentMatches: partial.paths } : {}) })); return EXIT.OK; }
+  if (dirs.length === 0 && files.length === 0) {
+    ctx.out(`${space}:${prefix} is empty.`);
+    if (partial?.names.includes(partial.segment)) {
+      ctx.err(`termag: ${space}:${ref.path} is a file, not a directory; read it with \`termag space get\`.`);
+    } else if (partial) {
+      ctx.err(`termag: space ls lists whole path segments, not string prefixes: \`${partial.segment}\` matches only a directory named exactly that.`);
+      if (partial.names.length) {
+        const shown = partial.names.slice(0, 10).join(', ') + (partial.names.length > 10 ? `, and ${partial.names.length - 10} more` : '');
+        ctx.err(`  In ${space}:${partial.parent} these start with \`${partial.segment}\`: ${shown}`);
+      }
+    }
+    return EXIT.OK;
+  }
   ctx.out(table(['NAME', 'SIZE', 'MODIFIED'], [
     ...dirs.map(d => [`${d.name}/`, '-', '-']),
     ...files.map(f => [f.shared ? `${f.name} (shared)` : f.name, formatBytes(f.size), f.modifiedAt ? f.modifiedAt.slice(0, 16).replace('T', ' ') : '-']),
   ]));
   return EXIT.OK;
+}
+
+/** What in the parent of `path` has a name starting with its last segment (`inter` → `internal/`). */
+async function segmentMatches(a: Api, space: string, path: string): Promise<{ segment: string; parent: string; names: string[]; paths: string[] }> {
+  const cut = path.lastIndexOf('/') + 1;
+  const parent = path.slice(0, cut);
+  const segment = path.slice(cut);
+  const paths: string[] = [];
+  const names: string[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: Tree = await a.request<Tree>('GET', `/spaces/${enc(space)}/tree?prefix=${enc(parent)}${cursor ? `&cursor=${enc(cursor)}` : ''}`);
+    for (const d of page.dirs) if (d.name.startsWith(segment)) { paths.push(d.path); names.push(`${d.name}/`); }
+    for (const f of page.files) if (f.name.startsWith(segment)) { paths.push(f.path); names.push(f.name); }
+    cursor = page.nextCursor;
+  } while (cursor);
+  return { segment, parent, names, paths };
 }
 
 // ---- get ----
@@ -344,7 +441,7 @@ export async function cmdSpaceGet(ctx: Ctx, args: ParsedArgs): Promise<ExitCode>
   if (!rawRemote) throw usage(`Usage: ${SPACE_COMMANDS['space get'].usage}`);
   const a = await api(ctx, args);
   const ref = parseRemote(rawRemote);
-  const space = await spaceOf(a, ref);
+  const space = await spaceOf(a, ref, spaceDefaults(ctx.env, args));
   const got: Array<{ path: string; local: string; size: number; etag?: string; versionId?: string }> = [];
   let root = '';
   const seen = (v: { size: number; etag: string | null; versionId: string | null }) => ({ size: v.size, ...(v.etag ? { etag: v.etag } : {}), ...(v.versionId ? { versionId: v.versionId } : {}) });
@@ -384,7 +481,7 @@ export async function cmdSpaceUrl(ctx: Ctx, args: ParsedArgs): Promise<ExitCode>
   const ref = parseRemote(raw);
   if (!ref.path || ref.path.endsWith('/')) throw usage('Name a file, not a folder');
   const a = await api(ctx, args);
-  const space = await spaceOf(a, ref);
+  const space = await spaceOf(a, ref, spaceDefaults(ctx.env, args));
   const r = await a.request<{ url: string; path: string; size: number }>('POST', `/spaces/${enc(space)}/files/link`, { path: ref.path });
   if (args.json) ctx.out(json({ space, path: r.path, url: r.url }));
   else ctx.out(r.url);
@@ -410,7 +507,7 @@ function fileRef(raw: string | undefined, command: 'space share' | 'space unshar
 export async function cmdSpaceShare(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const ref = fileRef(args.args[0], 'space share');
   const a = await api(ctx, args);
-  const space = await spaceOf(a, ref);
+  const space = await spaceOf(a, ref, spaceDefaults(ctx.env, args));
   const r = await a.request<ShareView>('PUT', `/spaces/${enc(space)}/files/share`, { path: ref.path });
   if (args.json) ctx.out(json({ space, path: ref.path, ...r }));
   else ctx.out(`${space}:${ref.path} is shared: everyone signed in to termag can open its link (\`termag space url ${space}:${ref.path}\`).`);
@@ -420,7 +517,7 @@ export async function cmdSpaceShare(ctx: Ctx, args: ParsedArgs): Promise<ExitCod
 export async function cmdSpaceUnshare(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const ref = fileRef(args.args[0], 'space unshare');
   const a = await api(ctx, args);
-  const space = await spaceOf(a, ref);
+  const space = await spaceOf(a, ref, spaceDefaults(ctx.env, args));
   const r = await a.request<ShareView>('DELETE', `/spaces/${enc(space)}/files/share?path=${enc(ref.path)}`);
   if (args.json) ctx.out(json({ space, path: ref.path, ...r }));
   else ctx.out(`${space}:${ref.path} is private: only the space's members can open it.`);
@@ -449,10 +546,11 @@ type WriteCondition = { ifMatch: string } | { ifNoneMatch: '*' } | null;
  * orchestrator too old to check it then writes unconditionally, with a
  * warning, where an explicit one refuses.
  */
-async function upload(ctx: Ctx, a: Api, space: string, local: string, path: string, quiet: boolean, condition: WriteCondition = null, implicit = false): Promise<{ size: number; etag: string | null; versionId: string | null }> {
+async function upload(ctx: Ctx, a: Api, space: string, local: string, path: string, quiet: boolean, condition: WriteCondition = null, implicit = false, chosen: SpaceChoice | null = null): Promise<{ size: number; etag: string | null; versionId: string | null }> {
   const size = statSync(local).size;
   const base = `/spaces/${enc(space)}`;
-  const start = await a.request<(SingleUpload | MultipartUpload) & { conditional?: boolean }>('POST', `${base}/files/upload`, { path, size, contentType: contentTypeFor(local), ...(condition ?? {}) });
+  // `chosen`: whether the space was named or defaulted, for the orchestrator's files.saved (an older one ignores it).
+  const start = await a.request<(SingleUpload | MultipartUpload) & { conditional?: boolean }>('POST', `${base}/files/upload`, { path, size, contentType: contentTypeFor(local), ...(condition ?? {}), ...(chosen ? { chosen } : {}) });
   let cond = condition;
   if (cond && start.conditional !== true) {
     if (!implicit) {
@@ -551,7 +649,7 @@ export async function cmdSpacePut(ctx: Ctx, args: ParsedArgs): Promise<ExitCode>
   checkWriteFlags(args, isDir);
   const a = await api(ctx, args);
   const ref = parseRemote(rawRemote);
-  const space = await spaceOf(a, ref);
+  const { space, chosen } = await resolveSpace(a, ref, spaceDefaults(ctx.env, args));
   const put: Array<{ local: string; path: string; size: number; etag?: string }> = [];
   const conflicts: Array<{ path: string; message: string }> = [];
 
@@ -559,7 +657,7 @@ export async function cmdSpacePut(ctx: Ctx, args: ParsedArgs): Promise<ExitCode>
   const one = async (file: string, path: string, many: boolean) => {
     const { condition, implicit } = writeCondition(ctx, args, space, path);
     try {
-      const w = await upload(ctx, a, space, file, path, args.json, condition, implicit);
+      const w = await upload(ctx, a, space, file, path, args.json, condition, implicit, chosen);
       // What it wrote is now the version this client knows.
       remembering(ctx, () => rememberVersion(ctx.home, space, path, w.etag, w.versionId, 'put'));
       put.push({ local: file, path, size: w.size, ...(w.etag ? { etag: w.etag } : {}) });
@@ -594,7 +692,7 @@ export async function cmdSpaceRm(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> 
   if (!args.args[0]) throw usage(`Usage: ${SPACE_COMMANDS['space rm'].usage}`);
   const a = await api(ctx, args);
   const ref = parseRemote(args.args[0]);
-  const space = await spaceOf(a, ref);
+  const space = await spaceOf(a, ref, spaceDefaults(ctx.env, args));
   const rec = args.options.recursive === true;
   if (rec && !ref.path) throw usage('Refusing to empty a whole space; name a folder');
   if (!rec && (!ref.path || ref.path.endsWith('/'))) throw usage('That is a folder; use -r');
@@ -614,7 +712,7 @@ export async function cmdSpaceMv(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> 
   const a = await api(ctx, args);
   const from = parseRemote(rawFrom);
   const to = parseRemote(rawTo);
-  const space = await spaceOf(a, from);
+  const space = await spaceOf(a, from, spaceDefaults(ctx.env, args));
   if (to.space && to.space !== space) throw usage('mv works inside one space; use get and put to copy between spaces');
   const toPath = from.path.endsWith('/') && to.path && !to.path.endsWith('/') ? `${to.path}/` : to.path;
   // A file this client read moves only if it is still that version; a folder's files aren't checked.

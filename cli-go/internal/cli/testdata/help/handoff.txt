@@ -1,0 +1,13 @@
+Hand an agent off: it writes a handoff, then its context is cleared or compacted, or the pane restarts, and the next agent starts on it.
+
+Usage: termag handoff <box>/<project>[@<workstream>] [--mode clear|compact|restart] [--agent <agent>] [--note <text>] [--wait [--timeout <seconds>]] [--yes]
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

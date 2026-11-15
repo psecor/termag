@@ -1,0 +1,22 @@
+Ask the box's owner to share a port as a preview link (for agents on a box).
+
+Usage: termag preview request <port> [--note <text>]
+
+Run it in a workstream's checkout on its box. The owner sees the request in the project's Share
+dialog and on Slack, and publishes it (for them and the project's collaborators only, to start with) or
+declines it. It waits 24 hours.
+--note says what the port is, up to 200 characters; the owner sees it as your words.
+A box can ask 10 times an hour. Asking again for the same port says where the request stands: still
+waiting, or published, declined or expired, and when. Once it was answered, the owner isn't asked again
+for 12 hours, so don't ask again in a loop.
+  termag preview request 5173 --note "the Vite dev server for the checkout page"
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

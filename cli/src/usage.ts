@@ -22,6 +22,13 @@ import { VERSION } from './version.js';
 const REPORT_TIMEOUT_MS = 1500;
 
 /**
+ * Which CLI sent the report, so the orchestrator's `cli.command` event can
+ * tell this Node CLI from the Go binary (`termag.runtime`). Older
+ * orchestrators ignore it.
+ */
+export const RUNTIME = 'node';
+
+/**
  * Commands that report as they start. Most run until someone ends them, often
  * with Ctrl-C or by closing the terminal, so a report at the end may never be
  * sent; theirs goes in the background while they run. `logout` revokes the
@@ -42,6 +49,8 @@ export interface UsageReport {
   interactive: boolean;
   /** Run from Claude Code's Bash tool, which sets CLAUDECODE=1. */
   claudeCode: boolean;
+  /** The CLI implementation: this one is always `node` (RUNTIME). */
+  runtime: typeof RUNTIME;
 }
 
 export type UsageReporter = (args: ParsedArgs, report: UsageReport) => Promise<void>;
@@ -64,6 +73,7 @@ export function usageReport(
     ...(outcome && { exitCode: outcome.exitCode, durationMs: Math.round(outcome.durationMs) }),
     interactive: ctx.interactive,
     claudeCode: ctx.env.CLAUDECODE === '1',
+    runtime: RUNTIME,
   };
 }
 

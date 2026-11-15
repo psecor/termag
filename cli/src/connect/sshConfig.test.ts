@@ -31,9 +31,18 @@ describe('renderBlock', () => {
     expect(lines.at(-2)).toBe('Host *');
   });
 
-  it('puts each per-box user ahead of the wildcard, since ssh keeps the first User it finds', () => {
-    const lines = renderBlock({ user: 'alice', proxyCommand: 'p', hostUsers: [{ alias: 'termag-warm', user: 'termag' }] }).split('\n');
-    expect(lines.slice(4, 7)).toEqual(['Host termag-warm', '  User termag', 'Host termag-*']);
+  it('puts each per-box host ahead of the wildcard, since ssh keeps the first User and HostName it finds', () => {
+    const lines = renderBlock({ user: 'alice', proxyCommand: 'p', boxHosts: [
+      { alias: 'termag-Devbox', hostName: 'i-0123456789abcdef0', user: null },
+      { alias: 'termag-warm', hostName: 'i-0fedcba98', user: 'termag' },
+      { alias: 'termag-old', hostName: null, user: 'termag' },
+    ] }).split('\n');
+    expect(lines.slice(4, 13)).toEqual([
+      'Host termag-Devbox', '  HostName i-0123456789abcdef0',
+      'Host termag-warm', '  HostName i-0fedcba98', '  User termag',
+      'Host termag-old', '  User termag',
+      'Host termag-*', '  User alice',
+    ]);
   });
 
   it("puts each session host ahead of the wildcard, aimed at its box's alias so the ProxyCommand's %h reaches it", () => {
@@ -58,8 +67,8 @@ describe('renderBlock', () => {
 });
 
 describe('sshHosts', () => {
-  const box = (id: string, name: string, hostUnixUser: string | null): ConnectBox => ({
-    id, name, hostUnixUser, addressable: true, kind: 'ec2', state: 'running', status: 'ready', agentConnected: true, error: null, projects: [],
+  const box = (id: string, name: string, hostUnixUser: string | null, ec2InstanceId: string | null = null): ConnectBox => ({
+    id, name, hostUnixUser, ec2InstanceId, addressable: true, kind: 'ec2', state: 'running', status: 'ready', agentConnected: true, error: null, projects: [],
   } as unknown as ConnectBox);
   const project = (boxId: string, name: string, sessions: ConnectProject['sessions']): ConnectProject => ({
     id: `${boxId}-${name}`, name, ref: name, box: { id: boxId, name: boxId }, provider: 'claude', status: 'idle',
@@ -72,7 +81,7 @@ describe('sshHosts', () => {
       project('i1', 'web', { agent: 'alice-web-agent', ctrl: 'alice-web-ctrl' }),
       project('i2', 'api', sessions('api')),
     ]);
-    expect(hosts.hostUsers).toEqual([{ alias: 'termag-warm', user: 'termag' }]);
+    expect(hosts.boxHosts).toEqual([{ alias: 'termag-warm', hostName: null, user: 'termag' }]);
     expect(hosts.sessionHosts).toEqual([
       { alias: 'termag-dev.api', hostName: 'termag-dev', user: 'alice', session: 'alice-api-agent' },
       { alias: 'termag-dev.api.ctrl', hostName: 'termag-dev', user: 'alice', session: 'alice-api-ctrl' },
@@ -80,6 +89,21 @@ describe('sshHosts', () => {
       { alias: 'termag-warm.web.ctrl', hostName: 'termag-warm', user: 'termag', session: 'alice-web-ctrl' },
     ]);
     expect(hosts.skipped).toEqual([]);
+  });
+
+  // OpenSSH lowercases %h, so a name can't tell Devbox from devbox; the instance id can.
+  it('aims each box, and its project hosts, at its instance id, keeping the alias in the box\'s own case', () => {
+    const hosts = sshHosts('alice', [
+      box('b1', 'Devbox', 'alice', 'i-0aaaaaaaaaaaaaaaa'), box('b2', 'devbox', 'alice', 'i-0bbbbbbbbbbbbbbbb'),
+      box('b3', 'odd', 'alice', 'i-0aaa\n  ProxyCommand touch /tmp/pwned'),
+    ], [project('b1', 'api', sessions('api'))]);
+    expect(hosts.boxHosts).toEqual([
+      { alias: 'termag-devbox', hostName: 'i-0bbbbbbbbbbbbbbbb', user: null },
+      { alias: 'termag-Devbox', hostName: 'i-0aaaaaaaaaaaaaaaa', user: null },
+    ]);
+    expect(hosts.sessionHosts.map(h => [h.alias, h.hostName])).toEqual([
+      ['termag-Devbox.api', 'i-0aaaaaaaaaaaaaaaa'], ['termag-Devbox.api.ctrl', 'i-0aaaaaaaaaaaaaaaa'],
+    ]);
   });
 
   it("skips, and names, a project whose name or session can't go in ssh_config; drops ones it can't reach", () => {

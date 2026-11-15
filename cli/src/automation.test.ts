@@ -191,6 +191,24 @@ describe('termag automation list and show', () => {
     expect(stdout()).toMatch(/^Box:\s+couldn't start its box 6 times since 2026-10-30 00:00 UTC \(Insufficient capacity\.\)$/m);
   });
 
+  it("says when its last alert send failed, and how long ago", async () => {
+    orch.automations.automations[0].alertTarget = 'C0123ABCD45';
+    orch.automations.automations[0].lastAlertError = { error: 'Slack: not_in_channel', at: new Date(Date.now() - 2 * 3600_000).toISOString() };
+    expect(await run(['automation', 'show', 'devbox/nightly'], ctx())).toBe(0);
+    expect(stdout()).toMatch(/^Alerts:\s+.*; last send failed: Slack: not_in_channel \(2h ago\)$/m);
+  });
+
+  it('names each failing channel on its own, and reads the per-channel errors over the old one', async () => {
+    orch.automations.automations[0].alertTarget = 'C0123ABCD45';
+    orch.automations.automations[0].lastAlertError = { error: 'webhook: answered 503', at: new Date(Date.now() - 5 * 60_000).toISOString() };
+    orch.automations.automations[0].lastAlertErrors = {
+      slack: { error: 'not_in_channel', at: new Date(Date.now() - 2 * 3600_000).toISOString() },
+      webhook: { error: 'answered 503', at: new Date(Date.now() - 5 * 60_000).toISOString() },
+    };
+    expect(await run(['automation', 'show', 'devbox/nightly'], ctx())).toBe(0);
+    expect(stdout()).toMatch(/^Alerts:\s+.*; last Slack send failed: not_in_channel \(2h ago\); last webhook send failed: answered 503 \(5m ago\)$/m);
+  });
+
   it('takes an id as well, and 404 is exit 3', async () => {
     expect(await run(['automation', 'show', 'nightly', '--json', '--runs', '1'], ctx())).toBe(0);
     expect(lastJson()).toMatchObject({ ref: 'devbox/nightly', id: 'nightly', runs: [{ id: 'r2' }] });
@@ -216,6 +234,38 @@ describe('termag automation edit, pause and resume', () => {
   it('refuses an edit with nothing to change', async () => {
     expect(await run(['automation', 'edit', 'devbox/nightly'], ctx())).toBe(2);
     expect(await run(['automation', 'edit', 'devbox/nightly', '--pr', '--no-pr'], ctx())).toBe(2);
+    expect(calls()).toEqual([]);
+  });
+
+  it('sends the keyword alert, its target, the health switch and the webhook, and prints the secret once', async () => {
+    expect(await run(['automation', 'edit', 'devbox/nightly', '--alert-prefix', 'BLOCKER:', '--alert-regex', '/fail(ed)?/i', '--alert-to', 'C0123ABCD45', '--no-health-alerts', '--webhook', 'https://hooks.example.com/x'], ctx())).toBe(0);
+    expect(orch.automations.calls).toEqual([{
+      route: 'PATCH /automations/nightly',
+      body: { alertPrefix: 'BLOCKER:', alertRegex: '/fail(ed)?/i', alertTarget: 'C0123ABCD45', healthAlerts: false, webhook: { url: 'https://hooks.example.com/x' } },
+    }]);
+    expect(stdout()).toContain('Webhook: hooks.example.com. Its signing secret, shown only now:\n  whsec_test');
+    out = [];
+    expect(await run(['automation', 'show', 'devbox/nightly'], ctx())).toBe(0);
+    expect(stdout()).toMatch(/^Alerts:\s+a run whose summary starts with `BLOCKER:` or matches \/fail\(ed\)\?\/i → channel C0123ABCD45$/m);
+    expect(stdout()).toMatch(/^Webhook:\s+hooks\.example\.com \(run\.done, run\.failed, automation\.paused\)$/m);
+    expect(stdout()).not.toContain('whsec_test');
+  });
+
+  it('keeps the one-time webhook secret when --name refreshes the automation after the PATCH', async () => {
+    expect(await run(['automation', 'edit', 'devbox/nightly', '--webhook', 'https://hooks.example.com/x', '--name', 'hourly'], ctx())).toBe(0);
+    expect(stdout()).toContain('  whsec_test');
+    out = [];
+    expect(await run(['automation', 'edit', 'devbox/hourly', '--webhook', 'https://hooks.example.com/y', '--name', 'nightly', '--json'], ctx())).toBe(0);
+    expect(lastJson()).toMatchObject({ ref: 'devbox/nightly', webhookSecret: 'whsec_test', webhook: { host: 'hooks.example.com' } });
+  });
+
+  it('--no-alert and --no-webhook clear them; contradictions and a bad target are refused before any call', async () => {
+    expect(await run(['automation', 'edit', 'devbox/nightly', '--no-alert', '--no-webhook', '--health-alerts'], ctx())).toBe(0);
+    expect(orch.automations.calls[0].body).toEqual({ alertPrefix: null, alertRegex: null, healthAlerts: true, webhook: null });
+    orch.automations.calls = [];
+    for (const argv of [['--no-alert', '--alert-prefix', 'X'], ['--webhook', 'https://h.example.com', '--no-webhook'], ['--alert-to', '#general'], ['--webhook', 'http://h.example.com'], ['--health-alerts', '--no-health-alerts']]) {
+      expect(await run(['automation', 'edit', 'devbox/nightly', ...argv], ctx()), argv.join(' ')).toBe(2);
+    }
     expect(calls()).toEqual([]);
   });
 

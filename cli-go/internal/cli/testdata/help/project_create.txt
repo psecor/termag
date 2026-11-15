@@ -1,0 +1,19 @@
+Create a project on a box, or on a new box with --new-box (at --size, else the repository's or environment's or your default size).
+
+Usage: termag project create <box>/<name> --agent <agent> [--model opus|sonnet|haiku] [--from <template|github-url|box/project> | --environment <name>] [--new-box [--size small|medium|large] [--disk <GB>] [--setup|--no-setup] [--timeout <seconds>]] [--if-not-exists] [--for-ask]
+
+--environment <name>  Start from an environment: the project holds its repositories, a
+                      multi-repo project for two or more, and with --new-box the box is sized by its definition
+                      (--size and --disk still win). Instead of --from.
+--model <tier>        The Claude model its main workstream starts on, in its agent pane and its chat: opus,
+                      sonnet or haiku. Claude Code (--agent claude) only; without it, the default.
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

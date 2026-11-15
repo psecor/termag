@@ -5,6 +5,7 @@ import { handleAutomations, newAutomationsState, type FakeAutomationsState } fro
 import { handleEnvironments, newEnvironmentsState, type FakeEnvironmentsState } from './fakeEnvironments.js';
 import { handleDoctor, newDoctorState, type FakeDoctorState } from './fakeDoctor.js';
 import { handleBugs, newBugsState, type FakeBugsState } from './fakeBugs.js';
+import { handleFeedback, newFeedbackState, type FakeFeedbackState } from './fakeFeedback.js';
 import { handlePreview, newPreviewState, type FakePreviewState } from './fakePreview.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -28,7 +29,8 @@ export interface FakeOrchestrator {
   boxTokens: Set<string>;
   /** `termag doctor`'s view: SSH keys, GitHub and the Claude gateway (fakeDoctor.ts). */
   doctor: FakeDoctorState;
-  requests: Array<{ method: string; path: string; auth: string | null }>;
+  /** Every request, in order; `search` is its query string (`?a=b`, or empty). */
+  requests: Array<{ method: string; path: string; auth: string | null; search: string }>;
   /** Overrides for a path, e.g. to simulate an ALB redirect or an old orchestrator. */
   override: Map<string, (res: ServerResponse) => void>;
   lifecycle: FakeLifecycleState;
@@ -38,6 +40,8 @@ export interface FakeOrchestrator {
   environments: FakeEnvironmentsState;
   /** `termag bug` (fakeBugs.ts). */
   bugs: FakeBugsState;
+  /** `termag feedback` (fakeFeedback.ts). */
+  feedback: FakeFeedbackState;
   /** `termag preview` (fakePreview.ts). */
   preview: FakePreviewState;
   /** WebSocket upgrades (the forward socket, fakeForward.ts); unset, they are dropped. */
@@ -85,6 +89,7 @@ export async function startFakeOrchestrator(): Promise<FakeOrchestrator> {
     automations: newAutomationsState(),
     environments: newEnvironmentsState(),
     bugs: newBugsState(),
+    feedback: newFeedbackState(),
     preview: newPreviewState(),
     upgrade: null as FakeOrchestrator['upgrade'],
   };
@@ -93,7 +98,7 @@ export async function startFakeOrchestrator(): Promise<FakeOrchestrator> {
     const url = new URL(req.url ?? '/', 'http://x');
     const path = url.pathname.replace(/^\/termag/, '');
     const auth = req.headers.authorization ?? null;
-    fake.requests.push({ method: req.method ?? '', path, auth });
+    fake.requests.push({ method: req.method ?? '', path, auth, search: url.search });
     const override = fake.override.get(path);
     if (override) { override(res); return; }
 
@@ -178,6 +183,7 @@ export async function startFakeOrchestrator(): Promise<FakeOrchestrator> {
         if (handleAutomations(fake.automations, route, body, isBox, res)) return;
         if (handleEnvironments(fake.environments, route, body, isBox, res)) return;
         if (handleBugs(fake.bugs, route, url.searchParams, body, isBox, res)) return;
+        if (handleFeedback(fake.feedback, route, body, isBox, res)) return;
         if (handlePreview(fake.preview, route, url.searchParams, body, isBox, res, !!device?.onBox)) return;
         if (handleLifecycle(fake.lifecycle, route, body, isBox, res)) return;
         sendJson(res, 404, { error: 'No such CLI endpoint', code: 'not_found' });

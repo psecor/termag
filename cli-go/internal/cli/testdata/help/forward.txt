@@ -1,0 +1,18 @@
+Forward local ports to ports on a box through the orchestrator, until Ctrl-C.
+
+Usage: termag forward <box> <port>[:<local>]…
+
+Each <port> on the box is reached at localhost:<local> (default: the same port) on
+127.0.0.1 and ::1 only. Local ports start at 1024.
+  termag forward devbox 3000 5173
+  termag forward devbox 80:8080
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

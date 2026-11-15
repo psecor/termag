@@ -1,0 +1,3 @@
+# The launcher binary, from go build in this directory. The bake builds it from source (packer/scripts/box-lib.sh).
+/preview-launcher
+/termag-preview

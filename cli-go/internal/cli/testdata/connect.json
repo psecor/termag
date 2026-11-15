@@ -1,0 +1,854 @@
+{
+  "shQuote": [
+    {
+      "input": "",
+      "ok": "''"
+    },
+    {
+      "input": "plain",
+      "ok": "plain"
+    },
+    {
+      "input": "a b",
+      "ok": "'a b'"
+    },
+    {
+      "input": "it's",
+      "ok": "'it'\\''s'"
+    },
+    {
+      "input": "x%y",
+      "ok": "x%y"
+    },
+    {
+      "input": "-dash",
+      "ok": "-dash"
+    },
+    {
+      "input": "ünï",
+      "ok": "'ünï'"
+    },
+    {
+      "input": "$HOME",
+      "ok": "'$HOME'"
+    }
+  ],
+  "remoteCommandLine": [
+    {
+      "input": [],
+      "ok": null
+    },
+    {
+      "input": [
+        "make test | tail"
+      ],
+      "ok": "make test | tail"
+    },
+    {
+      "input": [
+        "claude",
+        "-p",
+        "fix the \"test\""
+      ],
+      "ok": "claude -p 'fix the \"test\"'"
+    },
+    {
+      "input": [
+        "a b",
+        "c'd"
+      ],
+      "ok": "'a b' 'c'\\''d'"
+    }
+  ],
+  "scanSshOptions": [
+    {
+      "input": [
+        "-N",
+        "-L",
+        "3000:localhost:3000"
+      ],
+      "flags": [
+        "L",
+        "N"
+      ],
+      "stray": []
+    },
+    {
+      "input": [
+        "-NL",
+        "1:a:1",
+        "-v"
+      ],
+      "flags": [
+        "L",
+        "N",
+        "v"
+      ],
+      "stray": []
+    },
+    {
+      "input": [
+        "-o",
+        "X=y",
+        "stray",
+        "-t"
+      ],
+      "flags": [
+        "o",
+        "t"
+      ],
+      "stray": [
+        "stray"
+      ]
+    },
+    {
+      "input": [
+        "--",
+        "x"
+      ],
+      "flags": [],
+      "stray": [
+        "--",
+        "x"
+      ]
+    },
+    {
+      "input": [
+        "-L1:a:1",
+        "host"
+      ],
+      "flags": [
+        "L"
+      ],
+      "stray": [
+        "host"
+      ]
+    }
+  ],
+  "buildSshArgv": [
+    {
+      "plan": {
+        "route": {
+          "awsPath": "/usr/local/bin/aws",
+          "instanceId": "i-0123456789abcdef0",
+          "region": "us-east-2",
+          "profile": "termag-boxes",
+          "document": "TermagSSH"
+        },
+        "alias": "termag-dev",
+        "user": "ab",
+        "userOptions": [],
+        "remote": null,
+        "tty": false,
+        "batch": false
+      },
+      "ok": [
+        "-o",
+        "ProxyCommand=/usr/local/bin/aws ssm start-session --target i-0123456789abcdef0 --document-name TermagSSH --parameters portNumber=%p --region us-east-2 --profile termag-boxes",
+        "-o",
+        "HostKeyAlias=i-0123456789abcdef0",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "User=ab",
+        "termag-dev"
+      ]
+    },
+    {
+      "plan": {
+        "route": {
+          "awsPath": "/usr/local/bin/aws",
+          "instanceId": "i-0123456789abcdef0",
+          "region": "us-east-2",
+          "profile": "termag-boxes",
+          "document": "TermagSSH"
+        },
+        "alias": "termag-dev",
+        "user": "ab",
+        "userOptions": [
+          "-N",
+          "-L",
+          "3000:localhost:3000"
+        ],
+        "remote": null,
+        "tty": false,
+        "batch": true
+      },
+      "ok": [
+        "-N",
+        "-L",
+        "3000:localhost:3000",
+        "-o",
+        "ProxyCommand=/usr/local/bin/aws ssm start-session --target i-0123456789abcdef0 --document-name TermagSSH --parameters portNumber=%p --region us-east-2 --profile termag-boxes",
+        "-o",
+        "HostKeyAlias=i-0123456789abcdef0",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "User=ab",
+        "-o",
+        "BatchMode=yes",
+        "termag-dev"
+      ]
+    },
+    {
+      "plan": {
+        "route": {
+          "awsPath": "/Users/a b/100%/aws",
+          "instanceId": "i-1",
+          "region": "eu-west-1",
+          "profile": "it's",
+          "document": "Doc%x"
+        },
+        "alias": "termag-dev",
+        "user": "termag",
+        "userOptions": [
+          "-v"
+        ],
+        "remote": "cd 'termag/projects/x' && make test",
+        "tty": true,
+        "batch": false
+      },
+      "ok": [
+        "-v",
+        "-o",
+        "ProxyCommand='/Users/a b/100%%/aws' ssm start-session --target i-1 --document-name Doc%%x --parameters portNumber=%p --region eu-west-1 --profile 'it'\\''s'",
+        "-o",
+        "HostKeyAlias=i-1",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "User=termag",
+        "-t",
+        "termag-dev",
+        "cd 'termag/projects/x' && make test"
+      ]
+    }
+  ],
+  "proxyCommandFor": [
+    {
+      "termag": [
+        "/home/ab/.local/bin/termag"
+      ],
+      "host": null,
+      "wake": false,
+      "ok": "/home/ab/.local/bin/termag ssh-proxy %h %p"
+    },
+    {
+      "termag": [
+        "/usr/bin/node",
+        "/a b/termag.js"
+      ],
+      "host": "https://x.example/termag",
+      "wake": true,
+      "ok": "/usr/bin/node '/a b/termag.js' --host https://x.example/termag ssh-proxy --wake %h %p"
+    },
+    {
+      "termag": [
+        "/p%q/termag"
+      ],
+      "host": "http://h:1/t%x",
+      "wake": false,
+      "ok": "/p%%q/termag --host http://h:1/t%%x ssh-proxy %h %p"
+    }
+  ],
+  "sshHosts": {
+    "boxes": [
+      {
+        "id": "b1",
+        "name": "dev",
+        "addressable": true,
+        "kind": "ec2",
+        "state": "running",
+        "hostUnixUser": "termag",
+        "ec2InstanceId": "i-0123456789abcdef0"
+      },
+      {
+        "id": "b2",
+        "name": "alpha",
+        "addressable": true,
+        "kind": "ec2",
+        "state": "running",
+        "hostUnixUser": null,
+        "ec2InstanceId": "i-1"
+      },
+      {
+        "id": "b3",
+        "name": "bad name",
+        "addressable": false,
+        "kind": "ec2",
+        "state": "running"
+      },
+      {
+        "id": "b4",
+        "name": "Zed_box",
+        "addressable": true,
+        "kind": "ec2",
+        "state": "stopped",
+        "hostUnixUser": "Bad User"
+      },
+      {
+        "id": "b5",
+        "name": "beta-2",
+        "addressable": true,
+        "kind": "ec2",
+        "state": "running",
+        "hostUnixUser": "ab",
+        "ec2InstanceId": "i-0aaaabbbbccccdddd"
+      },
+      {
+        "id": "b6",
+        "name": "Dev",
+        "addressable": true,
+        "kind": "ec2",
+        "state": "running",
+        "hostUnixUser": "ab",
+        "ec2InstanceId": "i-0fedcba9876543210"
+      }
+    ],
+    "projects": [
+      {
+        "name": "web",
+        "box": {
+          "id": "b1",
+          "name": "dev"
+        },
+        "sessions": {
+          "agent": "ab-web-agent",
+          "ctrl": "ab-web-ctrl"
+        }
+      },
+      {
+        "name": "API",
+        "box": {
+          "id": "b1",
+          "name": "dev"
+        },
+        "sessions": {
+          "agent": "ab-API-agent",
+          "ctrl": "ab-API-ctrl"
+        }
+      },
+      {
+        "name": "odd.name",
+        "box": {
+          "id": "b2",
+          "name": "alpha"
+        },
+        "sessions": {
+          "agent": "x",
+          "ctrl": "y"
+        }
+      },
+      {
+        "name": "nosess",
+        "box": {
+          "id": "b2",
+          "name": "alpha"
+        },
+        "sessions": null
+      },
+      {
+        "name": "z",
+        "box": {
+          "id": "b3",
+          "name": "bad name"
+        },
+        "sessions": {
+          "agent": "a",
+          "ctrl": "c"
+        }
+      },
+      {
+        "name": "_under",
+        "box": {
+          "id": "b5",
+          "name": "beta-2"
+        },
+        "sessions": {
+          "agent": "a1",
+          "ctrl": "c1"
+        }
+      }
+    ],
+    "user": "ab",
+    "ok": {
+      "boxHosts": [
+        {
+          "alias": "termag-beta-2",
+          "hostName": "i-0aaaabbbbccccdddd",
+          "user": null
+        },
+        {
+          "alias": "termag-dev",
+          "hostName": "i-0123456789abcdef0",
+          "user": "termag"
+        },
+        {
+          "alias": "termag-Dev",
+          "hostName": "i-0fedcba9876543210",
+          "user": null
+        }
+      ],
+      "sessionHosts": [
+        {
+          "hostName": "i-0aaaabbbbccccdddd",
+          "user": "ab",
+          "alias": "termag-beta-2._under",
+          "session": "a1"
+        },
+        {
+          "hostName": "i-0aaaabbbbccccdddd",
+          "user": "ab",
+          "alias": "termag-beta-2._under.ctrl",
+          "session": "c1"
+        },
+        {
+          "hostName": "i-0123456789abcdef0",
+          "user": "termag",
+          "alias": "termag-dev.API",
+          "session": "ab-API-agent"
+        },
+        {
+          "hostName": "i-0123456789abcdef0",
+          "user": "termag",
+          "alias": "termag-dev.API.ctrl",
+          "session": "ab-API-ctrl"
+        },
+        {
+          "hostName": "i-0123456789abcdef0",
+          "user": "termag",
+          "alias": "termag-dev.web",
+          "session": "ab-web-agent"
+        },
+        {
+          "hostName": "i-0123456789abcdef0",
+          "user": "termag",
+          "alias": "termag-dev.web.ctrl",
+          "session": "ab-web-ctrl"
+        }
+      ],
+      "skipped": [
+        "alpha/odd.name"
+      ]
+    },
+    "block": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<"
+  },
+  "upsertBlock": [
+    {
+      "existing": "",
+      "top": true,
+      "block": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<",
+      "ok": {
+        "content": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<\n",
+        "action": "added"
+      }
+    },
+    {
+      "existing": "Host *\n  ForwardAgent no\n",
+      "top": true,
+      "block": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<",
+      "ok": {
+        "content": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<\n\nHost *\n  ForwardAgent no\n",
+        "action": "added"
+      }
+    },
+    {
+      "existing": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-*\n  User ab\n  ProxyCommand /usr/bin/node /home/ab/src/termag/cli/bin/termag.js ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<\n\nHost x\n  User y\n",
+      "top": true,
+      "block": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<",
+      "ok": {
+        "content": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<\n\nHost x\n  User y\n",
+        "action": "updated"
+      }
+    },
+    {
+      "existing": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<\n\nHost x\n",
+      "top": true,
+      "block": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<",
+      "ok": {
+        "content": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<\n\nHost x\n",
+        "action": "unchanged"
+      }
+    },
+    {
+      "existing": "# >>> termag ssh-config >>>\nHost a\n",
+      "top": true,
+      "block": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<",
+      "error": "The termag markers in ~/.ssh/config are unmatched or repeated; remove the termag lines by hand and re-run `termag ssh-config --install`",
+      "code": "failed"
+    },
+    {
+      "existing": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<\n# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<\n",
+      "top": true,
+      "block": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<",
+      "error": "The termag markers in ~/.ssh/config are unmatched or repeated; remove the termag lines by hand and re-run `termag ssh-config --install`",
+      "code": "failed"
+    },
+    {
+      "existing": "# <<< termag ssh-config <<<\n# >>> termag ssh-config >>>\n",
+      "top": true,
+      "block": "# >>> termag ssh-config >>>\n# Managed by `termag ssh-config --install`, which replaces everything between these markers.\n# `ssh termag-<box>` reaches that box over SSM (TermagSSH), with the same checks as `termag ssh`.\n# `ssh termag-<box>.<project>` attaches to the project's agent tmux session, and `.ctrl` to its ctrl shell.\nHost termag-beta-2\n  HostName i-0aaaabbbbccccdddd\nHost termag-dev\n  HostName i-0123456789abcdef0\n  User termag\nHost termag-Dev\n  HostName i-0fedcba9876543210\nHost termag-beta-2._under\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t a1 ';' set-option -w window-size latest\nHost termag-beta-2._under.ctrl\n  HostName i-0aaaabbbbccccdddd\n  User ab\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t c1 ';' set-option -w window-size latest\nHost termag-dev.API\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-agent ';' set-option -w window-size latest\nHost termag-dev.API.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-API-ctrl ';' set-option -w window-size latest\nHost termag-dev.web\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-agent ';' set-option -w window-size latest\nHost termag-dev.web.ctrl\n  HostName i-0123456789abcdef0\n  User termag\n  RequestTTY yes\n  RemoteCommand tmux attach-session -t ab-web-ctrl ';' set-option -w window-size latest\nHost termag-*\n  User ab\n  ProxyCommand /home/ab/.local/bin/termag ssh-proxy %h %p\n  StrictHostKeyChecking accept-new\n  ServerAliveInterval 30\nHost *\n# <<< termag ssh-config <<<",
+      "error": "The termag markers in ~/.ssh/config are unmatched or repeated; remove the termag lines by hand and re-run `termag ssh-config --install`",
+      "code": "failed"
+    },
+    {
+      "existing": "[default]\nregion = us-west-2\n\n\n",
+      "top": false,
+      "block": "# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile p]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<",
+      "ok": {
+        "content": "[default]\nregion = us-west-2\n\n# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile p]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<\n",
+        "action": "added"
+      }
+    },
+    {
+      "existing": "",
+      "top": false,
+      "block": "# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile p]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<",
+      "ok": {
+        "content": "# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile p]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<\n",
+        "action": "added"
+      }
+    }
+  ],
+  "dropBlock": [
+    {
+      "existing": "[default]\n\n# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile p]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<\n",
+      "ok": {
+        "content": "[default]\n",
+        "action": "removed"
+      }
+    },
+    {
+      "existing": "# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile p]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<\n\n[x]\n",
+      "ok": {
+        "content": "[x]\n",
+        "action": "removed"
+      }
+    },
+    {
+      "existing": "nothing",
+      "ok": {
+        "content": "nothing",
+        "action": "absent"
+      }
+    }
+  ],
+  "awsBlock": "# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile termag-boxes]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<",
+  "profileState": [
+    {
+      "content": "",
+      "ok": "missing"
+    },
+    {
+      "content": "[profile termag-boxes]\nsso_session = mine\n",
+      "ok": "own"
+    },
+    {
+      "content": "[profile termag-boxes]\nsso_start_url = https://x\nsso_region = us-east-1\n",
+      "ok": "own-legacy"
+    },
+    {
+      "content": "[profile other]\nregion = us-east-1\n",
+      "ok": "missing"
+    },
+    {
+      "content": "# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile termag-boxes]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<\n",
+      "ok": "managed"
+    },
+    {
+      "content": "# >>> termag aws-config >>>\n# Written by the termag CLI the first time it connects to a box; it replaces everything between these markers.\n[sso-session termag]\nsso_start_url = https://your-org.awsapps.com/start/\nsso_region = us-east-1\nsso_registration_scopes = sso:account:access\n\n[profile termag-boxes]\nsso_session = termag\nsso_account_id = 123456789012\nsso_role_name = TermagUser\nregion = us-east-2\n# <<< termag aws-config <<<\n[sso-session termag]\nsso_start_url = x\n",
+      "ok": "shadowed"
+    },
+    {
+      "content": "[ profile   termag-boxes ]\n; comment\nSSO_SESSION=termag\n",
+      "ok": "own"
+    },
+    {
+      "content": "[termag-boxes]\n",
+      "ok": "own"
+    }
+  ],
+  "awsVersion": [
+    {
+      "input": "aws-cli/2.15.30 Python/3.11.8 Darwin/23.4.0",
+      "version": [
+        2,
+        15
+      ],
+      "supports": true
+    },
+    {
+      "input": "aws-cli/2.8.1",
+      "version": [
+        2,
+        8
+      ],
+      "supports": false
+    },
+    {
+      "input": "aws-cli/1.33.0",
+      "version": [
+        1,
+        33
+      ],
+      "supports": false
+    },
+    {
+      "input": "nope",
+      "version": null,
+      "supports": null
+    }
+  ],
+  "withTerminfo": {
+    "ok": "if ! infocmp xterm-ghostty >/dev/null 2>&1; then printf %s eHRlcm0tZ2hvc3R0eXxnaG9zdHR5LAoJYW0sIGJjZSwK | base64 -d | tic -x -o \"$HOME/.terminfo\" - >/dev/null 2>&1; infocmp xterm-ghostty >/dev/null 2>&1 || { echo 'termag: could not install the terminfo entry for xterm-ghostty on the box; using TERM=xterm-256color' >&2; TERM=xterm-256color; export TERM; }; fi; exec \"${SHELL:-/bin/sh}\" -l"
+  },
+  "fallbackNotice": "termag: TERM=weird may be unknown on the box and because; using TERM=xterm-256color for this session",
+  "parseRef": [
+    {
+      "input": "dev",
+      "ok": {
+        "box": "dev",
+        "project": null
+      }
+    },
+    {
+      "input": "dev/web",
+      "ok": {
+        "box": "dev",
+        "project": "web"
+      }
+    },
+    {
+      "input": "",
+      "error": "Name a box (`devbox`) or a project (`devbox/my-project`)",
+      "code": "usage"
+    },
+    {
+      "input": "a/b/c",
+      "error": "`a/b/c` is neither a box (`devbox`) nor a project (`devbox/my-project`)",
+      "code": "usage"
+    },
+    {
+      "input": "/x",
+      "error": "`/x` is neither a box (`devbox`) nor a project (`devbox/my-project`)",
+      "code": "usage"
+    },
+    {
+      "input": "x/",
+      "error": "`x/` is neither a box (`devbox`) nor a project (`devbox/my-project`)",
+      "code": "usage"
+    }
+  ],
+  "ssmTarget": [
+    {
+      "state": "running",
+      "ok": {
+        "instanceId": "i-1",
+        "region": "us-east-2"
+      }
+    },
+    {
+      "state": "unknown",
+      "ok": {
+        "instanceId": "i-1",
+        "region": "us-east-2"
+      }
+    },
+    {
+      "state": "stopped",
+      "error": "dev is stopped; start it (`termag box start dev` or the web UI) and try again",
+      "code": "failed"
+    },
+    {
+      "state": "stopping",
+      "error": "dev is stopping",
+      "code": "failed"
+    },
+    {
+      "state": "hibernated",
+      "error": "dev is hibernated; resume it (`termag box start dev` or the web UI), which keeps its sessions, and try again",
+      "code": "failed"
+    },
+    {
+      "state": "hibernating",
+      "error": "dev is hibernating; once it is hibernated, resume it with `termag box start dev` and try again",
+      "code": "failed"
+    },
+    {
+      "state": "failed",
+      "error": "dev failed to come up: boom",
+      "code": "failed"
+    },
+    {
+      "state": "starting",
+      "error": "dev is starting; try again once it is running",
+      "code": "failed"
+    },
+    {
+      "state": "external",
+      "error": "dev is not an EC2 box, so termag can't reach it over SSM",
+      "code": "failed"
+    }
+  ],
+  "pickBox": [
+    {
+      "name": "dev",
+      "n": 6,
+      "caseLost": false,
+      "ok": "b1"
+    },
+    {
+      "name": "b2",
+      "n": 6,
+      "caseLost": false,
+      "ok": "b2"
+    },
+    {
+      "name": "nope",
+      "n": 6,
+      "caseLost": false,
+      "error": "No box named \"nope\"; your boxes: dev, alpha, Zed_box, beta-2, Dev",
+      "code": "not_found"
+    },
+    {
+      "name": null,
+      "n": 6,
+      "caseLost": false,
+      "error": "You have 6 boxes (dev, alpha, Zed_box, beta-2, Dev); name the one to use",
+      "code": "usage"
+    },
+    {
+      "name": null,
+      "n": 1,
+      "caseLost": false,
+      "ok": "b1"
+    },
+    {
+      "name": null,
+      "n": 0,
+      "caseLost": false,
+      "error": "You have no boxes; create one with `termag box create <name>`",
+      "code": "not_found"
+    },
+    {
+      "name": "x",
+      "n": 0,
+      "caseLost": false,
+      "error": "No box named \"x\"; you have no boxes",
+      "code": "not_found"
+    },
+    {
+      "name": "Dev",
+      "n": 6,
+      "caseLost": false,
+      "ok": "b6"
+    },
+    {
+      "name": "DEV",
+      "n": 6,
+      "caseLost": false,
+      "error": "\"DEV\" matches 2 boxes (dev, Dev) when case is ignored; name one exactly, or by id",
+      "code": "usage"
+    },
+    {
+      "name": "ALPHA",
+      "n": 6,
+      "caseLost": false,
+      "ok": "b2"
+    },
+    {
+      "name": "dev",
+      "n": 6,
+      "caseLost": true,
+      "error": "\"dev\" matches 2 boxes (dev, Dev) and ssh has lowercased it, so termag can't tell which; run `termag ssh-config --install` again, which names each box by its instance id",
+      "code": "usage"
+    },
+    {
+      "name": "beta-2",
+      "n": 6,
+      "caseLost": true,
+      "ok": "b5"
+    },
+    {
+      "name": "b1",
+      "n": 6,
+      "caseLost": true,
+      "ok": "b1"
+    }
+  ],
+  "pickProxyBox": [
+    {
+      "host": "i-0123456789abcdef0",
+      "ok": "b1"
+    },
+    {
+      "host": "I-0123456789ABCDEF0",
+      "ok": "b1"
+    },
+    {
+      "host": "i-0fedcba9876543210",
+      "ok": "b6"
+    },
+    {
+      "host": "i-00000000",
+      "error": "No box of yours is instance i-00000000 (your boxes: dev, alpha, Zed_box, beta-2, Dev); run `termag ssh-config --install` again to bring the ssh config up to date",
+      "code": "not_found"
+    },
+    {
+      "host": "i-1",
+      "error": "`i-1` is not a termag host; they are named termag-<box>",
+      "code": "usage"
+    },
+    {
+      "host": "termag-dev",
+      "error": "\"dev\" matches 2 boxes (dev, Dev) and ssh has lowercased it, so termag can't tell which; run `termag ssh-config --install` again, which names each box by its instance id",
+      "code": "usage"
+    },
+    {
+      "host": "termag-alpha",
+      "ok": "b2"
+    },
+    {
+      "host": "termag-beta-2",
+      "ok": "b5"
+    },
+    {
+      "host": "termag-nope",
+      "error": "No box named \"nope\"; your boxes: dev, alpha, Zed_box, beta-2, Dev",
+      "code": "not_found"
+    },
+    {
+      "host": "dev",
+      "error": "`dev` is not a termag host; they are named termag-<box>",
+      "code": "usage"
+    },
+    {
+      "host": "termag-",
+      "error": "`termag-` is not a termag host; they are named termag-<box>",
+      "code": "usage"
+    }
+  ],
+  "boxFromAlias": [
+    {
+      "input": "termag-dev",
+      "ok": "dev"
+    },
+    {
+      "input": "termag-",
+      "error": "`termag-` is not a termag host; they are named termag-<box>",
+      "code": "usage"
+    },
+    {
+      "input": "dev",
+      "error": "`dev` is not a termag host; they are named termag-<box>",
+      "code": "usage"
+    }
+  ]
+}

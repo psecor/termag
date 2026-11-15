@@ -542,6 +542,19 @@ describe('termag ssh-proxy (the ssh-config ProxyCommand)', () => {
     expect(out).toEqual([]);
   });
 
+  // The HostName ssh-config writes, so OpenSSH's lowercasing of %h can't land on the wrong box.
+  it('finds the box by the instance id ssh hands it as %h', async () => {
+    orch.override.set('/api/cli/v1/boxes', serve({ boxes: [
+      { ...CONNECT_BOXES[0], id: 'b1', name: 'Devbox', ec2InstanceId: 'i-0aaaaaaaaaaaaaaaa' },
+      { ...CONNECT_BOXES[0], id: 'b2', name: 'devbox', ec2InstanceId: 'i-0bbbbbbbbbbbbbbbb' },
+    ] }));
+    expect(await run(['ssh-proxy', 'i-0aaaaaaaaaaaaaaaa', '22'], ctx())).toBe(0);
+    expect(calls('aws').at(-1)?.slice(0, 4)).toEqual(['ssm', 'start-session', '--target', 'i-0aaaaaaaaaaaaaaaa']);
+    expect(await run(['ssh-proxy', 'termag-devbox', '22'], ctx())).toBe(2);
+    expect(err.join('\n')).toContain("ssh has lowercased it, so termag can't tell which");
+    expect(out).toEqual([]);
+  });
+
   it('allows port 22 only, as the TermagSSH document does', async () => {
     expect(await run(['ssh-proxy', 'termag-devbox', '2222'], ctx())).toBe(1);
   });
@@ -687,6 +700,18 @@ describe('termag ssh-config', () => {
     expect(lines.indexOf('Host termag-warm')).toBeLessThan(lines.indexOf('Host termag-*'));
     expect(lines[lines.indexOf('Host termag-warm') + 1]).toBe('  User termag');
     expect(lines.filter(l => l.startsWith('Host termag-') && !l.includes('.'))).toEqual(['Host termag-warm', 'Host termag-*']);
+  });
+
+  it('aims each box, in its own case, at its instance id', async () => {
+    orch.override.set('/api/cli/v1/boxes', serve({ boxes: [
+      { ...CONNECT_BOXES[0], id: 'b1', name: 'Devbox', ec2InstanceId: 'i-0aaaaaaaaaaaaaaaa' },
+      { ...CONNECT_BOXES[0], id: 'b2', name: 'devbox', ec2InstanceId: 'i-0bbbbbbbbbbbbbbbb' },
+    ] }));
+    expect(await run(['ssh-config'], ctx())).toBe(0);
+    const lines = out.join('\n').split('\n');
+    const at = (host: string) => lines.slice(lines.indexOf(`Host ${host}`), lines.indexOf(`Host ${host}`) + 2);
+    expect(at('termag-Devbox')).toEqual(['Host termag-Devbox', '  HostName i-0aaaaaaaaaaaaaaaa']);
+    expect(at('termag-devbox')).toEqual(['Host termag-devbox', '  HostName i-0bbbbbbbbbbbbbbbb']);
   });
 
   it("gives each project an agent and a ctrl host, and names the ones it leaves out", async () => {

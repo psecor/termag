@@ -108,12 +108,14 @@ export function handleAutomations(s: FakeAutomationsState, route: string, body: 
     if (!a) { send(res, 404, { error: 'Automation not found', code: 'not_found' }); return true; }
     if (refused()) return true;
     if (method === 'PATCH') {
-      const { spaceName: askedSpace, ...rest } = body as { spaceName?: string | null };
+      const { spaceName: askedSpace, webhook, ...rest } = body as { spaceName?: string | null; webhook?: { url: string } | null };
       const nextSpace = askedSpace !== undefined ? askedSpace : a.spaceName ?? null;
       const nextFolder = !nextSpace ? null : nextSpace !== a.spaceName ? fixedFolder(a.id) : a.spaceFolder ?? fixedFolder(a.id);
       Object.assign(a, rest, { pausedReason: null, spaceName: nextSpace, spaceFolder: nextFolder });
+      // The orchestrator keeps only the host, and shows the secret in this answer alone.
+      if (webhook !== undefined) a.webhook = webhook ? { host: new URL(webhook.url).host } : null;
       a.next = a.enabled ? a.next.length ? a.next : ['2026-10-27T13:00:00.000Z'] : [];
-      send(res, 200, a);
+      send(res, 200, webhook ? { ...a, webhookSecret: 'whsec_test' } : a);
       return true;
     }
     if (method === 'DELETE') {

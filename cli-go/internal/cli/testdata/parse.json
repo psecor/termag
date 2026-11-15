@@ -1,0 +1,688 @@
+[
+  {
+    "argv": [],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": null,
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "--help"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": null,
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "-h"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": null,
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "--version"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": true,
+      "command": null,
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "--version",
+      "--json"
+    ],
+    "result": {
+      "json": true,
+      "yes": false,
+      "help": false,
+      "version": true,
+      "command": null,
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "help"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": null,
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "help",
+      "box"
+    ],
+    "error": "No help for `box`. Run `termag --help`.",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "help",
+      "box",
+      "ls"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": "box list",
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "help",
+      "space",
+      "memory"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": "space memory",
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "help",
+      "nope"
+    ],
+    "error": "No help for `nope`. Run `termag --help`.",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "box"
+    ],
+    "error": "`termag box` needs a subcommand: list, create, start, stop, keep, set, rename, resize, rm",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "box",
+      "--help"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": null,
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "env"
+    ],
+    "error": "`termag env` needs a subcommand: list, show, create, edit, share, unshare, history, delete",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "bogus"
+    ],
+    "error": "Unknown command `bogus`. Run `termag --help`.",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "box",
+      "bogus"
+    ],
+    "error": "Unknown command `box bogus`. Run `termag --help`.",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "whoami",
+      "extra"
+    ],
+    "error": "Too many arguments. Usage: termag whoami",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "whoami",
+      "--bogus"
+    ],
+    "error": "Unknown option '--bogus'",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "whoami",
+      "--json=1"
+    ],
+    "error": "Option '--json' does not take an argument",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "whoami",
+      "--host"
+    ],
+    "error": "Option '--host <value>' argument missing",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "whoami",
+      "--host",
+      "--json"
+    ],
+    "error": "Option '--host' argument is ambiguous.\nDid you forget to specify the option argument for '--host'?\nTo specify an option argument starting with a dash use '--host=-XYZ'.",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "whoami",
+      "--host=x"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "host": "x",
+      "help": false,
+      "version": false,
+      "command": "whoami",
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "whoami",
+      "-x"
+    ],
+    "error": "Unknown option '-x'",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "login",
+      "--device",
+      "a",
+      "--device",
+      "b"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "login",
+      "args": [],
+      "options": {
+        "device": "b"
+      },
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "ask",
+      "a/b",
+      "hi",
+      "--from",
+      "x",
+      "--from",
+      "y"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "ask",
+      "args": [
+        "a/b",
+        "hi"
+      ],
+      "options": {
+        "from": "y"
+      },
+      "lists": {
+        "from": [
+          "x",
+          "y"
+        ]
+      }
+    }
+  },
+  {
+    "argv": [
+      "space",
+      "get",
+      "-r",
+      "a:b"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "space get",
+      "args": [
+        "a:b"
+      ],
+      "options": {
+        "recursive": true
+      },
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "space",
+      "get",
+      "-rh"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": "space get",
+      "args": [],
+      "options": {
+        "recursive": true
+      },
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "space",
+      "ls",
+      "--",
+      "--json"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "space ls",
+      "args": [
+        "--json"
+      ],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "box",
+      "ls"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "box list",
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "project",
+      "ls",
+      "--json"
+    ],
+    "result": {
+      "json": true,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "project list",
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "ssh",
+      "b",
+      "-L",
+      "1:localhost:1",
+      "--json"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "ssh",
+      "args": [
+        "b"
+      ],
+      "options": {},
+      "lists": {},
+      "passthrough": [
+        "-L",
+        "1:localhost:1",
+        "--json"
+      ]
+    }
+  },
+  {
+    "argv": [
+      "ssh",
+      "--host",
+      "h",
+      "b",
+      "--",
+      "ls",
+      "-la"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "host": "h",
+      "help": false,
+      "version": false,
+      "command": "ssh",
+      "args": [
+        "b"
+      ],
+      "options": {},
+      "lists": {},
+      "passthrough": [
+        "--",
+        "ls",
+        "-la"
+      ]
+    }
+  },
+  {
+    "argv": [
+      "space",
+      "memory",
+      "context",
+      "--hook",
+      "SessionStart",
+      "--refresh",
+      "60s"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "space memory",
+      "args": [
+        "context"
+      ],
+      "options": {
+        "hook": "SessionStart",
+        "refresh": "60s"
+      },
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "space",
+      "put",
+      "-",
+      "x:y"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "space put",
+      "args": [
+        "-",
+        "x:y"
+      ],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "whoami",
+      "-"
+    ],
+    "error": "Too many arguments. Usage: termag whoami",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "space",
+      "ls",
+      "-1"
+    ],
+    "error": "Unknown option '-1'",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "update",
+      "--no-pull"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "update",
+      "args": [],
+      "options": {
+        "no-pull": true
+      },
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "ask",
+      "--inbox",
+      "--json"
+    ],
+    "result": {
+      "json": true,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "ask",
+      "args": [],
+      "options": {
+        "inbox": true
+      },
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "bug",
+      "report",
+      "--title",
+      "x",
+      "-"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "bug report",
+      "args": [
+        "-"
+      ],
+      "options": {
+        "title": "x"
+      },
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "space",
+      "rm",
+      "-rf",
+      "x:y"
+    ],
+    "error": "Unknown option '-f'",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "events",
+      "--json",
+      "--yes"
+    ],
+    "result": {
+      "json": true,
+      "yes": true,
+      "help": false,
+      "version": false,
+      "command": "events",
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "help",
+      "webapp-up"
+    ],
+    "error": "No help for `webapp-up`. Run `termag --help`.",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "webapp-up",
+      "--help"
+    ],
+    "error": "Unknown command `webapp-up`. Run `termag --help`.",
+    "code": "usage"
+  },
+  {
+    "argv": [
+      "doctor",
+      "--help"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": "doctor",
+      "args": [],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "whoami",
+      "--help",
+      "extra",
+      "extra2"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": true,
+      "version": false,
+      "command": "whoami",
+      "args": [
+        "extra",
+        "extra2"
+      ],
+      "options": {},
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "feedback",
+      "--kind",
+      "idea",
+      "--",
+      "- the sidebar is confusing"
+    ],
+    "result": {
+      "json": false,
+      "yes": false,
+      "help": false,
+      "version": false,
+      "command": "feedback",
+      "args": [
+        "- the sidebar is confusing"
+      ],
+      "options": {
+        "kind": "idea"
+      },
+      "lists": {}
+    }
+  },
+  {
+    "argv": [
+      "feedback",
+      "- the sidebar is confusing"
+    ],
+    "error": "Unknown option '- '",
+    "code": "usage"
+  }
+]

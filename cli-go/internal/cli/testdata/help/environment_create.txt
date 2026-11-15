@@ -1,0 +1,20 @@
+Create an environment from a definition (JSON, checked against docs/environment.schema.json) or a pointer to a file.
+
+Usage: termag environment create <name> (--file <path.json> | - | --pointer <owner/name>:<branch>:<path>) [--shared]
+
+--file reads the definition (environment.json's JSON, with "repos" and "resources") from a file, and - from stdin.
+--pointer <owner/name>:<branch>:<path> points at a file in a repository instead, read from that branch when a box is
+made; an empty branch is the default branch, an empty path .termag/environment.json.
+It is personal, yours alone, unless --shared (admins only): everyone signed in may then use it, only admins
+change it, and it must be a --pointer to a file on its repository's default branch. Then deploy from it:
+  termag project create <box>/<name> --agent claude --new-box --environment <name>
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

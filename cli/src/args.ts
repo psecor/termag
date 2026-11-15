@@ -11,6 +11,7 @@ import { FORWARD_COMMANDS } from './forward/command.js';
 import { PREVIEW_COMMANDS } from './preview/command.js';
 import { AUTOMATION_ALIASES, AUTOMATION_COMMANDS } from './automation.js';
 import { BUG_COMMANDS } from './bug.js';
+import { FEEDBACK_COMMANDS } from './feedback.js';
 import { ENVIRONMENT_ALIASES, ENVIRONMENT_COMMANDS } from './environment.js';
 import { EVENTS_COMMANDS } from './events/command.js';
 
@@ -67,6 +68,7 @@ export const COMMANDS: Record<string, CommandSpec> = {
   ...HANDOFF_COMMANDS,
   ...AUTOMATION_COMMANDS,
   ...BUG_COMMANDS,
+  ...FEEDBACK_COMMANDS,
   ...ENVIRONMENT_COMMANDS,
   ...EVENTS_COMMANDS,
   update: {

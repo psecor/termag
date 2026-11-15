@@ -1,0 +1,18 @@
+Open a shell on a box or in a project's directory, or run a command there.
+
+Usage: termag ssh <box>[/<project>] [<ssh options>] [-- <cmd>]
+
+termag flags go before <box>; everything after it goes to ssh. One <cmd> argument is a
+shell command line, as with ssh; several are words passed through intact.
+  termag ssh devbox/my-project -- claude -p "fix the failing test"
+  termag ssh devbox/my-project -N -L 3000:localhost:3000
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

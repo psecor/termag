@@ -2,7 +2,7 @@ import type { Api } from './api.js';
 import type { CommandSpec, ParsedArgs } from './args.js';
 import { authedApi, session } from './commands.js';
 import type { Ctx } from './context.js';
-import { EXIT, usage, type ExitCode } from './errors.js';
+import { CliError, EXIT, usage, type ExitCode } from './errors.js';
 import { confirmOrRefuse } from './lifecycle.js';
 import { formatDate, json, table } from './output.js';
 
@@ -17,11 +17,13 @@ import { formatDate, json, table } from './output.js';
  * pointer, --pointer <owner/name>:<branch>:<path> (an empty branch is the
  * repository's default, an empty path `.termag/environment.json`).
  *
- * An environment is personal (its owner's alone) or shared (everyone's, from
- * a file on its repository's default branch). `create` makes a personal one
- * unless --shared; `share` and `unshare` are the owner's switch. The
- * orchestrator checks the shared rules and its refusal, which says the rule,
- * is passed on as it comes.
+ * An environment is personal (its owner's alone) or shared (everyone's to use,
+ * from a file on its repository's default branch). `create` makes a personal
+ * one unless --shared; `share` and `unshare` switch it. Only an admin creates,
+ * edits, shares, unshares or deletes a shared one: the orchestrator answers
+ * anyone else 403 `environment_admin_only`, passed on with what to do instead
+ * (adminOnly). It checks the shared rules too, and its refusal, which says the
+ * rule, is passed on as it comes.
  */
 
 const TIMEOUT_MS = 60_000;
@@ -30,7 +32,7 @@ const definitionOptions = { file: { type: 'string' }, pointer: { type: 'string' 
 
 export const ENVIRONMENT_COMMANDS: Record<string, CommandSpec> = {
   'environment list': {
-    summary: 'List your personal environments, then the shared ones (anyone can use and edit those)',
+    summary: 'List your personal environments, then the shared ones (anyone can use those; admins change them)',
     usage: 'termag environment list',
     maxArgs: 0,
   },
@@ -47,23 +49,23 @@ export const ENVIRONMENT_COMMANDS: Record<string, CommandSpec> = {
     details: '--file reads the definition (environment.json\'s JSON, with "repos" and "resources") from a file, and - from stdin.\n'
       + '--pointer <owner/name>:<branch>:<path> points at a file in a repository instead, read from that branch when a box is\n'
       + 'made; an empty branch is the default branch, an empty path .termag/environment.json.\n'
-      + 'It is personal, yours alone, unless --shared: everyone signed in may then use and edit it, and it must be a\n'
-      + '--pointer to a file on its repository\'s default branch. Then deploy from it:\n'
+      + 'It is personal, yours alone, unless --shared (admins only): everyone signed in may then use it, only admins\n'
+      + 'change it, and it must be a --pointer to a file on its repository\'s default branch. Then deploy from it:\n'
       + '  termag project create <box>/<name> --agent claude --new-box --environment <name>',
   },
   'environment edit': {
-    summary: 'Replace an environment\'s definition or pointer (every change is in its history)',
+    summary: 'Replace an environment\'s definition or pointer (every change is in its history; a shared one: admins only)',
     usage: `termag environment edit <name> ${DEFINITION_USAGE}`,
     options: definitionOptions,
     maxArgs: 2,
   },
   'environment share': {
-    summary: 'Share your environment with everyone: it must point at a file on its repository\'s default branch',
+    summary: 'Share your environment with everyone (admins only): it must point at a file on its repository\'s default branch',
     usage: 'termag environment share <name>',
     maxArgs: 1,
   },
   'environment unshare': {
-    summary: 'Make your shared environment personal again: only you see and use it',
+    summary: 'Make a shared environment personal again, its owner\'s alone (admins only)',
     usage: 'termag environment unshare <name>',
     maxArgs: 1,
   },
@@ -73,7 +75,7 @@ export const ENVIRONMENT_COMMANDS: Record<string, CommandSpec> = {
     maxArgs: 1,
   },
   'environment delete': {
-    summary: 'Delete an environment, a shared one for everyone (its history stays; projects made from it keep their repositories)',
+    summary: 'Delete an environment, a shared one for everyone and by an admin (its history stays; projects made from it keep their repositories)',
     usage: 'termag environment delete <name> [--yes]',
     maxArgs: 1,
   },
@@ -98,6 +100,23 @@ interface EventView { id: string; at: string; action: string; actor: Person | nu
 function api(ctx: Ctx, args: ParsedArgs): Promise<Api> {
   return authedApi(ctx, session(ctx, args), { timeoutMs: TIMEOUT_MS });
 }
+
+/**
+ * The orchestrator's 403 `environment_admin_only` (only an admin changes a shared environment), with what this
+ * command's user can do instead on a second line; any other failure as it comes.
+ */
+async function adminOnly<T>(instead: string, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (err) {
+    if (err instanceof CliError && err.body?.code === 'environment_admin_only') throw new CliError(err.code, `${err.message}.\n  ${instead}`, err.status, err.body);
+    throw err;
+  }
+}
+
+/** `--file`/`--pointer` as typed, for a hint that repeats the command line. */
+const definitionArgs = (args: ParsedArgs): string =>
+  typeof args.options.pointer === 'string' ? `--pointer ${args.options.pointer}` : typeof args.options.file === 'string' ? `--file ${args.options.file}` : '-';
 
 function nameArg(args: ParsedArgs, command: string): string {
   const value = args.args[0];
@@ -177,7 +196,9 @@ async function cmdCreate(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const name = nameArg(args, 'environment create');
   const body = await definitionBody(ctx, args, name, 'environment create');
   const visibility: Visibility = args.options.shared === true ? 'shared' : 'personal';
-  const { environment: env } = await (await api(ctx, args)).request<{ environment: EnvironmentView }>('POST', '/environments', { ...body, visibility });
+  const a = await api(ctx, args);
+  const { environment: env } = await adminOnly(`Drop --shared to make it yours: termag environment create ${name} ${definitionArgs(args)}`,
+    () => a.request<{ environment: EnvironmentView }>('POST', '/environments', { ...body, visibility }));
   if (args.json) { ctx.out(json(env)); return EXIT.OK; }
   ctx.out(`Created ${env.visibility} environment ${env.name} (${env.kind === 'pointer' ? `file ${pointerLabel(env.file)}` : 'inline'}).`);
   ctx.out(`Next: termag project create <box>/<name> --agent claude --new-box --environment ${env.name}`);
@@ -187,23 +208,27 @@ async function cmdCreate(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
 async function cmdEdit(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const name = nameArg(args, 'environment edit');
   const body = await definitionBody(ctx, args, name, 'environment edit');
-  const { environment: env, changed } = await (await api(ctx, args)).request<{ environment: EnvironmentView; changed: boolean }>('PUT', path(name), body);
+  const a = await api(ctx, args);
+  const { environment: env, changed } = await adminOnly(`${name} is shared; ask an admin to change it, or make your own: termag environment create ${name}-mine ${definitionArgs(args)}`,
+    () => a.request<{ environment: EnvironmentView; changed: boolean }>('PUT', path(name), body));
   if (args.json) { ctx.out(json({ ...env, changed })); return EXIT.OK; }
   ctx.out(changed ? `Saved environment ${env.name}.` : `Environment ${env.name} already says that; nothing changed.`);
   return EXIT.OK;
 }
 
-/** The owner's switch: `share` or `unshare`. */
+/** The switch, `share` or `unshare`: an admin's (sharing their own personal one). */
 function cmdSwitch(to: Visibility) {
   const command = to === 'shared' ? 'environment share' : 'environment unshare';
   return async (ctx: Ctx, args: ParsedArgs): Promise<ExitCode> => {
     const name = nameArg(args, command);
-    const { environment: env, changed } = await (await api(ctx, args))
-      .request<{ environment: EnvironmentView; changed: boolean }>('POST', `${path(name)}/visibility`, { visibility: to });
+    const a = await api(ctx, args);
+    const { environment: env, changed } = await adminOnly(
+      to === 'shared' ? `${name} stays personal: yours to use. Ask an admin to make a shared one.` : `${name} stays shared; ask an admin to make it personal.`,
+      () => a.request<{ environment: EnvironmentView; changed: boolean }>('POST', `${path(name)}/visibility`, { visibility: to }));
     if (args.json) { ctx.out(json({ ...env, changed })); return EXIT.OK; }
     ctx.out(!changed ? `Environment ${env.name} is already ${to}.`
-      : to === 'shared' ? `Shared environment ${env.name}: everyone signed in can use and edit it.`
-      : `Environment ${env.name} is personal: only you see and use it.`);
+      : to === 'shared' ? `Shared environment ${env.name}: everyone signed in can use it, and admins change it.`
+      : `Environment ${env.name} is personal: only its owner, ${person(env.owner)}, sees and uses it.`);
     return EXIT.OK;
   };
 }
@@ -242,7 +267,8 @@ async function cmdHistory(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
 async function cmdDelete(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const name = nameArg(args, 'environment delete');
   await confirmOrRefuse(ctx, args, `Delete environment ${name} (a shared one for everyone; its history stays)?`);
-  await (await api(ctx, args)).request('DELETE', path(name));
+  const a = await api(ctx, args);
+  await adminOnly(`${name} is shared; ask an admin to delete it.`, () => a.request('DELETE', path(name)));
   if (args.json) ctx.out(json({ name, deleted: true }));
   else ctx.out(`Deleted environment ${name}.`);
   return EXIT.OK;

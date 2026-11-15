@@ -5,7 +5,7 @@ import { authedApi, session } from './commands.js';
 import type { Ctx } from './context.js';
 import { CliError, EXIT, usage, type ExitCode } from './errors.js';
 import { json, table } from './output.js';
-import { CREATE_WAIT_S, claudeModelOption, diskOption, environmentOption, ownBox, projectOnNewBox, startAndWait, START_WAIT_S } from './lifecycle.js';
+import { CLAUDE_MODELS, CREATE_WAIT_S, diskOption, environmentOption, ownBox, projectOnNewBox, startAndWait, START_WAIT_S } from './lifecycle.js';
 
 /**
  * `termag ask`: agent-to-agent asks. The
@@ -36,8 +36,8 @@ export const ASK_COMMANDS: Record<string, CommandSpec> = {
   ask: {
     summary: "Ask another project's agent; prints its answer and a draft PR for any commits (a --thread follow-up while it works joins the running turn)",
     // A --thread follow-up while the thread's turn works goes into that turn where the box can take it ("Steering a working ask").
-    usage: 'termag ask <box>/<project>[@<workstream>][:<repo>] <prompt|-> [--title <text>] [--model opus|sonnet|haiku] [--thread <id>] [--update-pr <n>] [--no-wait] [--no-notify] [--timeout <seconds>]\n'
-      + '       termag ask --new-box [--size small|medium|large] [--disk <GB>] [--from <box/project|template|github-url>... | --environment <name>] <box>/<project>[:<repo>] <prompt|-> [--title <text>] [--model opus|sonnet|haiku] [--no-wait] [--no-notify]\n'
+    usage: 'termag ask <box>/<project>[@<workstream>][:<repo>] <prompt|-> [--title <text>] [--model opus|sonnet|haiku|fireworks:<model>] [--thread <id>] [--update-pr <n>] [--no-wait] [--no-notify] [--timeout <seconds>]\n'
+      + '       termag ask --new-box [--size small|medium|large] [--disk <GB>] [--from <box/project|template|github-url>... | --environment <name>] <box>/<project>[:<repo>] <prompt|-> [--title <text>] [--model opus|sonnet|haiku|fireworks:<model>] [--no-wait] [--no-notify]\n'
       + '       termag ask --reply <message> [--no-wait] [--timeout <seconds>]\n'
       + '       termag ask --cancel <message>\n'
       + '       termag ask --inbox\n'
@@ -70,11 +70,17 @@ export const ASK_COMMANDS: Record<string, CommandSpec> = {
       + `                 e.g. ${TITLE_EXAMPLE}. termag shows the thread by this name (sidebar, tabs,\n`
       + '                 Files, chat header); an untitled thread shows as ask-<thread id>. Nothing is taken from the prompt.\n'
       + '                 With --thread it names or renames that thread, and the sidebar shows the new name at once.\n'
-      + '--model <tier>   The Claude model the turn runs on: opus, sonnet or haiku (the gateway\'s pinned Opus, Sonnet or\n'
-      + '                 Haiku). The thread keeps it: follow-ups without --model run on it too, and one with --model\n'
-      + '                 switches it from that turn on. Without it, the thread\'s model, else the box\'s default. With\n'
-      + '                 --new-box the new project starts on it too. An orchestrator or box agent too old for it runs\n'
-      + '                 the ask anyway, on its default, and says --model was ignored.\n'
+      + '--model <model>  The model the turn runs on: opus, sonnet or haiku (the gateway\'s pinned Opus, Sonnet or\n'
+      + '                 Haiku), or fireworks:<model> for an open-weight model on Fireworks, by its id or its last part\n'
+      + '                 (fireworks:kimi-k3, or fireworks alone for your default; the simple UI\'s model picker lists\n'
+      + '                 yours). Claude stays the default, and the one to use for code and PRs. The thread keeps it:\n'
+      + '                 follow-ups without --model run on it too, and one with --model switches it from that turn on\n'
+      + '                 (--model sonnet takes a Fireworks thread back to Claude). Without it, the thread\'s model, else\n'
+      + '                 the box\'s default. With --new-box the new project starts on a Claude tier too. An orchestrator\n'
+      + '                 or box agent too old for a Claude tier runs the ask anyway, on its default, and says --model\n'
+      + '                 was ignored. A Fireworks ask is never run on Claude instead: one that can\'t run as asked is\n'
+      + '                 refused with the reason (fireworks_unavailable; on an orchestrator too old for --model the\n'
+      + '                 CLI cancels it and exits 1).\n'
       + '--update-pr <n>  The pull request to publish to: <n>, <owner>/<name>#<n> or its github.com URL. Without it, a run\n'
       + '                 whose branch builds on exactly one open pull request you opened publishes there anyway; name one\n'
       + "                 when it builds on a stack of yours, or to override. It must be open, in the project's repository\n"
@@ -675,6 +681,24 @@ function newBoxOptions(args: ParsedArgs, target: string): NewBoxLaunch | null {
   return { box, project, ...(repo ? { repo } : {}), size, diskGiB, froms, ...(environment ? { environment } : {}) };
 }
 
+/** A Fireworks model as `--model` names it: `fireworks`, or `fireworks:<id>` (a full id, or its last part). */
+const FIREWORKS_MODEL_RE = /^fireworks(?::[A-Za-z0-9._/-]{1,200})?$/;
+
+/**
+ * `termag ask --model`: a Claude tier (any case), or a Fireworks model,
+ * which the orchestrator checks against
+ * your fireworks-models; null without it.
+ */
+export function askModelOption(args: ParsedArgs): string | null {
+  const raw = args.options.model;
+  if (raw === undefined) return null;
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (CLAUDE_MODELS.includes(value.toLowerCase())) return value.toLowerCase();
+  const fw = /^fireworks(?=$|:)/i.test(value) ? `fireworks${value.slice('fireworks'.length)}` : value;
+  if (FIREWORKS_MODEL_RE.test(fw) && fw !== 'fireworks:') return fw;
+  throw usage(`--model takes ${CLAUDE_MODELS.join(', ')}, or fireworks:<model> for a Fireworks model (e.g. fireworks:kimi-k3)`);
+}
+
 /**
  * `--new-box`: the box and the project made for this ask, with if-not-exists
  * semantics, before the ask is sent: a project of the one --from, a
@@ -715,7 +739,7 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const cancel = args.options.cancel;
   const find = args.options.find;
   if (args.options.model !== undefined && (args.options.inbox === true || args.options.targets === true || find !== undefined || cancel !== undefined || reply !== undefined)) {
-    throw usage('--model goes with an ask: termag ask <box>/<project> <prompt|-> --model opus|sonnet|haiku');
+    throw usage('--model goes with an ask: termag ask <box>/<project> <prompt|-> --model opus|sonnet|haiku|fireworks:<model>');
   }
   if (args.options.inbox === true) {
     if (args.args.length || reply !== undefined || cancel !== undefined || args.options.targets === true || find !== undefined) throw usage('--inbox takes no other arguments');
@@ -762,12 +786,13 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   const rawPr = args.options['update-pr'];
   const pr = typeof rawPr === 'string' ? rawPr.trim() : undefined;
   if (rawPr !== undefined && !(pr && PR_RE.test(pr))) throw usage('--update-pr takes a pull request: <n>, <owner>/<name>#<n> or its github.com URL');
-  const model = claudeModelOption(args);
+  const model = askModelOption(args);
   const prompt = await readPrompt(ctx, rawPrompt);
   if (!prompt.trim()) throw usage('The prompt is empty');
 
   const api = await authedApi(ctx, s, { timeoutMs: REQUEST_TIMEOUT_MS });
-  const made = launch ? await makeAskBox(ctx, api, target, launch, args, model) : { madeBox: false, repos: [] };
+  // A new project's agent row takes a Claude tier; a Fireworks model goes with the ask alone, whose thread keeps it.
+  const made = launch ? await makeAskBox(ctx, api, target, launch, args, model && CLAUDE_MODELS.includes(model) ? model : null) : { madeBox: false, repos: [] };
   const madeBox = made.madeBox;
   let askAt = target;
   const pickRepo = !!launch && !launch.repo;
@@ -814,7 +839,29 @@ export async function cmdAsk(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   } else if (!args.json && started.queuedBehind) {
     ctx.err(`termag: ${started.queuedBehind} is still working and its turn can't take this follow-up${started.steerRefused ? ` (${started.steerRefused})` : ''}; it is queued as the next turn on the thread, with a reply of its own`);
   }
-  // An older orchestrator drops --model, and an older box agent can't take it: the ask still runs, on the default.
+  // An older orchestrator drops --model, and an older box agent can't take it. A Claude tier still runs, on
+  // the default, and says so; a Fireworks model may not run on Claude, so the ask is canceled and refused
+  // (the orchestrator took it already: nothing local can stop it before this 202).
+  if (model && started.model === undefined && FIREWORKS_MODEL_RE.test(model)) {
+    // A 200 cancels the message; its `stop` says whether the run on the box ended too. A box that cannot
+    // stop runs (no ask-cancel-v1, or no answer) leaves the Claude turn going: say that, never that it stopped.
+    let outcome: string;
+    try {
+      const r = await api.request<{ stop?: { stopped: boolean; detail?: string } | null } | null>('POST', `/ask/messages/${started.message}/cancel`);
+      const stop = r?.stop;
+      outcome = stop === undefined ? `${started.message} was canceled (this orchestrator does not say whether the run stopped)`
+        : stop === null || stop.stopped ? `${started.message} was canceled`
+        : `canceled the ask message, but the run on ${started.target} did not stop${stop.detail ? ` (${stop.detail})` : ''}`;
+    } catch (e) {
+      outcome = `${started.message} could not be canceled`;
+      ctx.err(`termag: could not cancel ${started.message}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const why = `this orchestrator predates --model, so ${model} would run on Claude; `
+      + `${outcome}: ask again once the deploy is out`;
+    if (args.json) ctx.out(json(rejectedTask(started.message, started.thread, why)));
+    else ctx.err(`termag: rejected: ${why}`);
+    return EXIT.FAILED;
+  }
   if (model && started.model === undefined) ctx.err(`termag: warning: --model ${model} was ignored: the orchestrator predates it; the ask runs on the thread's model, else the box's default`);
   else if (model && started.modelIgnored) ctx.err(`termag: warning: --model ${model} was ignored: ${started.modelIgnored}`);
   if (!args.json && started.targetPr) ctx.err(`termag: the thread publishes to PR #${started.targetPr} (${started.branch})${pr ? '' : ', as it remembers'}`);

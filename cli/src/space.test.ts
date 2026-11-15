@@ -31,6 +31,8 @@ interface FakeSpaces {
   shareRefusal: string | null;
   /** Called as storage serves a download, before the CLI has the bytes. */
   onS3Get: ((path: string) => void) | null;
+  /** Each upload the CLI started: the space, the path and what it said about choosing the space. */
+  uploadStarts: Array<{ space: string; path: string; chosen?: string }>;
   calls: string[];
   close: () => Promise<void>;
 }
@@ -59,6 +61,7 @@ async function startFake(): Promise<FakeSpaces> {
     shared: new Set(),
     shareRefusal: null,
     onS3Get: null,
+    uploadStarts: [],
     calls: [] as string[],
   } satisfies FakeSpaces as FakeSpaces;
   const server: Server = createServer(async (req, res) => {
@@ -115,7 +118,9 @@ async function startFake(): Promise<FakeSpaces> {
       return;
     }
     if (rest === '/tree') {
-      const prefix = url.searchParams.get('prefix') ?? '';
+      // As the server's normalizePrefix: a prefix is a whole directory, never a string prefix.
+      const raw = url.searchParams.get('prefix') ?? '';
+      const prefix = raw === '' || raw.endsWith('/') ? raw : `${raw}/`;
       const recursive = url.searchParams.get('recursive') === '1';
       const under = [...fake.files.keys(), ...fake.extraPaths].filter(k => k.startsWith(prefix)).sort();
       const dirs = new Set<string>();
@@ -160,6 +165,7 @@ async function startFake(): Promise<FakeSpaces> {
       return;
     }
     if (rest === '/files/upload') {
+      fake.uploadStarts.push({ space, path: json.path, ...(json.chosen ? { chosen: json.chosen } : {}) });
       if (json.size <= fake.singleMax) {
         sendJson(res, 200, { kind: 'single', path: json.path, url: `${fake.host}/s3/put?path=${encodeURIComponent(json.path)}`, method: 'PUT', headers: { 'content-type': json.contentType } });
         return;
@@ -219,10 +225,12 @@ let home: string;
 let work: string;
 let out: string[];
 let err: string[];
+/** The session's environment beyond the agent config: TERMAG_SPACE, TERMAG_MY_FILES. */
+let sessionEnv: Record<string, string> = {};
 
 function ctx(): Ctx {
   return {
-    env: { TERMAG_AGENT_CONFIG: join(home, 'agent.config.json') },
+    env: { TERMAG_AGENT_CONFIG: join(home, 'agent.config.json'), ...sessionEnv },
     home,
     hostname: 'devbox',
     interactive: false,
@@ -245,6 +253,7 @@ beforeEach(async () => {
   writeFileSync(join(home, 'agent.config.json'), JSON.stringify({ server_url: `${fake.host.replace(/^http/, 'ws')}/termag/ws/agent`, token: 'tmag_box' }));
   out = [];
   err = [];
+  sessionEnv = {};
   process.chdir(work);
 });
 
@@ -422,6 +431,32 @@ describe('termag space', () => {
     expect(await termag('space', 'url', 'team:docs/')).toBe(2);
   });
 
+  it('says when an empty ls is a partial path segment, and names what starts with it', async () => {
+    fake.files.set('internal/a.md', Buffer.from('a'));
+    fake.files.set('internal/features/b.md', Buffer.from('b'));
+    fake.files.set('interop.md', Buffer.from('c'));
+    fake.files.set('runtime/x', Buffer.from('x'));
+    expect(await termag('space', 'ls', 'team:inter')).toBe(0);
+    expect(out).toEqual(['team:inter/ is empty.']);
+    expect(err.join('\n')).toContain('whole path segments, not string prefixes');
+    expect(err.join('\n')).toContain('In team: these start with `inter`: internal/, interop.md');
+    out = []; err = [];
+    expect(await termag('space', 'ls', 'team:internal/feat', '--json')).toBe(0);
+    expect(JSON.parse(out.join(''))).toMatchObject({ dirs: [], files: [], segmentMatches: ['internal/features/'] });
+    out = []; err = [];
+    expect(await termag('space', 'ls', 'team:interop.md')).toBe(0);
+    expect(err.join('\n')).toContain('team:interop.md is a file, not a directory');
+    out = []; err = [];
+    // A real directory, or a path that ends in `/`, says nothing more.
+    expect(await termag('space', 'ls', 'team:nothing/')).toBe(0);
+    expect(err).toEqual([]);
+    expect(await termag('space', 'ls', 'team:internal')).toBe(0);
+    expect(err).toEqual([]);
+    out = [];
+    expect(await termag('space', 'ls', 'team:zzz', '--json')).toBe(0);
+    expect(JSON.parse(out.join(''))).toMatchObject({ segmentMatches: [] });
+  });
+
   it('shares a file with termag, marks it in ls, and makes it private again', async () => {
     fake.files.set('artifacts/x.png', Buffer.from('png'));
     fake.files.set('notes.md', Buffer.from('md'));
@@ -458,5 +493,69 @@ describe('termag space', () => {
 
   it('reports a missing file as not found (exit 3)', async () => {
     expect(await termag('space', 'get', 'team:nope.txt')).toBe(3);
+  });
+});
+
+describe('Project files and My files', () => {
+  beforeEach(() => {
+    fake.spaces = ['team', 'ana-termag', 'ana-my-files'];
+    sessionEnv = { TERMAG_SPACE: 'ana-termag', TERMAG_MY_FILES: 'ana-my-files' };
+    writeFileSync(join(work, 'shot.png'), 'png');
+  });
+
+  it('puts a bare path in Project files, --mine in My files, and a named space wins', async () => {
+    expect(await termag('space', 'put', 'shot.png', 'screenshots/')).toBe(0);
+    expect(await termag('space', 'put', '--mine', 'shot.png', 'screenshots/')).toBe(0);
+    expect(await termag('space', 'put', 'shot.png', 'team:screenshots/')).toBe(0);
+    expect(await termag('space', 'put', '--mine', 'shot.png', 'team:named/')).toBe(0);
+    expect(fake.uploadStarts).toEqual([
+      { space: 'ana-termag', path: 'screenshots/shot.png', chosen: 'default' },
+      { space: 'ana-my-files', path: 'screenshots/shot.png', chosen: 'explicit' },
+      { space: 'team', path: 'screenshots/shot.png', chosen: 'explicit' },
+      { space: 'team', path: 'named/shot.png', chosen: 'explicit' },
+    ]);
+    expect(out[0]).toBe('ana-termag:screenshots/shot.png (3 B)');
+  });
+
+  it('reads, links, moves and removes in Project files or My files the same way', async () => {
+    fake.files.set('notes/a.md', Buffer.from('a'));
+    expect(await termag('space', 'get', 'notes/a.md', 'a.md')).toBe(0);
+    expect(await termag('space', 'url', '--mine', 'notes/a.md')).toBe(0);
+    expect(await termag('space', 'mv', 'notes/a.md', 'notes/b.md')).toBe(0);
+    expect(await termag('space', 'rm', '--mine', 'notes/b.md')).toBe(0);
+    expect(await termag('space', 'ls', '--mine', 'notes/')).toBe(0);
+    const used = fake.calls.filter(c => /\/spaces\/[^/]+\//.test(c)).map(c => c.replace(/^\w+ \/termag\/api\/cli\/v1\/spaces\//, ''));
+    expect(used).toEqual(['ana-termag/files/download', 'ana-my-files/files/link', 'ana-termag/files/move', 'ana-my-files/files', 'ana-my-files/tree']);
+  });
+
+  it('says My files is off when the session has none, and never falls back to another space', async () => {
+    sessionEnv = { TERMAG_SPACE: 'ana-termag' };
+    expect(await termag('space', 'put', '--mine', 'shot.png', 'screenshots/')).toBe(3);
+    expect(err.join('\n')).toContain("My files isn't on this box (Settings → My files)");
+    expect(fake.uploadStarts).toEqual([]);
+  });
+
+  it('without Project files on this box, a bare path works only where it did', async () => {
+    // The session names a space this box isn't granted: as without one, the only space it reaches.
+    fake.spaces = ['team'];
+    expect(await termag('space', 'put', 'shot.png', 'x/')).toBe(0);
+    expect(fake.uploadStarts).toEqual([{ space: 'team', path: 'x/shot.png', chosen: 'default' }]);
+    // No session variables at all, and several spaces: name one, as before.
+    sessionEnv = {};
+    fake.spaces = ['team', 'other'];
+    expect(await termag('space', 'put', 'shot.png', 'x/')).toBe(2);
+    expect(err.join('\n')).toContain('team, other');
+  });
+
+  it('lists Project files and My files first, labelled', async () => {
+    expect(await termag('space', 'ls')).toBe(0);
+    const rows = out.join('\n').split('\n').slice(1).map(r => r.split(/\s{2,}/)[0]);
+    expect(rows).toEqual(['ana-termag (Project files)', 'ana-my-files (My files)', 'team']);
+    out = [];
+    expect(await termag('space', 'ls', '--json')).toBe(0);
+    const { spaces } = JSON.parse(out.join(''));
+    expect(spaces.map((x: { name: string; files?: string }) => [x.name, x.files ?? null])).toEqual([
+      ['ana-termag', 'project'], ['ana-my-files', 'mine'], ['team', null],
+    ]);
   });
 });

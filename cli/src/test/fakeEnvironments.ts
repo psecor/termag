@@ -5,8 +5,8 @@ import type { ServerResponse } from 'node:http';
  * routes/cliEnvironments.ts), in memory: an environment by name, its events,
  * and the refusals the CLI must pass on as they come (an invalid
  * definition's schema path and message, a taken name, no such environment,
- * and a share the shared rules refuse: here, anything but a pointer with no
- * branch named).
+ * a share the shared rules refuse: here, anything but a pointer with no
+ * branch named, and a non-admin's change to a shared one, with `admin` false).
  */
 interface Env {
   id: string; name: string; kind: 'inline' | 'pointer'; definition?: unknown; file?: { repo: string; branch: string | null; path: string };
@@ -18,10 +18,12 @@ export interface FakeEnvironmentsState {
   calls: Array<{ route: string; body: Record<string, unknown>; isBox: boolean }>;
   /** What GET /:ref/resolved answers, by name. */
   resolved: Record<string, { repos: Array<{ repo: string; branch?: string; path?: string }>; size: unknown; warnings: string[] }>;
+  /** Whether the signed-in person is an admin: only an admin changes a shared environment (backend sharedNeedsAdmin). */
+  admin: boolean;
 }
 
 export function newEnvironmentsState(): FakeEnvironmentsState {
-  return { envs: [], events: [], calls: [], resolved: {} };
+  return { envs: [], events: [], calls: [], resolved: {}, admin: true };
 }
 
 const PERSON = { id: 'u1', email: 'ada@example.com', name: 'Ada' };
@@ -31,6 +33,8 @@ function notShareable(e: Pick<Env, 'kind' | 'file'>): string | null {
   if (e.kind !== 'pointer') return "a shared environment runs from a file on a repository's default branch, not inline JSON; point it at .termag/environment.json on its repository's default branch";
   return e.file?.branch && e.file.branch !== 'main' ? `a shared environment runs from a file on ${e.file.repo}'s default branch; point it at ${e.file.path} on main` : null;
 }
+const ADMIN_ONLY = { error: 'Only admins can change shared environments; make a personal one', code: 'environment_admin_only' };
+
 function send(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
 }
@@ -74,6 +78,7 @@ export function handleEnvironments(s: FakeEnvironmentsState, route: string, body
   }
   if (method === 'GET' && !ref) { send(res, 200, { environments: s.envs.map(view) }); return true; }
   if (method === 'POST' && !ref) {
+    if (body.visibility === 'shared' && !s.admin) { send(res, 403, ADMIN_ONLY); return true; }
     const f = fields(body);
     if ('error' in f) { send(res, 400, { error: f.error, code: 'invalid_environment' }); return true; }
     if (s.envs.some(e => e.name === f.name)) { send(res, 409, { error: `An environment named "${f.name}" already exists`, code: 'environment_name_taken' }); return true; }
@@ -90,6 +95,8 @@ export function handleEnvironments(s: FakeEnvironmentsState, route: string, body
   if (method === 'GET' && sub === 'events') { send(res, 200, { events: s.events.filter(e => e.environmentId === env.id).reverse() }); return true; }
   if (method === 'GET' && sub === 'resolved') { send(res, 200, s.resolved[env.name] ?? { repos: [], size: null, warnings: [] }); return true; }
   if (method === 'GET') { send(res, 200, { environment: view(env) }); return true; }
+  const after = method === 'POST' && sub === 'visibility' ? (body.visibility === 'shared' ? 'shared' : 'personal') : env.visibility;
+  if (!s.admin && (env.visibility === 'shared' || after === 'shared')) { send(res, 403, ADMIN_ONLY); return true; }
   if (method === 'POST' && sub === 'visibility') {
     const to = body.visibility === 'shared' ? 'shared' : 'personal';
     const broken = to === 'shared' ? notShareable(env) : null;

@@ -3,6 +3,8 @@ import { VERSION } from './version.js';
 
 export const API_PREFIX = '/api/cli/v1';
 const DEFAULT_TIMEOUT_MS = 15_000;
+/** A request its caller's signal ended (a Ctrl-C): the caller says what that means. */
+export const REQUEST_CANCELLED = 'Cancelled';
 
 /** The URL, headers and body of a request to the CLI API: what Api sends, and what a report sent from another process sends (usage.ts). */
 export function cliRequest(host: string, method: string, path: string, body: unknown, token: string | null): {
@@ -21,7 +23,7 @@ export function cliRequest(host: string, method: string, path: string, body: unk
  * one that stays valid at least that long (the forward's in-band renewal); a
  * source whose credential has no expiry ignores it.
  */
-export type BearerSource = (opts?: { rejected?: string; validForMs?: number }) => Promise<string>;
+export type BearerSource = (opts?: { rejected?: string; validForMs?: number; signal?: AbortSignal }) => Promise<string>;
 
 export interface ApiOptions {
   host: string;
@@ -42,48 +44,61 @@ export class Api {
     return this.opts.host;
   }
 
-  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  /**
+   * `opts.signal` (a Ctrl-C) ends the request at once, with REQUEST_CANCELLED, on top of the
+   * client's own timeout: the bearer's refresh, the response's headers and its body alike.
+   */
+  async request<T>(method: string, path: string, body?: unknown, opts: { signal?: AbortSignal } = {}): Promise<T> {
+    const { signal } = opts;
     const given = this.opts.token;
     const source = typeof given === 'function' ? given : null;
-    const token = typeof given === 'function' ? await given() : given;
-    let res = await this.send(method, path, body, token);
+    const token = typeof given === 'function' ? await given({ signal }) : given;
+    let res = await this.send(method, path, body, token, signal);
     // A 401 to an access token whose clock says it's good (its key was retired): one refresh and one retry.
     // A refresh that fails throws its own auth_required, which says to run `termag login`.
-    if (res.status === 401 && source && token) {
-      const again = await source({ rejected: token });
-      if (again && again !== token) {
-        await res.body?.cancel().catch(() => {});
-        res = await this.send(method, path, body, again);
-      }
+    if (res.res.status === 401 && source && token) {
+      const again = await source({ rejected: token, signal });
+      if (again && again !== token) res = await this.send(method, path, body, again, signal);
     }
-    return this.decode<T>(res);
+    return this.decode<T>(res.res, res.text);
   }
 
-  private async send(method: string, path: string, body: unknown, token: string | null): Promise<Response> {
+  /**
+   * The response and its whole body, read under one timeout and the caller's signal: a server or
+   * network that stalls after the headers is cut there too.
+   */
+  private async send(method: string, path: string, body: unknown, token: string | null, signal?: AbortSignal): Promise<{ res: Response; text: string }> {
+    if (signal?.aborted) throw new CliError('failed', REQUEST_CANCELLED);
     const req = cliRequest(this.opts.host, method, path, body, token);
 
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-    let res: Response;
+    // Not AbortSignal.any: Node 20.0 to 20.2 lack it, and the CLI takes Node 20.
+    const onAbort = () => ctl.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      res = await this.opts.fetch(req.url, {
+      const res = await this.opts.fetch(req.url, {
         method,
         headers: req.headers,
         body: req.body,
         redirect: 'manual',
         signal: ctl.signal,
       });
+      // A 204's body, and a redirect's, is never read.
+      const text = res.status === 204 || (res.status >= 300 && res.status < 400) ? '' : await res.text();
+      return { res, text };
     } catch (err) {
+      if (signal?.aborted) throw new CliError('failed', REQUEST_CANCELLED);
       if (ctl.signal.aborted) throw new CliError('timeout', `Timed out waiting for the orchestrator at ${this.opts.host}`);
       const cause = (err as { cause?: { code?: string; message?: string } }).cause;
       throw new CliError('unreachable', `Can't reach the orchestrator at ${this.opts.host} (${cause?.code ?? cause?.message ?? (err as Error).message})`);
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
     }
-    return res;
   }
 
-  private async decode<T>(res: Response): Promise<T> {
+  private async decode<T>(res: Response, text: string): Promise<T> {
     if (res.status >= 300 && res.status < 400) {
       let where = '';
       try { where = ` to ${new URL(res.headers.get('location') ?? '').host}`; } catch { /* no usable location */ }
@@ -91,7 +106,6 @@ export class Api {
         `${this.opts.host} redirected the CLI${where} for a browser sign-in: its edge does not let the CLI API through yet`, res.status);
     }
     if (res.status === 204) return undefined as T;
-    const text = await res.text();
     const isJson = (res.headers.get('content-type') ?? '').includes('application/json');
     let data: { error?: unknown; code?: unknown } | null = null;
     if (isJson && text) {

@@ -15,7 +15,7 @@ import {
 import { installBlock, proxyCommandFor, renderBlock, sshConfigPath, sshHosts } from './sshConfig.js';
 import { FALLBACK_TERM, fallbackNotice, planTerm, sshSessionConfig, withTerminfo } from './terminfo.js';
 import {
-  aliasFor, boxFromAlias, parseRef, pickBox, pickProject, ssmTarget, wakeAction, type ConnectBox, type ConnectProject,
+  aliasFor, parseRef, pickBox, pickProject, pickProxyBox, ssmTarget, wakeAction, type ConnectBox, type ConnectProject,
   type Ref,
 } from './target.js';
 
@@ -35,6 +35,13 @@ export async function resolveBox(ctx: Ctx, s: Session, name: string | null): Pro
   const api = await authedApi(ctx, s);
   const { boxes } = await api.request<{ boxes: ConnectBox[] }>('GET', '/boxes');
   return { api, box: pickBox(boxes, name) };
+}
+
+/** The box ssh-proxy's `%h` names: an instance id (the ssh-config block's HostName), else `termag-<box>`. */
+async function resolveProxyBox(ctx: Ctx, s: Session, host: string): Promise<{ api: Api; box: ConnectBox }> {
+  const api = await authedApi(ctx, s);
+  const { boxes } = await api.request<{ boxes: ConnectBox[] }>('GET', '/boxes');
+  return { api, box: pickProxyBox(boxes, host) };
 }
 
 /** A box (and project) to reach over SSM: the box must be an EC2 box that is running. */
@@ -156,13 +163,13 @@ export async function cmdSshConfig(ctx: Ctx, args: ParsedArgs): Promise<ExitCode
     api.request<{ boxes: ConnectBox[] }>('GET', '/boxes'),
     api.request<{ projects: ConnectProject[] }>('GET', '/projects'),
   ]);
-  const { hostUsers, sessionHosts, skipped } = sshHosts(user, boxes, projects);
+  const { boxHosts, sessionHosts, skipped } = sshHosts(user, boxes, projects);
   for (const ref of skipped) {
     ctx.err(`${ref} has no termag-<box>.<project> host: a name in it has characters ssh_config can't carry. \`termag attach ${ref}\` reaches it.`);
   }
   const block = renderBlock({
     user,
-    hostUsers,
+    boxHosts,
     sessionHosts,
     proxyCommand: proxyCommandFor(termagCommand(ctx), s.target.source === 'default' ? null : s.target.host, { wake }),
   });
@@ -196,7 +203,7 @@ export async function cmdSshProxy(ctx: Ctx, args: ParsedArgs): Promise<ExitCode>
   const wake = args.options.wake === true;
   if (!wake && args.options.timeout !== undefined) throw usage('--timeout goes with --wake, which waits for the box');
   const timeoutS = timeoutSeconds(args, START_WAIT_S);
-  const { api, box } = await resolveBox(ctx, session(ctx, args), boxFromAlias(alias));
+  const { api, box } = await resolveProxyBox(ctx, session(ctx, args), alias);
   const settings = awsSettings(ctx.env);
   const action = wake && box.kind === 'ec2' ? wakeAction(box.state) : 'connect';
   const wakes = action !== 'connect' && action !== 'refuse';

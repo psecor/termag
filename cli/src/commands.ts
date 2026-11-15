@@ -22,7 +22,7 @@ export function session(ctx: Ctx, args: ParsedArgs): Session {
 }
 
 /** The login's access token, refreshed with its device token when missing, about to lapse, or `rejected`. */
-async function accessToken(ctx: Ctx, s: Session, login: StoredLogin, opts: { rejected?: string; validForMs?: number } = {}): Promise<string> {
+async function accessToken(ctx: Ctx, s: Session, login: StoredLogin, opts: { rejected?: string; validForMs?: number; signal?: AbortSignal } = {}): Promise<string> {
   return (await freshAccess({ host: s.target.host, credsPath: s.credsPath, fetch: ctx.fetch }, login, opts)).accessToken;
 }
 
@@ -45,7 +45,7 @@ export function bearerFor(ctx: Ctx, s: Session): BearerSource {
   return async (opts = {}) => {
     const current = loadLogin(s.credsPath, s.target.host);
     if (!current) throw notSignedIn();
-    return accessToken(ctx, s, current, { rejected: opts.rejected, validForMs: opts.validForMs });
+    return accessToken(ctx, s, current, { rejected: opts.rejected, validForMs: opts.validForMs, signal: opts.signal });
   };
 }
 

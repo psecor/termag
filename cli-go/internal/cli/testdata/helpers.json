@@ -1,0 +1,319 @@
+{
+  "normalizeHost": [
+    {
+      "input": "localhost:3040",
+      "ok": "http://localhost:3040/termag"
+    },
+    {
+      "input": "LOCALHOST:3040/",
+      "ok": "http://localhost:3040/termag"
+    },
+    {
+      "input": "http://localhost:3040/termag/",
+      "ok": "http://localhost:3040/termag"
+    },
+    {
+      "input": "Example.COM",
+      "ok": "https://example.com/termag"
+    },
+    {
+      "input": "https://Example.COM:443/termag/",
+      "ok": "https://example.com/termag"
+    },
+    {
+      "input": "http://h:80/x/",
+      "ok": "http://h/x"
+    },
+    {
+      "input": "https://h:8443",
+      "ok": "https://h:8443/termag"
+    },
+    {
+      "input": "https://h/a/../termag",
+      "ok": "https://h/termag"
+    },
+    {
+      "input": "https://h/a/./b//",
+      "ok": "https://h/a/b"
+    },
+    {
+      "input": "127.0.0.1:3040",
+      "ok": "http://127.0.0.1:3040/termag"
+    },
+    {
+      "input": "[::1]:3040",
+      "ok": "http://[::1]:3040/termag"
+    },
+    {
+      "input": "  app.example.com/termag  ",
+      "ok": "https://app.example.com/termag"
+    },
+    {
+      "input": "ftp://h",
+      "error": "The orchestrator URL must be http(s): ftp://h"
+    },
+    {
+      "input": "https://u:p@h",
+      "error": "The orchestrator URL must not contain credentials"
+    },
+    {
+      "input": "",
+      "error": "--host must not be empty"
+    },
+    {
+      "input": "   ",
+      "error": "--host must not be empty"
+    },
+    {
+      "input": "https://h:99999",
+      "error": "Not a valid orchestrator URL: https://h:99999"
+    },
+    {
+      "input": "https://h:abc",
+      "error": "Not a valid orchestrator URL: https://h:abc"
+    },
+    {
+      "input": "HTTPS://H.example/TERMAG",
+      "ok": "https://h.example/TERMAG"
+    },
+    {
+      "input": "https://h/a%20b",
+      "ok": "https://h/a%20b"
+    },
+    {
+      "input": "https://h?x=1#y",
+      "ok": "https://h/termag"
+    },
+    {
+      "input": "http://[0:0:0:0:0:0:0:1]:3040/termag",
+      "ok": "http://[::1]:3040/termag"
+    }
+  ],
+  "deviceNameFrom": [
+    {
+      "input": "my-mac.local",
+      "ok": "my-mac.local"
+    },
+    {
+      "input": "ip-10-0-0-1",
+      "ok": "ip-10-0-0-1"
+    },
+    {
+      "input": "__weird host!",
+      "ok": "weird host-"
+    },
+    {
+      "input": "",
+      "ok": "device"
+    },
+    {
+      "input": "...",
+      "ok": "device"
+    },
+    {
+      "input": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "ok": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "input": "Alice’s MacBook Pro",
+      "ok": "Alice-s MacBook Pro"
+    },
+    {
+      "input": " a ",
+      "ok": "a"
+    }
+  ],
+  "table": [
+    {
+      "headers": [
+        "A",
+        "BB",
+        "C"
+      ],
+      "rows": [
+        [
+          "x",
+          "y",
+          "z"
+        ],
+        [
+          "longer",
+          "",
+          "last col  "
+        ]
+      ],
+      "ok": "A       BB  C\nx       y   z\nlonger      last col"
+    },
+    {
+      "headers": [
+        "NAME",
+        "SIZE"
+      ],
+      "rows": [],
+      "ok": "NAME  SIZE"
+    },
+    {
+      "headers": [
+        "É",
+        "X"
+      ],
+      "rows": [
+        [
+          "ü✓",
+          "1"
+        ]
+      ],
+      "ok": "É   X\nü✓  1"
+    }
+  ],
+  "formatDate": [
+    {
+      "input": "2026-10-02T14:05:00.000Z",
+      "ok": "2026-10-02 14:05 UTC"
+    },
+    {
+      "input": "2026-10-02T14:05:59Z",
+      "ok": "2026-10-02 14:05 UTC"
+    },
+    {
+      "input": "2026-10-02T23:59:00+02:00",
+      "ok": "2026-10-02 21:59 UTC"
+    },
+    {
+      "input": "",
+      "ok": "-"
+    },
+    {
+      "input": null,
+      "ok": "-"
+    },
+    {
+      "input": "nope",
+      "ok": "-"
+    }
+  ],
+  "formatBytes": [
+    {
+      "input": 0,
+      "ok": "0 B"
+    },
+    {
+      "input": 1,
+      "ok": "1 B"
+    },
+    {
+      "input": 1023,
+      "ok": "1023 B"
+    },
+    {
+      "input": 1024,
+      "ok": "1.0 KiB"
+    },
+    {
+      "input": 1536,
+      "ok": "1.5 KiB"
+    },
+    {
+      "input": 10239,
+      "ok": "10.0 KiB"
+    },
+    {
+      "input": 10240,
+      "ok": "10 KiB"
+    },
+    {
+      "input": 1048575,
+      "ok": "1024 KiB"
+    },
+    {
+      "input": 1048576,
+      "ok": "1.0 MiB"
+    },
+    {
+      "input": 5905580032,
+      "ok": "5.5 GiB"
+    },
+    {
+      "input": 3377699720527872,
+      "ok": "3072 TiB"
+    }
+  ],
+  "redactSecrets": [
+    {
+      "inputPieces": [
+        "nothing ",
+        "here"
+      ],
+      "text": "nothing here",
+      "redacted": []
+    },
+    {
+      "inputPieces": [
+        "key AKIA",
+        "ABCDEFGH",
+        "IJKLMNOP",
+        " and tma",
+        "g_abcdef",
+        "ghijklmn",
+        "op1234"
+      ],
+      "text": "key [redacted: AWS access key id] and [redacted: termag agent token]",
+      "redacted": [
+        "AWS access key id",
+        "termag agent token"
+      ]
+    },
+    {
+      "inputPieces": [
+        "a\n-----B",
+        "EGIN RSA",
+        " PRIVATE",
+        " KEY----",
+        "-\nMIIx\n-",
+        "----END ",
+        "RSA PRIV",
+        "ATE KEY-",
+        "----\nb"
+      ],
+      "text": "a\n[redacted: private key]\nb",
+      "redacted": [
+        "private key"
+      ]
+    },
+    {
+      "inputPieces": [
+        "-----BEG",
+        "IN PRIVA",
+        "TE KEY--",
+        "---\ncut ",
+        "off"
+      ],
+      "text": "[redacted: private key]",
+      "redacted": [
+        "private key"
+      ]
+    },
+    {
+      "inputPieces": [
+        "ghp_aaaa",
+        "aaaaaaaa",
+        "aaaaaaaa",
+        "aaaaaaaa",
+        "aaaaaaaa",
+        " xoxb-12",
+        "34567890",
+        "-abc sk-",
+        "ant-bbbb",
+        "bbbbbbbb",
+        "bbbbbbbb",
+        "bbbb"
+      ],
+      "text": "[redacted: GitHub token] [redacted: Slack token] [redacted: Anthropic key]",
+      "redacted": [
+        "GitHub token",
+        "Slack token",
+        "Anthropic key"
+      ]
+    }
+  ]
+}

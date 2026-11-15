@@ -3,7 +3,7 @@ import type { ServerResponse } from 'node:http';
 /**
  * The orchestrator's preview link routes on /api/cli/v1 (backend
  * routes/cliPreviewLinks.ts): a device sign-in's only, so a box token gets
- * 403 forbidden, as there.
+ * 403 forbidden, worded by route as there.
  */
 export interface FakePreviewState {
   /** The bodies POSTed, newest last. */
@@ -16,22 +16,50 @@ export interface FakePreviewState {
   /** A box-made sign-in's wider publish: the confirm's states, one per poll; the last one sticks. */
   confirmStates: string[];
   polls: number;
+  /** `termag preview request` bodies, newest last. */
+  requestPosts: Array<Record<string, unknown>>;
+  /** A request the owner answered lately, by port: a repeat for it gets this, as the orchestrator answers. */
+  answered: Record<number, { state: string; decidedAt: string; askAgainAfter: string }>;
 }
 
 export function newPreviewState(): FakePreviewState {
-  return { posts: [], links: [], requests: [], deleted: [], refuse: null, confirmStates: ['pending', 'confirmed'], polls: 0 };
+  return { posts: [], links: [], requests: [], deleted: [], refuse: null, confirmStates: ['pending', 'confirmed'], polls: 0, requestPosts: [], answered: {} };
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
 }
 
+/** The backend's boxRefused (routes/cliPreviewLinks.ts), for the routes the CLI calls. */
+function boxRefusal(route: string): string {
+  const why = '(anything on the box can use them)';
+  const signIn = 'sign in on the box with `termag login --device <name>`';
+  if (/^GET \/preview-links\/confirmations\//.test(route)) {
+    return `A box's own credentials can't read a preview link's confirmation ${why}; the owner confirms or declines it in their browser, and the \`termag preview publish\` that asked for it reads it with the owner's own sign-in`;
+  }
+  if (route.startsWith('GET ')) return `A box's own credentials can't read preview links ${why}; ask the owner to look in termag's Share dialog or run their own \`termag preview list\`, or ${signIn}`;
+  if (route.startsWith('DELETE ')) return `A box's own credentials can't revoke a preview link ${why}; ask the owner to revoke it from termag's Share dialog or their own \`termag preview revoke\`, or ${signIn}`;
+  return `A box's own credentials can't publish a preview link ${why}; the owner publishes from termag's Share dialog or their own \`termag preview publish\`; ${signIn}, or ask the owner with \`termag preview request\``;
+}
+
 const TOKEN = 'AAAAAAAAAAAAAAAAAAAAAA';
 
 export function handlePreview(s: FakePreviewState, route: string, query: URLSearchParams, body: Record<string, unknown>, isBox: boolean, res: ServerResponse, onBox = false): boolean {
+  // `termag preview request`: a box's own token only, as routes/cliPreviewLinks.ts has it.
+  if (route === 'POST /preview-link-requests') {
+    if (!isBox) { send(res, 403, { error: '`termag preview request` is for an agent on a box', code: 'forbidden' }); return true; }
+    s.requestPosts.push(body);
+    const repeated = s.requests.find(r => r.port === body.port && r.project === body.project);
+    const answer = s.answered[body.port as number];
+    if (repeated && answer) { send(res, 200, { ...answer, request: repeated, repeated: true }); return true; }
+    const request = repeated ?? { id: `creq${String(s.requests.length + 1).padStart(8, '0')}`, port: body.port, project: body.project, note: body.note ?? null, expiresAt: '2026-11-02T12:00:00.000Z' };
+    if (!repeated) s.requests.push(request);
+    send(res, repeated ? 200 : 201, { state: 'pending', request, ...(repeated ? { repeated: true } : {}) });
+    return true;
+  }
   if (!/^(GET|POST|DELETE) \/preview-links(\/|$)/.test(route)) return false;
   if (isBox) {
-    send(res, 403, { error: "A box's own credentials can't publish a preview link; sign in on the box with `termag login --device <name>`, or ask the owner with `termag preview request`", code: 'forbidden' });
+    send(res, 403, { error: boxRefusal(route), code: 'forbidden' });
     return true;
   }
   const poll = route.match(/^GET \/preview-links\/confirmations\/([^/]+)$/);

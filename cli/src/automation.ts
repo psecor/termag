@@ -6,6 +6,18 @@ import { CliError, EXIT, usage, type ErrorCode, type ExitCode } from './errors.j
 import { confirmOrRefuse, findBox, parseProjectRef } from './lifecycle.js';
 import { formatDate, json, table } from './output.js';
 
+/** How long ago an ISO time was, short: `42s ago`, `5m ago`, `3h ago`, `2d ago`; `-` when unknown. */
+function ago(iso: string | null, now: number): string {
+  if (!iso) return '-';
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '-';
+  const s = Math.max(0, Math.round((now - t) / 1000));
+  if (s < 90) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 36 * 3600) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
 /**
  * `termag automation`: the web UI's scheduled automations,
  * over /api/cli/v1/automations. The orchestrator's handlers
@@ -37,6 +49,28 @@ const spaceOptions = {
   space: { type: 'string' },
 } as const;
 
+const alertOptions = {
+  'alert-prefix': { type: 'string' },
+  'alert-regex': { type: 'string' },
+  'alert-to': { type: 'string' },
+  'no-health-alerts': { type: 'boolean' },
+  webhook: { type: 'string' },
+} as const;
+
+const ALERT_USAGE = '[--alert-prefix <text>] [--alert-regex <re>] [--alert-to dm|project|<channel-id>] [--no-health-alerts] [--webhook <https-url>]';
+
+const ALERT_DETAILS = [
+  'Alerts are sent by the orchestrator, so they arrive with your laptop off (automation-alerts-enabled).',
+  '--alert-prefix pings you when a finished run\'s STATUS summary starts with the text (BLOCKER:);',
+  '--alert-regex when it matches the pattern (`re` or `/re/i`; checked when saved).',
+  '--alert-to is where keyword and health alerts go: dm (your Slack DM, the default), project (the',
+  'project\'s Slack channel) or a channel id (C…, from the channel\'s details in Slack).',
+  'Health alerts name the cause of every pause (failed runs in a row, timeouts among them, the box',
+  'gone) and the first run skipped because the box was unavailable; --no-health-alerts turns them off.',
+  '--webhook POSTs run.done, run.failed and automation.paused as JSON to an https URL, signed with',
+  'X-Termag-Signature: t=<unix>,v1=<HMAC-SHA256 of "<t>.<body>">. The secret is printed once, when set.',
+].join('\n');
+
 const SCHEDULE_USAGE = '(--every <15m|30m|1h|6h|1d|1w> [--at <HH:MM>] | --at <HH:MM> [--weekdays] | --cron "<m h dom mon dow>") [--tz <zone>]';
 
 const SPACE_DETAILS = [
@@ -59,10 +93,11 @@ export const AUTOMATION_COMMANDS: Record<string, CommandSpec> = {
     summary: 'Create an automation: a project whose prompt a fresh agent runs on a schedule; --preview shows the next runs and creates nothing',
     usage: `termag automation create <box>/<name> ${SCHEDULE_USAGE} [--from <github-url|template|box/project>]\n`
       + '       [--tier full|read] [--max-minutes <n>] [--no-pr] [--wake-box] [--space <name>]\n'
+      + `       ${ALERT_USAGE}\n`
       + '       [--paused] [--preview] <prompt|->',
-    options: { ...schedule, ...settings, ...spaceOptions, from: { type: 'string' }, paused: { type: 'boolean' }, preview: { type: 'boolean' } },
+    options: { ...schedule, ...settings, ...spaceOptions, ...alertOptions, from: { type: 'string' }, paused: { type: 'boolean' }, preview: { type: 'boolean' } },
     maxArgs: 2,
-    details: SPACE_DETAILS,
+    details: `${SPACE_DETAILS}\n\n${ALERT_DETAILS}`,
   },
   'automation show': {
     summary: 'Show an automation: its schedule, space folder, next runs and last runs with their state',
@@ -74,13 +109,15 @@ export const AUTOMATION_COMMANDS: Record<string, CommandSpec> = {
     summary: 'Change an automation\'s schedule, prompt, name, space or settings; any change clears a pause',
     usage: `termag automation edit <automation> [${SCHEDULE_USAGE}] [--prompt <text|->] [--name <new-name>]\n`
       + '       [--tier full|read] [--max-minutes <n>] [--pr|--no-pr] [--wake-box|--no-wake-box]\n'
-      + '       [--space <name>|--no-space]',
+      + '       [--space <name>|--no-space]\n'
+      + `       ${ALERT_USAGE} [--no-alert] [--health-alerts] [--no-webhook]`,
     options: {
-      ...schedule, ...settings, ...spaceOptions, prompt: { type: 'string' }, name: { type: 'string' }, pr: { type: 'boolean' },
+      ...schedule, ...settings, ...spaceOptions, ...alertOptions, prompt: { type: 'string' }, name: { type: 'string' }, pr: { type: 'boolean' },
       'no-wake-box': { type: 'boolean' }, 'no-space': { type: 'boolean' },
+      'no-alert': { type: 'boolean' }, 'health-alerts': { type: 'boolean' }, 'no-webhook': { type: 'boolean' },
     },
     maxArgs: 1,
-    details: `${SPACE_DETAILS}\n\n`
+    details: `${SPACE_DETAILS}\n\n${ALERT_DETAILS}\n--no-alert clears the prefix and the regex; --no-webhook removes the webhook and its secret.\n\n`
       + '--space with another space leaves the files in the old one where they are: the orchestrator\n'
       + 'does not copy them. --no-space detaches it; its files stay in the space.',
   },
@@ -155,6 +192,18 @@ export interface AutomationView {
   next: string[];
   lastRun: RunView | null;
   owner: boolean;
+  /** Keyword and health alerts and the webhook's host (absent from orchestrators before alerts). */
+  alertPrefix?: string | null;
+  alertRegex?: string | null;
+  alertTarget?: string;
+  healthAlerts?: boolean;
+  webhook?: { host: string } | null;
+  /** The last alert send (Slack or the webhook) that failed, until one goes (absent from orchestrators before it). */
+  lastAlertError?: { error: string; at: string } | null;
+  /** Each channel's last failed send, until a send on that channel goes (absent from orchestrators before it: read lastAlertError). */
+  lastAlertErrors?: { slack: { error: string; at: string } | null; webhook: { error: string; at: string } | null };
+  /** The webhook's signing secret: only in the answer to the save that set its URL. */
+  webhookSecret?: string;
   /** The space it lives in, and its folder there; null with no space (absent from orchestrators before spaces). */
   spaceName?: string | null;
   spaceFolder?: string | null;
@@ -261,6 +310,72 @@ function settingsBody(args: ParsedArgs): Record<string, unknown> {
   if (args.options['wake-box'] === true) out.wakeBox = true;
   if (args.options['no-wake-box'] === true) out.wakeBox = false;
   return out;
+}
+
+/**
+ * The alert and webhook options, as the request body takes them. The
+ * orchestrator checks the regex, the target and the URL; the CLI only
+ * catches contradictions and the target's shape.
+ */
+export function alertsBody(args: ParsedArgs): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const prefix = str(args, 'alert-prefix');
+  const regex = str(args, 'alert-regex');
+  if (args.options['no-alert'] === true) {
+    if (prefix !== undefined || regex !== undefined) throw usage('--no-alert clears the keyword alert; leave out --alert-prefix and --alert-regex');
+    out.alertPrefix = null;
+    out.alertRegex = null;
+  }
+  if (prefix !== undefined) out.alertPrefix = prefix;
+  if (regex !== undefined) out.alertRegex = regex;
+  const to = str(args, 'alert-to');
+  if (to !== undefined) {
+    if (to !== 'dm' && to !== 'project' && !/^[CG][A-Z0-9]{8,20}$/.test(to)) {
+      throw usage(`--alert-to is dm, project or a Slack channel id such as C0123ABCD45 (got "${to}"); a channel's id is at the bottom of its details in Slack`);
+    }
+    out.alertTarget = to;
+  }
+  if (args.options['health-alerts'] === true && args.options['no-health-alerts'] === true) throw usage('--health-alerts and --no-health-alerts contradict each other');
+  if (args.options['health-alerts'] === true) out.healthAlerts = true;
+  if (args.options['no-health-alerts'] === true) out.healthAlerts = false;
+  const webhook = str(args, 'webhook');
+  if (args.options['no-webhook'] === true) {
+    if (webhook !== undefined) throw usage('--webhook and --no-webhook contradict each other');
+    out.webhook = null;
+  }
+  if (webhook !== undefined) {
+    if (!/^https:\/\//i.test(webhook)) throw usage(`--webhook takes an https URL (got "${webhook}")`);
+    out.webhook = { url: webhook };
+  }
+  return out;
+}
+
+/** "starts with `BLOCKER:` or matches /fail/ → your DM; health alerts on", or '-' with nothing set. */
+/** "; last Slack send failed: not_in_channel (2h ago); last webhook send failed: answered 503 (5m ago)", or "". */
+export function sendErrorsOf(a: Pick<AutomationView, 'lastAlertError' | 'lastAlertErrors'>, now: number): string {
+  if (!a.lastAlertErrors) return a.lastAlertError ? `; last send failed: ${a.lastAlertError.error} (${ago(a.lastAlertError.at, now)})` : '';
+  const { slack, webhook } = a.lastAlertErrors;
+  return (slack ? `; last Slack send failed: ${slack.error} (${ago(slack.at, now)})` : '')
+    + (webhook ? `; last webhook send failed: ${webhook.error} (${ago(webhook.at, now)})` : '');
+}
+
+export function alertsOf(a: Pick<AutomationView, 'alertPrefix' | 'alertRegex' | 'alertTarget' | 'healthAlerts'>): string {
+  if (a.alertTarget === undefined) return '-';
+  const to = a.alertTarget === 'dm' ? 'your DM' : a.alertTarget === 'project' ? "the project's channel" : `channel ${a.alertTarget}`;
+  const when = [a.alertPrefix ? `starts with \`${a.alertPrefix}\`` : null, a.alertRegex ? `matches ${a.alertRegex.startsWith('/') ? a.alertRegex : `/${a.alertRegex}/`}` : null].filter(Boolean);
+  const keyword = when.length ? `a run whose summary ${when.join(' or ')}` : null;
+  const parts = [keyword, a.healthAlerts ? 'pauses and box trouble' : null].filter(Boolean);
+  return parts.length ? `${parts.join('; ')} → ${to}` : 'off';
+}
+
+/** What a save that set a webhook says about its secret, which is never shown again. */
+function webhookSecretLines(a: Pick<AutomationView, 'webhook' | 'webhookSecret'>): string[] {
+  if (!a.webhookSecret) return [];
+  return [
+    `Webhook: ${a.webhook?.host ?? 'set'}. Its signing secret, shown only now:`,
+    `  ${a.webhookSecret}`,
+    'Check X-Termag-Signature (t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">) with it.',
+  ];
 }
 
 const SPACE_NAME = /^[a-z0-9-]{2,40}$/;
@@ -435,17 +550,18 @@ async function cmdCreate(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   if (!box) throw new CliError('not_found', `No box named "${boxName}". Run \`termag box list\`.`);
   const from = str(args, 'from');
   const body: Record<string, unknown> = {
-    name, instanceId: box.id, schedule: cron, timezone, prompt, ...settingsBody(args), ...inSpace,
+    name, instanceId: box.id, schedule: cron, timezone, prompt, ...settingsBody(args), ...alertsBody(args), ...inSpace,
     ...(from !== undefined ? { from } : {}),
     ...(args.options.paused === true ? { enabled: false } : {}),
   };
-  const res = await api.request<{ project: { id: string; name: string }; automation: AutomationView; next: string[] }>('POST', '/automations', body)
+  const res = await api.request<{ project: { id: string; name: string }; automation: AutomationView; next: string[]; webhookSecret?: string }>('POST', '/automations', body)
     .catch(err => spaceError(err, inSpace.spaceName));
   const a = res.automation;
   if (args.json) { ctx.out(json({ ref: `${box.name}/${a.projectName}`, ...res })); return EXIT.OK; }
   ctx.out(`Created automation ${box.name}/${a.projectName} (${a.id}): ${a.schedule} ${a.timezone}, ${a.tier} tier${a.enabled ? '' : ', paused'}.`);
   if (a.enabled && res.next.length) ctx.out(`Next runs: ${res.next.map(formatDate).join(', ')}`);
   if (a.spaceName) ctx.out(`Its files live in ${spaceOf(a)}`);
+  for (const line of webhookSecretLines({ webhook: a.webhook, webhookSecret: res.webhookSecret })) ctx.out(line);
   ctx.out(`Run it now with \`termag automation run ${box.name}/${a.projectName}\`.`);
   return EXIT.OK;
 }
@@ -469,6 +585,8 @@ async function cmdShow(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
     ['Tier', `${a.tier}, at most ${a.maxRunMinutes} min a run${a.prOnChange ? ', opens a draft PR when it commits' : ''}${a.wakeBox ? ', wakes its box' : ''}`],
     ['Repository', a.repoUrl ?? '-'],
     ['Space', spaceOf(a)],
+    ...(a.alertTarget !== undefined ? [['Alerts', alertsOf(a) + sendErrorsOf(a, Date.now())] as [string, string]] : []),
+    ...(a.webhook ? [['Webhook', `${a.webhook.host} (run.done, run.failed, automation.paused)`] as [string, string]] : []),
     ['Prompt', oneLine(a.prompt, 100)],
     ['Web', `${api.host}/automations/${a.projectId}`],
   ];
@@ -491,7 +609,7 @@ async function patch(ctx: Ctx, args: ParsedArgs, command: string, body: Record<s
 }
 
 async function cmdEdit(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
-  const body: Record<string, unknown> = settingsBody(args);
+  const body: Record<string, unknown> = { ...settingsBody(args), ...alertsBody(args) };
   const cron = scheduleOptions(args);
   if (cron) body.schedule = cron;
   const tz = str(args, 'tz');
@@ -517,13 +635,16 @@ async function cmdEdit(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   if (newName !== undefined) {
     // The automation's name is its project's: renamed as `termag project rename` renames it.
     await api.request('POST', `/projects/${encodeURIComponent(a.projectId)}/rename`, { name: newName });
-    a = await api.request<AutomationView>('GET', `/automations/${encodeURIComponent(a.id)}`);
+    // The PATCH's answer is the only place a new webhook secret ever appears: keep it past the refresh.
+    const { webhookSecret } = a;
+    a = { ...(await api.request<AutomationView>('GET', `/automations/${encodeURIComponent(a.id)}`)), ...(webhookSecret ? { webhookSecret } : {}) };
   }
   const boxes = await listBoxes(api);
   if (args.json) { ctx.out(json({ ref: refOf(a, boxes), ...a })); return EXIT.OK; }
   ctx.out(`Updated ${refOf(a, boxes)}${newName !== undefined ? ` (was ${ref})` : ''}: ${a.schedule} ${a.timezone}, ${stateOf(a)}.`);
   if (a.next.length) ctx.out(`Next runs: ${a.next.map(formatDate).join(', ')}`);
   if (before) for (const line of spaceMoveNote(before, a)) ctx.out(line);
+  for (const line of webhookSecretLines(a)) ctx.out(line);
   return EXIT.OK;
 }
 

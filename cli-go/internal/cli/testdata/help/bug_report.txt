@@ -1,0 +1,20 @@
+Report a termag bug: a termag command or feature that behaved wrongly.
+
+Usage: termag bug report --title <title> [--severity low|medium|high] [--area <area>] [--command <command>] [--error-file <path>] [--agent <agent>] [--model <model>] - < body.md
+
+The body is Markdown on stdin (`-`): what you ran, what you expected, what happened.
+Areas: spaces, asks, publish, boxes, chat, cli, broker, other (default other). Severity defaults to medium.
+--command is the termag command that went wrong; --error-file a file with its error output (the last 20k characters are kept).
+The CLI version, the agent and model (from the environment, or --agent / --model) and this session's project and workstream are attached.
+Secret-shaped strings (tokens, keys) are replaced with [redacted: …] before sending.
+Prints the report's id. Only admins read reports and mark duplicates.
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

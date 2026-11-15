@@ -1,0 +1,13 @@
+Delete an environment, a shared one for everyone and by an admin (its history stays; projects made from it keep their repositories).
+
+Usage: termag environment delete <name> [--yes]
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

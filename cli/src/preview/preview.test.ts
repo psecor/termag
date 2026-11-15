@@ -148,8 +148,21 @@ describe("on a box, with the box's own credentials", () => {
     const onBox = ctx({ env: {}, home: boxHome, interactive: false });
     expect(await run(['preview', 'publish', 'devbox/webapp-fix', '5173'], onBox)).toBe(1);
     expect(orch.requests.at(-1)?.auth).toBe('Bearer tmag_box');
-    expect(err.at(-1)).toMatch(/^termag: A box's own credentials can't publish a preview link; sign in on the box with `termag login --device <name>`/);
+    expect(err.at(-1)).toMatch(/^termag: A box's own credentials can't publish a preview link .*`termag login --device <name>`, or ask the owner with `termag preview request`$/);
     expect(orch.preview.links).toEqual([]);
+  });
+
+  it("is refused listing a project's links, in words about reading them", async () => {
+    const boxHome = join(home, 'box-home');
+    orch.boxTokens.add('tmag_box');
+    const dir = join(boxHome, 'src', 'termag', 'agent');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'agent.config.json'), JSON.stringify({ termag_url: orch.host.replace(/^http/, 'ws') + '/ws/agent', token: 'tmag_box' }));
+    const onBox = ctx({ env: {}, home: boxHome, interactive: false });
+    expect(await run(['preview', 'list', 'devbox/webapp-fix'], onBox)).toBe(1);
+    expect(orch.requests.at(-1)?.auth).toBe('Bearer tmag_box');
+    expect(err.at(-1)).toMatch(/^termag: A box's own credentials can't read preview links .*`termag preview list`.*`termag login --device <name>`$/);
+    expect(err.at(-1)).not.toContain('publish');
   });
 });
 
@@ -239,5 +252,57 @@ describe('checkoutOf', () => {
     for (const dir of ['/home/a', '/home/a/termag/projects', '/home/a/termag/projects/app/.worktrees', '/home/a/termag/projects/.cache', '/elsewhere/termag/projects/app']) {
       expect(checkoutOf(dir, '/home/a'), dir).toBeNull();
     }
+  });
+});
+
+describe('termag preview request, from an agent on a box (SR5: it can only ask)', () => {
+  let boxHome: string;
+  beforeEach(() => {
+    boxHome = join(home, 'box-home');
+    orch.boxTokens.add('tmag_box');
+    const dir = join(boxHome, 'src', 'termag', 'agent');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'agent.config.json'), JSON.stringify({ termag_url: orch.host.replace(/^http/, 'ws') + '/ws/agent', token: 'tmag_box' }));
+    mkdirSync(join(boxHome, 'termag/projects/webapp/.worktrees/feature-x/web'), { recursive: true });
+  });
+  const onBox = (cwd: string) => ctx({ env: {}, home: boxHome, cwd: () => cwd, interactive: false });
+
+  it("asks with the box's own credentials, for the checkout it is in, and says nothing is shared yet", async () => {
+    const at = join(boxHome, 'termag/projects/webapp/.worktrees/feature-x/web');
+    expect(await run(['preview', 'request', '5173', '--note', 'the checkout page'], onBox(at))).toBe(0);
+    expect(orch.preview.requestPosts).toEqual([{ project: 'webapp', workstream: 'feature-x', port: 5173, note: 'the checkout page' }]);
+    expect(orch.requests.at(-1)?.auth).toBe('Bearer tmag_box');
+    expect(out.join('\n')).toContain("Asked the box's owner to share port 5173 of webapp@feature-x (request creq00000001).");
+    expect(out.join('\n')).toContain('Nothing is shared until they do.');
+    out = [];
+    expect(await run(['preview', 'request', '5173'], onBox(at))).toBe(0);
+    expect(out[0]).toBe('Port 5173 of webapp@feature-x is already waiting for the owner (request creq00000001).');
+  });
+
+  it('a repeat after the owner answered says how and when, never the link, and when they may be asked again (#1568)', async () => {
+    const at = join(boxHome, 'termag/projects/webapp/.worktrees/feature-x/web');
+    expect(await run(['preview', 'request', '5173'], onBox(at))).toBe(0);
+    for (const [state, says] of [
+      ['declined', 'The owner declined sharing port 5173 of webapp@feature-x at 2026-11-01 13:00 UTC. (request creq00000001)'],
+      ['expired', 'The request to share port 5173 of webapp@feature-x expired at 2026-11-01 13:00 UTC without an answer. (request creq00000001)'],
+      ['approved', "The owner published port 5173 of webapp@feature-x at 2026-11-01 13:00 UTC. Ask them for the link; it isn't shown here. (request creq00000001)"],
+    ] as const) {
+      orch.preview.answered[5173] = { state, decidedAt: '2026-11-01T13:00:00.000Z', askAgainAfter: '2026-11-02T01:00:00.000Z' };
+      out = [];
+      expect(await run(['preview', 'request', '5173'], onBox(at))).toBe(0);
+      expect(out).toEqual([says, "They won't be asked about this port again before 2026-11-02 01:00 UTC."]);
+    }
+  });
+
+  it('its help says who "only me" lets in, as the owner\'s DM does (#1568)', async () => {
+    const { REQUEST_COMMANDS } = await import('./request.js');
+    expect(REQUEST_COMMANDS['preview request'].details).toContain("for them and the project's collaborators only");
+    expect(REQUEST_COMMANDS['preview request'].details).not.toContain('for them alone');
+  });
+
+  it('needs a checkout and a port', async () => {
+    expect(await run(['preview', 'request', '5173'], onBox(boxHome))).toBe(2);
+    expect(await run(['preview', 'request', 'x'], onBox(join(boxHome, 'termag/projects/webapp')))).toBe(2);
+    expect(orch.preview.requestPosts).toEqual([]);
   });
 });

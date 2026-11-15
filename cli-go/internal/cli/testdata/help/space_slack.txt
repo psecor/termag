@@ -1,0 +1,26 @@
+Link Slack channels to a space, and manage its Slack (owners); not `space link`, which is `space url`.
+
+Usage: termag space slack status <space>
+       termag space slack channels [query]
+       termag space slack link <space> <#channel|id> [--runner-box <box> | --new-box]
+       termag space slack link <space> --create <name> [--private] [--invite-members] [--runner-box <box> | --new-box]
+       termag space slack unlink <space> <#channel|id> [--archive]
+       termag space slack pause|resume|disable <space>
+       termag space slack runner <space> offer <email> | accept [--runner-box <box> | --new-box] | cancel
+
+Every link and unlink shows a preview first (who in the channel is not a member of the space) and asks;
+pass --yes when no terminal is attached. The first link turns Slack on for the space with you as its
+runner, on --runner-box <box> (one of yours) or a new small box (--new-box, the default).
+A channel is #name, a Slack id (C0123ABCD) or <#C0123ABCD|name>. You must be a member of the channel,
+public or private, as from Slack; a private channel also needs termag in it (`/invite @termag` there first).
+From Slack: `/termag link <space>` in the channel.
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

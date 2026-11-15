@@ -1,0 +1,18 @@
+List termag bug reports, new first (admins, on their own box).
+
+Usage: termag bug list [--status <status>[,…]|open] [--area <area>[,…]] [--severity <severity>[,…]] [--q <text>] [--limit <n>]
+
+Statuses: new, triaged, duplicate, fixed, wontfix; open is new and triaged. --q searches title, body, command and error output.
+New reports come first, then the rest, newest first; --limit (default 50, at most 500) applies after that order.
+Admins only, on their own box: the box's own credential, checked against the owner's admin role on every call.
+Every call is in the admin audit log, with the box.
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

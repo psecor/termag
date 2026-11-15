@@ -37,6 +37,7 @@ const PICKER = {
   channels: [
     { id: 'C0FAKEGEN1', name: 'general', private: false, termagIn: false, members: 14 },
     { id: 'C0FAKEPROJ', name: 'proj-demo-main', private: false, termagIn: true, members: 2, disabled: 'channel_workstream' },
+    { id: 'C0FAKEOUT1', name: 'outsiders', private: false, termagIn: false, members: 5, disabled: 'not_in_channel' },
   ],
   nextCursor: null,
 };
@@ -164,6 +165,7 @@ describe('termag space slack', () => {
     expect(err.join('\n')).toMatch(/Only an owner of payments/);
     answers.set('GET /slack/channels', { status: 200, body: { channels: [], nextCursor: null } });
     expect(await termag('space', 'slack', 'link', 'payments', '#nope', '--yes')).toBe(3);
+    expect(err.join('\n')).toMatch(/You must be a member of the channel, public or private/);
   });
 
   it('unlinks a linked channel by name, showing what stops answering; --archive only for one termag created', async () => {
@@ -247,10 +249,18 @@ describe('termag space slack', () => {
     expect(JSON.parse(out.join(''))).toMatchObject({ already: true, channel: { channelId: 'C0FAKEGEN1' } });
   });
 
+  it('says the server\'s not_in_channel refusal for a public channel the owner is not in, and exits 1', async () => {
+    answers.set('POST /payments/slack/channels/preview', { status: 403, body: { error: 'You need to be a member of this channel to link it.', code: 'not_in_channel' } });
+    expect(await termag('space', 'slack', 'link', 'payments', 'C0FAKEOUT1', '--yes')).toBe(1);
+    expect(err.join('\n')).toMatch(/You need to be a member of this channel to link it/);
+    expect(writes()).toEqual([]);
+  });
+
   it('lists the channels one can link', async () => {
     expect(await termag('space', 'slack', 'channels')).toBe(0);
     expect(out.join('\n')).toMatch(/#general\s+no\s+14\s+-\s+C0FAKEGEN1/);
     expect(out.join('\n')).toMatch(/can't: a workstream channel/);
+    expect(out.join('\n')).toMatch(/#outsiders\s+no\s+5\s+can't: you aren't in it\s+C0FAKEOUT1/);
   });
 
   it('is not `space link`, which stays `space url`', async () => {

@@ -41,8 +41,9 @@ export const SPACE_SLACK_COMMAND: CommandSpec = {
     'Every link and unlink shows a preview first (who in the channel is not a member of the space) and asks;',
     'pass --yes when no terminal is attached. The first link turns Slack on for the space with you as its',
     'runner, on --runner-box <box> (one of yours) or a new small box (--new-box, the default).',
-    'A channel is #name, a Slack id (C0123ABCD) or <#C0123ABCD|name>. A private channel needs termag in it:',
-    '`/invite @termag` there first. From Slack: `/termag link <space>` in the channel.',
+    'A channel is #name, a Slack id (C0123ABCD) or <#C0123ABCD|name>. You must be a member of the channel,',
+    'public or private, as from Slack; a private channel also needs termag in it (`/invite @termag` there first).',
+    'From Slack: `/termag link <space>` in the channel.',
   ].join('\n'),
 };
 
@@ -90,7 +91,7 @@ async function channelIdOf(a: Api, raw: string): Promise<{ id: string; name: str
   }
   if (!found) {
     const more = cursor ? ' (termag stopped looking after many channels)' : '';
-    throw new CliError('not_found', `No channel #${name} that you can see${more}. A private channel needs termag in it (\`/invite @termag\`); or pass its id`);
+    throw new CliError('not_found', `No channel #${name} that you can see${more}. You must be a member of the channel, public or private, and a private channel also needs termag in it (\`/invite @termag\`); or pass its id`);
   }
   return { id: found.id, name: found.name };
 }
@@ -157,7 +158,10 @@ async function cmdChannels(ctx: Ctx, args: ParsedArgs, a: Api): Promise<ExitCode
   const r = await a.request<{ channels: PickerEntry[]; nextCursor: string | null }>('GET', `/spaces/slack/channels?query=${enc(query)}`);
   if (args.json) { ctx.out(json(r)); return EXIT.OK; }
   if (!r.channels.length) { ctx.out(query ? `No channel matches ${query}.` : 'No channels.'); return EXIT.OK; }
-  const why: Record<string, string> = { channel_workstream: 'a workstream channel', channel_ext_shared: 'Slack Connect' };
+  const why: Record<string, string> = {
+    channel_workstream: 'a workstream channel', channel_ext_shared: 'Slack Connect',
+    not_in_channel: 'you aren\'t in it', actor_not_in_slack: 'no Slack account for you',
+  };
   ctx.out(table(['CHANNEL', 'TERMAG IN', 'MEMBERS', 'LINKED', 'ID'], r.channels.map(c => [
     `#${c.name}${c.private ? ' (private)' : ''}`, c.termagIn ? 'yes' : 'no', c.members === null ? '-' : String(c.members),
     c.disabled === 'channel_linked' ? (c.linkedTo ?? 'another space') : c.disabled ? `can't: ${why[c.disabled] ?? c.disabled}` : '-', c.id,

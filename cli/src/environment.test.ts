@@ -193,10 +193,31 @@ describe('termag environment', () => {
     expect(stdout()).toContain('Shared environment on-default');
     out = [];
     expect(await run(['environment', 'unshare', 'on-default'], ctx())).toBe(0);
-    expect(stdout()).toContain('Environment on-default is personal');
+    expect(stdout()).toContain('Environment on-default is personal: only its owner, Ada, sees and uses it.');
     out = [];
     expect(await run(['environment', 'history', 'on-default'], ctx())).toBe(0);
     expect(stdout()).toMatch(/Switched by Ada\n  shared → personal[\s\S]*Switched by Ada\n  personal → shared/);
+  });
+
+  it("passes on the orchestrator's refusal of a non-admin's change to a shared environment, with what to do instead", async () => {
+    await run(['environment', 'create', 'ours', '--pointer', 'acme/web', '--shared'], ctx());
+    await run(['environment', 'create', 'mine', '--pointer', 'acme/web'], ctx());
+    orch.environments.admin = false;
+    const refused = 'termag: Only admins can change shared environments; make a personal one.';
+    const refuses = async (argv: string[], instead: string) => {
+      err = [];
+      expect(await run(argv, ctx()), argv.join(' ')).toBe(1);
+      expect(stderr()).toBe(`${refused}\n  ${instead}`);
+    };
+    await refuses(['environment', 'create', 'theirs', '--pointer', 'acme/web', '--shared'], 'Drop --shared to make it yours: termag environment create theirs --pointer acme/web');
+    await refuses(['environment', 'edit', 'ours', '--pointer', 'acme/elsewhere'], 'ours is shared; ask an admin to change it, or make your own: termag environment create ours-mine --pointer acme/elsewhere');
+    await refuses(['environment', 'unshare', 'ours'], 'ours stays shared; ask an admin to make it personal.');
+    await refuses(['environment', 'delete', 'ours', '--yes'], 'ours is shared; ask an admin to delete it.');
+    await refuses(['environment', 'share', 'mine'], 'mine stays personal: yours to use. Ask an admin to make a shared one.');
+    expect(orch.environments.envs.map(e => `${e.name}:${e.visibility}:${e.file?.repo}`)).toEqual(['ours:shared:acme/web', 'mine:personal:acme/web']);
+    // A personal one stays wholly its owner's.
+    expect(await run(['environment', 'edit', 'mine', '--pointer', 'acme/api'], ctx())).toBe(0);
+    expect(await run(['environment', 'delete', 'mine', '--yes'], ctx())).toBe(0);
   });
 
   it('parses env as environment for every subcommand', () => {

@@ -1,0 +1,24 @@
+Publish a port of a workstream's box at https://<name>.<preview domain>.
+
+Usage: termag preview publish [<box>/<project>[@<workstream>]] <port> [--name <name>] [--audience owner|people|link] [--email <address>]… [--ttl <hours>] [--public-host]
+
+--name is the hostname label: 3 to 40 of a-z, 0-9 and -, suggested from the project and workstream.
+--audience owner (the default) is you and the project's collaborators; people adds each --email;
+link is anyone signed in to termag with the link, whose token is printed once.
+--ttl is 1 to 168 hours (default 24). --public-host sends the app the public Host instead of
+localhost:<port>. Publishing a name again for the same workstream renews it.
+With <port> alone, the project and workstream are the checkout you are in, on its box.
+From a sign-in made on a box, --audience people or link prints a link to confirm in your browser
+and waits for it: anything on the box can use that sign-in, so it can't share beyond you alone.
+  termag preview publish 5173
+  termag preview publish devbox/webapp@feature-x 5173 --name webapp-feature-x
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

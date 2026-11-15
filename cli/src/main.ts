@@ -18,6 +18,7 @@ import { PREVIEW_HANDLERS } from './preview/command.js';
 import { AUTOMATION_HANDLERS } from './automation.js';
 import { ENVIRONMENT_HANDLERS } from './environment.js';
 import { BUG_HANDLERS } from './bug.js';
+import { FEEDBACK_HANDLERS } from './feedback.js';
 import { EVENTS_HANDLERS } from './events/command.js';
 import { AWAITED_AT_START, REPORTED_AT_START, countRequests, usageReport, usageReporter, type UsageReporter } from './usage.js';
 
@@ -42,11 +43,14 @@ const HANDLERS: Record<string, (ctx: Ctx, args: ParsedArgs) => Promise<ExitCode>
   ...AUTOMATION_HANDLERS,
   ...ENVIRONMENT_HANDLERS,
   ...BUG_HANDLERS,
+  ...FEEDBACK_HANDLERS,
   ...EVENTS_HANDLERS,
 };
 
 function reportError(ctx: Ctx, err: CliError, asJson: boolean): void {
-  if (asJson) ctx.err(JSON.stringify({ error: { code: err.code, message: err.message } }));
+  // A named refusal (termag preview run's launcher_missing, say) is a field of its own, for scripts (Devin, #1520).
+  const refusal = typeof err.body?.refusal === 'string' ? { refusal: err.body.refusal } : {};
+  if (asJson) ctx.err(JSON.stringify({ error: { code: err.code, message: err.message, ...refusal } }));
   else ctx.err(`termag: ${err.message}`);
 }
 

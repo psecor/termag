@@ -1,0 +1,13 @@
+Replace an environment's definition or pointer (every change is in its history; a shared one: admins only).
+
+Usage: termag environment edit <name> (--file <path.json> | - | --pointer <owner/name>:<branch>:<path>)
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

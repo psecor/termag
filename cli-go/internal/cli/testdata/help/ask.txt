@@ -1,0 +1,64 @@
+Ask another project's agent; prints its answer and a draft PR for any commits (a --thread follow-up while it works joins the running turn).
+
+Usage: termag ask <box>/<project>[@<workstream>][:<repo>] <prompt|-> [--title <text>] [--model opus|sonnet|haiku|fireworks:<model>] [--thread <id>] [--update-pr <n>] [--no-wait] [--no-notify] [--timeout <seconds>]
+       termag ask --new-box [--size small|medium|large] [--disk <GB>] [--from <box/project|template|github-url>... | --environment <name>] <box>/<project>[:<repo>] <prompt|-> [--title <text>] [--model opus|sonnet|haiku|fireworks:<model>] [--no-wait] [--no-notify]
+       termag ask --reply <message> [--no-wait] [--timeout <seconds>]
+       termag ask --cancel <message>
+       termag ask --inbox
+       termag ask --targets
+       termag ask --find <title>
+
+A multi-repo project is asked one repository at a time, <box>/<project>[@<workstream>]:<repo>: the run
+starts in that repository's checkout, or the workstream's worktree of it. --targets lists each one.
+
+--title <text>   Names the thread: what it is about, plus the PR number if any, at most 60 characters,
+                 e.g. --title "Members-only file composer (#765)". termag shows the thread by this name (sidebar, tabs,
+                 Files, chat header); an untitled thread shows as ask-<thread id>. Nothing is taken from the prompt.
+                 With --thread it names or renames that thread, and the sidebar shows the new name at once.
+--model <model>  The model the turn runs on: opus, sonnet or haiku (the gateway's pinned Opus, Sonnet or
+                 Haiku), or fireworks:<model> for an open-weight model on Fireworks, by its id or its last part
+                 (fireworks:kimi-k3, or fireworks alone for your default; the simple UI's model picker lists
+                 yours). Claude stays the default, and the one to use for code and PRs. The thread keeps it:
+                 follow-ups without --model run on it too, and one with --model switches it from that turn on
+                 (--model sonnet takes a Fireworks thread back to Claude). Without it, the thread's model, else
+                 the box's default. With --new-box the new project starts on a Claude tier too. An orchestrator
+                 or box agent too old for a Claude tier runs the ask anyway, on its default, and says --model
+                 was ignored. A Fireworks ask is never run on Claude instead: one that can't run as asked is
+                 refused with the reason (fireworks_unavailable; on an orchestrator too old for --model the
+                 CLI cancels it and exits 1).
+--update-pr <n>  The pull request to publish to: <n>, <owner>/<name>#<n> or its github.com URL. Without it, a run
+                 whose branch builds on exactly one open pull request you opened publishes there anyway; name one
+                 when it builds on a stack of yours, or to override. It must be open, in the project's repository
+                 (not a fork), not a base branch, and opened by you (or a termag-<you>/… branch). A push that is not a
+                 fast-forward of it is refused. The thread keeps it: follow-ups publish there too.
+--new-box        Ask on a box of its own: makes <box> and <project> for this ask when they are not there yet
+                 (an existing one is used as it is), waits for the box, then asks. The box is sized like any
+                 (--size, else the repositories' .termag/environment.json, the largest of them, else your default)
+                 with a disk of --disk GB (50 to 300, else the repositories' diskGiB, else 120), is
+                 always with termag setup on (a repository's "setupEnabled": false is overridden, and said: the run needs it),
+                 stopped when idle and never hibernated, and is recorded as made for the thread; the simple UI
+                 shows only its asks. --timeout covers the wait for a new box too.
+--from <src>     What the project starts from: another project (<box>/<project>), a template or a GitHub URL.
+                 Give it once per repository the task needs: twice or more makes a multi-repo project of exactly
+                 those, and the ask runs in one of them, :<repo> on the target, else the first --from's. None is
+                 an empty project. Each extra repository costs clone time and can raise the box size. A multi-repo
+                 project that is already there is asked as it is, no --from needed: :<repo>, else its first.
+--environment <name>  Instead of --from: the project holds that environment's repositories,
+                 and the new box is sized by its definition (--size still wins). The ask runs in its first
+                 repository, or :<repo>.
+--no-notify      Don't tell this session when the ask finishes. By default termag does, once, when nothing is
+                 waiting on it (with --no-wait, say): a chat gets a [termag] notice as its next turn, an agent pane
+                 has it typed in once it is idle. The notice has the state, ids, PR and publish outcome, never the reply.
+--find <title>   The sessions and ask threads of yours that termag shows by that title (the sidebar's name for
+                 them: Claude's title for a session, an ask thread's --title), each with the target to ask and,
+                 for a thread, the --thread that talks to that same session. Every word must match; case is ignored.
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

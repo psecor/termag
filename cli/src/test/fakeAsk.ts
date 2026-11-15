@@ -59,6 +59,12 @@ export interface FakeAskState {
    * which drops it; `{ ignored }`, one whose box can't honour it, saying why.
    */
   model?: 'unknown' | { ignored: string; later?: true };
+  /**
+   * The cancel response's `stop`: unset, the run stopped. `{ stopped: false }`
+   * is a box that cannot stop it (no ask-cancel-v1, or no answer), so the turn
+   * may still finish.
+   */
+  cancelStop?: { stopped: boolean; detail: string };
 }
 
 interface FakeAskMessage {
@@ -164,7 +170,7 @@ export function handleAsk(s: FakeAskState, route: string, query: URLSearchParams
     if (m.status === 'canceled') { send(res, 200, { ...view(s, m, false), stop: null }); return true; }
     if (m.status !== 'working') { send(res, 409, { error: `Can't cancel: the message is already ${m.status}`, code: 'finished' }); return true; }
     m.status = 'canceled';
-    send(res, 200, { ...view(s, m, false), stop: { stopped: true, detail: 'the run was stopped' } });
+    send(res, 200, { ...view(s, m, false), stop: s.cancelStop ?? { stopped: true, detail: 'the run was stopped' } });
     return true;
   }
   const match = /^GET \/ask\/messages\/([^/]+)$/.exec(route);

@@ -6,6 +6,8 @@ import type { Ctx } from '../context.js';
 import { CliError, EXIT, usage, type ExitCode } from '../errors.js';
 import { confirmOrRefuse, resolveProject } from '../lifecycle.js';
 import { formatDate, json, table } from '../output.js';
+import { REQUEST_COMMANDS, REQUEST_HANDLERS } from './request.js';
+import { RUN_COMMANDS, RUN_HANDLERS } from './run.js';
 
 /**
  * `termag preview publish|list|revoke`
@@ -14,8 +16,9 @@ import { formatDate, json, table } from '../output.js';
  * it expires. The orchestrator's /api/cli/v1/preview-links
  * (routes/cliPreviewLinks.ts) takes a device sign-in only: on a box, run
  * `termag login --device <name>` first (a plain `termag login` there keeps the
- * box's own credentials, which are refused). An
- * agent can only ask for a link (`termag preview request`, phase 3).
+ * box's own credentials, which are refused: the owner publishes from the
+ * Share dialog or their own sign-in). An agent can only ask for a link
+ * (`termag preview request`, ./request.ts).
  */
 
 const REF_RE = /^[^/@\s]+\/[^/@\s]+(@[A-Za-z0-9_-]+)?$/;
@@ -59,6 +62,8 @@ export const PREVIEW_COMMANDS: Record<string, CommandSpec> = {
     usage: 'termag preview revoke <name> [--yes]',
     maxArgs: 1,
   },
+  ...RUN_COMMANDS,
+  ...REQUEST_COMMANDS,
 };
 
 export interface PreviewLinkView {
@@ -277,4 +282,6 @@ export const PREVIEW_HANDLERS: Record<string, (ctx: Ctx, args: ParsedArgs) => Pr
   'preview publish': cmdPublish,
   'preview list': cmdList,
   'preview revoke': cmdRevoke,
+  ...RUN_HANDLERS,
+  ...REQUEST_HANDLERS,
 };

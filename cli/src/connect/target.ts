@@ -37,16 +37,33 @@ export function parseRef(text: string | undefined, opts: { defaultBox?: boolean 
   return { box: parts[0], project: parts[1] ?? null };
 }
 
-/** A box by name or id; with no name, the only box, since with several the caller must say which. */
-export function pickBox(boxes: ConnectBox[], name: string | null): ConnectBox {
+/**
+ * A box by name or id; with no name, the only box, since with several the caller must say which.
+ *
+ * Names match without regard to case. An exact name wins, since names that
+ * differ only in case can coexist; failing that, one match is the box and
+ * several are ambiguous. With `caseLost` (a name OpenSSH lowercased, see
+ * pickProxyBox) an exact match proves nothing, so only the case-blind match counts.
+ */
+export function pickBox(boxes: ConnectBox[], name: string | null, opts: { caseLost?: boolean } = {}): ConnectBox {
   const names = boxes.filter(b => b.addressable).map(b => b.name);
   if (name === null) {
     if (boxes.length === 1) return boxes[0];
     if (boxes.length === 0) throw new CliError('not_found', 'You have no boxes; create one with `termag box create <name>`');
     throw usage(`You have ${boxes.length} boxes${names.length ? ` (${names.join(', ')})` : ''}; name the one to use`);
   }
-  const box = boxes.find(b => b.name === name) ?? boxes.find(b => b.id === name);
+  const box = (opts.caseLost ? undefined : boxes.find(b => b.name === name)) ?? boxes.find(b => b.id === name);
   if (box) return box;
+  const folded = name.toLowerCase();
+  const matches = boxes.filter(b => b.name.toLowerCase() === folded);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    const list = matches.map(b => b.name).join(', ');
+    throw usage(opts.caseLost
+      ? `"${name}" matches ${matches.length} boxes (${list}) and ssh has lowercased it, so termag can't tell which;`
+        + ' run `termag ssh-config --install` again, which names each box by its instance id'
+      : `"${name}" matches ${matches.length} boxes (${list}) when case is ignored; name one exactly, or by id`);
+  }
   throw new CliError('not_found', `No box named "${name}"${names.length ? `; your boxes: ${names.join(', ')}` : '; you have no boxes'}`);
 }
 
@@ -108,11 +125,31 @@ export function wakeAction(state: string): WakeAction {
   return WAKE_ACTIONS.get(state) ?? 'refuse';
 }
 
+/** A box's instance id as EC2 writes it: what ssh-config puts on a HostName line, and ssh-proxy looks up. */
+export const INSTANCE_ID = /^i-[0-9a-f]{8,17}$/;
+
 /** `termag-<box>`, the host name ssh and the ssh-config entry use. */
 export const HOST_PREFIX = 'termag-';
 
 export function aliasFor(box: ConnectBox): string {
   return `${HOST_PREFIX}${box.name}`;
+}
+
+/**
+ * The box `termag ssh-proxy %h` is for. ssh-config's blocks make `%h` the
+ * box's instance id. An older block's `%h` is `termag-<box>`, lowercased by
+ * OpenSSH, so its name is matched with `caseLost`.
+ */
+export function pickProxyBox(boxes: ConnectBox[], host: string): ConnectBox {
+  const id = host.toLowerCase();
+  if (INSTANCE_ID.test(id)) {
+    const box = boxes.find(b => b.ec2InstanceId?.toLowerCase() === id);
+    if (box) return box;
+    const names = boxes.filter(b => b.addressable).map(b => b.name);
+    throw new CliError('not_found', `No box of yours is instance ${host}${names.length ? ` (your boxes: ${names.join(', ')})` : ''};`
+      + ' run `termag ssh-config --install` again to bring the ssh config up to date');
+  }
+  return pickBox(boxes, boxFromAlias(host), { caseLost: true });
 }
 
 export function boxFromAlias(alias: string): string {

@@ -63,6 +63,8 @@ export interface FakeLifecycleState {
   defaultSize: string | null;
   /** What a resize of a running box is refused for until `force` (backend boxResizePolicy blockers); empty is idle. */
   resizeBlockers: Array<{ check: string; reason: string; forceable: boolean }>;
+  /** What a stop of a running box is refused for until `force` (backend liveCloudSessionRefusal); empty is none. */
+  stopBlockers: Array<{ check: string; reason: string; forceable: boolean }>;
   /** Why a disk grow is refused now (backend boxDisk.ts: EBS's six hours, say); null lets it through. */
   diskRefusal: { code: string; error: string } | null;
   /** Each `from`'s .termag/environment.json as the orchestrator read it: its preset, and the warnings for what it left out. */
@@ -97,7 +99,7 @@ const pending = new WeakMap<FakeBox, number>();
 export function newLifecycleState(boxes: FakeBox[], projects: FakeProject[]): FakeLifecycleState {
   const state: FakeLifecycleState = {
     boxes: structuredClone(boxes), projects: structuredClone(projects),
-    provisionPolls: 1, parkPolls: 1, provisionOutcome: 'running', projectWaitsForBox: true, calls: [], cannotHibernate: new Set(), cannotPark: new Set(), idleStopHours: null, defaultSize: null, resizeBlockers: [], repoFiles: {}, diskRefusal: null, environments: {}, setupOff: true,
+    provisionPolls: 1, parkPolls: 1, provisionOutcome: 'running', projectWaitsForBox: true, calls: [], cannotHibernate: new Set(), cannotPark: new Set(), idleStopHours: null, defaultSize: null, resizeBlockers: [], stopBlockers: [], repoFiles: {}, diskRefusal: null, environments: {}, setupOff: true,
     imageFloorGiB: null, imageFloorKnown: true, newBoxFields: {}, newProjectFields: {},
   };
   syncBoxProjects(state);
@@ -227,6 +229,12 @@ export function handleLifecycle(
     if (!b) { send(res, 404, { error: 'Box not found' }); return true; }
     const from = m[2] === 'start' ? ['stopped', 'hibernated'] : ['running', 'starting'];
     if (!from.includes(b.state)) { send(res, 409, { error: `Can't ${m[2]} a box that is ${b.status}`, code: 'conflict' }); return true; }
+    const stopForceable = state.stopBlockers.every(x => x.forceable);
+    if (m[2] === 'stop' && b.state === 'running' && state.stopBlockers.length && !(body?.force === true && stopForceable)) {
+      const forceable = stopForceable;
+      send(res, 409, { error: `${state.stopBlockers.map(x => x.reason).join('; ')}.`, code: 'box_busy', blockers: state.stopBlockers, forceable });
+      return true;
+    }
     b.state = b.status = m[2] === 'start' ? 'starting' : 'stopping';
     b.agentConnected = false;
     send(res, 202, { box: b });

@@ -1,0 +1,19 @@
+Print, or with --install add, the `Host termag-*` entry for ~/.ssh/config.
+
+Usage: termag ssh-config [--install] [--wake]
+
+Then `ssh termag-<box>`, scp, rsync and editor Remote-SSH reach every box you own, and
+`ssh termag-<box>.<project>` (or `.ctrl`) attaches to a project's agent (or ctrl shell).
+Re-run it after adding a box or a project.
+With --wake, connecting to a stopped or hibernated box starts it first. An editor
+that reconnects on its own then keeps a parked box up, so it is off by default.
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

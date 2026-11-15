@@ -1,0 +1,18 @@
+Triage a termag bug report: status, duplicate, link, note (admins, on their own box).
+
+Usage: termag bug triage <id> [--status <status>] [--duplicate-of <id>] [--link <github issue or PR url>] [--note <text>]
+
+Statuses: new, triaged, fixed, wontfix; --duplicate-of sets duplicate, pointing at the original's root.
+--link takes https://github.com/<owner>/<repo>/issues/<n> or /pull/<n>; --link '' clears it. --note goes into the history with the change.
+Admins only, on their own box: the box's own credential, checked against the owner's admin role on every call.
+Every call is in the admin audit log, with the box.
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

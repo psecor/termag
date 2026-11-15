@@ -1,0 +1,21 @@
+Load and change a space's shared agent memory (.termag/).
+
+Usage: termag space memory sync [space] [--if-older 60s]
+       termag space memory context [space] [--session <file>] [--refresh 60s] [--hook SessionStart|UserPromptSubmit]
+       termag space memory ls [space]
+       termag space memory add <space> <name> --description <text> [--note <why>] < body
+       termag space memory edit <space> <name> [--description <text>] [--note <why>] < body
+       termag space memory cat <space> <name>
+       termag space memory rm <space> <name> [--note <why>]
+       termag space memory log [space] [--since 7d]
+       termag space memory pane-claude [space] --key <project>--<workstream> [--resume]
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

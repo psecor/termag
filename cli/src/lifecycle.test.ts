@@ -228,6 +228,29 @@ describe('termag box start and stop', () => {
     expect(mutations()).toEqual(['POST /boxes/i1/stop']);
   });
 
+  it('a box running cloud sessions needs --force without a terminal', async () => {
+    orch.lifecycle.stopBlockers = [{ check: 'claude-runner', reason: 'devbox is running a Claude Code cloud session, and stopping it ends it', forceable: true }];
+    expect(await run(['box', 'stop', 'devbox', '--yes'], agentless())).toBe(1);
+    expect(stderr()).toMatch(/cloud session, and stopping it ends it\. Pass --force to stop it anyway\./);
+    expect(box('devbox')?.state).toBe('running');
+    expect(await run(['box', 'stop', 'devbox', '--yes', '--force'], agentless())).toBe(0);
+    expect(orch.lifecycle.calls.at(-1)).toEqual({ route: 'POST /boxes/i1/stop', body: { force: true } });
+    expect(box('devbox')?.state).toBe('stopping');
+  });
+
+  it('at a terminal, a box running cloud sessions is a question, then a forced stop', async () => {
+    orch.lifecycle.stopBlockers = [{ check: 'claude-runner', reason: 'devbox is running a Claude Code cloud session, and stopping it ends it', forceable: true }];
+    expect(await run(['box', 'stop', 'devbox'], ctx())).toBe(0);
+    expect(questions.at(-1)).toBe('Stop devbox anyway? [y/N] ');
+    expect(mutations()).toEqual(['POST /boxes/i1/stop', 'POST /boxes/i1/stop']);
+  });
+
+  it('a stop a box credential may not force says so, and --force does not help', async () => {
+    orch.lifecycle.stopBlockers = [{ check: 'claude-runner', reason: 'devbox is running a Claude Code cloud session, and stopping it ends it', forceable: false }];
+    expect(await run(['box', 'stop', 'devbox', '--yes', '--force'], agentless())).toBe(1);
+    expect(box('devbox')?.state).toBe('running');
+  });
+
   it('--wait gives up on a box that stops instead', async () => {
     const seq = [{ ...BOXES[0], state: 'stopping', status: 'stopping', agentConnected: false }];
     const api = { request: async () => ({ boxes: seq }) } as unknown as Api;

@@ -1085,11 +1085,66 @@ describe('termag ask --model', () => {
     expect(orch.ask.asks).toEqual([]);
   });
 
+  it('fireworks:<model> picks a Fireworks model, sent as given for the orchestrator to check; a follow-up may switch back', async () => {
+    expect(await run(['ask', 'devbox/webapp-fix', 'summarize the logs', '--model', 'fireworks:kimi-k3', '--title', 'Logs'], ctx())).toBe(0);
+    expect(await run(['ask', 'devbox/webapp-fix', 'and the full id', '--model', 'Fireworks:accounts/fireworks/models/kimi-k3', '--thread', 'thread00001'], ctx())).toBe(0);
+    expect(await run(['ask', 'devbox/webapp-fix', 'your default', '--model', 'fireworks', '--thread', 'thread00001'], ctx())).toBe(0);
+    expect(await run(['ask', 'devbox/webapp-fix', 'now the PR', '--model', 'sonnet', '--thread', 'thread00001'], ctx())).toBe(0);
+    expect(orch.ask.asks.map(a => a.model ?? null)).toEqual(['fireworks:kimi-k3', 'fireworks:accounts/fireworks/models/kimi-k3', 'fireworks', 'sonnet']);
+    expect(stderr()).not.toContain('ignored');
+    out = [];
+    expect(await run(['ask', '--inbox'], ctx())).toBe(0);
+    expect(stdout()).toMatch(/message0001\s+thread00001\s+devbox\/webapp-fix\s+completed\s+delivered\s+none\s+-\s+-\s+fireworks:kimi-k3\s/m);
+  });
+
+  it('a Fireworks ask the orchestrator refuses is a rejection with its reason, never run on Claude', async () => {
+    orch.ask.reject = "devbox's agent cannot run an ask on Fireworks yet (it lacks ask-backend-v1); update the box (termag-box-update), or ask on a Claude model (--model opus|sonnet|haiku)";
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'fireworks:kimi-k3', '--title', 'T'], ctx())).not.toBe(0);
+    expect(stderr()).toContain("termag: rejected: devbox's agent cannot run an ask on Fireworks yet (it lacks ask-backend-v1)");
+  });
+
+  it('--new-box with a Fireworks model: the new project keeps its default tier, and the ask carries the model', async () => {
+    expect(await run(['ask', '--new-box', '--from', 'research', 'askbox/m1', 'look', '--model', 'fireworks:kimi-k3', '--title', 'Look'], ctx())).toBe(0);
+    expect(orch.lifecycle.calls.find(c => c.route === 'POST /projects')?.body).toEqual({ boxId: 'i-askbox', name: 'm1', agent: 'claude', from: 'research', createdFor: 'ask' });
+    expect(orch.ask.asks[0]).toMatchObject({ target: 'askbox/m1', newBox: true, model: 'fireworks:kimi-k3' });
+  });
+
+  it('refuses a malformed Fireworks model before asking', async () => {
+    for (const bad of ['fireworks:', 'fireworks:kimi k3', 'fireworksx', 'openai:gpt-5']) {
+      err = [];
+      expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', bad], ctx())).toBe(2);
+      expect(stderr()).toContain('or fireworks:<model> for a Fireworks model');
+    }
+    expect(orch.ask.asks).toEqual([]);
+  });
+
   it('an orchestrator from before --model runs the ask anyway, and the CLI says --model was ignored', async () => {
     orch.ask.model = 'unknown';
     expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'opus', '--title', 'Old'], ctx())).toBe(0);
     expect(stdout()).toContain('thread: thread00001');
     expect(stderr()).toContain("termag: warning: --model opus was ignored: the orchestrator predates it; the ask runs on the thread's model, else the box's default");
+  });
+
+  it('an orchestrator from before --model: a Fireworks ask is canceled and refused, never run on Claude', async () => {
+    orch.ask.model = 'unknown';
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'fireworks:kimi-k3', '--title', 'Old'], ctx())).not.toBe(0);
+    // The orchestrator took the ask before the CLI could know; it cancels it rather than let it run on Claude.
+    expect(orch.requests.some(r => r.method === 'POST' && r.path.endsWith('/ask/messages/message0001/cancel'))).toBe(true);
+    expect(orch.ask.messages.get('message0001')?.status).toBe('canceled');
+    expect(stderr()).toContain('termag: rejected: this orchestrator predates --model, so fireworks:kimi-k3 would run on Claude; message0001 was canceled: ask again once the deploy is out');
+    expect(stderr()).not.toContain('was ignored');
+    expect(stdout()).toBe('');
+  });
+
+  it('a canceled ask whose run the box could not stop says the message was canceled but the run did not stop', async () => {
+    orch.ask.model = 'unknown';
+    orch.ask.cancelStop = { stopped: false, detail: "the box's agent can't stop runs yet; the run ends on its own and is ignored" };
+    expect(await run(['ask', 'devbox/webapp-fix', 'hi', '--model', 'fireworks:kimi-k3', '--title', 'Old'], ctx())).not.toBe(0);
+    // The 200 canceled the message; stop.stopped false means the Claude turn may still finish.
+    expect(orch.ask.messages.get('message0001')?.status).toBe('canceled');
+    expect(stderr()).toContain("termag: rejected: this orchestrator predates --model, so fireworks:kimi-k3 would run on Claude; canceled the ask message, but the run on devbox/webapp-fix did not stop (the box's agent can't stop runs yet; the run ends on its own and is ignored): ask again once the deploy is out");
+    expect(stderr()).not.toContain('was canceled');
+    expect(stdout()).toBe('');
   });
 
   it('a box whose agent predates --model: the ask runs, with the orchestrator\'s reason', async () => {

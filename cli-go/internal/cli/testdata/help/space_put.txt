@@ -1,0 +1,21 @@
+Upload a file, or a folder with -r; refused (exit 6) if it changed since you read it.
+
+Usage: termag space put <local> <space:path> [-r] [--mine] [--if-match <etag> | --if-new | --force]
+
+With -r the folder's contents go to <space:path>, not a folder of its name under it:
+  termag space put -r dist team:site        # dist/a.html is team:site/a.html
+  termag space put -r dist team:site/dist/  # dist/a.html is team:site/dist/a.html
+A single file put to a path ending in / keeps its name there.
+With no space: named, a session with Project files saves there, and --mine saves to My files:
+  termag space put shot.png screenshots/         # Project files ($TERMAG_SPACE)
+  termag space put --mine notes.md notes/        # My files ($TERMAG_MY_FILES)
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

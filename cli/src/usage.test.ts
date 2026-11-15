@@ -7,7 +7,7 @@ import type { Ctx } from './context.js';
 import { credentialsPath, saveLogin } from './credentials.js';
 import { run } from './main.js';
 import type { BackgroundRequest } from './backgroundPost.js';
-import { AWAITED_AT_START, REPORTED_AT_START, countRequests, usageBearer, usageOptedOut, usageReporter, type UsageReport } from './usage.js';
+import { AWAITED_AT_START, REPORTED_AT_START, RUNTIME, countRequests, usageBearer, usageOptedOut, usageReport, usageReporter, type UsageReport } from './usage.js';
 
 const HOST = 'https://termag.example.com/termag';
 let home: string;
@@ -54,6 +54,20 @@ describe('run reports usage', () => {
     expect(reports[0].durationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it('marks every report as the Node CLI\'s, so a dashboard can tell it from the Go binary', async () => {
+    expect(RUNTIME).toBe('node');
+    const env = { TERMAG_URL: HOST };
+    expect(usageReport({ env, interactive: true }, 'box list', { exitCode: 0, durationMs: 41.6 })).toEqual({
+      command: 'box list', phase: 'finished', version: expect.any(String), exitCode: 0, durationMs: 42, interactive: true, claudeCode: false, runtime: 'node',
+    });
+    expect(usageReport({ env, interactive: false }, 'tui', null)).toEqual({
+      command: 'tui', phase: 'started', version: expect.any(String), interactive: false, claudeCode: false, runtime: 'node',
+    });
+    const reports: UsageReport[] = [];
+    await run(['whoami'], ctx(), { report: async (_a, r) => { reports.push(r); } });
+    expect(reports).toEqual([expect.objectContaining({ command: 'whoami', runtime: 'node' })]);
+  });
+
   it('reports nothing for help, the version or a command line that does not parse', async () => {
     const reports: UsageReport[] = [];
     const report = async (_a: ParsedArgs, r: UsageReport) => { reports.push(r); };
@@ -83,7 +97,7 @@ describe('run reports usage', () => {
 
 describe('usageReporter', () => {
   const args = { command: 'box list' } as ParsedArgs;
-  const report: UsageReport = { command: 'box list', phase: 'finished', version: '1', exitCode: 0, durationMs: 5, interactive: true, claudeCode: false };
+  const report: UsageReport = { command: 'box list', phase: 'finished', version: '1', exitCode: 0, durationMs: 5, interactive: true, claudeCode: false, runtime: 'node' };
 
   it('posts the report with the device sign-in', async () => {
     signIn();

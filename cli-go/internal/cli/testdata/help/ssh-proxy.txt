@@ -1,0 +1,17 @@
+The ssh-config entry's ProxyCommand (run by ssh, not by hand).
+
+Usage: termag ssh-proxy [--wake [--timeout <seconds>]] termag-<box> <port>
+
+--wake starts a stopped or hibernated box (one still stopping or hibernating once it
+has), as `termag box start --wait` does, then connects. Progress goes to stderr.
+--timeout bounds each wait (default 600).
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

@@ -1,0 +1,81 @@
+termag: manage termag boxes and projects from the command line.
+
+Commands:
+  tui                  Open the terminal UI: your projects, live status, peek and attach
+  login                Sign this device in through the browser
+  logout               Sign this device out and revoke its token
+  whoami               Show the signed-in user and the orchestrator
+  doctor               Check this machine's termag setup and offer to fix what is missing
+  box list             List your boxes
+  project list         List your projects as <box>/<project>
+  box create           Create a box; --size small (2 vCPU, 8 GB), medium (4, 16) or large (4, 32), else your default size; --disk 50 to 300 GB, else 120; --minimal for the lean image; --no-setup to turn termag setup off
+  box start            Start a stopped box; its projects come back on their own
+  box stop             Stop a box, keeping its disk and projects; a box running Claude Code cloud sessions needs --force, which ends them
+  box keep             Keep a running box up: restart its idle clock, as using it would, so auto-park waits another full limit
+  box set              Change box settings: --auto-park parks it after that long idle, --terminate-after terminates it after that long parked
+  box rename           Rename a box; its projects stay on it, now named <new-name>/<project>
+  box resize           Resize a box to small (2 vCPU, 8 GB), medium (4, 16) or large (4, 32): it stops for two to three minutes, and running turns stop with it; a stopped or hibernated box is resized and left stopped. --disk grows its disk (up to 300 GB, never smaller, once every six hours) with the box up
+  box rm               Terminate a box and archive its projects
+  project create       Create a project on a box, or on a new box with --new-box (at --size, else the repository's or environment's or your default size)
+  project rename       Rename a project; it stays on the same box
+  project archive      Archive a project
+  ssh                  Open a shell on a box or in a project's directory, or run a command there
+  attach               Attach this terminal to a project's agent session (--ctrl: its ctrl shell)
+  ssh-config           Print, or with --install add, the `Host termag-*` entry for ~/.ssh/config
+  ssh-proxy            The ssh-config entry's ProxyCommand (run by ssh, not by hand)
+  forward              Forward local ports to ports on a box through the orchestrator, until Ctrl-C
+  preview publish      Publish a port of a workstream's box at https://<name>.<preview domain>
+  preview list         List your live preview links, or a project's links and pending requests
+  preview revoke       Revoke one of your preview links by its name
+  preview run          Run a dev server confined to this checkout, so a preview link of it can be shared beyond you
+  preview request      Ask the box's owner to share a port as a preview link (for agents on a box)
+  ask                  Ask another project's agent; prints its answer and a draft PR for any commits (a --thread follow-up while it works joins the running turn)
+  space ls             List the spaces you (or this box) can reach, or the files in one
+  space get            Download a file, or a folder with -r
+  space url            Print a browser link to a file; it opens for anyone who can read the space, or everyone on termag once shared
+  space share          Share a file read-only with everyone signed in to termag (needs editor or owner)
+  space unshare        Make a shared file private again: only the space's members can open it
+  space put            Upload a file, or a folder with -r; refused (exit 6) if it changed since you read it
+  space rm             Delete a file, or a folder with -r (old versions are kept); a file you read is checked first
+  space mv             Move or rename a file or folder (folders end in /); a file you read is checked first
+  space create         Create a space; you become its owner
+  space members        List or change a space's members
+  space boxes          List or change the boxes that can reach a space
+  space slack          Link Slack channels to a space, and manage its Slack (owners); not `space link`, which is `space url`
+  space memory         Load and change a space's shared agent memory (.termag/)
+  space sync           Copy the spaces you (or this box) reach to ~/termag/spaces, read-only
+  handoff              Hand an agent off: it writes a handoff, then its context is cleared or compacted, or the pane restarts, and the next agent starts on it
+  automation list      List your automations, with their schedule, state and next run
+  automation create    Create an automation: a project whose prompt a fresh agent runs on a schedule; --preview shows the next runs and creates nothing
+  automation show      Show an automation: its schedule, space folder, next runs and last runs with their state
+  automation edit      Change an automation's schedule, prompt, name, space or settings; any change clears a pause
+  automation pause     Pause an automation: no scheduled runs until it is resumed (Run now still works)
+  automation resume    Resume a paused automation, from its next occurrence (missed ones are not owed)
+  automation run       Run an automation now, as its Run now button does
+  automation stop      Stop a live run of an automation
+  automation rm        Delete an automation: its project is archived and its runs stop; the run history stays
+  bug report           Report a termag bug: a termag command or feature that behaved wrongly
+  bug list             List termag bug reports, new first (admins, on their own box)
+  bug show             Show one termag bug report with its history (admins, on their own box)
+  bug triage           Triage a termag bug report: status, duplicate, link, note (admins, on their own box)
+  feedback             Log feedback about termag that a person gave: praise, a problem, an idea
+  environment list     List your personal environments, then the shared ones (anyone can use those; admins change them)
+  environment show     Show an environment: its definition or pointer, and the repositories it resolves to now
+  environment create   Create an environment from a definition (JSON, checked against docs/environment.schema.json) or a pointer to a file
+  environment edit     Replace an environment's definition or pointer (every change is in its history; a shared one: admins only)
+  environment share    Share your environment with everyone (admins only): it must point at a file on its repository's default branch
+  environment unshare  Make a shared environment personal again, its owner's alone (admins only)
+  environment history  An environment's history: every change, who made it and when, newest first
+  environment delete   Delete an environment, a shared one for everyone and by an admin (its history stays; projects made from it keep their repositories)
+  events               Stream your boxes' state changes and your agents' status changes, until Ctrl-C
+  update               Pull the termag checkout this CLI was installed from and reinstall it
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

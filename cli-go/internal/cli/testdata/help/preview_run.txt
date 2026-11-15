@@ -1,0 +1,25 @@
+Run a dev server confined to this checkout, so a preview link of it can be shared beyond you.
+
+Usage: termag preview run [--allow <port>,…] [--repo <dir>] [--port <port>] -- <command> [args]…
+
+The box's agent starts <command> in a copy of the checkout you are in, under Landlock and seccomp:
+it can't read the rest of your home directory, write the checkout, reach your tmux, Docker or the
+agent, or connect to port 80 (instance metadata). Edits to the checkout reach it, so HMR works.
+Its TCP connects reach only port 443 and the ports you --allow, on this box or anywhere: name the
+app's own API or database (--allow 3001,5432), never a debugger's port. Port 80 can't be allowed.
+Links for named people or for anyone on termag with the link need their port started this way.
+--port sets PORT for the app. --repo names the repository in a multi-repository workstream.
+Ctrl-C stops it.
+  termag preview run -- npm run dev
+  termag preview run --port 5173 -- npx vite --port 5173
+  termag preview run --allow 3001,5432 -- npm run dev
+
+Global flags:
+  --json          Machine-readable output
+  --yes           Skip confirmations
+  --host <url>    Orchestrator to use (or TERMAG_URL). Default: the production orchestrator,
+                  or this box's own orchestrator when run on a box
+  -h, --help      Show help
+  --version       Show the version
+
+Exit codes: 0 ok, 1 failed, 2 usage error, 3 not found, 4 auth needed, 5 timeout.

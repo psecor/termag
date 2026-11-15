@@ -25,7 +25,7 @@ export interface FreshAccess {
 export async function freshAccess(
   deps: { host: string; credsPath: string; fetch: typeof fetch },
   login: StoredLogin,
-  opts: { rejected?: string; validForMs?: number } = {},
+  opts: { rejected?: string; validForMs?: number; signal?: AbortSignal } = {},
 ): Promise<FreshAccess> {
   const expiresAt = Date.parse(login.accessTokenExpiresAt ?? '');
   const refused = opts.rejected !== undefined && login.accessToken === opts.rejected;
@@ -33,10 +33,12 @@ export async function freshAccess(
   if (login.accessToken && login.accessTokenExpiresAt && !refused && expiresAt - margin > Date.now()) {
     return { accessToken: login.accessToken, accessTokenExpiresAt: login.accessTokenExpiresAt };
   }
+  // `signal` (a Ctrl-C) ends the refresh at once. Safe to cut: /token answers a new access token
+  // and never rotates the device token, so a refresh cut short leaves the login as it was.
   const fresh = await new Api({ host: deps.host, token: null, fetch: deps.fetch }).request<RefreshResponse>('POST', '/token', {
     grant_type: 'refresh_token',
     refresh_token: login.token,
-  });
+  }, { signal: opts.signal });
   const access = { accessToken: fresh.accessToken, accessTokenExpiresAt: expiresAtFrom(fresh.accessTokenExpiresIn) };
   saveLogin(deps.credsPath, deps.host, { ...login, ...access, expiresAt: fresh.expiresAt, maxExpiresAt: fresh.maxExpiresAt });
   return access;

@@ -51,7 +51,7 @@ export const FOR_ASK_DEPRECATED = 'termag: --for-ask is deprecated: `termag ask 
 
 export const LIFECYCLE_COMMANDS: Record<string, CommandSpec> = {
   'box create': {
-    summary: 'Create a box; --size small (2 vCPU, 8 GB), medium (4, 16) or large (8, 32), else your default size; --disk 50 to 300 GB, else 120; --minimal for the lean image; --no-setup to turn termag setup off',
+    summary: 'Create a box; --size small (2 vCPU, 8 GB), medium (4, 16) or large (4, 32), else your default size; --disk 50 to 300 GB, else 120; --minimal for the lean image; --no-setup to turn termag setup off',
     usage: 'termag box create <name> [--size small|medium|large] [--disk <GB>] [--from <github-url>] [--setup|--no-setup] [--wait] [--timeout <seconds>] [--if-not-exists] [--for-ask] [--minimal]',
     options: { size, disk, from: { type: 'string' }, setup, 'no-setup': noSetup, wait, timeout, 'if-not-exists': ifNotExists, 'for-ask': forAsk, minimal: { type: 'boolean' } as const },
     maxArgs: 1,
@@ -62,7 +62,12 @@ export const LIFECYCLE_COMMANDS: Record<string, CommandSpec> = {
     options: { wait, timeout },
     maxArgs: 1,
   },
-  'box stop': { summary: 'Stop a box, keeping its disk and projects', usage: 'termag box stop <box>', maxArgs: 1 },
+  'box stop': {
+    summary: 'Stop a box, keeping its disk and projects; a box running Claude Code cloud sessions needs --force, which ends them',
+    usage: 'termag box stop <box> [--force] [--yes]',
+    options: { force: { type: 'boolean' } },
+    maxArgs: 1,
+  },
   'box keep': {
     summary: 'Keep a running box up: restart its idle clock, as using it would, so auto-park waits another full limit',
     usage: 'termag box keep <box>',
@@ -80,7 +85,7 @@ export const LIFECYCLE_COMMANDS: Record<string, CommandSpec> = {
     maxArgs: 2,
   },
   'box resize': {
-    summary: 'Resize a box to small (2 vCPU, 8 GB), medium (4, 16) or large (8, 32): it stops for two to three minutes, '
+    summary: 'Resize a box to small (2 vCPU, 8 GB), medium (4, 16) or large (4, 32): it stops for two to three minutes, '
       + 'and running turns stop with it; a stopped or hibernated box is resized and left stopped. '
       + '--disk grows its disk (up to 300 GB, never smaller, once every six hours) with the box up',
     usage: 'termag box resize <box> [small|medium|large] [--disk <GB>] [--force] [--wait] [--timeout <seconds>] [--yes]',
@@ -482,7 +487,24 @@ async function cmdBoxStop(ctx: Ctx, args: ParsedArgs): Promise<ExitCode> {
   if (PARKED.has(box.state)) {
     return emitBox(ctx, args, box, { stopped: false }, `${box.name} is already ${box.state}.`);
   }
-  box = (await api.request<{ box: Box }>('POST', `/boxes/${encodeURIComponent(box.id)}/stop`)).box;
+  const found = box;
+  const send = (force: boolean) => api.request<{ box: Box }>(
+    'POST', `/boxes/${encodeURIComponent(found.id)}/stop`, force ? { force: true } : undefined);
+  try {
+    box = (await send(args.options.force === true)).box;
+  } catch (err) {
+    // Cloud sessions run on it: say so, and stop it anyway only when told to.
+    const body = err instanceof CliError ? err.body : undefined;
+    if (!(body?.code === 'box_busy' && body.forceable === true)) throw err;
+    if (!args.yes && ctx.interactive && ctx.confirm) {
+      const reasons = Array.isArray(body.blockers) ? (body.blockers as Array<{ reason: string }>).map(b => b.reason) : [];
+      for (const r of reasons) ctx.err(`  ${r}`);
+      if (!(await ctx.confirm(`Stop ${found.name} anyway? [y/N] `))) throw new CliError('failed', 'Cancelled');
+    } else {
+      throw new CliError('conflict', `${(err as Error).message} Pass --force to stop it anyway.`, (err as CliError).status, body);
+    }
+    box = (await send(true)).box;
+  }
   return emitBox(ctx, args, box, { stopped: true }, `Stopping ${box.name}; its disk and projects are kept.`);
 }
 
@@ -763,8 +785,8 @@ export interface ProjectInput {
 /**
  * An environment's checkouts now, said on stderr (with --json too, which
  * leaves stderr to the caller): what any ask of a project made from it runs
- * without asking, so they are said before it is made. Anyone can edit a shared
- * environment, so the create also names them and the orchestrator refuses (409
+ * without asking, so they are said before it is made. An admin can edit a shared
+ * environment (and anyone who can push its file can change that), so the create also names them and the orchestrator refuses (409
  * environment_repos_changed) when it resolves to anything else by then
  * (backend services/environments.ts withEnvironmentRepos): a guard against an
  * edit in between, not a sign anyone looked.
