@@ -17,6 +17,11 @@
  * `Content-Security-Policy: sandbox`: an uploaded HTML or SVG file opened from
  * its URL runs no script in termag's origin. PDF is in SAFE_INLINE because
  * Chrome's viewer won't render in a sandboxed document.
+ *
+ * `ready` is the storage's prepare() (spacesRuntime.prepareLocalSpaceStorage):
+ * null once the directory is private, else why it refused. While it refuses,
+ * every request here is 503, so a URL signed before the refusal cannot keep
+ * serving from a directory other accounts can read.
  */
 import { Router, type Request, type Response } from 'express';
 import { StorageError, type LocalSpaceObjects } from '../services/spaces/localSpaceObjects';
@@ -50,10 +55,30 @@ function failed(res: Response, err: unknown, what: string): void {
   s3Error(res, 500, 'InternalError', 'We encountered an internal error. Please try again.');
 }
 
-export function spaceStorageRouter(objects: LocalSpaceObjects): Router {
+export interface SpaceStorageRouterOptions {
+  /** Resolves null when the storage may serve, else the reason it may not (answered 503). */
+  ready?: () => Promise<string | null>;
+}
+
+export function spaceStorageRouter(objects: LocalSpaceObjects, opts: SpaceStorageRouterOptions = {}): Router {
   const router = Router();
+  const ready = opts.ready ?? (() => Promise.resolve(null));
+
+  /** 503 and false while the storage refuses to serve; true when it may. */
+  async function serving(res: Response): Promise<boolean> {
+    let refused: string | null;
+    try {
+      refused = await ready();
+    } catch (err) {
+      refused = (err as Error).message;
+    }
+    if (refused === null) return true;
+    refuse(res, 503, 'ServiceUnavailable', `Local space storage is unavailable: ${refused}`);
+    return false;
+  }
 
   router.put('/:token', async (req: Request, res: Response) => {
+    if (!await serving(res)) return;
     const grant = objects.grantOf(req.params.token);
     if (!grant || grant.op === 'get') { refuse(res, 403, 'AccessDenied', 'Request has expired or is not a signed upload'); return; }
     const declared = req.headers['content-length'];
@@ -76,6 +101,7 @@ export function spaceStorageRouter(objects: LocalSpaceObjects): Router {
   });
 
   router.get('/:token', async (req: Request, res: Response) => {
+    if (!await serving(res)) return;
     const grant = objects.grantOf(req.params.token);
     if (!grant || grant.op !== 'get') { refuse(res, 403, 'AccessDenied', 'Request has expired or is not a signed download'); return; }
     let file;

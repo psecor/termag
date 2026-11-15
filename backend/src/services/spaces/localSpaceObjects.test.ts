@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync } from 'fs';
+import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { Readable } from 'stream';
@@ -283,6 +283,70 @@ describe('LocalSpaceObjects', () => {
     expect(await objects.versionsOf('sp1/a')).toEqual([]);
     expect(readdirSync(join(root, 'objects'))).toEqual(['d.sp2']);
     expect(await text('sp2/c')).toBe('4');
+  });
+
+  describe('privacy on a shared host', () => {
+    const modeOf = (p: string) => statSync(p).mode & 0o777;
+    let umask: number;
+    beforeEach(() => { umask = process.umask(0); });
+    afterEach(() => { process.umask(umask); });
+
+    it('creates folders 0700 and files 0600 whatever the umask', async () => {
+      await put('sp1/long/' + 'n'.repeat(240) + '/a.txt', 'x');
+      const up = await multipart('sp1/big.zip', ['a', 'b']);
+      await objects.createMultipart('sp1/open.zip', 'application/zip');
+      await objects.copy('sp1/long/' + 'n'.repeat(240) + '/a.txt', 'sp1/copy.txt');
+      await up.complete();
+      const open: string[] = [];
+      const walk = (dir: string) => {
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+          const p = join(dir, e.name);
+          if (e.isDirectory()) { if (modeOf(p) !== 0o700) open.push(`${p} ${modeOf(p).toString(8)}`); walk(p); }
+          else if (modeOf(p) !== 0o600) open.push(`${p} ${modeOf(p).toString(8)}`);
+        }
+      };
+      walk(root);
+      expect(open).toEqual([]);
+    });
+
+    it('prepare makes a missing root 0700 and tightens an open one it owns', async () => {
+      const fresh = join(root, 'new', 'spaces');
+      await new LocalSpaceObjects({ root: fresh, baseUrl: 'https://termag.test/x', secret: 's' }).prepare();
+      expect(modeOf(fresh)).toBe(0o700);
+      chmodSync(root, 0o755);
+      await objects.prepare();
+      expect(modeOf(root)).toBe(0o700);
+      await objects.prepare();
+      expect(modeOf(root)).toBe(0o700);
+    });
+
+    it('prepare tightens a tree written before modes were set, not only its root', async () => {
+      await put('sp1/docs/a.txt', 'x');
+      await (await multipart('sp1/big.zip', ['a', 'b'])).complete();
+      await objects.createMultipart('sp1/open.zip', 'application/zip');
+      // What the first release left behind under UMask=0022.
+      const loosen = (dir: string) => {
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+          const p = join(dir, e.name);
+          if (e.isDirectory()) { chmodSync(p, 0o755); loosen(p); } else chmodSync(p, 0o644);
+        }
+      };
+      loosen(root);
+      chmodSync(root, 0o755);
+      await objects.prepare();
+      const open: string[] = [];
+      const walk = (dir: string) => {
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+          const p = join(dir, e.name);
+          if (e.isDirectory()) { if (modeOf(p) !== 0o700) open.push(p); walk(p); }
+          else if (modeOf(p) !== 0o600) open.push(p);
+        }
+      };
+      walk(root);
+      expect(modeOf(root)).toBe(0o700);
+      expect(open).toEqual([]);
+      expect(await text('sp1/docs/a.txt')).toBe('x');
+    });
   });
 
   it('signs URLs that carry the grant and expire', async () => {
