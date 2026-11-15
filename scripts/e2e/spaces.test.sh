@@ -11,15 +11,25 @@
 # files kept out of space memory, and the move script taking an old folder's
 # notes there. Runs on its own ports and TMPDIR, beside any stack that is up.
 #
+# E2E_TEST_SPACES=local runs it all against spaces on the backend's own disk
+# (SPACES_STORAGE=local, docs/spaces-local-storage.md) instead of Floci: links
+# go to the backend's /api/space-storage, and the storage checks look at the
+# files on disk (where they are, and that nobody else can read them) instead
+# of SSE-KMS.
+#
 # Run: bash scripts/e2e/spaces.test.sh   (or make e2e-test-spaces)
+#      E2E_TEST_SPACES=local bash scripts/e2e/spaces.test.sh   (or make e2e-test-spaces-local)
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 WORK=$(mktemp -d)
 export TMPDIR=$WORK
+MODE=${E2E_TEST_SPACES:-1}
+case $MODE in 1|local) ;; *) echo "E2E_TEST_SPACES must be 1 or local, got '$MODE'"; exit 1 ;; esac
 export E2E_PORT=${E2E_TEST_PORT:-3960} E2E_FRONTEND_PORT=${E2E_TEST_FRONTEND_PORT:-5994} E2E_PG_PORT=${E2E_TEST_PG_PORT:-55459} E2E_BOXES=2 \
-  E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4676} E2E_FAKE_AWS=1 E2E_SPACES=1 E2E_FLAGS='{"automations-enabled":true,"automation-space-folder-enabled":true}'
+  E2E_SPACES=$MODE E2E_FLAGS='{"automations-enabled":true,"automation-space-folder-enabled":true}'
+if [ "$MODE" = 1 ]; then export E2E_AWS_PORT=${E2E_TEST_AWS_PORT:-4676} E2E_FAKE_AWS=1; fi
 [ -n "${E2E_KEEP:-}" ] || trap 'bash "$here/down.sh" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
 
 failures=0
@@ -46,8 +56,10 @@ pass "up.sh brought the stack up"
 . "$here/lib.sh"
 ROOT=$(e2e_root) || { echo "FAIL: no stack root after up.sh"; exit 1; }
 API="http://127.0.0.1:$E2E_PORT/termag"
-AWS="http://127.0.0.1:$E2E_AWS_PORT"
+AWS="http://127.0.0.1:${E2E_AWS_PORT:-}"
 BUCKET=termag-spaces-000000000000-us-east-2-an
+# Where a signed link points: the bucket, or the backend's own storage route behind the frontend's origin.
+if [ "$MODE" = local ]; then STORE="http://localhost:$E2E_FRONTEND_PORT/termag/api/space-storage/"; else STORE="$AWS/$BUCKET/"; fi
 JAR="$WORK/browser-cookies"
 curl -s -o /dev/null -c "$JAR" -b "$JAR" "$API/auth/login"
 PSQL=(psql -tA "postgresql://termag@127.0.0.1:$E2E_PG_PORT/termag")
@@ -64,7 +76,9 @@ on_box() { local box=$1; shift; (cd "$WORK/$box" && HOME="$ROOT/boxes/$box/home"
 mkdir -p "$WORK/box-1" "$WORK/box-2"
 
 echo "--- the browser API"
-check "the seeded bucket is the derived name" "$BUCKET" "$(grep -o 'termag-spaces-[0-9a-z-]*-an' "$ROOT/logs/aws-seed.log" | tail -1)"
+if [ "$MODE" = 1 ]; then
+  check "the seeded bucket is the derived name" "$BUCKET" "$(grep -o 'termag-spaces-[0-9a-z-]*-an' "$ROOT/logs/aws-seed.log" | tail -1)"
+fi
 check "spaces list starts empty" "[]" "$(browser GET /spaces | jq -c .spaces)"
 check "a bad space name is refused" 400 "$(status POST /spaces '{"name":"Bad Name"}')"
 check "create a space" "team owner" "$(browser POST /spaces '{"name":"team","description":"e2e"}' | jq -r '"\(.space.name) \(.space.role)"')"
@@ -124,12 +138,19 @@ check "after mv and rm only data/ and docs/ are left" "data/ docs/" "$(on_box bo
 
 echo "--- storage"
 space_id=$(browser GET /spaces/team | jq -r .space.id)
-key="$space_id/docs/note.txt"
-head_out=$(curl -sI "$AWS/$BUCKET/$key")
-check "the object is under <space id>/" 200 "$(printf '%s' "$head_out" | head -1 | awk '{print $2}')"
-check "it is SSE-KMS" "aws:kms" "$(printf '%s' "$head_out" | tr -d '\r' | sed -n 's/^x-amz-server-side-encryption: //Ip')"
-check "under the alias ARN" "arn:aws:kms:us-east-2:000000000000:alias/termag-spaces" \
-  "$(printf '%s' "$head_out" | tr -d '\r' | sed -n 's/^x-amz-server-side-encryption-aws-kms-key-id: //Ip')"
+if [ "$MODE" = local ]; then
+  obj="$ROOT/spaces/objects/d.$space_id/d.docs/o.note.txt"
+  check "the object is under <space id>/ on disk" 1 "$(jq '.versions | length' "$obj/index.json" 2>/dev/null)"
+  check "the storage root is private to the backend's user" 700 "$(stat -c %a "$ROOT/spaces")"
+  check "and so is the version file" 600 "$(stat -c %a "$obj/$(jq -r '.versions[0].versionId' "$obj/index.json")")"
+else
+  key="$space_id/docs/note.txt"
+  head_out=$(curl -sI "$AWS/$BUCKET/$key")
+  check "the object is under <space id>/" 200 "$(printf '%s' "$head_out" | head -1 | awk '{print $2}')"
+  check "it is SSE-KMS" "aws:kms" "$(printf '%s' "$head_out" | tr -d '\r' | sed -n 's/^x-amz-server-side-encryption: //Ip')"
+  check "under the alias ARN" "arn:aws:kms:us-east-2:000000000000:alias/termag-spaces" \
+    "$(printf '%s' "$head_out" | tr -d '\r' | sed -n 's/^x-amz-server-side-encryption-aws-kms-key-id: //Ip')"
+fi
 
 echo "--- the browser's own transfers"
 up=$(browser POST /spaces/team/files/upload '{"path":"docs/from-browser.md","size":6,"contentType":"text/markdown"}')
@@ -149,15 +170,17 @@ check "space url prints the file's /termag/files/ link" "$link_path" \
   "$(on_box box-1 space url team:docs/note.txt 2>/dev/null | sed -E 's#^https?://[^/]+##')"
 check "space url of a missing file is exit 3" 3 "$(on_box box-1 space url team:docs/nope.txt >/dev/null 2>&1; echo $?)"
 loc=$(curl -s -o /dev/null -w '%{redirect_url}' -b "$JAR" "$API/files/team/docs/note.txt")
-check "a signed-in link is a 302 to storage" "$AWS/$BUCKET/" "$(printf '%s' "$loc" | grep -o "^$AWS/$BUCKET/")"
+check "a signed-in link is a 302 to storage" "$STORE" "$(printf '%s' "$loc" | grep -o "^$STORE")"
 check "which serves the file" "hello spaces" "$(curl -s "$loc")"
 check "plain text opens inline" yes "$(curl -sI "$loc" | grep -qi '^content-disposition: inline' && echo yes || echo no)"
 printf '<script>alert(1)</script>' >"$WORK/box-1/page.html"
 on_box box-1 space put page.html team:docs/page.html >/dev/null 2>&1
-html_loc=$(curl -s -o /dev/null -w '%{redirect_url}' -b "$JAR" "$API/files/team/docs/page.html")
-html_head=$(curl -sI "$html_loc" | tr -d '\r')
-check "HTML downloads as an attachment" yes "$(printf '%s' "$html_head" | grep -qi '^content-disposition: attachment' && echo yes || echo no)"
-check "typed application/octet-stream" "application/octet-stream" "$(printf '%s' "$html_head" | sed -n 's/^content-type: //Ip')"
+# A small HTML file is no redirect: termag answers it itself, sandboxed (spaceLinks.ts HTML_LINK_HEADERS),
+# whatever the storage, so its script never runs in termag's origin or the bucket's.
+html_head=$(curl -s -D - -o /dev/null -b "$JAR" "$API/files/team/docs/page.html" | tr -d '\r')
+check "a small HTML link is answered by termag, not a redirect" 200 "$(printf '%s' "$html_head" | head -1 | awk '{print $2}')"
+check "sandboxed" yes "$(printf '%s' "$html_head" | grep -qi '^content-security-policy: sandbox' && echo yes || echo no)"
+check "never sniffed" nosniff "$(printf '%s' "$html_head" | sed -n 's/^x-content-type-options: //Ip')"
 check "a missing file is 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$API/files/team/docs/nope.txt")"
 check "an unknown space is the same 404" 404 "$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "$API/files/nope/docs/note.txt")"
 check "the link works through the frontend's proxy" 302 \
@@ -195,9 +218,9 @@ check "the share names the box's owner" "e2e@termag.local" \
   "$(on_box box-1 space share team:artifacts/x.png --json 2>/dev/null | jq -r .sharedBy.email)"
 check "and its event the box" "$("${PSQL[@]}" -c "select id from instances where name = 'box-1'")" \
   "$(browser GET /spaces/team/events | jq -r '[.events[] | select(.action == "file.share" and .path == "artifacts/x.png")][0].actorInstanceId')"
-check "riley, no member, opens the box's link" "$AWS/$BUCKET/" "$(as_riley '%{redirect_url}' artifacts/x.png | grep -o "^$AWS/$BUCKET/")"
+check "riley, no member, opens the box's link" "$STORE" "$(as_riley '%{redirect_url}' artifacts/x.png | grep -o "^$STORE")"
 check "the box shares a file at the space root too: there is no folder limit" 0 "$(on_box box-1 space share team:notes.md >/dev/null 2>&1; echo $?)"
-check "which riley opens as well" "$AWS/$BUCKET/" "$(as_riley '%{redirect_url}' notes.md | grep -o "^$AWS/$BUCKET/")"
+check "which riley opens as well" "$STORE" "$(as_riley '%{redirect_url}' notes.md | grep -o "^$STORE")"
 check "the box makes it private again" 0 "$(on_box box-1 space unshare team:notes.md >/dev/null 2>&1; echo $?)"
 check "the box unshares it" 0 "$(on_box box-1 space unshare team:artifacts/x.png >/dev/null 2>&1; echo $?)"
 check "and riley's link is a 404 again" 404 "$(as_riley '%{http_code}' artifacts/x.png)"

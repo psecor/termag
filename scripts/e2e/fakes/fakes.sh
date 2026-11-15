@@ -15,6 +15,8 @@
 #   E2E_AWS_SEED=f     script run once Floci is up (E2E_AWS_URL set, aws.sh on PATH)
 #   E2E_SPACES=1       the spaces bucket and KMS alias in Floci, under the names the
 #                      backend derives (fakes/spaces.sh); needs FAKE_AWS.
+#   E2E_SPACES=local   spaces on the backend's own disk instead (SPACES_STORAGE=local,
+#                      under $ROOT/spaces): no Floci, no AWS
 #   E2E_CREDENTIAL_STORE=1
 #                      the per-user credential store's KMS key in Floci, and its ARN
 #                      in the backend env; needs FAKE_AWS
@@ -180,7 +182,8 @@ fakes_check() {
   [ "$EC2_BOXES" -le "$BOXES" ] || die "E2E_EC2_BOXES ($EC2_BOXES) is more than E2E_BOXES ($BOXES)"
   if [ -n "$AWS_SEED" ] && [ -z "$FAKE_AWS" ]; then die "E2E_AWS_SEED needs E2E_FAKE_AWS=1"; fi
   if [ -n "$CREDENTIAL_STORE" ] && [ -z "$FAKE_AWS" ]; then die "E2E_CREDENTIAL_STORE needs E2E_FAKE_AWS=1"; fi
-  if [ -n "$SPACES" ] && [ -z "$FAKE_AWS" ]; then die "E2E_SPACES needs E2E_FAKE_AWS=1"; fi
+  case $SPACES in ''|1|local) ;; *) die "E2E_SPACES must be 1 (S3 in Floci) or local, got '$SPACES'" ;; esac
+  if [ "$SPACES" = 1 ] && [ -z "$FAKE_AWS" ]; then die "E2E_SPACES=1 needs E2E_FAKE_AWS=1 (or use E2E_SPACES=local)"; fi
   if [ -n "$EC2_LAUNCH" ] && [ -z "$FAKE_AWS" ]; then die "E2E_EC2_LAUNCH needs E2E_FAKE_AWS=1"; fi
   if [ -n "$FLOCI_MODE" ] && [ -z "$FAKE_AWS" ]; then die "E2E_FLOCI needs E2E_FAKE_AWS=1"; fi
   if [ -n "$FAKE_AWS" ]; then
@@ -278,6 +281,7 @@ fakes_record() {
   cat >>"$ROOT/stack.env" <<EOF
 FAKES="${PG_IAM:+pg-iam }${FAKE_AWS:+aws }${CREDENTIAL_STORE:+credential-store }${SPACES:+spaces }${FAKE_BEDROCK:+bedrock }${FAKE_MCP:+mcp }${CLAUDE_GATEWAY_TF:+claude-gateway }${EC2_LAUNCH:+ec2-launch }${WARM_POOL:+warm-pool }${FLAGS:+flags }${FAKE_CLAUDE:+claude }${CLAUDE_BIN:+real-claude }${T3:+t3 }${FAKE_GITHUB:+github }${REAL_GITHUB:+real-github }${DOTFILES_REPO:+dotfiles }${FAKE_TLS:+tls }${FAKE_SSHD:+sshd }${TMUX_FAULTS:+tmux-faults }"
 EC2_BOXES=$EC2_BOXES
+SPACES=$SPACES
 AWS_URL=${FAKE_AWS:+http://127.0.0.1:$AWS_PORT}
 FLOCI_MODE=$FLOCI_MODE
 EC2_URL=${EC2_LAUNCH:+http://127.0.0.1:$EC2_PORT}
@@ -353,6 +357,11 @@ tls_certs() {
 
 # Before the backend starts: services it must reach, and its env.
 fakes_before_backend() {
+  if [ "$SPACES" = local ]; then
+    log "spaces on local disk under $ROOT/spaces"
+    printf 'SPACES_STORAGE=local\nSPACES_LOCAL_DIR=%s\n' "$ROOT/spaces" >>"$ROOT/backend.env"
+  fi
+
   if [ -n "$T3" ]; then
     T3_BIN=$(t3_box_command) || exit 1
     box_extra+=("TERMAG_T3_COMMAND=$T3_BIN")
@@ -431,7 +440,7 @@ EOF
       env -i "${base_env[@]}" "PATH=$fakes_dir:$PATH" "E2E_AWS_URL=http://127.0.0.1:$AWS_PORT" \
         bash "$AWS_SEED" >"$ROOT/logs/aws-seed.log" 2>&1 || die "E2E_AWS_SEED failed (logs/aws-seed.log)"
     fi
-    if [ -n "$SPACES" ]; then
+    if [ "$SPACES" = 1 ]; then
       log "creating the spaces bucket and KMS alias in floci"
       env -i "${base_env[@]}" "E2E_AWS_URL=http://127.0.0.1:$AWS_PORT" "E2E_AWS_REGION=$AWS_REGION_E2E" \
         bash "$fakes_dir/spaces.sh" seed "http://127.0.0.1:$FRONTEND_PORT" "http://localhost:$FRONTEND_PORT" \
